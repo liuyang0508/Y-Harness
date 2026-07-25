@@ -1,3 +1,7 @@
+[workspace]
+members = ["clients/tui"]
+resolver = "3"
+
 [package]
 name = "y-harness"
 version = "0.1.0"
@@ -9,6 +13,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/liuyang0508/Y-Harness"
 homepage = "https://github.com/liuyang0508/Y-Harness"
 readme = "README.md"
+exclude = ["clients/", "scripts/install-tui.sh", "scripts/smoke-tui.py"]
 keywords = ["agent", "harness", "runtime", "llm", "orchestration"]
 categories = ["development-tools", "asynchronous"]
 

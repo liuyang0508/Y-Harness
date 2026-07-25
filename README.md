@@ -21,6 +21,13 @@ Run the deterministic, zero-network Agent Loop:
 yh demo "hello Y-Harness"
 ```
 
+Install and run the optional full-screen terminal product:
+
+```bash
+./scripts/install-tui.sh
+yh-tui --demo
+```
+
 Create and validate a persistent Harness service:
 
 ```bash
@@ -46,17 +53,26 @@ See the [Chinese quick start](docs/quickstart.zh-CN.md), the
 ## Product boundary
 
 ```text
-CLI/TUI · SDK hosts · future Web/Desktop clients
-                       │
-                 typed protocol
-                       │
-                Y-Harness Runtime
-                       │
-                  Y-Harness Core
+optional products: TUI · Desktop · Web · IM · SDK hosts
+                           │
+                    versioned protocol
+                           │
+                 headless Y-Harness Runtime
+                           │
+                      Harness Core
 ```
 
-Core and Runtime own execution semantics. Clients render and control them;
-clients do not own agent state or policy.
+Core and Runtime own execution semantics. Every product surface is an
+independent, replaceable client module that renders and controls the same
+engine through its public contract. Clients do not open engine databases,
+construct providers, own authoritative Agent state, or bypass Policy.
+
+The repository currently ships two separately installable packages:
+
+| Package | Binary | Role |
+|---|---|---|
+| `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v10 |
 
 ## Architecture
 
@@ -516,14 +532,17 @@ It accepts one JSON request per line and emits only JSON responses on stdout.
 `serve-demo` uses the deterministic local model and `echo` tool; it is a
 protocol reference host, not a production provider configuration.
 
-Run the dependency-free, line-oriented reference TUI:
+Run the independently installable full-screen TUI:
 
 ```bash
-cargo run -- tui-demo
+./scripts/install-tui.sh
+yh-tui --demo
 ```
 
-The TUI creates Threads, streams/runs Turns, polls and forgets Operations, and
-reads paginated events only through the typed protocol.
+The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
+streams Turns, polls and forgets Operations, and projects paginated State,
+Approval, and Task views only through Protocol v10. It is implemented in
+[`clients/tui`](clients/tui) and can be omitted without changing the engine.
 
 Agent Memory Hub is the first-party reference integration for governed
 long-term memory. Y-Harness owns when and under which policy a memory provider

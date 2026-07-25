@@ -27,13 +27,14 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Headless embeddable Rust core | public contracts in `src/lib.rs`; zero-default build; external-view examples execute a Policy-controlled Model/Tool loop and a fenced Task DAG | compiled and run locally; CI-gated |
 | Reference-project derivation | primary-source comparison, immutable open-source snapshots, adopted/rejected decisions, code/ADR mapping in `reference-analysis.md` | documented and link-checked locally |
 | Serviceable typed protocol | language-neutral v10 specification, exact envelope/schema-4 provenance test, negotiation, async Turn operations, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS tests; passing locally |
-| Reference CLI + lightweight TUI | `yh init/doctor/serve`, durable State/Approval/Task databases, deterministic demo, `src/reference_cli`, process tests | installed-binary and restart tests passing locally |
+| Engine CLI | `yh init/doctor/serve`, durable State/Approval/Task databases, deterministic demo, `src/reference_cli`, process tests | installed-binary and restart tests passing locally |
+| Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v10-only child transport, TestBackend render tests, real PTY Turn | independently installable; local unit/lint/PTY gates passing |
 | Install and operator path | Cargo-backed no-side-effect install script, strict config template, Chinese quick start, real language-neutral Task Worker, acceptance checklist | clean-prefix install and revision-6 worker lifecycle passing locally |
 | MCP tools | official SDK client plus atomic namespaced Tool registration | passing locally |
 | Agent Memory Hub | first-party provider adapter over persistent stdio MCP | live local round trip passing; CI environment-gated |
 | External model provider | exact-versioned HTTPS JSON/NDJSON gateway, secret references, exclusive private-CA trust and mTLS identity | local private-gateway TLS passing; live gateway environment-gated |
 | External executable capabilities | deny-by-default Process Broker and bounded JSON adapters | passing locally |
-| Web/Desktop | intentionally outside the first core; connect through the same protocol | future clients, not duplicate runtimes |
+| Desktop/Web/IM | intentionally independent optional products over the same protocol | future clients, never duplicate runtimes |
 
 ## Local gate evidence
 
@@ -49,20 +50,29 @@ cargo check --locked --no-default-features --features tls-host
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --no-default-features
 cargo test --locked --all-features
+cargo test --locked -p y-harness-tui
+cargo clippy --locked -p y-harness-tui --all-targets -- -D warnings
 cargo run --locked --example embedded
 cargo run --locked --example orchestrated
 cargo run --locked -- eval-smoke
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo audit --deny warnings
-cargo package --locked
+cargo package --locked -p y-harness
 ./scripts/install.sh --root /isolated/prefix
+./scripts/install-tui.sh --root /isolated/tui-prefix
+python3 scripts/smoke-tui.py
+python3 scripts/smoke-tui.py --configured
 YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
   /isolated/project/y-harness.json
 ```
 
-The all-feature run contains 253 passing library tests, 1 CLI configuration
-test, 8 process/service tests, and 2 local private-gateway TLS integration
-tests. One additional 64 MiB migration test and one 126.9 MiB Approval Inbox
+The all-feature workspace run contains 253 passing library tests, 1 CLI
+configuration test, 7 Engine process/service tests, 8 TUI unit/render tests,
+and 2 local private-gateway TLS integration tests. The demo and configured
+PTY smoke gates submit real Turns, verify durable State, and check
+alternate-screen and bracketed-paste restoration. One additional 64 MiB
+migration test and one
+126.9 MiB Approval Inbox
 migration test are deliberately manual.
 Four integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:

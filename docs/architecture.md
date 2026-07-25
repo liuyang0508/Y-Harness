@@ -2,16 +2,20 @@
 
 ## System shape
 
-Y-Harness has one semantic core with two consumption modes:
+Y-Harness has one semantic core with two consumption modes and replaceable
+product clients:
 
 ```text
-embedded application ──────── Core API
-                                      \
-CLI/TUI/Web/Desktop ─ typed protocol ─ Runtime ─ Core
+embedded host ───────────────────────────── Core API
+                                                   \
+TUI · Desktop · Web · IM · SDK ─ versioned protocol ─ Runtime ─ Core
+        independent optional products
 ```
 
 The service mode must not implement a second agent loop. It hosts the same
-Core and translates protocol commands and events.
+Core and translates protocol commands and events. Product clients never import
+provider implementations, open Runtime storage, or become authoritative state
+owners.
 
 This shape is derived from a primary-source comparison of Pi Agent Harness,
 Claude Code, Codex, Hermes Agent, and OpenCode. The observations, decisions,
@@ -219,9 +223,12 @@ direction:
   fingerprint principal, checks exact per-command grants before execution,
   filters advertised capabilities, and trusts only local-process callers by
   default;
-- a dependency-free reference CLI/TUI that controls the Runtime through typed
-  commands rather than duplicating Agent Loop behavior, plus strict project
-  initialization, diagnostic, and persistent stdio service commands;
+- a thin engine CLI with strict project initialization, diagnostic, migration,
+  deterministic demo, and persistent stdio service commands;
+- an independently installable full-screen Rust TUI under `clients/tui` that
+  supervises the engine process and controls it exclusively through Protocol
+  v10, with authoritative Thread projection, bounded provisional streaming,
+  cancellation, event paging, and read-only Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
   adapters for Tools and Models with the Runtime's exact Turn cancellation

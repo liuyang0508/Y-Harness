@@ -32,6 +32,8 @@ Observability reads State evidence; it does not mutate execution
 ## Source layout
 
 ```text
+clients/
+└── tui/             optional full-screen Protocol client; no Runtime internals
 src/
 ├── approval/        durable inbox, CAS settlement, and handler adapter
 ├── context/         context compilation and token allocation
@@ -44,7 +46,7 @@ src/
 ├── observability/   content-free phase observations and evidence exports
 ├── orchestration/   Task DAGs, bounded scheduling, leases, messages, Artifacts
 ├── protocol/        transport-neutral client commands and bounded stdio
-├── reference_cli/   demo/TUI plus strict project and persistent service host
+├── reference_cli/   demo plus strict project and persistent service host
 ├── runtime/         Agent Loop and policy/tool settlement
 ├── secret/          opaque references, zeroizing values, resolver registry
 ├── skill/           package integrity, resolution, and context loading
@@ -59,6 +61,11 @@ src/
 
 New directories are added when a real layer obtains code. Empty architectural
 placeholders are not created.
+
+Product clients are separate workspace packages and release assets. They may
+depend on public wire DTOs for compile-time type safety, but execute only
+against the versioned protocol boundary. No client may call Runtime/provider
+internals or read Engine storage directly.
 
 ## Code and comments
 

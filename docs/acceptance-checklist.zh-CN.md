@@ -5,9 +5,12 @@
 ## A. 安装与第一体验
 
 - [ ] `./scripts/install.sh` 成功完成。
+- [ ] `./scripts/install-tui.sh` 成功完成，且不改变 `yh` 引擎安装。
 - [ ] `yh --version` 输出当前版本。
 - [ ] `yh demo "验收 Harness"` 返回终态文本、Thread ID 和 Trace 路径。
-- [ ] `yh tui-demo` 可执行 Turn、`/events` 和 `/quit`。
+- [ ] `yh-tui --demo` 进入 alternate screen，可执行 Turn、查看 Inspector
+      并用 `/quit` 完整恢复终端。
+- [ ] 不安装 `yh-tui` 时，`yh serve`、嵌入式 Core 和协议行为保持不变。
 
 ## B. 项目初始化与诊断
 
@@ -66,16 +69,23 @@ cargo run --locked --example orchestrated
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo clippy --locked --lib --all-features -- \
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked -p y-harness --lib --all-features -- \
   -D clippy::unwrap_used \
   -D clippy::expect_used \
   -D clippy::panic \
   -D warnings
-cargo test --locked --all-targets --no-default-features
-cargo test --locked --all-targets --all-features
+cargo clippy --locked -p y-harness-tui --bin yh-tui -- \
+  -D clippy::unwrap_used \
+  -D clippy::expect_used \
+  -D clippy::panic \
+  -D warnings
+cargo test --locked --workspace --all-targets --no-default-features
+cargo test --locked --workspace --all-targets --all-features
+python3 scripts/smoke-tui.py
+python3 scripts/smoke-tui.py --configured
 cargo run --locked -- eval-smoke
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
 cargo audit --deny warnings
 ```
 
@@ -87,7 +97,7 @@ cargo audit --deny warnings
 ## G. 发布
 
 - [ ] `LICENSE-MIT` 与 `LICENSE-APACHE` 存在。
-- [ ] `cargo package --locked` 成功。
+- [ ] `cargo package --locked -p y-harness` 成功。
 - [ ] Git 工作区干净。
 - [ ] 远程 CI 在精确发布提交上全绿。
 - [ ] Release notes 明确 unsupported platform、外部 Gateway 和沙箱边界。

@@ -26,24 +26,36 @@ yh --version
 yh demo "你好，Y-Harness"
 ```
 
-进入轻量 TUI：
+TUI 是独立选装产品，不编进引擎。安装并进入全屏 TUI：
 
 ```bash
-yh tui-demo
+./scripts/install-tui.sh
+yh-tui --demo
 ```
 
 TUI 支持：
 
 ```text
-任意文本     执行一个 Turn
-/new         创建新 Thread
-/events      查看前 20 条权威事件
-/help        查看命令
-/quit        退出
+Enter           发送并执行一个 Turn
+Ctrl/Alt+Enter  输入多行
+Tab、←/→        切换输入区与 Inspector 面板
+PageUp/Down     滚动权威会话投影
+Ctrl+N          创建新 Thread
+Ctrl+R          刷新 State、事件、Approval 与 Task 投影
+Esc             取消运行中的 Turn
+F1 或 ?         打开帮助
 ```
+
+也可使用 `/new`、`/thread <id>`、`/graph <id>`、`/events`、
+`/approvals`、`/tasks`、`/refresh`、`/cancel`、`/help` 和 `/quit`。
+连接真实配置时执行 `yh-tui --config y-harness.json`。
 
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
+
+`yh-tui` 只通过 Protocol v10 调用 `yh`：它不读取 SQLite，不构造
+Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
+同一边界并独立选装。
 
 ## 3. 初始化持久化服务项目
 

@@ -7,10 +7,10 @@
 
 ## Context
 
-Embedded callers, CLI/TUI clients, and future Web/Desktop hosts must control the
-same Runtime without reimplementing Agent Loop semantics. A Turn can outlive one
-request/response exchange, and its cancellation or timeout must remain distinct
-from a transport disconnect.
+Embedded callers and independent TUI/Desktop/Web/IM clients must control the
+same Runtime without reimplementing Agent Loop semantics. A Turn can outlive
+one request/response exchange, and its cancellation or timeout must remain
+distinct from a transport disconnect.
 
 An unbounded line protocol, unbounded operation registry, or whole-history event
 read would make the reference service vulnerable to memory exhaustion even when
@@ -57,8 +57,8 @@ settles the durable running Turn as `interrupted`; the old process-local
 ## Consequences
 
 Local clients now have a bounded, black-box-tested service surface suitable for
-the reference CLI/TUI. Other transports can reuse `ProtocolHandler` without
-changing Core execution semantics.
+independently shipped TUI/Desktop/Web/IM products. Other transports can reuse
+`ProtocolHandler` without changing Core execution semantics.
 
 Clients must distinguish protocol correlation, process-local operation
 identity, and durable Thread/Turn identity. They must page history, release

@@ -9,6 +9,7 @@ upgrade support that has not been tested.
 | Surface | Current coordinate | Negotiation |
 |---|---:|---|
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
+| Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
 | Client protocol | `"10"` | exact `Initialize` request/response |
 | State events | `4` | per-event durable envelope; reads schemas 1, 2, 3, and 4 |

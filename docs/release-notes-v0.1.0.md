@@ -7,15 +7,18 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v10 service, reference CLI
-and lightweight TUI, durable SQLite State/Approval/Task coordination, governed
-extension contracts, evaluation gates, and executable examples.
+It ships an embeddable Rust Core/Runtime, Protocol v10 service, thin engine CLI,
+an independently installable full-screen TUI, durable SQLite
+State/Approval/Task coordination, governed extension contracts, evaluation
+gates, and executable examples.
 
 ## Start
 
 ```bash
 ./scripts/install.sh
+./scripts/install-tui.sh
 yh demo "hello Y-Harness"
+yh-tui --demo
 yh init my-harness
 cd my-harness
 yh doctor
@@ -25,6 +28,7 @@ yh serve
 ## Compatibility
 
 - Rust crate: `0.1.0`
+- optional TUI package: `0.1.0`
 - service configuration: `1`
 - client protocol: `10`
 - State event/snapshot schema: `4` / `4`

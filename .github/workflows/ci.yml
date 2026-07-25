@@ -31,23 +31,34 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
       - name: Lints
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Production panic boundary
         run: |
-          cargo clippy --locked --lib --all-features -- \
+          cargo clippy --locked -p y-harness --lib --all-features -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D warnings
+          cargo clippy --locked -p y-harness-tui --bin yh-tui -- \
             -D clippy::unwrap_used \
             -D clippy::expect_used \
             -D clippy::panic \
             -D warnings
       - name: Minimal surface tests
-        run: cargo test --locked --all-targets --no-default-features
+        run: cargo test --locked --workspace --all-targets --no-default-features
       - name: Isolated optional-feature checks
         run: |
           cargo check --locked --no-default-features --features https-model
           cargo check --locked --no-default-features --features https-skill
           cargo check --locked --no-default-features --features tls-host
       - name: All-feature tests
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
+      - name: Full-screen TUI pseudo-terminal smoke
+        run: |
+          cargo build --locked --bin yh -p y-harness
+          cargo build --locked --bin yh-tui -p y-harness-tui
+          python3 scripts/smoke-tui.py
+          python3 scripts/smoke-tui.py --configured
       - name: Public API embedding
         run: |
           cargo run --locked --example embedded
@@ -57,9 +68,9 @@ jobs:
       - name: Public documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps --all-features
+        run: cargo doc --locked --workspace --no-deps --all-features
       - name: Publishable crate archive
-        run: cargo package --locked
+        run: cargo package --locked -p y-harness
 
   portability:
     name: Tests on ${{ matrix.os }}
@@ -81,7 +92,7 @@ jobs:
       - name: Select minimum Rust toolchain
         run: rustup default 1.88.0
       - name: Tests
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
 
   security-audit:
     name: RustSec dependency audit

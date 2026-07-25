@@ -510,6 +510,8 @@ mapping. Task integration tests prove conditional discovery, bounded cursor
 paging, principal-derived ownership, cross-principal fencing, server-clock
 heartbeat, messaging, terminal recovery, and explicit-revision cancellation.
 Process tests additionally prove stdout purity, one response per request,
-asynchronous Turn control, and the protocol-only reference TUI. The optional
-TLS integration tests prove that the same handler requires and authenticates
-client certificates.
+and asynchronous Turn control. The independent `y-harness-tui` package has
+TestBackend rendering tests and a real-PTY smoke gate against `yh serve-demo`;
+it does not call Runtime internals or open State storage. The optional TLS
+integration tests prove that the same handler requires and authenticates client
+certificates.

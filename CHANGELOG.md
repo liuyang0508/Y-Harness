@@ -14,8 +14,11 @@ Initial public baseline:
 - Protocol v10 stdio and mandatory-mTLS hosts;
 - durable Task Graph coordination with leases, fencing, Mailbox, workspaces,
   and authenticated worker commands;
-- `yh init`, `yh doctor`, `yh serve`, deterministic demo, lightweight TUI,
-  backup-first migration commands, and regression evaluation;
+- `yh init`, `yh doctor`, `yh serve`, deterministic demo, backup-first
+  migration commands, and regression evaluation;
+- independently installable `yh-tui` full-screen product client over Protocol
+  v10, with authoritative State projection, streaming, cancellation, and
+  read-only Approval/Task inspection;
 - MIT OR Apache-2.0 licensing.
 
 Supported evidence is limited to the exact release commit and CI platforms.

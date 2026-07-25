@@ -1,0 +1,25 @@
+[package]
+name = "y-harness-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Optional full-screen terminal client for Y-Harness"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/liuyang0508/Y-Harness"
+readme = "README.md"
+keywords = ["agent", "harness", "tui", "llm", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "yh-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+unicode-width = "=0.2.2"
+y-harness = { path = "../..", version = "0.1.0" }
+
+[lints.rust]
+unsafe_code = "forbid"

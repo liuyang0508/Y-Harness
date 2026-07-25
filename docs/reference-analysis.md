@@ -30,9 +30,9 @@ Web, and Desktop are consumption surfaces, not separate Harness
 implementations.
 
 Y-Harness therefore has one `HarnessRuntime`, an embedded Rust API, and one
-versioned protocol. The reference CLI/TUI calls that protocol. A future client
-must do the same instead of duplicating Agent Loop, Policy, or State behavior.
-See [`architecture.md`](architecture.md) and
+versioned protocol. Independent product clients call that protocol. A future
+client must do the same instead of duplicating Agent Loop, Policy, or State
+behavior. See [`architecture.md`](architecture.md) and
 [ADR 0012](adr/0012-versioned-asynchronous-runtime-protocol.md).
 
 ### Explicit loop and authoritative evidence

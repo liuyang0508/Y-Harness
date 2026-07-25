@@ -15,7 +15,8 @@ of the kernel.
 
 ## Decision
 
-Use Rust as the primary language for Core, Runtime, CLI, and the reference TUI.
+Use Rust as the primary language for Core, Runtime, engine CLI, and the first
+independent reference product client (`y-harness-tui`).
 
 Keep third-party capability contracts language-neutral. Trusted built-ins may
 run in process. Untrusted executable extensions will use a supervised

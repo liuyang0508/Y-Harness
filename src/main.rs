@@ -22,10 +22,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reference_cli::run_service(config).await
         }
         Some("demo") => reference_cli::run_demo(args.collect()).await,
-        Some("tui-demo") => {
-            reject_extra_argument(args.next())?;
-            reference_cli::run_tui_demo().await
-        }
         Some("serve-demo") => {
             reject_extra_argument(args.next())?;
             reference_cli::run_demo_server().await
