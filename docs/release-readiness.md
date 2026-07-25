@@ -11,7 +11,7 @@ not release-ready while any blocking row remains open.
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
 | Deterministic tests | 253 library, 1 CLI, 8 process/service, and 2 private-gateway TLS integration tests | passing |
 | Installed operator path | isolated-prefix install; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked`, clean-room crate verification | 157 files, 1.9 MiB unpacked / 429.9 KiB compressed; passing |
+| Distribution package | `cargo package --locked`, clean-room crate verification | 162 files, 1.9 MiB unpacked / 432.4 KiB compressed; passing |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 232 locked crates | passing |
 | State performance | 1,000 events, 5 samples, SQLite WAL + FULL | 68.51 ms append; 2.64 ms full projection; 2.12 ms snapshot load |
