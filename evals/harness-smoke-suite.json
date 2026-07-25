@@ -1,0 +1,37 @@
+{
+  "format_version": 2,
+  "name": "harness-smoke-v1",
+  "cases": [
+    {
+      "id": "ascii-tool-loop",
+      "prompt": "evaluate harness contracts",
+      "memory_scope": {
+        "project": "harness-smoke",
+        "tenant_id": null,
+        "tags": [
+          "deterministic"
+        ]
+      },
+      "timeout_ms": 5000,
+      "metadata": {
+        "expected_output": "Y-Harness observed tool output: {\"text\":\"evaluate harness contracts\"}"
+      }
+    },
+    {
+      "id": "unicode-tool-loop",
+      "prompt": "验证 Harness 状态契约",
+      "memory_scope": {
+        "project": "harness-smoke",
+        "tenant_id": null,
+        "tags": [
+          "deterministic",
+          "unicode"
+        ]
+      },
+      "timeout_ms": 5000,
+      "metadata": {
+        "expected_output": "Y-Harness observed tool output: {\"text\":\"验证 Harness 状态契约\"}"
+      }
+    }
+  ]
+}

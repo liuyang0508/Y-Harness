@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "https_json_gateway",
+    "id": "gateway/default",
+    "endpoint": "https://model-gateway.example.com/v1/complete",
+    "bearer_secret_reference": "model/default",
+    "bearer_environment": "YH_MODEL_TOKEN",
+    "request_timeout_ms": 60000,
+    "connect_timeout_ms": 10000,
+    "max_response_bytes": 2097152,
+    "max_concurrency": 16,
+    "exclusive_root_ca_pem_path": null
+  }
+}

@@ -1,0 +1,3817 @@
+//! Append-only runtime state, deterministic projection, and recovery.
+
+mod migration;
+
+pub use migration::{StateMigrationReport, StateMigrationStatus};
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Write},
+    path::Path,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::{
+    sync::{Mutex, Notify, Semaphore},
+    task,
+};
+
+use crate::{
+    Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemKind, PendingEvent,
+    StateEvent, StoredEvent, Thread, ThreadId, Turn, TurnId, TurnStatus,
+    json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
+    kernel::validate_capability_name,
+    sqlite::bounded_text,
+};
+
+/// Current append-only State event schema.
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 4;
+// A Runtime text field is bounded at 1 MiB, but JSON control-character
+// escaping can expand each input byte sixfold. Keep the journal envelope above
+// that worst case while retaining an absolute per-event allocation bound.
+const MAX_STATE_EVENT_BYTES: usize = 8_388_608;
+const MAX_STATE_EVENT_PAGE: usize = 10_000;
+const MAX_STATE_EVENT_PAGE_RECOVERY_BYTES: u64 = 16_777_216;
+const MAX_CHECKPOINT_LABEL_BYTES: usize = 4_096;
+const MAX_STATE_SNAPSHOT_BYTES: usize = 67_108_864;
+/// Hard serialized-plus-overhead recovery boundary for one Thread.
+pub const STATE_THREAD_RECOVERY_BYTE_LIMIT: u64 = 67_108_864;
+/// Conservative in-memory bookkeeping charge added to every encoded event.
+const STATE_EVENT_RECOVERY_OVERHEAD_BYTES: u64 = 512;
+/// Space unavailable to general events so a running Turn can always settle.
+pub const STATE_TERMINAL_RECOVERY_BYTE_RESERVE: u64 = 4_096;
+/// Hard per-Thread journal boundary that keeps worst-case recovery finite.
+pub const STATE_THREAD_EVENT_LIMIT: u64 = 1_000_000;
+/// Final event slot reserved so a running Turn can always settle durably.
+pub const STATE_TERMINAL_EVENT_RESERVE: u64 = 1;
+const MAX_STATE_RECOVERY_EVENTS: usize = STATE_THREAD_EVENT_LIMIT as usize;
+const STATE_CAPACITY_WARNING_AT: u64 = STATE_THREAD_EVENT_LIMIT * 80 / 100;
+const STATE_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_EVENT_LIMIT * 95 / 100;
+const STATE_RECOVERY_CAPACITY_WARNING_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMIT * 80 / 100;
+const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMIT * 95 / 100;
+const SNAPSHOT_TAIL_PAGE: usize = 1_000;
+const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
+/// Current disposable State snapshot schema.
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Validated, disposable projection cache anchored to the event journal.
+///
+/// The event journal remains authoritative. Fields are private, values are
+/// normally created by [`StateEngine`], and deserialized values are revalidated.
+pub struct StateSnapshot {
+    schema_version: u32,
+    thread: Thread,
+    through_sequence: u64,
+    stream_version: u64,
+    recovery_bytes: u64,
+    anchor_event_id: EventId,
+    projection_sha256: String,
+    created_at_ms: u64,
+}
+
+impl StateSnapshot {
+    /// Returns the projected Thread cached by this snapshot.
+    #[must_use]
+    pub fn thread(&self) -> &Thread {
+        &self.thread
+    }
+
+    /// Returns the last global journal sequence included.
+    #[must_use]
+    pub fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+
+    /// Returns the number of Thread events included.
+    #[must_use]
+    pub fn stream_version(&self) -> u64 {
+        self.stream_version
+    }
+
+    /// Returns the exact recovery charge of the represented journal prefix.
+    #[must_use]
+    pub fn recovery_bytes(&self) -> u64 {
+        self.recovery_bytes
+    }
+
+    /// Returns the event identity anchoring the included journal prefix.
+    #[must_use]
+    pub fn anchor_event_id(&self) -> &EventId {
+        &self.anchor_event_id
+    }
+
+    /// Returns the snapshot creation time in Unix milliseconds.
+    #[must_use]
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Operator-facing pressure level before a Thread reaches its hard boundary.
+pub enum StateCapacityLevel {
+    /// Less than 80% of both boundaries is occupied.
+    Healthy,
+    /// At least 80% of either boundary is occupied; archival planning should begin.
+    Warning,
+    /// At least 95% of either boundary is occupied; new work risks rejection.
+    Critical,
+    /// Only reserved terminal-settlement count or bytes remain.
+    TerminalOnly,
+    /// At least one hard boundary is exhausted.
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Read-only journal pressure projection for one Thread.
+pub struct StateCapacity {
+    /// Current number of authoritative events in this Thread stream.
+    pub used_events: u64,
+    /// Maximum supported events in one Thread stream.
+    pub event_limit: u64,
+    /// Events that can still be appended before the hard boundary.
+    pub remaining_events: u64,
+    /// Remaining events available for non-terminal State transitions.
+    pub general_events_remaining: u64,
+    /// Remaining slot reserved exclusively for terminal Turn settlement.
+    pub terminal_event_reserve: u64,
+    /// Current serialized-plus-overhead recovery charge.
+    pub used_recovery_bytes: u64,
+    /// Maximum supported recovery charge for one Thread.
+    pub recovery_byte_limit: u64,
+    /// Recovery bytes available before the hard boundary.
+    pub remaining_recovery_bytes: u64,
+    /// Recovery bytes available to non-terminal State transitions.
+    pub general_recovery_bytes_remaining: u64,
+    /// Remaining bytes reserved exclusively for terminal Turn settlement.
+    pub terminal_recovery_byte_reserve: u64,
+    /// Stable worst-case pressure classification across count and bytes.
+    pub level: StateCapacityLevel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Validated opt-in policy for automatic disposable snapshot maintenance.
+pub struct SnapshotMaintenanceConfig {
+    every_events: u64,
+    max_concurrency: usize,
+}
+
+impl SnapshotMaintenanceConfig {
+    /// Creates a policy that considers a Thread after this many new events.
+    pub fn new(every_events: u64, max_concurrency: usize) -> Result<Self, HarnessError> {
+        if every_events == 0 || every_events > MAX_STATE_RECOVERY_EVENTS as u64 {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "snapshot interval must be 1-{MAX_STATE_RECOVERY_EVENTS} events"
+            )));
+        }
+        if max_concurrency == 0 || max_concurrency > MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "snapshot maintenance concurrency must be 1-{MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY}"
+            )));
+        }
+        Ok(Self {
+            every_events,
+            max_concurrency,
+        })
+    }
+
+    /// Returns the minimum journal growth between maintenance attempts.
+    #[must_use]
+    pub fn every_events(self) -> u64 {
+        self.every_events
+    }
+
+    /// Returns the maximum simultaneous snapshot workers.
+    #[must_use]
+    pub fn max_concurrency(self) -> usize {
+        self.max_concurrency
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Content-free class of the most recent isolated maintenance failure.
+pub enum SnapshotMaintenanceFailure {
+    /// Snapshot loading, validation, projection, or persistence failed.
+    Operation,
+    /// A snapshot worker panicked.
+    WorkerPanicked,
+    /// A snapshot worker was cancelled before settlement.
+    WorkerCancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Content-free operational counters for automatic snapshot maintenance.
+pub struct SnapshotMaintenanceStats {
+    /// Workers accepted by the scheduler.
+    pub scheduled: u64,
+    /// New snapshots persisted successfully.
+    pub created: u64,
+    /// Attempts avoided because another store writer already had a fresh cache.
+    pub already_current: u64,
+    /// Attempts isolated after an operation error, panic, or cancellation.
+    pub failed: u64,
+    /// Terminal Turns below the configured event cadence.
+    pub skipped_cadence: u64,
+    /// Terminal Turns skipped because this Thread already had a worker.
+    pub skipped_in_flight: u64,
+    /// Terminal Turns skipped because all global worker permits were occupied.
+    pub skipped_capacity: u64,
+    /// Workers currently active.
+    pub active: usize,
+    /// Time of the latest successful create, or `None` before the first one.
+    pub last_created_at_ms: Option<u64>,
+    /// Time of the latest isolated failure, or `None` before the first one.
+    pub last_failure_at_ms: Option<u64>,
+    /// Stable class of the latest isolated failure.
+    pub last_failure: Option<SnapshotMaintenanceFailure>,
+}
+
+/// Append-only persistence port for ordered State events.
+pub trait EventStore: Send + Sync {
+    /// Atomically compares stream version and appends, or returns an idempotent event.
+    ///
+    /// Implementations must compare both expected stream fields and update the
+    /// version and recovery-byte charge in the same transaction as the event.
+    /// Returned writes must use [`STATE_EVENT_SCHEMA_VERSION`]; prior supported
+    /// coordinates are read compatibility, not write authority.
+    fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent>;
+    /// Returns events after one sequence within both caller-supplied bounds.
+    ///
+    /// Implementations must not materialize more than `max_recovery_bytes`
+    /// plus one bounded event needed to determine that the page is full.
+    fn events_page<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        after_sequence: u64,
+        limit: usize,
+        max_recovery_bytes: u64,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>>;
+
+    /// Loads an optional disposable projection snapshot.
+    fn load_snapshot<'a>(
+        &'a self,
+        _thread_id: &'a ThreadId,
+    ) -> HarnessFuture<'a, Option<StateSnapshot>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Persists a validated disposable projection snapshot.
+    fn save_snapshot<'a>(&'a self, _snapshot: StateSnapshot) -> HarnessFuture<'a, ()> {
+        Box::pin(async {
+            Err(HarnessError::State(
+                "Event Store does not support State snapshots".to_owned(),
+            ))
+        })
+    }
+}
+
+#[derive(Default)]
+/// In-memory Event Store with production-equivalent idempotency semantics.
+pub struct MemoryEventStore {
+    data: Mutex<MemoryStoreData>,
+}
+
+#[derive(Default)]
+struct MemoryStoreData {
+    events: Vec<StoredEvent>,
+    stream_versions: BTreeMap<ThreadId, u64>,
+    stream_recovery_bytes: BTreeMap<ThreadId, u64>,
+    snapshots: BTreeMap<ThreadId, StateSnapshot>,
+}
+
+impl MemoryEventStore {
+    #[must_use]
+    /// Creates an empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl EventStore for MemoryEventStore {
+    fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+        Box::pin(async move {
+            let encoded = validate_pending_event(&pending)?;
+            let mut data = self.data.lock().await;
+            if let Some(existing) = data
+                .events
+                .iter()
+                .find(|event| event.event_id == pending.event_id)
+            {
+                return matching_existing(existing, &pending);
+            }
+
+            let actual_stream_version = data
+                .stream_versions
+                .get(&pending.thread_id)
+                .copied()
+                .unwrap_or(0);
+            validate_stream_version(actual_stream_version, &pending)?;
+            let actual_recovery_bytes = data
+                .stream_recovery_bytes
+                .get(&pending.thread_id)
+                .copied()
+                .unwrap_or(0);
+            validate_stream_recovery_bytes(actual_recovery_bytes, &pending)?;
+            let thread_exists = actual_stream_version > 0;
+            validate_thread_existence(thread_exists, &pending)?;
+            let next_stream_version = actual_stream_version
+                .checked_add(1)
+                .ok_or_else(|| HarnessError::State("stream version overflow".to_owned()))?;
+            let next_recovery_bytes = actual_recovery_bytes
+                .checked_add(encoded.recovery_bytes)
+                .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
+
+            let stored = StoredEvent {
+                schema_version: STATE_EVENT_SCHEMA_VERSION,
+                sequence: u64::try_from(data.events.len() + 1).unwrap_or(u64::MAX),
+                event_id: pending.event_id,
+                thread_id: pending.thread_id.clone(),
+                recorded_at_ms: pending.recorded_at_ms,
+                event: pending.event,
+            };
+            data.stream_versions
+                .insert(pending.thread_id.clone(), next_stream_version);
+            data.stream_recovery_bytes
+                .insert(pending.thread_id, next_recovery_bytes);
+            data.events.push(stored.clone());
+            Ok(stored)
+        })
+    }
+
+    fn events_page<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        after_sequence: u64,
+        limit: usize,
+        max_recovery_bytes: u64,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+        Box::pin(async move {
+            validate_event_page_request(limit, max_recovery_bytes)?;
+            let data = self.data.lock().await;
+            let mut page = Vec::new();
+            let mut recovery_bytes = 0_u64;
+            for event in data
+                .events
+                .iter()
+                .filter(|event| &event.thread_id == thread_id && event.sequence > after_sequence)
+                .take(limit)
+            {
+                let event_bytes = stored_event_recovery_bytes(event)?;
+                let next = recovery_bytes
+                    .checked_add(event_bytes)
+                    .ok_or_else(|| HarnessError::State("event page charge overflow".to_owned()))?;
+                if next > max_recovery_bytes {
+                    if page.is_empty() {
+                        return Err(HarnessError::State(
+                            "next State event exceeds the requested page byte budget".to_owned(),
+                        ));
+                    }
+                    break;
+                }
+                recovery_bytes = next;
+                page.push(event.clone());
+            }
+            Ok(page)
+        })
+    }
+
+    fn load_snapshot<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+    ) -> HarnessFuture<'a, Option<StateSnapshot>> {
+        Box::pin(async move { Ok(self.data.lock().await.snapshots.get(thread_id).cloned()) })
+    }
+
+    fn save_snapshot<'a>(&'a self, snapshot: StateSnapshot) -> HarnessFuture<'a, ()> {
+        Box::pin(async move {
+            validate_snapshot(&snapshot)?;
+            let mut data = self.data.lock().await;
+            let replace = data
+                .snapshots
+                .get(&snapshot.thread.id)
+                .is_none_or(|existing| existing.stream_version <= snapshot.stream_version);
+            if replace {
+                data.snapshots.insert(snapshot.thread.id.clone(), snapshot);
+            }
+            Ok(())
+        })
+    }
+}
+
+/// SQLite-backed append-only Event Store.
+pub struct SqliteEventStore {
+    connection: Arc<StdMutex<Connection>>,
+}
+
+impl SqliteEventStore {
+    /// Opens or creates a database and enforces required durability pragmas.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
+        let path = path.as_ref().to_owned();
+        let connection = task::spawn_blocking(move || {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+            }
+
+            let connection =
+                Connection::open(path).map_err(|error| HarnessError::State(error.to_string()))?;
+            configure_sqlite_busy_timeout(&connection)?;
+            migration::validate_or_bootstrap_store(&connection)?;
+            configure_sqlite_connection(&connection)?;
+            let schema = format!(
+                "
+                    CREATE TABLE IF NOT EXISTS events (
+                        sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id       TEXT NOT NULL UNIQUE,
+                        thread_id      TEXT NOT NULL,
+                        recorded_at_ms INTEGER NOT NULL,
+                        schema_version INTEGER NOT NULL,
+                        event_json     TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS events_thread_sequence
+                        ON events(thread_id, sequence);
+                    CREATE TABLE IF NOT EXISTS streams (
+                        thread_id TEXT PRIMARY KEY,
+                        version   INTEGER NOT NULL CHECK(version >= 0)
+                    );
+                    CREATE TABLE IF NOT EXISTS stream_recovery (
+                        thread_id      TEXT PRIMARY KEY,
+                        recovery_bytes INTEGER NOT NULL CHECK(recovery_bytes >= 0),
+                        FOREIGN KEY(thread_id) REFERENCES streams(thread_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS state_snapshots (
+                        thread_id       TEXT PRIMARY KEY,
+                        stream_version  INTEGER NOT NULL CHECK(stream_version > 0),
+                        snapshot_json   TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO streams (thread_id, version)
+                        SELECT thread_id, COUNT(*)
+                        FROM events
+                        GROUP BY thread_id;
+                    INSERT OR IGNORE INTO stream_recovery (thread_id, recovery_bytes)
+                        SELECT thread_id,
+                               COALESCE(SUM(
+                                   length(CAST(event_json AS BLOB))
+                                   + {STATE_EVENT_RECOVERY_OVERHEAD_BYTES}
+                               ), 0)
+                        FROM events
+                        GROUP BY thread_id;
+                    {}
+                    ",
+                migration::metadata_schema_sql()
+            );
+            connection
+                .execute_batch(&schema)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+            Ok(connection)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::State(format!("SQLite initialization task failed: {error}"))
+        })??;
+
+        Ok(Self {
+            connection: Arc::new(StdMutex::new(connection)),
+        })
+    }
+
+    async fn with_connection<T, F>(&self, operation: F) -> Result<T, HarnessError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, HarnessError> + Send + 'static,
+    {
+        let connection = Arc::clone(&self.connection);
+        task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| HarnessError::State("SQLite connection lock poisoned".to_owned()))?;
+            operation(&mut connection)
+        })
+        .await
+        .map_err(|error| HarnessError::State(format!("SQLite task failed: {error}")))?
+    }
+}
+
+fn configure_sqlite_connection(connection: &Connection) -> Result<(), HarnessError> {
+    configure_sqlite_busy_timeout(connection)?;
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .map_err(|error| HarnessError::State(error.to_string()))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(HarnessError::State(format!(
+            "SQLite refused WAL mode and selected {mode}"
+        )));
+    }
+    configure_sqlite_session(connection)
+}
+
+pub(super) fn configure_sqlite_busy_timeout(connection: &Connection) -> Result<(), HarnessError> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| HarnessError::State(error.to_string()))
+}
+
+pub(super) fn configure_sqlite_session(connection: &Connection) -> Result<(), HarnessError> {
+    connection
+        .execute_batch(
+            "
+            PRAGMA synchronous = FULL;
+            PRAGMA foreign_keys = ON;
+            ",
+        )
+        .map_err(|error| HarnessError::State(error.to_string()))
+}
+
+impl EventStore for SqliteEventStore {
+    fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+        Box::pin(async move {
+            let encoded = validate_pending_event(&pending)?;
+            self.with_connection(move |connection| {
+                let recorded_at_ms = i64::try_from(pending.recorded_at_ms).map_err(|_| {
+                    HarnessError::State("timestamp exceeds SQLite INTEGER".to_owned())
+                })?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+
+                let existing = transaction
+                    .query_row(
+                        "SELECT sequence,
+                                length(CAST(thread_id AS BLOB)), thread_id,
+                                recorded_at_ms, schema_version,
+                                length(CAST(event_json AS BLOB)), event_json
+                         FROM events WHERE event_id = ?1",
+                        [pending.event_id.as_str()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                bounded_text(row, 1, 2, 256, "State thread identity")?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                                bounded_text(row, 5, 6, MAX_STATE_EVENT_BYTES, "State event")?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+
+                if let Some(row) = existing {
+                    let stored = decode_row(pending.event_id.clone(), row)?;
+                    return matching_existing(&stored, &pending);
+                }
+
+                let actual_stream_version: Option<i64> = transaction
+                    .query_row(
+                        "SELECT version FROM streams WHERE thread_id = ?1",
+                        [pending.thread_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let actual_stream_version = u64::try_from(actual_stream_version.unwrap_or(0))
+                    .map_err(|_| HarnessError::State("negative stream version".to_owned()))?;
+                validate_stream_version(actual_stream_version, &pending)?;
+                let actual_recovery_bytes: Option<i64> = transaction
+                    .query_row(
+                        "SELECT recovery_bytes FROM stream_recovery WHERE thread_id = ?1",
+                        [pending.thread_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let actual_recovery_bytes = match (actual_stream_version, actual_recovery_bytes) {
+                    (0, None) => 0,
+                    (0, Some(_)) => {
+                        return Err(HarnessError::State(
+                            "orphaned stream recovery metadata".to_owned(),
+                        ));
+                    }
+                    (_, None) => {
+                        return Err(HarnessError::State(
+                            "missing stream recovery metadata".to_owned(),
+                        ));
+                    }
+                    (_, Some(bytes)) => u64::try_from(bytes).map_err(|_| {
+                        HarnessError::State("negative stream recovery charge".to_owned())
+                    })?,
+                };
+                validate_stream_recovery_bytes(actual_recovery_bytes, &pending)?;
+                let thread_exists = actual_stream_version > 0;
+                validate_thread_existence(thread_exists, &pending)?;
+                let next_stream_version = actual_stream_version
+                    .checked_add(1)
+                    .ok_or_else(|| HarnessError::State("stream version overflow".to_owned()))?;
+                let next_recovery_bytes = actual_recovery_bytes
+                    .checked_add(encoded.recovery_bytes)
+                    .ok_or_else(|| {
+                        HarnessError::State("stream recovery charge overflow".to_owned())
+                    })?;
+
+                transaction
+                    .execute(
+                        "INSERT INTO events
+                            (event_id, thread_id, recorded_at_ms, schema_version, event_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            pending.event_id.as_str(),
+                            pending.thread_id.as_str(),
+                            recorded_at_ms,
+                            i64::from(STATE_EVENT_SCHEMA_VERSION),
+                            encoded.json
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                // Capture the authoritative event row before inserts into
+                // auxiliary rowid tables can change last_insert_rowid().
+                let sequence = u64::try_from(transaction.last_insert_rowid())
+                    .map_err(|_| HarnessError::State("negative SQLite sequence".to_owned()))?;
+                transaction
+                    .execute(
+                        "INSERT INTO streams (thread_id, version) VALUES (?1, ?2)
+                         ON CONFLICT(thread_id) DO UPDATE SET version = excluded.version",
+                        params![
+                            pending.thread_id.as_str(),
+                            i64::try_from(next_stream_version).map_err(|_| {
+                                HarnessError::State(
+                                    "stream version exceeds SQLite INTEGER".to_owned(),
+                                )
+                            })?
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .execute(
+                        "INSERT INTO stream_recovery (thread_id, recovery_bytes)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(thread_id) DO UPDATE SET
+                            recovery_bytes = excluded.recovery_bytes",
+                        params![
+                            pending.thread_id.as_str(),
+                            i64::try_from(next_recovery_bytes).map_err(|_| {
+                                HarnessError::State(
+                                    "stream recovery charge exceeds SQLite INTEGER".to_owned(),
+                                )
+                            })?
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .commit()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+
+                Ok(StoredEvent {
+                    schema_version: STATE_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    event_id: pending.event_id,
+                    thread_id: pending.thread_id,
+                    recorded_at_ms: pending.recorded_at_ms,
+                    event: pending.event,
+                })
+            })
+            .await
+        })
+    }
+
+    fn events_page<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        after_sequence: u64,
+        limit: usize,
+        max_recovery_bytes: u64,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            validate_event_page_request(limit, max_recovery_bytes)?;
+            let after_sequence = i64::try_from(after_sequence).map_err(|_| {
+                HarnessError::State("event cursor exceeds SQLite INTEGER".to_owned())
+            })?;
+            let limit = i64::try_from(limit).map_err(|_| {
+                HarnessError::State("event page limit exceeds SQLite INTEGER".to_owned())
+            })?;
+            self.with_connection(move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT sequence,
+                                length(CAST(event_id AS BLOB)), event_id,
+                                recorded_at_ms, schema_version,
+                                length(CAST(event_json AS BLOB)), event_json
+                         FROM events
+                         WHERE thread_id = ?1 AND sequence > ?2
+                         ORDER BY sequence
+                         LIMIT ?3",
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let rows = statement
+                    .query_map(params![thread_id.as_str(), after_sequence, limit], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            bounded_text(row, 1, 2, 256, "State event identity")?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            bounded_text(row, 5, 6, MAX_STATE_EVENT_BYTES, "State event")?,
+                        ))
+                    })
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+
+                let mut events = Vec::new();
+                let mut recovery_bytes = 0_u64;
+                for row in rows {
+                    let (sequence, event_id, recorded_at_ms, schema_version, event_json) =
+                        row.map_err(|error| HarnessError::State(error.to_string()))?;
+                    let event = decode_row(
+                        EventId::from_string(event_id),
+                        (
+                            sequence,
+                            thread_id.as_str().to_owned(),
+                            recorded_at_ms,
+                            schema_version,
+                            event_json,
+                        ),
+                    )?;
+                    let event_bytes = stored_event_recovery_bytes(&event)?;
+                    let next = recovery_bytes.checked_add(event_bytes).ok_or_else(|| {
+                        HarnessError::State("event page charge overflow".to_owned())
+                    })?;
+                    if next > max_recovery_bytes {
+                        if events.is_empty() {
+                            return Err(HarnessError::State(
+                                "next State event exceeds the requested page byte budget"
+                                    .to_owned(),
+                            ));
+                        }
+                        break;
+                    }
+                    recovery_bytes = next;
+                    events.push(event);
+                }
+                Ok(events)
+            })
+            .await
+        })
+    }
+
+    fn load_snapshot<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+    ) -> HarnessFuture<'a, Option<StateSnapshot>> {
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            self.with_connection(move |connection| {
+                let stored = connection
+                    .query_row(
+                        "SELECT stream_version,
+                                length(CAST(snapshot_json AS BLOB)), snapshot_json
+                         FROM state_snapshots WHERE thread_id = ?1",
+                        [thread_id.as_str()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                bounded_text(
+                                    row,
+                                    1,
+                                    2,
+                                    MAX_STATE_SNAPSHOT_BYTES,
+                                    "State snapshot",
+                                )?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let Some((stream_version, snapshot_json)) = stored else {
+                    return Ok(None);
+                };
+                if snapshot_json.len() > MAX_STATE_SNAPSHOT_BYTES {
+                    return Err(HarnessError::State(format!(
+                        "stored State snapshot exceeds {MAX_STATE_SNAPSHOT_BYTES} bytes"
+                    )));
+                }
+                let snapshot: StateSnapshot = serde_json::from_str(&snapshot_json)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let stored_stream_version = u64::try_from(stream_version).map_err(|_| {
+                    HarnessError::State("invalid snapshot stream version".to_owned())
+                })?;
+                if snapshot.stream_version != stored_stream_version {
+                    return Err(HarnessError::State(
+                        "snapshot stream-version index does not match its body".to_owned(),
+                    ));
+                }
+                validate_snapshot(&snapshot)?;
+                Ok(Some(snapshot))
+            })
+            .await
+        })
+    }
+
+    fn save_snapshot<'a>(&'a self, snapshot: StateSnapshot) -> HarnessFuture<'a, ()> {
+        Box::pin(async move {
+            let snapshot_json = encode_snapshot(&snapshot)?;
+            let thread_id = snapshot.thread.id.clone();
+            let stream_version = i64::try_from(snapshot.stream_version).map_err(|_| {
+                HarnessError::State("snapshot stream version exceeds SQLite INTEGER".to_owned())
+            })?;
+            self.with_connection(move |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO state_snapshots
+                            (thread_id, stream_version, snapshot_json)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(thread_id) DO UPDATE SET
+                            stream_version = excluded.stream_version,
+                            snapshot_json = excluded.snapshot_json
+                         WHERE excluded.stream_version >= state_snapshots.stream_version",
+                        params![thread_id.as_str(), stream_version, snapshot_json],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(())
+            })
+            .await
+        })
+    }
+}
+
+struct SnapshotMaintenanceMetrics {
+    scheduled: AtomicU64,
+    created: AtomicU64,
+    already_current: AtomicU64,
+    failed: AtomicU64,
+    skipped_cadence: AtomicU64,
+    skipped_in_flight: AtomicU64,
+    skipped_capacity: AtomicU64,
+    active: AtomicUsize,
+    last_created_at_ms: AtomicU64,
+    last_failure_at_ms: AtomicU64,
+    last_failure: AtomicU8,
+}
+
+impl SnapshotMaintenanceMetrics {
+    fn new() -> Self {
+        Self {
+            scheduled: AtomicU64::new(0),
+            created: AtomicU64::new(0),
+            already_current: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            skipped_cadence: AtomicU64::new(0),
+            skipped_in_flight: AtomicU64::new(0),
+            skipped_capacity: AtomicU64::new(0),
+            active: AtomicUsize::new(0),
+            last_created_at_ms: AtomicU64::new(0),
+            last_failure_at_ms: AtomicU64::new(0),
+            last_failure: AtomicU8::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> SnapshotMaintenanceStats {
+        SnapshotMaintenanceStats {
+            scheduled: self.scheduled.load(Ordering::Relaxed),
+            created: self.created.load(Ordering::Acquire),
+            already_current: self.already_current.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Acquire),
+            skipped_cadence: self.skipped_cadence.load(Ordering::Relaxed),
+            skipped_in_flight: self.skipped_in_flight.load(Ordering::Relaxed),
+            skipped_capacity: self.skipped_capacity.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Acquire),
+            last_created_at_ms: nonzero(self.last_created_at_ms.load(Ordering::Relaxed)),
+            last_failure_at_ms: nonzero(self.last_failure_at_ms.load(Ordering::Relaxed)),
+            last_failure: match self.last_failure.load(Ordering::Relaxed) {
+                1 => Some(SnapshotMaintenanceFailure::Operation),
+                2 => Some(SnapshotMaintenanceFailure::WorkerPanicked),
+                3 => Some(SnapshotMaintenanceFailure::WorkerCancelled),
+                _ => None,
+            },
+        }
+    }
+
+    fn record_failure(&self, failure: SnapshotMaintenanceFailure) {
+        self.last_failure_at_ms
+            .store(crate::kernel::now_ms(), Ordering::Relaxed);
+        self.last_failure.store(
+            match failure {
+                SnapshotMaintenanceFailure::Operation => 1,
+                SnapshotMaintenanceFailure::WorkerPanicked => 2,
+                SnapshotMaintenanceFailure::WorkerCancelled => 3,
+            },
+            Ordering::Relaxed,
+        );
+        self.failed.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct SnapshotScheduleState {
+    in_flight: BTreeSet<ThreadId>,
+    watermarks: BTreeMap<ThreadId, u64>,
+}
+
+struct SnapshotMaintenance {
+    config: SnapshotMaintenanceConfig,
+    permits: Arc<Semaphore>,
+    schedule: Mutex<SnapshotScheduleState>,
+    metrics: SnapshotMaintenanceMetrics,
+    drained: Notify,
+}
+
+impl SnapshotMaintenance {
+    fn new(config: SnapshotMaintenanceConfig) -> Self {
+        Self {
+            config,
+            permits: Arc::new(Semaphore::new(config.max_concurrency)),
+            schedule: Mutex::new(SnapshotScheduleState::default()),
+            metrics: SnapshotMaintenanceMetrics::new(),
+            drained: Notify::new(),
+        }
+    }
+}
+
+enum SnapshotMaintenanceOutcome {
+    Created(u64),
+    AlreadyCurrent(u64),
+}
+
+#[derive(Clone)]
+/// Validates State transitions and projects Thread aggregates from events.
+pub struct StateEngine {
+    store: Arc<dyn EventStore>,
+    heads: Arc<Mutex<BTreeMap<ThreadId, StreamHead>>>,
+    snapshot_maintenance: Option<Arc<SnapshotMaintenance>>,
+}
+
+#[derive(Clone)]
+struct StreamHead {
+    stream_version: u64,
+    recovery_bytes: u64,
+    last_sequence: u64,
+    turns: Arc<BTreeSet<TurnId>>,
+    running_turn: Option<TurnId>,
+}
+
+struct LoadedProjection {
+    thread: Option<Thread>,
+    stream_version: u64,
+    recovery_bytes: u64,
+    last_sequence: u64,
+}
+
+struct CheckedEvents {
+    events: Vec<StoredEvent>,
+    recovery_bytes: u64,
+}
+
+impl StateEngine {
+    #[must_use]
+    /// Creates an engine over an Event Store implementation.
+    pub fn new(store: Arc<dyn EventStore>) -> Self {
+        Self {
+            store,
+            heads: Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_maintenance: None,
+        }
+    }
+
+    /// Enables failure-isolated automatic snapshots after terminal Turns.
+    #[must_use]
+    pub fn with_snapshot_maintenance(mut self, config: SnapshotMaintenanceConfig) -> Self {
+        self.snapshot_maintenance = Some(Arc::new(SnapshotMaintenance::new(config)));
+        self
+    }
+
+    /// Returns content-free maintenance state when automatic snapshots are enabled.
+    #[must_use]
+    pub fn snapshot_maintenance_stats(&self) -> Option<SnapshotMaintenanceStats> {
+        self.snapshot_maintenance
+            .as_ref()
+            .map(|maintenance| maintenance.metrics.snapshot())
+    }
+
+    /// Waits for accepted snapshot workers, returning `false` on timeout.
+    ///
+    /// Call this during graceful host shutdown. A timeout does not affect the
+    /// authoritative journal and detached work is cancelled when its Tokio
+    /// runtime stops.
+    pub async fn drain_snapshot_maintenance(&self, timeout: Duration) -> bool {
+        let Some(maintenance) = &self.snapshot_maintenance else {
+            return true;
+        };
+        if maintenance.metrics.active.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = maintenance.drained.notified();
+                if maintenance.metrics.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Creates and persists a new Thread stream.
+    pub async fn create_thread(&self) -> Result<Thread, HarnessError> {
+        let thread = Thread::new();
+        self.commit(
+            thread.id.clone(),
+            0,
+            0,
+            StateEvent::ThreadCreated {
+                created_at_ms: thread.created_at_ms,
+            },
+        )
+        .await?;
+        Ok(thread)
+    }
+
+    /// Loads and validates the projected Thread, returning `None` when absent.
+    pub async fn load_thread(&self, thread_id: &ThreadId) -> Result<Option<Thread>, HarnessError> {
+        let loaded = self.load_projection(thread_id).await?;
+        if let Some(thread) = &loaded.thread {
+            self.cache_head(
+                thread_id.clone(),
+                stream_head_from_parts(
+                    thread,
+                    loaded.stream_version,
+                    loaded.recovery_bytes,
+                    loaded.last_sequence,
+                ),
+            )
+            .await;
+        } else {
+            self.heads.lock().await.remove(thread_id);
+        }
+        Ok(loaded.thread)
+    }
+
+    /// Returns bounded journal pressure for a Thread, or `None` when absent.
+    pub async fn thread_capacity(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<StateCapacity>, HarnessError> {
+        let loaded = self.load_projection(thread_id).await?;
+        let Some(thread) = loaded.thread else {
+            self.heads.lock().await.remove(thread_id);
+            return Ok(None);
+        };
+        self.cache_head(
+            thread_id.clone(),
+            stream_head_from_parts(
+                &thread,
+                loaded.stream_version,
+                loaded.recovery_bytes,
+                loaded.last_sequence,
+            ),
+        )
+        .await;
+        Ok(Some(state_capacity(
+            loaded.stream_version,
+            loaded.recovery_bytes,
+        )))
+    }
+
+    /// Returns the authoritative ordered events for a Thread.
+    pub async fn events(&self, thread_id: &ThreadId) -> Result<Vec<StoredEvent>, HarnessError> {
+        Ok(self.checked_events(thread_id).await?.events)
+    }
+
+    /// Returns a bounded authoritative event page after one durable sequence.
+    pub async fn events_page(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, HarnessError> {
+        validate_state_id("thread", thread_id.as_str())?;
+        validate_event_page_limit(limit)?;
+        let events = self
+            .store
+            .events_page(
+                thread_id,
+                after_sequence,
+                limit,
+                MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+            )
+            .await?;
+        let _ = validate_stored_events(
+            thread_id,
+            &events,
+            after_sequence,
+            Some(limit),
+            Some(MAX_STATE_EVENT_PAGE_RECOVERY_BYTES),
+        )?;
+        Ok(events)
+    }
+
+    /// Materializes and persists a validated snapshot of the current journal prefix.
+    ///
+    /// Snapshot creation is an explicit maintenance operation. It never deletes
+    /// journal events and remains safe while another writer appends a newer tail.
+    pub async fn create_snapshot(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<StateSnapshot, HarnessError> {
+        let checked = self.checked_events(thread_id).await?;
+        let events = checked.events;
+        let thread = project_events(&events)?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let anchor = events
+            .last()
+            .ok_or_else(|| HarnessError::State("cannot snapshot an empty stream".to_owned()))?;
+        let snapshot = StateSnapshot {
+            schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+            projection_sha256: projection_sha256(&thread)?,
+            thread,
+            through_sequence: anchor.sequence,
+            stream_version: u64::try_from(events.len())
+                .map_err(|_| HarnessError::State("snapshot stream version overflow".to_owned()))?,
+            recovery_bytes: checked.recovery_bytes,
+            anchor_event_id: anchor.event_id.clone(),
+            created_at_ms: crate::kernel::now_ms(),
+        };
+        validate_snapshot(&snapshot)?;
+        self.store.save_snapshot(snapshot.clone()).await?;
+        Ok(snapshot)
+    }
+
+    /// Starts a Turn when no other Turn is running in the Thread.
+    pub async fn start_turn(&self, thread_id: &ThreadId) -> Result<Turn, HarnessError> {
+        let mut head = self.require_stream_head(thread_id).await?;
+        if head.running_turn.is_some() {
+            head = self.refresh_stream_head(thread_id).await?;
+            if head.running_turn.is_some() {
+                return Err(HarnessError::State(format!(
+                    "thread {thread_id} already has a running turn"
+                )));
+            }
+        }
+
+        let turn = Turn::new(thread_id.clone());
+        self.commit(
+            thread_id.clone(),
+            head.stream_version,
+            head.recovery_bytes,
+            StateEvent::TurnStarted {
+                turn_id: turn.id.clone(),
+            },
+        )
+        .await?;
+        Ok(turn)
+    }
+
+    /// Appends an Item after validating that its Turn is still running.
+    pub async fn append_item(&self, turn: &Turn, item: Item) -> Result<StoredEvent, HarnessError> {
+        let mut head = self.require_stream_head(&turn.thread_id).await?;
+        if require_running_head(&head, &turn.id).is_err() {
+            head = self.refresh_stream_head(&turn.thread_id).await?;
+            require_running_head(&head, &turn.id)?;
+        }
+        self.commit(
+            turn.thread_id.clone(),
+            head.stream_version,
+            head.recovery_bytes,
+            StateEvent::ItemAppended {
+                turn_id: turn.id.clone(),
+                item,
+            },
+        )
+        .await
+    }
+
+    /// Settles a running Turn with a terminal status.
+    pub async fn finish_turn(
+        &self,
+        turn: &Turn,
+        status: TurnStatus,
+    ) -> Result<StoredEvent, HarnessError> {
+        if status == TurnStatus::Running {
+            return Err(HarnessError::State(
+                "cannot finish a turn with running status".to_owned(),
+            ));
+        }
+        let mut head = self.require_stream_head(&turn.thread_id).await?;
+        if require_running_head(&head, &turn.id).is_err() {
+            head = self.refresh_stream_head(&turn.thread_id).await?;
+            require_running_head(&head, &turn.id)?;
+        }
+        let next_stream_version = head.stream_version.checked_add(1).ok_or_else(|| {
+            HarnessError::State("cannot schedule snapshot after stream-version overflow".to_owned())
+        })?;
+        let stored = self
+            .commit(
+                turn.thread_id.clone(),
+                head.stream_version,
+                head.recovery_bytes,
+                StateEvent::TurnFinished {
+                    turn_id: turn.id.clone(),
+                    status,
+                },
+            )
+            .await?;
+        self.schedule_snapshot(turn.thread_id.clone(), next_stream_version)
+            .await;
+        Ok(stored)
+    }
+
+    /// Marks unfinished Turns interrupted and returns the recovered projection.
+    ///
+    /// Callers must hold exclusive Thread ownership and know that the previous
+    /// worker is no longer live. Recovery is a takeover operation, not a normal
+    /// preflight for starting a Turn.
+    pub async fn recover_thread(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<Thread>, HarnessError> {
+        let Some(thread) = self.load_thread(thread_id).await? else {
+            return Ok(None);
+        };
+        for turn in thread
+            .turns
+            .iter()
+            .filter(|turn| turn.status == TurnStatus::Running)
+        {
+            self.finish_turn(turn, TurnStatus::Interrupted).await?;
+        }
+        self.load_thread(thread_id).await
+    }
+
+    /// Persists a checkpoint targeting the current Thread sequence.
+    pub async fn create_checkpoint(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: Option<TurnId>,
+        label: Option<String>,
+    ) -> Result<Checkpoint, HarnessError> {
+        validate_checkpoint_label(label.as_deref())?;
+        let mut head = self.require_stream_head(thread_id).await?;
+        if let Some(turn_id) = &turn_id
+            && !head.turns.contains(turn_id)
+        {
+            head = self.refresh_stream_head(thread_id).await?;
+            if !head.turns.contains(turn_id) {
+                return Err(HarnessError::State(format!(
+                    "turn {turn_id} does not belong to thread {thread_id}"
+                )));
+            }
+        }
+        let checkpoint = Checkpoint {
+            id: CheckpointId::generate(),
+            thread_id: thread_id.clone(),
+            turn_id,
+            target_sequence: head.last_sequence,
+            created_at_ms: crate::kernel::now_ms(),
+            label,
+        };
+        self.commit(
+            thread_id.clone(),
+            head.stream_version,
+            head.recovery_bytes,
+            StateEvent::CheckpointCreated {
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .await?;
+        Ok(checkpoint)
+    }
+
+    async fn require_stream_head(&self, thread_id: &ThreadId) -> Result<StreamHead, HarnessError> {
+        if let Some(head) = self.heads.lock().await.get(thread_id).cloned() {
+            return Ok(head);
+        }
+        self.refresh_stream_head(thread_id).await
+    }
+
+    async fn refresh_stream_head(&self, thread_id: &ThreadId) -> Result<StreamHead, HarnessError> {
+        let loaded = self.load_projection(thread_id).await?;
+        let thread = loaded
+            .thread
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let head = stream_head_from_parts(
+            &thread,
+            loaded.stream_version,
+            loaded.recovery_bytes,
+            loaded.last_sequence,
+        );
+        self.cache_head(thread_id.clone(), head.clone()).await;
+        Ok(head)
+    }
+
+    async fn load_projection(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<LoadedProjection, HarnessError> {
+        validate_state_id("thread", thread_id.as_str())?;
+        if let Some(loaded) = self.try_snapshot_projection(thread_id).await? {
+            return Ok(loaded);
+        }
+        let checked = self.checked_events(thread_id).await?;
+        let events = checked.events;
+        Ok(LoadedProjection {
+            thread: project_events(&events)?,
+            stream_version: u64::try_from(events.len())
+                .map_err(|_| HarnessError::State("stream version exceeds u64".to_owned()))?,
+            recovery_bytes: checked.recovery_bytes,
+            last_sequence: events.last().map_or(0, |event| event.sequence),
+        })
+    }
+
+    async fn try_snapshot_projection(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<LoadedProjection>, HarnessError> {
+        let snapshot = match self.store.load_snapshot(thread_id).await {
+            Ok(Some(snapshot)) if validate_snapshot(&snapshot).is_ok() => snapshot,
+            Ok(None) | Ok(Some(_)) | Err(_) => return Ok(None),
+        };
+        if &snapshot.thread.id != thread_id {
+            return Ok(None);
+        }
+
+        let anchor_after = snapshot.through_sequence.saturating_sub(1);
+        match self
+            .store
+            .events_page(
+                thread_id,
+                anchor_after,
+                1,
+                MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+            )
+            .await
+        {
+            Ok(events)
+                if validate_stored_events(
+                    thread_id,
+                    &events,
+                    anchor_after,
+                    Some(1),
+                    Some(MAX_STATE_EVENT_PAGE_RECOVERY_BYTES),
+                )
+                .is_ok()
+                    && events.len() == 1
+                    && events[0].sequence == snapshot.through_sequence
+                    && events[0].event_id == snapshot.anchor_event_id => {}
+            Ok(_) | Err(_) => return Ok(None),
+        }
+
+        let checked_tail = self
+            .snapshot_tail(
+                thread_id,
+                snapshot.through_sequence,
+                STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(snapshot.recovery_bytes),
+            )
+            .await?;
+        let tail = checked_tail.events;
+        let tail_len = u64::try_from(tail.len())
+            .map_err(|_| HarnessError::State("snapshot tail length exceeds u64".to_owned()))?;
+        let stream_version = snapshot
+            .stream_version
+            .checked_add(tail_len)
+            .ok_or_else(|| HarnessError::State("snapshot stream version overflow".to_owned()))?;
+        if stream_version > MAX_STATE_RECOVERY_EVENTS as u64 {
+            return Err(HarnessError::State(format!(
+                "Thread exceeds {MAX_STATE_RECOVERY_EVENTS} recoverable events"
+            )));
+        }
+        let recovery_bytes = snapshot
+            .recovery_bytes
+            .checked_add(checked_tail.recovery_bytes)
+            .ok_or_else(|| HarnessError::State("snapshot recovery charge overflow".to_owned()))?;
+        if recovery_bytes > STATE_THREAD_RECOVERY_BYTE_LIMIT {
+            return Err(HarnessError::State(format!(
+                "Thread exceeds its {STATE_THREAD_RECOVERY_BYTE_LIMIT}-byte recovery boundary"
+            )));
+        }
+        let last_sequence = tail
+            .last()
+            .map_or(snapshot.through_sequence, |event| event.sequence);
+        let mut thread = Some(snapshot.thread);
+        apply_events(&mut thread, &tail)?;
+        Ok(Some(LoadedProjection {
+            thread,
+            stream_version,
+            recovery_bytes,
+            last_sequence,
+        }))
+    }
+
+    async fn snapshot_tail(
+        &self,
+        thread_id: &ThreadId,
+        through_sequence: u64,
+        max_recovery_bytes: u64,
+    ) -> Result<CheckedEvents, HarnessError> {
+        let mut after_sequence = through_sequence;
+        let mut recovery_bytes = 0_u64;
+        let mut event_ids = BTreeSet::new();
+        let mut tail = Vec::new();
+        loop {
+            let page = self
+                .store
+                .events_page(
+                    thread_id,
+                    after_sequence,
+                    SNAPSHOT_TAIL_PAGE,
+                    MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+                )
+                .await?;
+            let page_recovery_bytes = validate_stored_events(
+                thread_id,
+                &page,
+                after_sequence,
+                Some(SNAPSHOT_TAIL_PAGE),
+                Some(MAX_STATE_EVENT_PAGE_RECOVERY_BYTES),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            recovery_bytes = recovery_bytes
+                .checked_add(page_recovery_bytes)
+                .ok_or_else(|| HarnessError::State("snapshot tail charge overflow".to_owned()))?;
+            if recovery_bytes > max_recovery_bytes {
+                return Err(HarnessError::State(
+                    "snapshot tail exceeds the Thread recovery-byte boundary".to_owned(),
+                ));
+            }
+            remember_event_ids(&mut event_ids, &page)?;
+            after_sequence = page.last().map_or(after_sequence, |event| event.sequence);
+            tail.extend(page);
+            if tail.len() > MAX_STATE_RECOVERY_EVENTS {
+                return Err(HarnessError::State(format!(
+                    "snapshot tail exceeds {MAX_STATE_RECOVERY_EVENTS} events"
+                )));
+            }
+        }
+        Ok(CheckedEvents {
+            events: tail,
+            recovery_bytes,
+        })
+    }
+
+    async fn checked_events(&self, thread_id: &ThreadId) -> Result<CheckedEvents, HarnessError> {
+        validate_state_id("thread", thread_id.as_str())?;
+        let mut after_sequence = 0_u64;
+        let mut recovery_bytes = 0_u64;
+        let mut event_ids = BTreeSet::new();
+        let mut events = Vec::new();
+        loop {
+            let page = self
+                .store
+                .events_page(
+                    thread_id,
+                    after_sequence,
+                    SNAPSHOT_TAIL_PAGE,
+                    MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+                )
+                .await?;
+            let page_recovery_bytes = validate_stored_events(
+                thread_id,
+                &page,
+                after_sequence,
+                Some(SNAPSHOT_TAIL_PAGE),
+                Some(MAX_STATE_EVENT_PAGE_RECOVERY_BYTES),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            recovery_bytes = recovery_bytes
+                .checked_add(page_recovery_bytes)
+                .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
+            if recovery_bytes > STATE_THREAD_RECOVERY_BYTE_LIMIT {
+                return Err(HarnessError::State(format!(
+                    "Thread exceeds its {STATE_THREAD_RECOVERY_BYTE_LIMIT}-byte recovery boundary"
+                )));
+            }
+            remember_event_ids(&mut event_ids, &page)?;
+            after_sequence = page.last().map_or(after_sequence, |event| event.sequence);
+            events.extend(page);
+            if events.len() > MAX_STATE_RECOVERY_EVENTS {
+                return Err(HarnessError::State(format!(
+                    "Thread exceeds {MAX_STATE_RECOVERY_EVENTS} recoverable events"
+                )));
+            }
+        }
+        Ok(CheckedEvents {
+            events,
+            recovery_bytes,
+        })
+    }
+
+    async fn schedule_snapshot(&self, thread_id: ThreadId, stream_version: u64) {
+        let Some(maintenance) = self.snapshot_maintenance.clone() else {
+            return;
+        };
+        if stream_version < maintenance.config.every_events {
+            maintenance
+                .metrics
+                .skipped_cadence
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let mut schedule = maintenance.schedule.lock().await;
+        if schedule.in_flight.contains(&thread_id) {
+            maintenance
+                .metrics
+                .skipped_in_flight
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if schedule
+            .watermarks
+            .get(&thread_id)
+            .is_some_and(|watermark| {
+                stream_version.saturating_sub(*watermark) < maintenance.config.every_events
+            })
+        {
+            maintenance
+                .metrics
+                .skipped_cadence
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let Ok(permit) = Arc::clone(&maintenance.permits).try_acquire_owned() else {
+            maintenance
+                .metrics
+                .skipped_capacity
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        schedule.in_flight.insert(thread_id.clone());
+        schedule
+            .watermarks
+            .insert(thread_id.clone(), stream_version);
+        drop(schedule);
+        maintenance
+            .metrics
+            .scheduled
+            .fetch_add(1, Ordering::Relaxed);
+        maintenance.metrics.active.fetch_add(1, Ordering::Release);
+
+        let engine = self.clone();
+        task::spawn(async move {
+            let worker_thread_id = thread_id.clone();
+            let worker = task::spawn(async move {
+                engine
+                    .maintain_snapshot(&worker_thread_id, stream_version)
+                    .await
+            });
+            let result = worker.await;
+
+            let mut schedule = maintenance.schedule.lock().await;
+            match result {
+                Ok(Ok(SnapshotMaintenanceOutcome::Created(version))) => {
+                    schedule
+                        .watermarks
+                        .entry(thread_id.clone())
+                        .and_modify(|watermark| *watermark = (*watermark).max(version))
+                        .or_insert(version);
+                    maintenance
+                        .metrics
+                        .last_created_at_ms
+                        .store(crate::kernel::now_ms(), Ordering::Relaxed);
+                    maintenance.metrics.created.fetch_add(1, Ordering::Release);
+                }
+                Ok(Ok(SnapshotMaintenanceOutcome::AlreadyCurrent(version))) => {
+                    schedule
+                        .watermarks
+                        .entry(thread_id.clone())
+                        .and_modify(|watermark| *watermark = (*watermark).max(version))
+                        .or_insert(version);
+                    maintenance
+                        .metrics
+                        .already_current
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Err(_)) => maintenance
+                    .metrics
+                    .record_failure(SnapshotMaintenanceFailure::Operation),
+                Err(error) if error.is_panic() => maintenance
+                    .metrics
+                    .record_failure(SnapshotMaintenanceFailure::WorkerPanicked),
+                Err(_) => maintenance
+                    .metrics
+                    .record_failure(SnapshotMaintenanceFailure::WorkerCancelled),
+            }
+            schedule.in_flight.remove(&thread_id);
+            drop(schedule);
+            drop(permit);
+            maintenance.metrics.active.fetch_sub(1, Ordering::Release);
+            maintenance.drained.notify_waiters();
+        });
+    }
+
+    async fn maintain_snapshot(
+        &self,
+        thread_id: &ThreadId,
+        scheduled_stream_version: u64,
+    ) -> Result<SnapshotMaintenanceOutcome, HarnessError> {
+        if let Ok(Some(snapshot)) = self.store.load_snapshot(thread_id).await
+            && validate_snapshot(&snapshot).is_ok()
+            && &snapshot.thread.id == thread_id
+            && scheduled_stream_version.saturating_sub(snapshot.stream_version)
+                < self
+                    .snapshot_maintenance
+                    .as_ref()
+                    .map_or(u64::MAX, |maintenance| maintenance.config.every_events)
+        {
+            return Ok(SnapshotMaintenanceOutcome::AlreadyCurrent(
+                snapshot.stream_version,
+            ));
+        }
+        let snapshot = self.create_snapshot(thread_id).await?;
+        Ok(SnapshotMaintenanceOutcome::Created(snapshot.stream_version))
+    }
+
+    async fn cache_head(&self, thread_id: ThreadId, head: StreamHead) {
+        let mut heads = self.heads.lock().await;
+        if heads
+            .get(&thread_id)
+            .is_none_or(|current| current.stream_version <= head.stream_version)
+        {
+            heads.insert(thread_id, head);
+        }
+    }
+
+    async fn advance_head(
+        &self,
+        expected_version: u64,
+        expected_recovery_bytes: u64,
+        event_recovery_bytes: u64,
+        stored: &StoredEvent,
+    ) {
+        let mut heads = self.heads.lock().await;
+        let base = match heads.get(&stored.thread_id) {
+            Some(head)
+                if head.stream_version == expected_version
+                    && head.recovery_bytes == expected_recovery_bytes =>
+            {
+                head.clone()
+            }
+            None if expected_version == 0
+                && expected_recovery_bytes == 0
+                && matches!(&stored.event, StateEvent::ThreadCreated { .. }) =>
+            {
+                StreamHead {
+                    stream_version: 0,
+                    recovery_bytes: 0,
+                    last_sequence: 0,
+                    turns: Arc::new(BTreeSet::new()),
+                    running_turn: None,
+                }
+            }
+            _ => return,
+        };
+        let Some(stream_version) = expected_version.checked_add(1) else {
+            return;
+        };
+        let Some(recovery_bytes) = expected_recovery_bytes.checked_add(event_recovery_bytes) else {
+            return;
+        };
+        let mut next = StreamHead {
+            stream_version,
+            recovery_bytes,
+            last_sequence: stored.sequence,
+            ..base
+        };
+        match &stored.event {
+            StateEvent::ThreadCreated { .. }
+            | StateEvent::ItemAppended { .. }
+            | StateEvent::CheckpointCreated { .. } => {}
+            StateEvent::TurnStarted { turn_id } => {
+                let mut turns = (*next.turns).clone();
+                turns.insert(turn_id.clone());
+                next.turns = Arc::new(turns);
+                next.running_turn = Some(turn_id.clone());
+            }
+            StateEvent::TurnFinished { turn_id, .. } => {
+                if next.running_turn.as_ref() == Some(turn_id) {
+                    next.running_turn = None;
+                }
+            }
+        }
+        heads.insert(stored.thread_id.clone(), next);
+    }
+
+    async fn invalidate_head(&self, thread_id: &ThreadId, expected: u64) {
+        let mut heads = self.heads.lock().await;
+        if heads
+            .get(thread_id)
+            .is_some_and(|head| head.stream_version <= expected)
+        {
+            heads.remove(thread_id);
+        }
+    }
+
+    async fn commit(
+        &self,
+        thread_id: ThreadId,
+        expected_stream_version: u64,
+        expected_stream_recovery_bytes: u64,
+        event: StateEvent,
+    ) -> Result<StoredEvent, HarnessError> {
+        let pending = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: thread_id.clone(),
+            expected_stream_version,
+            expected_stream_recovery_bytes,
+            recorded_at_ms: crate::kernel::now_ms(),
+            event,
+        };
+        let encoded = validate_pending_event(&pending)?;
+        let result = self.store.append(pending.clone()).await;
+        match result {
+            Ok(stored) => {
+                validate_append_result(&pending, &stored)?;
+                self.advance_head(
+                    expected_stream_version,
+                    expected_stream_recovery_bytes,
+                    encoded.recovery_bytes,
+                    &stored,
+                )
+                .await;
+                Ok(stored)
+            }
+            Err(error @ HarnessError::StateConflict { .. }) => {
+                self.invalidate_head(&thread_id, expected_stream_version)
+                    .await;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn stream_head_from_parts(
+    thread: &Thread,
+    stream_version: u64,
+    recovery_bytes: u64,
+    last_sequence: u64,
+) -> StreamHead {
+    let turns = thread
+        .turns
+        .iter()
+        .map(|turn| turn.id.clone())
+        .collect::<BTreeSet<_>>();
+    let running_turn = thread
+        .turns
+        .iter()
+        .find(|turn| turn.status == TurnStatus::Running)
+        .map(|turn| turn.id.clone());
+    StreamHead {
+        stream_version,
+        recovery_bytes,
+        last_sequence,
+        turns: Arc::new(turns),
+        running_turn,
+    }
+}
+
+fn nonzero(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn state_capacity(used_events: u64, used_recovery_bytes: u64) -> StateCapacity {
+    let event_level = if used_events >= STATE_THREAD_EVENT_LIMIT {
+        StateCapacityLevel::Exhausted
+    } else if used_events >= STATE_THREAD_EVENT_LIMIT.saturating_sub(STATE_TERMINAL_EVENT_RESERVE) {
+        StateCapacityLevel::TerminalOnly
+    } else if used_events >= STATE_CAPACITY_CRITICAL_AT {
+        StateCapacityLevel::Critical
+    } else if used_events >= STATE_CAPACITY_WARNING_AT {
+        StateCapacityLevel::Warning
+    } else {
+        StateCapacityLevel::Healthy
+    };
+    let recovery_level = if used_recovery_bytes >= STATE_THREAD_RECOVERY_BYTE_LIMIT {
+        StateCapacityLevel::Exhausted
+    } else if used_recovery_bytes
+        >= STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(STATE_TERMINAL_RECOVERY_BYTE_RESERVE)
+    {
+        StateCapacityLevel::TerminalOnly
+    } else if used_recovery_bytes >= STATE_RECOVERY_CAPACITY_CRITICAL_AT {
+        StateCapacityLevel::Critical
+    } else if used_recovery_bytes >= STATE_RECOVERY_CAPACITY_WARNING_AT {
+        StateCapacityLevel::Warning
+    } else {
+        StateCapacityLevel::Healthy
+    };
+    let level = more_severe_capacity_level(event_level, recovery_level);
+    let remaining_events = STATE_THREAD_EVENT_LIMIT.saturating_sub(used_events);
+    let terminal_event_reserve = remaining_events.min(STATE_TERMINAL_EVENT_RESERVE);
+    let remaining_recovery_bytes =
+        STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(used_recovery_bytes);
+    let terminal_recovery_byte_reserve =
+        remaining_recovery_bytes.min(STATE_TERMINAL_RECOVERY_BYTE_RESERVE);
+    StateCapacity {
+        used_events,
+        event_limit: STATE_THREAD_EVENT_LIMIT,
+        remaining_events,
+        general_events_remaining: remaining_events.saturating_sub(terminal_event_reserve),
+        terminal_event_reserve,
+        used_recovery_bytes,
+        recovery_byte_limit: STATE_THREAD_RECOVERY_BYTE_LIMIT,
+        remaining_recovery_bytes,
+        general_recovery_bytes_remaining: remaining_recovery_bytes
+            .saturating_sub(terminal_recovery_byte_reserve),
+        terminal_recovery_byte_reserve,
+        level,
+    }
+}
+
+fn more_severe_capacity_level(
+    left: StateCapacityLevel,
+    right: StateCapacityLevel,
+) -> StateCapacityLevel {
+    fn rank(level: StateCapacityLevel) -> u8 {
+        match level {
+            StateCapacityLevel::Healthy => 0,
+            StateCapacityLevel::Warning => 1,
+            StateCapacityLevel::Critical => 2,
+            StateCapacityLevel::TerminalOnly => 3,
+            StateCapacityLevel::Exhausted => 4,
+        }
+    }
+    if rank(left) >= rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
+fn require_running_head(head: &StreamHead, turn_id: &TurnId) -> Result<(), HarnessError> {
+    if !head.turns.contains(turn_id) {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} does not exist"
+        )));
+    }
+    if head.running_turn.as_ref() != Some(turn_id) {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+fn project_events(events: &[StoredEvent]) -> Result<Option<Thread>, HarnessError> {
+    let mut thread: Option<Thread> = None;
+    apply_events(&mut thread, events)?;
+    Ok(thread)
+}
+
+fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(), HarnessError> {
+    let mut turn_ids = thread
+        .iter()
+        .flat_map(|thread| thread.turns.iter())
+        .map(|turn| turn.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut item_ids = thread
+        .iter()
+        .flat_map(|thread| thread.turns.iter())
+        .flat_map(|turn| turn.items.iter())
+        .map(|item| item.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut checkpoint_ids = thread
+        .iter()
+        .flat_map(|thread| thread.checkpoints.iter())
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect::<BTreeSet<_>>();
+    for stored in events {
+        validate_stored_schema(stored)?;
+        match &stored.event {
+            StateEvent::ThreadCreated { created_at_ms } => {
+                if thread.is_some() {
+                    return Err(HarnessError::State(
+                        "thread has multiple creation events".to_owned(),
+                    ));
+                }
+                *thread = Some(Thread {
+                    id: stored.thread_id.clone(),
+                    created_at_ms: *created_at_ms,
+                    turns: Vec::new(),
+                    checkpoints: Vec::new(),
+                });
+            }
+            StateEvent::TurnStarted { turn_id } => {
+                if !turn_ids.insert(turn_id.clone()) {
+                    return Err(HarnessError::State(format!("duplicate turn {turn_id}")));
+                }
+                let thread = projection_thread(thread)?;
+                if thread
+                    .turns
+                    .iter()
+                    .any(|turn| turn.status == TurnStatus::Running)
+                {
+                    return Err(HarnessError::State(
+                        "thread contains overlapping running turns".to_owned(),
+                    ));
+                }
+                thread.turns.push(Turn {
+                    id: turn_id.clone(),
+                    thread_id: stored.thread_id.clone(),
+                    status: TurnStatus::Running,
+                    items: Vec::new(),
+                });
+            }
+            StateEvent::ItemAppended { turn_id, item } => {
+                if !item_ids.insert(item.id.clone()) {
+                    return Err(HarnessError::State(format!("duplicate item {}", item.id)));
+                }
+                let thread = projection_thread(thread)?;
+                let turn = thread
+                    .turns
+                    .iter_mut()
+                    .find(|turn| &turn.id == turn_id)
+                    .ok_or_else(|| {
+                        HarnessError::State(format!("item references unknown turn {turn_id}"))
+                    })?;
+                if turn.status != TurnStatus::Running {
+                    return Err(HarnessError::State(format!(
+                        "item appended after turn {turn_id} finished"
+                    )));
+                }
+                turn.items.push(item.clone());
+            }
+            StateEvent::TurnFinished { turn_id, status } => {
+                if status == &TurnStatus::Running {
+                    return Err(HarnessError::State(
+                        "turn finish event contains running status".to_owned(),
+                    ));
+                }
+                let thread = projection_thread(thread)?;
+                let turn = thread
+                    .turns
+                    .iter_mut()
+                    .find(|turn| &turn.id == turn_id)
+                    .ok_or_else(|| {
+                        HarnessError::State(format!("finish references unknown turn {turn_id}"))
+                    })?;
+                if turn.status != TurnStatus::Running {
+                    return Err(HarnessError::State(format!(
+                        "turn {turn_id} has multiple terminal events"
+                    )));
+                }
+                turn.status = status.clone();
+            }
+            StateEvent::CheckpointCreated { checkpoint } => {
+                if !checkpoint_ids.insert(checkpoint.id.clone()) {
+                    return Err(HarnessError::State(format!(
+                        "duplicate checkpoint {}",
+                        checkpoint.id
+                    )));
+                }
+                let thread = projection_thread(thread)?;
+                if checkpoint.thread_id != stored.thread_id {
+                    return Err(HarnessError::State(
+                        "checkpoint thread does not match event thread".to_owned(),
+                    ));
+                }
+                if checkpoint.target_sequence >= stored.sequence {
+                    return Err(HarnessError::State(
+                        "checkpoint target must precede its event".to_owned(),
+                    ));
+                }
+                thread.checkpoints.push(checkpoint.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn projection_thread(thread: &mut Option<Thread>) -> Result<&mut Thread, HarnessError> {
+    thread
+        .as_mut()
+        .ok_or_else(|| HarnessError::State("event precedes thread creation".to_owned()))
+}
+
+fn validate_stream_version(actual: u64, pending: &PendingEvent) -> Result<(), HarnessError> {
+    if actual == pending.expected_stream_version {
+        Ok(())
+    } else {
+        Err(HarnessError::StateConflict {
+            thread_id: pending.thread_id.clone(),
+            expected: pending.expected_stream_version,
+            actual,
+        })
+    }
+}
+
+fn validate_stream_recovery_bytes(actual: u64, pending: &PendingEvent) -> Result<(), HarnessError> {
+    if actual == pending.expected_stream_recovery_bytes {
+        Ok(())
+    } else {
+        Err(HarnessError::State(format!(
+            "stream recovery charge mismatch: expected {}, found {actual}",
+            pending.expected_stream_recovery_bytes
+        )))
+    }
+}
+
+fn projection_sha256(thread: &Thread) -> Result<String, HarnessError> {
+    struct DigestWriter<'a>(&'a mut Sha256);
+
+    impl Write for DigestWriter<'_> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.update(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut digest = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut digest), thread)
+        .map_err(|error| HarnessError::State(format!("cannot encode State projection: {error}")))?;
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
+}
+
+fn encode_snapshot(snapshot: &StateSnapshot) -> Result<String, HarnessError> {
+    validate_snapshot(snapshot)?;
+    let encoded = to_bounded_json_vec(snapshot, MAX_STATE_SNAPSHOT_BYTES)
+        .map_err(|error| state_json_error("State snapshot", MAX_STATE_SNAPSHOT_BYTES, error))?;
+    String::from_utf8(encoded)
+        .map_err(|_| HarnessError::State("State snapshot is not UTF-8 JSON".to_owned()))
+}
+
+fn validate_snapshot(snapshot: &StateSnapshot) -> Result<(), HarnessError> {
+    if snapshot.schema_version != STATE_SNAPSHOT_SCHEMA_VERSION {
+        return Err(HarnessError::State(format!(
+            "unsupported State snapshot schema version {}",
+            snapshot.schema_version
+        )));
+    }
+    if snapshot.through_sequence == 0
+        || snapshot.stream_version == 0
+        || snapshot.stream_version > MAX_STATE_RECOVERY_EVENTS as u64
+        || snapshot.stream_version > snapshot.through_sequence
+        || snapshot.recovery_bytes == 0
+        || snapshot.recovery_bytes > STATE_THREAD_RECOVERY_BYTE_LIMIT
+    {
+        return Err(HarnessError::State(
+            "State snapshot has invalid sequence metadata".to_owned(),
+        ));
+    }
+    validate_state_id("snapshot thread", snapshot.thread.id.as_str())?;
+    validate_state_id("snapshot anchor event", snapshot.anchor_event_id.as_str())?;
+    let projected_recovery_bytes = validate_projected_thread(&snapshot.thread, snapshot)?;
+    if projected_recovery_bytes != snapshot.recovery_bytes {
+        return Err(HarnessError::State(
+            "State snapshot recovery charge does not match its projection".to_owned(),
+        ));
+    }
+    let digest = projection_sha256(&snapshot.thread)?;
+    if snapshot.projection_sha256 != digest {
+        return Err(HarnessError::State(
+            "State snapshot projection digest mismatch".to_owned(),
+        ));
+    }
+    bounded_serialized_size(snapshot, MAX_STATE_SNAPSHOT_BYTES)
+        .map_err(|error| state_json_error("State snapshot", MAX_STATE_SNAPSHOT_BYTES, error))?;
+    Ok(())
+}
+
+fn validate_projected_thread(
+    thread: &Thread,
+    snapshot: &StateSnapshot,
+) -> Result<u64, HarnessError> {
+    let mut turn_ids = BTreeSet::new();
+    let mut item_ids = BTreeSet::new();
+    let mut running_turns = 0_usize;
+    let mut represented_events = 1_usize;
+
+    let mut recovery_bytes = encode_state_event(&StateEvent::ThreadCreated {
+        created_at_ms: thread.created_at_ms,
+    })?
+    .recovery_bytes;
+    for turn in &thread.turns {
+        validate_state_id("snapshot turn", turn.id.as_str())?;
+        if turn.thread_id != thread.id || !turn_ids.insert(turn.id.as_str()) {
+            return Err(HarnessError::State(
+                "State snapshot contains an invalid or duplicate Turn".to_owned(),
+            ));
+        }
+        represented_events = represented_events
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+        add_recovery_bytes(
+            &mut recovery_bytes,
+            encode_state_event(&StateEvent::TurnStarted {
+                turn_id: turn.id.clone(),
+            })?
+            .recovery_bytes,
+        )?;
+
+        for item in &turn.items {
+            validate_state_id("snapshot item", item.id.as_str())?;
+            validate_state_item(item)?;
+            if !item_ids.insert(item.id.as_str()) {
+                return Err(HarnessError::State(
+                    "State snapshot contains a duplicate Item".to_owned(),
+                ));
+            }
+            represented_events = represented_events
+                .checked_add(1)
+                .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+            add_recovery_bytes(
+                &mut recovery_bytes,
+                encode_state_event(&StateEvent::ItemAppended {
+                    turn_id: turn.id.clone(),
+                    item: item.clone(),
+                })?
+                .recovery_bytes,
+            )?;
+        }
+
+        if turn.status == TurnStatus::Running {
+            running_turns = running_turns
+                .checked_add(1)
+                .ok_or_else(|| HarnessError::State("running Turn count overflow".to_owned()))?;
+        } else {
+            represented_events = represented_events
+                .checked_add(1)
+                .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+            add_recovery_bytes(
+                &mut recovery_bytes,
+                encode_state_event(&StateEvent::TurnFinished {
+                    turn_id: turn.id.clone(),
+                    status: turn.status.clone(),
+                })?
+                .recovery_bytes,
+            )?;
+        }
+    }
+    if running_turns > 1 {
+        return Err(HarnessError::State(
+            "State snapshot contains overlapping running Turns".to_owned(),
+        ));
+    }
+
+    let mut checkpoint_ids = BTreeSet::new();
+    for checkpoint in &thread.checkpoints {
+        if checkpoint.thread_id != thread.id
+            || checkpoint.target_sequence >= snapshot.through_sequence
+            || !checkpoint_ids.insert(checkpoint.id.as_str())
+            || checkpoint
+                .turn_id
+                .as_ref()
+                .is_some_and(|turn_id| !turn_ids.contains(turn_id.as_str()))
+        {
+            return Err(HarnessError::State(
+                "State snapshot contains an invalid Checkpoint".to_owned(),
+            ));
+        }
+        represented_events = represented_events
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+        add_recovery_bytes(
+            &mut recovery_bytes,
+            encode_state_event(&StateEvent::CheckpointCreated {
+                checkpoint: checkpoint.clone(),
+            })?
+            .recovery_bytes,
+        )?;
+    }
+
+    if u64::try_from(represented_events)
+        .map_err(|_| HarnessError::State("snapshot event count exceeds u64".to_owned()))?
+        != snapshot.stream_version
+    {
+        return Err(HarnessError::State(
+            "State snapshot projection does not match its stream version".to_owned(),
+        ));
+    }
+    Ok(recovery_bytes)
+}
+
+struct EncodedStateEvent {
+    json: String,
+    recovery_bytes: u64,
+}
+
+fn validate_pending_event(pending: &PendingEvent) -> Result<EncodedStateEvent, HarnessError> {
+    validate_state_id("event", pending.event_id.as_str())?;
+    validate_state_id("thread", pending.thread_id.as_str())?;
+    if pending.expected_stream_version >= MAX_STATE_RECOVERY_EVENTS as u64 {
+        return Err(HarnessError::State(format!(
+            "Thread reached its {MAX_STATE_RECOVERY_EVENTS}-event retention boundary"
+        )));
+    }
+    if pending.expected_stream_version
+        >= STATE_THREAD_EVENT_LIMIT.saturating_sub(STATE_TERMINAL_EVENT_RESERVE)
+        && !matches!(&pending.event, StateEvent::TurnFinished { .. })
+    {
+        return Err(HarnessError::State(
+            "Thread has only its terminal-settlement event reserve remaining".to_owned(),
+        ));
+    }
+    validate_state_event(&pending.event)?;
+    validate_state_event_schema(&pending.event, STATE_EVENT_SCHEMA_VERSION)?;
+    let encoded = encode_state_event(&pending.event)?;
+    let next_recovery_bytes = pending
+        .expected_stream_recovery_bytes
+        .checked_add(encoded.recovery_bytes)
+        .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
+    let limit = if matches!(&pending.event, StateEvent::TurnFinished { .. }) {
+        STATE_THREAD_RECOVERY_BYTE_LIMIT
+    } else {
+        STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(STATE_TERMINAL_RECOVERY_BYTE_RESERVE)
+    };
+    if next_recovery_bytes > limit {
+        return Err(HarnessError::State(format!(
+            "Thread reached its {STATE_THREAD_RECOVERY_BYTE_LIMIT}-byte recovery boundary"
+        )));
+    }
+    Ok(encoded)
+}
+
+fn validate_state_event(event: &StateEvent) -> Result<(), HarnessError> {
+    match event {
+        StateEvent::ThreadCreated { .. } => {}
+        StateEvent::TurnStarted { turn_id } | StateEvent::TurnFinished { turn_id, .. } => {
+            validate_state_id("turn", turn_id.as_str())?;
+        }
+        StateEvent::ItemAppended { turn_id, item } => {
+            validate_state_id("turn", turn_id.as_str())?;
+            validate_state_id("item", item.id.as_str())?;
+            validate_state_item(item)?;
+        }
+        StateEvent::CheckpointCreated { checkpoint } => {
+            validate_state_id("checkpoint", checkpoint.id.as_str())?;
+            validate_state_id("checkpoint thread", checkpoint.thread_id.as_str())?;
+            if let Some(turn_id) = &checkpoint.turn_id {
+                validate_state_id("checkpoint turn", turn_id.as_str())?;
+            }
+            validate_checkpoint_label(checkpoint.label.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_label(label: Option<&str>) -> Result<(), HarnessError> {
+    if let Some(label) = label
+        && (label.trim().is_empty() || label.len() > MAX_CHECKPOINT_LABEL_BYTES)
+    {
+        return Err(HarnessError::State(format!(
+            "checkpoint label must be 1-{MAX_CHECKPOINT_LABEL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
+    match &item.kind {
+        crate::ItemKind::ConversationSummary {
+            compactor,
+            covered_turns,
+            older_omitted_turns,
+            source_sha256,
+            content_sha256,
+            estimated_tokens,
+            serialized_bytes,
+        } => {
+            validate_capability_name("conversation compactor", compactor)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+            if covered_turns.is_empty() || covered_turns.len() > 256 {
+                return Err(HarnessError::State(
+                    "conversation summary evidence must cover 1-256 Turns".to_owned(),
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for turn_id in covered_turns {
+                validate_state_id("conversation summary Turn", turn_id.as_str())?;
+                if !seen.insert(turn_id.as_str()) {
+                    return Err(HarnessError::State(
+                        "conversation summary evidence contains duplicate Turns".to_owned(),
+                    ));
+                }
+            }
+            if *older_omitted_turns > MAX_STATE_RECOVERY_EVENTS
+                || !is_lower_sha256(source_sha256)
+                || !is_lower_sha256(content_sha256)
+                || !(1..=1_048_576).contains(estimated_tokens)
+                || !(1..=1_048_576).contains(serialized_bytes)
+            {
+                return Err(HarnessError::State(
+                    "conversation summary evidence violates bounded provenance".to_owned(),
+                ));
+            }
+        }
+        crate::ItemKind::PolicyDecision {
+            tool_origin: Some(tool_origin),
+            ..
+        } => {
+            crate::kernel::validate_capability_origin(tool_origin)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+        }
+        crate::ItemKind::ApprovalRequested {
+            requested_by,
+            tool_origin,
+            model_request_sha256,
+            ..
+        } => match (requested_by, tool_origin, model_request_sha256) {
+            (Some(requested_by), Some(tool_origin), Some(model_request_sha256)) => {
+                requested_by
+                    .validate_current("State approval requester")
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                crate::kernel::validate_capability_origin(tool_origin)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                if !is_lower_sha256(model_request_sha256) {
+                    return Err(HarnessError::State(
+                        "approval continuation requires a lowercase Model request SHA-256"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(HarnessError::State(
+                    "approval continuation evidence must be wholly present or absent".to_owned(),
+                ));
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_state_event_schema(
+    event: &StateEvent,
+    schema_version: u32,
+) -> Result<(), HarnessError> {
+    let StateEvent::ItemAppended {
+        item: Item { kind, .. },
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+    match kind {
+        ItemKind::PolicyDecision { tool_origin, .. } => {
+            if schema_version >= 4 && tool_origin.is_none() {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} Policy decision requires Tool origin evidence"
+                )));
+            }
+            if schema_version < 4 && tool_origin.is_some() {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} Policy decision cannot contain Tool origin evidence"
+                )));
+            }
+        }
+        ItemKind::ApprovalRequested {
+            requested_by,
+            tool_origin,
+            model_request_sha256,
+            ..
+        } => {
+            let has_continuation =
+                requested_by.is_some() && tool_origin.is_some() && model_request_sha256.is_some();
+            if schema_version >= 3 && !has_continuation {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} approval request requires continuation evidence"
+                )));
+            }
+            if schema_version < 3 && has_continuation {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} approval request cannot contain continuation evidence"
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_state_id(kind: &str, value: &str) -> Result<(), HarnessError> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(HarnessError::State(format!(
+            "{kind} identity must be 1-256 non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_page_limit(limit: usize) -> Result<(), HarnessError> {
+    if !(1..=MAX_STATE_EVENT_PAGE).contains(&limit) {
+        return Err(HarnessError::State(format!(
+            "event page limit must be 1-{MAX_STATE_EVENT_PAGE}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_page_request(limit: usize, max_recovery_bytes: u64) -> Result<(), HarnessError> {
+    validate_event_page_limit(limit)?;
+    if max_recovery_bytes == 0 || max_recovery_bytes > MAX_STATE_EVENT_PAGE_RECOVERY_BYTES {
+        return Err(HarnessError::State(format!(
+            "event page recovery budget must be 1-{MAX_STATE_EVENT_PAGE_RECOVERY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_state_event(event: &StateEvent) -> Result<EncodedStateEvent, HarnessError> {
+    validate_state_event_json_shape(event)?;
+    let encoded = to_bounded_json_vec(event, MAX_STATE_EVENT_BYTES)
+        .map_err(|error| state_json_error("state event", MAX_STATE_EVENT_BYTES, error))?;
+    let encoded_bytes = u64::try_from(encoded.len())
+        .map_err(|_| HarnessError::State("state event size exceeds u64".to_owned()))?;
+    let recovery_bytes = encoded_bytes
+        .checked_add(STATE_EVENT_RECOVERY_OVERHEAD_BYTES)
+        .ok_or_else(|| HarnessError::State("state event recovery charge overflow".to_owned()))?;
+    Ok(EncodedStateEvent {
+        json: String::from_utf8(encoded)
+            .map_err(|_| HarnessError::State("state event is not UTF-8 JSON".to_owned()))?,
+        recovery_bytes,
+    })
+}
+
+fn validate_state_event_json_shape(event: &StateEvent) -> Result<(), HarnessError> {
+    let value = match event {
+        StateEvent::ItemAppended { item, .. } => match &item.kind {
+            ItemKind::ToolCall { input, .. } => Some(input),
+            ItemKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        },
+        _ => None,
+    };
+    if value.is_some_and(|value| validate_value_shape(value).is_err()) {
+        return Err(HarnessError::State(
+            "state event JSON exceeds the supported depth or node count".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn state_json_error(kind: &str, maximum: usize, error: BoundedJsonError) -> HarnessError {
+    match error {
+        BoundedJsonError::LimitExceeded => {
+            HarnessError::State(format!("{kind} exceeds {maximum} bytes"))
+        }
+        BoundedJsonError::CannotEncode => HarnessError::State(format!("cannot encode {kind}")),
+    }
+}
+
+fn stored_event_recovery_bytes(event: &StoredEvent) -> Result<u64, HarnessError> {
+    Ok(encode_state_event(&event.event)?.recovery_bytes)
+}
+
+#[cfg(test)]
+fn stored_events_recovery_bytes(events: &[StoredEvent]) -> Result<u64, HarnessError> {
+    events.iter().try_fold(0_u64, |total, event| {
+        total
+            .checked_add(stored_event_recovery_bytes(event)?)
+            .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))
+    })
+}
+
+fn add_recovery_bytes(total: &mut u64, increment: u64) -> Result<(), HarnessError> {
+    *total = total
+        .checked_add(increment)
+        .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
+    Ok(())
+}
+
+fn validate_append_result(
+    pending: &PendingEvent,
+    stored: &StoredEvent,
+) -> Result<(), HarnessError> {
+    let _ = validate_stored_event(stored)?;
+    if stored.schema_version != STATE_EVENT_SCHEMA_VERSION
+        || stored.sequence == 0
+        || stored.event_id != pending.event_id
+        || stored.thread_id != pending.thread_id
+        || stored.recorded_at_ms != pending.recorded_at_ms
+        || stored.event != pending.event
+    {
+        return Err(HarnessError::State(
+            "Event Store returned an append result that does not match the pending event"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stored_events(
+    thread_id: &ThreadId,
+    events: &[StoredEvent],
+    after_sequence: u64,
+    limit: Option<usize>,
+    max_recovery_bytes: Option<u64>,
+) -> Result<u64, HarnessError> {
+    if limit.is_some_and(|limit| events.len() > limit) {
+        return Err(HarnessError::State(
+            "Event Store returned more events than requested".to_owned(),
+        ));
+    }
+    if limit.is_none() && events.len() > MAX_STATE_RECOVERY_EVENTS {
+        return Err(HarnessError::State(format!(
+            "Thread exceeds {MAX_STATE_RECOVERY_EVENTS} recoverable events"
+        )));
+    }
+    let mut previous_sequence = after_sequence;
+    let mut event_ids = BTreeSet::new();
+    let mut recovery_bytes = 0_u64;
+    for stored in events {
+        add_recovery_bytes(&mut recovery_bytes, validate_stored_event(stored)?)?;
+        if &stored.thread_id != thread_id {
+            return Err(HarnessError::State(
+                "Event Store returned an event from another thread".to_owned(),
+            ));
+        }
+        if stored.sequence <= previous_sequence {
+            return Err(HarnessError::State(
+                "Event Store returned non-increasing event sequences".to_owned(),
+            ));
+        }
+        if !event_ids.insert(stored.event_id.as_str()) {
+            return Err(HarnessError::State(
+                "Event Store returned duplicate event identities".to_owned(),
+            ));
+        }
+        previous_sequence = stored.sequence;
+    }
+    if max_recovery_bytes.is_some_and(|maximum| recovery_bytes > maximum) {
+        return Err(HarnessError::State(
+            "Event Store returned more recovery bytes than requested".to_owned(),
+        ));
+    }
+    if limit.is_none() && recovery_bytes > STATE_THREAD_RECOVERY_BYTE_LIMIT {
+        return Err(HarnessError::State(format!(
+            "Thread exceeds its {STATE_THREAD_RECOVERY_BYTE_LIMIT}-byte recovery boundary"
+        )));
+    }
+    Ok(recovery_bytes)
+}
+
+fn validate_stored_event(stored: &StoredEvent) -> Result<u64, HarnessError> {
+    validate_stored_schema(stored)?;
+    validate_state_id("event", stored.event_id.as_str())?;
+    validate_state_id("thread", stored.thread_id.as_str())?;
+    validate_state_event(&stored.event)?;
+    Ok(encode_state_event(&stored.event)?.recovery_bytes)
+}
+
+fn validate_stored_schema(stored: &StoredEvent) -> Result<(), HarnessError> {
+    if !(1..=STATE_EVENT_SCHEMA_VERSION).contains(&stored.schema_version) {
+        return Err(HarnessError::State(format!(
+            "unsupported state schema version {}",
+            stored.schema_version
+        )));
+    }
+    if stored.schema_version == 1
+        && matches!(
+            &stored.event,
+            StateEvent::ItemAppended {
+                item: Item {
+                    kind: crate::ItemKind::ConversationSummary { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    {
+        return Err(HarnessError::State(
+            "schema-1 State event cannot contain conversation summary evidence".to_owned(),
+        ));
+    }
+    validate_state_event_schema(&stored.event, stored.schema_version)?;
+    Ok(())
+}
+
+fn remember_event_ids(
+    event_ids: &mut BTreeSet<EventId>,
+    events: &[StoredEvent],
+) -> Result<(), HarnessError> {
+    for event in events {
+        if !event_ids.insert(event.event_id.clone()) {
+            return Err(HarnessError::State(
+                "Event Store returned a duplicate event identity across pages".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_thread_existence(
+    thread_exists: bool,
+    pending: &PendingEvent,
+) -> Result<(), HarnessError> {
+    match (&pending.event, thread_exists) {
+        (StateEvent::ThreadCreated { .. }, true) => Err(HarnessError::State(format!(
+            "thread {} already exists",
+            pending.thread_id
+        ))),
+        (StateEvent::ThreadCreated { .. }, false) | (_, true) => Ok(()),
+        (_, false) => Err(HarnessError::State(format!(
+            "thread {} does not exist",
+            pending.thread_id
+        ))),
+    }
+}
+
+fn matching_existing(
+    existing: &StoredEvent,
+    pending: &PendingEvent,
+) -> Result<StoredEvent, HarnessError> {
+    if existing.thread_id == pending.thread_id
+        && existing.recorded_at_ms == pending.recorded_at_ms
+        && existing.event == pending.event
+    {
+        Ok(existing.clone())
+    } else {
+        Err(HarnessError::State(format!(
+            "event id {} was reused with different content",
+            pending.event_id
+        )))
+    }
+}
+
+fn decode_row(
+    event_id: EventId,
+    row: (i64, String, i64, i64, String),
+) -> Result<StoredEvent, HarnessError> {
+    let (sequence, thread_id, recorded_at_ms, schema_version, event_json) = row;
+    if event_json.len() > MAX_STATE_EVENT_BYTES {
+        return Err(HarnessError::State(format!(
+            "stored state event exceeds {MAX_STATE_EVENT_BYTES} bytes"
+        )));
+    }
+    let stored = StoredEvent {
+        schema_version: u32::try_from(schema_version)
+            .map_err(|_| HarnessError::State("invalid schema version".to_owned()))?,
+        sequence: u64::try_from(sequence)
+            .map_err(|_| HarnessError::State("negative event sequence".to_owned()))?,
+        event_id,
+        thread_id: ThreadId::from_string(thread_id),
+        recorded_at_ms: u64::try_from(recorded_at_ms)
+            .map_err(|_| HarnessError::State("negative event timestamp".to_owned()))?,
+        event: serde_json::from_str(&event_json)
+            .map_err(|error| HarnessError::State(error.to_string()))?,
+    };
+    validate_stored_event(&stored)?;
+    Ok(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    use serde_json::json;
+
+    use super::{
+        EventStore, MemoryEventStore, SnapshotMaintenanceConfig, SnapshotMaintenanceFailure,
+        SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
+    };
+    use crate::{
+        EventId, HarnessError, HarnessFuture, Item, ItemKind, PendingEvent, StateEvent,
+        StoredEvent, ThreadId, TurnId, TurnStatus, kernel::now_ms,
+    };
+
+    struct LyingAppendStore;
+
+    impl EventStore for LyingAppendStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            Box::pin(async move {
+                Ok(StoredEvent {
+                    schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                    sequence: 1,
+                    event_id: EventId::from_static("wrong-event"),
+                    thread_id: pending.thread_id,
+                    recorded_at_ms: pending.recorded_at_ms,
+                    event: pending.event,
+                })
+            })
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            _thread_id: &'a ThreadId,
+            _after_sequence: u64,
+            _limit: usize,
+            _max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct LegacyLabelAppendStore;
+
+    impl EventStore for LegacyLabelAppendStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            Box::pin(async move {
+                Ok(StoredEvent {
+                    schema_version: 1,
+                    sequence: 1,
+                    event_id: pending.event_id,
+                    thread_id: pending.thread_id,
+                    recorded_at_ms: pending.recorded_at_ms,
+                    event: pending.event,
+                })
+            })
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            _thread_id: &'a ThreadId,
+            _after_sequence: u64,
+            _limit: usize,
+            _max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct OversizedPageStore {
+        events: Vec<StoredEvent>,
+    }
+
+    impl EventStore for OversizedPageStore {
+        fn append<'a>(&'a self, _pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            Box::pin(async { Err(HarnessError::State("read-only test Event Store".to_owned())) })
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            _thread_id: &'a ThreadId,
+            _after_sequence: u64,
+            _limit: usize,
+            _max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            let events = self.events.clone();
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    struct FailingSnapshotStore {
+        inner: MemoryEventStore,
+        panic_on_save: bool,
+    }
+
+    impl FailingSnapshotStore {
+        fn new(panic_on_save: bool) -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+                panic_on_save,
+            }
+        }
+    }
+
+    struct BlockingSnapshotStore {
+        inner: MemoryEventStore,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingSnapshotStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl EventStore for BlockingSnapshotStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            self.inner.append(pending)
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            after_sequence: u64,
+            limit: usize,
+            max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            self.inner
+                .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
+        }
+
+        fn load_snapshot<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+        ) -> HarnessFuture<'a, Option<StateSnapshot>> {
+            self.inner.load_snapshot(thread_id)
+        }
+
+        fn save_snapshot<'a>(&'a self, snapshot: StateSnapshot) -> HarnessFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.inner.save_snapshot(snapshot).await
+            })
+        }
+    }
+
+    impl EventStore for FailingSnapshotStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            self.inner.append(pending)
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            after_sequence: u64,
+            limit: usize,
+            max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            self.inner
+                .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
+        }
+
+        fn save_snapshot<'a>(&'a self, _snapshot: StateSnapshot) -> HarnessFuture<'a, ()> {
+            let panic_on_save = self.panic_on_save;
+            Box::pin(async move {
+                assert!(!panic_on_save, "simulated snapshot provider panic");
+                Err(HarnessError::State(
+                    "simulated snapshot provider failure".to_owned(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn event_ids_are_idempotent_but_cannot_change_content() {
+        let store = MemoryEventStore::new();
+        let event_id = EventId::generate();
+        let thread_id = ThreadId::generate();
+        let pending = PendingEvent {
+            event_id,
+            thread_id,
+            expected_stream_version: 0,
+            expected_stream_recovery_bytes: 0,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::ThreadCreated {
+                created_at_ms: now_ms(),
+            },
+        };
+
+        let first = store.append(pending.clone()).await.expect("first append");
+        let second = store
+            .append(pending.clone())
+            .await
+            .expect("idempotent retry");
+        assert_eq!(first, second);
+
+        let mut changed = pending;
+        changed.recorded_at_ms += 1;
+        assert!(store.append(changed).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_store_atomically_rejects_a_stream_version_race() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+        assert_competing_turn_starts(store.clone(), store).await;
+    }
+
+    #[tokio::test]
+    async fn stale_state_engine_head_is_safe_and_refreshes_before_rejection() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+        let first = StateEngine::new(store.clone());
+        let second = StateEngine::new(store);
+        let thread = first.create_thread().await.expect("create thread");
+        second
+            .load_thread(&thread.id)
+            .await
+            .expect("prime stale head");
+
+        let first_turn = first.start_turn(&thread.id).await.expect("first turn");
+        let conflict = second
+            .start_turn(&thread.id)
+            .await
+            .expect_err("stale writer must conflict");
+        assert!(matches!(conflict, HarnessError::StateConflict { .. }));
+        second
+            .load_thread(&thread.id)
+            .await
+            .expect("cache running head");
+
+        first
+            .finish_turn(&first_turn, TurnStatus::Completed)
+            .await
+            .expect("finish first");
+        let second_turn = second
+            .start_turn(&thread.id)
+            .await
+            .expect("refresh should observe finished turn");
+        assert_eq!(second_turn.status, TurnStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn separate_sqlite_connections_reject_a_stream_version_race() {
+        let path = temp_database_path();
+        let first: Arc<dyn EventStore> = Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("first connection"),
+        );
+        let second: Arc<dyn EventStore> = Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("second connection"),
+        );
+        assert_competing_turn_starts(first, second).await;
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_returns_the_event_rowid_after_auxiliary_metadata_writes() {
+        let path = temp_database_path();
+        let store = SqliteEventStore::open(&path).await.expect("open database");
+        let first_thread = ThreadId::from_static("rowid-first-thread");
+        let first_created = store
+            .append(PendingEvent {
+                event_id: EventId::generate(),
+                thread_id: first_thread.clone(),
+                expected_stream_version: 0,
+                expected_stream_recovery_bytes: 0,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            })
+            .await
+            .expect("create first stream");
+        let first_charge =
+            super::stored_event_recovery_bytes(&first_created).expect("first event charge");
+        let first_started = store
+            .append(PendingEvent {
+                event_id: EventId::generate(),
+                thread_id: first_thread,
+                expected_stream_version: 1,
+                expected_stream_recovery_bytes: first_charge,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::TurnStarted {
+                    turn_id: TurnId::generate(),
+                },
+            })
+            .await
+            .expect("grow first stream");
+        assert_eq!(first_started.sequence, 2);
+
+        let second_thread = ThreadId::from_static("rowid-second-thread");
+        let second_created = store
+            .append(PendingEvent {
+                event_id: EventId::generate(),
+                thread_id: second_thread.clone(),
+                expected_stream_version: 0,
+                expected_stream_recovery_bytes: 0,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            })
+            .await
+            .expect("create second stream");
+        assert_eq!(second_created.sequence, 3);
+        let persisted = store
+            .events_page(
+                &second_thread,
+                0,
+                1,
+                super::MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+            )
+            .await
+            .expect("read second stream");
+        assert_eq!(persisted[0].sequence, second_created.sequence);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn memory_event_pages_are_bounded_and_cursor_ordered() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+        assert_event_pages(store).await;
+    }
+
+    #[tokio::test]
+    async fn state_authority_rejects_oversized_events_and_unbounded_pages() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::UserMessage {
+                    content: "x".repeat(super::MAX_STATE_EVENT_BYTES + 1),
+                }),
+            )
+            .await
+            .expect_err("oversized event");
+        assert!(matches!(error, HarnessError::State(_)));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 2);
+
+        let mut nested = serde_json::Value::Null;
+        for _ in 0..=crate::json::MAX_JSON_DEPTH {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::ToolResult {
+                    call_id: "deep-call".to_owned(),
+                    output: nested,
+                    is_error: false,
+                }),
+            )
+            .await
+            .expect_err("deep event");
+        assert!(error.to_string().contains("depth or node count"));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 2);
+        assert!(state.events_page(&thread.id, 0, 0).await.is_err());
+        assert!(
+            state
+                .events_page(&thread.id, 0, super::MAX_STATE_EVENT_PAGE + 1)
+                .await
+                .is_err()
+        );
+
+        let store = MemoryEventStore::new();
+        let error = store
+            .append(PendingEvent {
+                event_id: EventId::generate(),
+                thread_id: ThreadId::generate(),
+                expected_stream_version: super::MAX_STATE_RECOVERY_EVENTS as u64,
+                expected_stream_recovery_bytes: 0,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            })
+            .await
+            .expect_err("retention boundary");
+        assert!(matches!(error, HarnessError::State(_)));
+    }
+
+    #[tokio::test]
+    async fn state_engine_revalidates_untrusted_event_store_results() {
+        let state = StateEngine::new(Arc::new(LyingAppendStore));
+        assert!(state.create_thread().await.is_err());
+        let state = StateEngine::new(Arc::new(LegacyLabelAppendStore));
+        assert!(
+            state.create_thread().await.is_err(),
+            "a current writer must reject predecessor-labeled append results"
+        );
+
+        let thread_id = ThreadId::from_static("thread-test");
+        let events = [1_u64, 2]
+            .into_iter()
+            .map(|sequence| StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence,
+                event_id: EventId::from_string(format!("event-{sequence}")),
+                thread_id: thread_id.clone(),
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            })
+            .collect();
+        let state = StateEngine::new(Arc::new(OversizedPageStore { events }));
+        let error = state
+            .events_page(&thread_id, 0, 1)
+            .await
+            .expect_err("provider page overflow");
+        assert!(matches!(error, HarnessError::State(_)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_replays_only_newer_tail_and_corruption_falls_back() {
+        let store = Arc::new(MemoryEventStore::new());
+        let state = StateEngine::new(store.clone());
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::UserMessage {
+                    content: "before snapshot".to_owned(),
+                }),
+            )
+            .await
+            .expect("append before snapshot");
+        let snapshot = state
+            .create_snapshot(&thread.id)
+            .await
+            .expect("create snapshot");
+        assert_eq!(snapshot.stream_version(), 3);
+
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::AssistantMessage {
+                    model_id: None,
+                    model_origin: None,
+                    content: "after snapshot".to_owned(),
+                }),
+            )
+            .await
+            .expect("append tail");
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("finish tail");
+
+        let loaded = StateEngine::new(store.clone())
+            .load_thread(&thread.id)
+            .await
+            .expect("load from snapshot")
+            .expect("thread");
+        assert_eq!(loaded.turns[0].items.len(), 2);
+        assert_eq!(loaded.turns[0].status, TurnStatus::Completed);
+
+        store
+            .data
+            .lock()
+            .await
+            .snapshots
+            .get_mut(&thread.id)
+            .expect("stored snapshot")
+            .projection_sha256 = "0".repeat(64);
+        let loaded = StateEngine::new(store)
+            .load_thread(&thread.id)
+            .await
+            .expect("corrupt snapshot must fall back")
+            .expect("thread");
+        assert_eq!(loaded.turns[0].items.len(), 2);
+    }
+
+    #[test]
+    fn automatic_snapshot_policy_rejects_unbounded_values() {
+        assert!(SnapshotMaintenanceConfig::new(0, 1).is_err());
+        assert!(SnapshotMaintenanceConfig::new(1, 0).is_err());
+        assert!(SnapshotMaintenanceConfig::new(1, 65).is_err());
+        assert!(SnapshotMaintenanceConfig::new(1_000_001, 1).is_err());
+        let config = SnapshotMaintenanceConfig::new(100, 4).expect("bounded policy");
+        assert_eq!(config.every_events(), 100);
+        assert_eq!(config.max_concurrency(), 4);
+    }
+
+    #[tokio::test]
+    async fn thread_capacity_exposes_stable_pressure_boundaries() {
+        assert_eq!(
+            super::state_capacity(799_999, 0).level,
+            StateCapacityLevel::Healthy
+        );
+        assert_eq!(
+            super::state_capacity(800_000, 0).level,
+            StateCapacityLevel::Warning
+        );
+        assert_eq!(
+            super::state_capacity(950_000, 0).level,
+            StateCapacityLevel::Critical
+        );
+        let terminal_only = super::state_capacity(999_999, 0);
+        assert_eq!(terminal_only.level, StateCapacityLevel::TerminalOnly);
+        assert_eq!(terminal_only.remaining_events, 1);
+        assert_eq!(terminal_only.general_events_remaining, 0);
+        assert_eq!(terminal_only.terminal_event_reserve, 1);
+        let exhausted = super::state_capacity(1_000_000, 0);
+        assert_eq!(exhausted.level, StateCapacityLevel::Exhausted);
+        assert_eq!(exhausted.remaining_events, 0);
+        assert_eq!(exhausted.terminal_event_reserve, 0);
+        let byte_critical = super::state_capacity(1, super::STATE_RECOVERY_CAPACITY_CRITICAL_AT);
+        assert_eq!(byte_critical.level, StateCapacityLevel::Critical);
+        let byte_terminal = super::state_capacity(
+            1,
+            super::STATE_THREAD_RECOVERY_BYTE_LIMIT - super::STATE_TERMINAL_RECOVERY_BYTE_RESERVE,
+        );
+        assert_eq!(byte_terminal.level, StateCapacityLevel::TerminalOnly);
+        assert_eq!(byte_terminal.general_recovery_bytes_remaining, 0);
+
+        let thread_id = ThreadId::from_static("capacity-thread");
+        let turn_id = TurnId::from_static("capacity-turn");
+        let non_terminal = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: thread_id.clone(),
+            expected_stream_version: 999_999,
+            expected_stream_recovery_bytes: 0,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+            },
+        };
+        assert!(super::validate_pending_event(&non_terminal).is_err());
+        let terminal = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id,
+            expected_stream_version: 999_999,
+            expected_stream_recovery_bytes: 0,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnFinished {
+                turn_id,
+                status: TurnStatus::Completed,
+            },
+        };
+        super::validate_pending_event(&terminal).expect("terminal reserve remains usable");
+
+        let terminal_event = StateEvent::TurnFinished {
+            // Backslashes and quotes maximize JSON expansion while remaining a
+            // valid 256-byte State identity.
+            turn_id: TurnId::from_string("\\\"".repeat(128)),
+            status: TurnStatus::Interrupted,
+        };
+        let terminal_charge = super::encode_state_event(&terminal_event)
+            .expect("terminal charge")
+            .recovery_bytes;
+        assert!(terminal_charge <= super::STATE_TERMINAL_RECOVERY_BYTE_RESERVE);
+        let byte_terminal = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: ThreadId::from_static("byte-reserve-thread"),
+            expected_stream_version: 1,
+            expected_stream_recovery_bytes: super::STATE_THREAD_RECOVERY_BYTE_LIMIT
+                - terminal_charge,
+            recorded_at_ms: now_ms(),
+            event: terminal_event,
+        };
+        super::validate_pending_event(&byte_terminal)
+            .expect("terminal byte reserve remains usable");
+        let byte_general = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: ThreadId::from_static("byte-general-thread"),
+            expected_stream_version: 1,
+            expected_stream_recovery_bytes: super::STATE_THREAD_RECOVERY_BYTE_LIMIT
+                - super::STATE_TERMINAL_RECOVERY_BYTE_RESERVE,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+            },
+        };
+        assert!(super::validate_pending_event(&byte_general).is_err());
+
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let missing = ThreadId::from_static("missing-thread");
+        assert_eq!(
+            state
+                .thread_capacity(&missing)
+                .await
+                .expect("missing capacity"),
+            None
+        );
+        let thread = state.create_thread().await.expect("create thread");
+        let capacity = state
+            .thread_capacity(&thread.id)
+            .await
+            .expect("thread capacity")
+            .expect("existing thread");
+        assert_eq!(capacity.used_events, 1);
+        assert_eq!(capacity.event_limit, 1_000_000);
+        assert_eq!(capacity.remaining_events, 999_999);
+        assert_eq!(capacity.general_events_remaining, 999_998);
+        assert_eq!(capacity.terminal_event_reserve, 1);
+        assert!(capacity.used_recovery_bytes > 0);
+        assert_eq!(
+            capacity.recovery_byte_limit,
+            super::STATE_THREAD_RECOVERY_BYTE_LIMIT
+        );
+        assert_eq!(capacity.level, StateCapacityLevel::Healthy);
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_automatically_creates_and_drains_snapshot() {
+        let store = Arc::new(MemoryEventStore::new());
+        let state = StateEngine::new(store.clone()).with_snapshot_maintenance(
+            SnapshotMaintenanceConfig::new(1, 1).expect("snapshot policy"),
+        );
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("journal settlement must not wait for snapshot");
+        assert!(
+            state
+                .drain_snapshot_maintenance(Duration::from_secs(1))
+                .await
+        );
+
+        let snapshot = store
+            .load_snapshot(&thread.id)
+            .await
+            .expect("load snapshot")
+            .expect("automatic snapshot");
+        assert_eq!(snapshot.stream_version(), 3);
+        let stats = state
+            .snapshot_maintenance_stats()
+            .expect("maintenance enabled");
+        assert_eq!(stats.scheduled, 1);
+        assert_eq!(stats.created, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.active, 0);
+        assert!(stats.last_created_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn automatic_snapshot_scheduler_sheds_work_at_capacity() {
+        let store = Arc::new(BlockingSnapshotStore::new());
+        let state = StateEngine::new(store.clone()).with_snapshot_maintenance(
+            SnapshotMaintenanceConfig::new(1, 1).expect("snapshot policy"),
+        );
+        let first_thread = state.create_thread().await.expect("first thread");
+        let first_turn = state
+            .start_turn(&first_thread.id)
+            .await
+            .expect("first turn");
+        let second_thread = state.create_thread().await.expect("second thread");
+        let second_turn = state
+            .start_turn(&second_thread.id)
+            .await
+            .expect("second turn");
+
+        state
+            .finish_turn(&first_turn, TurnStatus::Completed)
+            .await
+            .expect("settle first turn");
+        tokio::time::timeout(Duration::from_secs(1), store.entered.notified())
+            .await
+            .expect("first snapshot worker entered");
+        state
+            .finish_turn(&second_turn, TurnStatus::Completed)
+            .await
+            .expect("settle second turn without queueing");
+
+        let busy = state
+            .snapshot_maintenance_stats()
+            .expect("maintenance enabled");
+        assert_eq!(busy.scheduled, 1);
+        assert_eq!(busy.skipped_capacity, 1);
+        assert_eq!(busy.active, 1);
+
+        store.release.notify_one();
+        assert!(
+            state
+                .drain_snapshot_maintenance(Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(
+            state
+                .snapshot_maintenance_stats()
+                .expect("maintenance enabled")
+                .active,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_snapshot_errors_and_panics_never_reverse_turn_settlement() {
+        for (panic_on_save, expected) in [
+            (false, SnapshotMaintenanceFailure::Operation),
+            (true, SnapshotMaintenanceFailure::WorkerPanicked),
+        ] {
+            let state = StateEngine::new(Arc::new(FailingSnapshotStore::new(panic_on_save)))
+                .with_snapshot_maintenance(
+                    SnapshotMaintenanceConfig::new(1, 1).expect("snapshot policy"),
+                );
+            let thread = state.create_thread().await.expect("create thread");
+            let turn = state.start_turn(&thread.id).await.expect("start turn");
+            state
+                .finish_turn(&turn, TurnStatus::Completed)
+                .await
+                .expect("journal settlement survives snapshot failure");
+            assert!(
+                state
+                    .drain_snapshot_maintenance(Duration::from_secs(1))
+                    .await
+            );
+
+            let loaded = state
+                .load_thread(&thread.id)
+                .await
+                .expect("load settled thread")
+                .expect("thread");
+            assert_eq!(loaded.turns[0].status, TurnStatus::Completed);
+            let stats = state
+                .snapshot_maintenance_stats()
+                .expect("maintenance enabled");
+            assert_eq!(stats.created, 0);
+            assert_eq!(stats.failed, 1);
+            assert_eq!(stats.last_failure, Some(expected));
+            assert!(stats.last_failure_at_ms.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_snapshot_survives_reopen_with_authoritative_tail() {
+        let path = temp_database_path();
+        let store = Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("open snapshot database"),
+        );
+        let state = StateEngine::new(store);
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::UserMessage {
+                    content: "snapshot body".to_owned(),
+                }),
+            )
+            .await
+            .expect("append body");
+        state
+            .create_snapshot(&thread.id)
+            .await
+            .expect("persist snapshot");
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("append authoritative tail");
+        drop(state);
+
+        let reopened = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen snapshot database"),
+        ));
+        let loaded = reopened
+            .load_thread(&thread.id)
+            .await
+            .expect("load snapshot plus tail")
+            .expect("thread");
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].status, TurnStatus::Completed);
+        assert_eq!(loaded.turns[0].items.len(), 1);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_labels_are_bounded_before_state_growth() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state.create_thread().await.expect("create thread");
+        let error = state
+            .create_checkpoint(&thread.id, None, Some(String::new()))
+            .await
+            .expect_err("empty checkpoint label");
+        assert!(matches!(error, HarnessError::State(_)));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_event_pages_are_bounded_and_cursor_ordered() {
+        let path = temp_database_path();
+        let store: Arc<dyn EventStore> =
+            Arc::new(SqliteEventStore::open(&path).await.expect("open database"));
+        assert_event_pages(store).await;
+        remove_database_files(&path);
+    }
+
+    async fn assert_event_pages(store: Arc<dyn EventStore>) {
+        let state = StateEngine::new(store.clone());
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("finish turn");
+
+        let first = store
+            .events_page(&thread.id, 0, 2, super::MAX_STATE_EVENT_PAGE_RECOVERY_BYTES)
+            .await
+            .expect("first page");
+        assert_eq!(first.len(), 2);
+        let second = store
+            .events_page(
+                &thread.id,
+                first.last().expect("cursor event").sequence,
+                2,
+                super::MAX_STATE_EVENT_PAGE_RECOVERY_BYTES,
+            )
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        assert!(second[0].sequence > first[1].sequence);
+
+        let first_charge =
+            super::stored_event_recovery_bytes(&first[0]).expect("first event charge");
+        let byte_page = store
+            .events_page(&thread.id, 0, 3, first_charge)
+            .await
+            .expect("byte-bounded page");
+        assert_eq!(byte_page.len(), 1);
+
+        let current_recovery_bytes =
+            super::stored_events_recovery_bytes(&[first, second].concat()).expect("stream charge");
+        let mut pending = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: thread.id,
+            expected_stream_version: 3,
+            expected_stream_recovery_bytes: current_recovery_bytes + 1,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+            },
+        };
+        assert!(
+            store
+                .append(pending.clone())
+                .await
+                .expect_err("recovery charge mismatch")
+                .to_string()
+                .contains("recovery charge mismatch")
+        );
+        pending.expected_stream_recovery_bytes = current_recovery_bytes;
+        store.append(pending).await.expect("exact recovery charge");
+    }
+
+    async fn assert_competing_turn_starts(first: Arc<dyn EventStore>, second: Arc<dyn EventStore>) {
+        let thread_id = ThreadId::generate();
+        let created = first
+            .append(PendingEvent {
+                event_id: EventId::generate(),
+                thread_id: thread_id.clone(),
+                expected_stream_version: 0,
+                expected_stream_recovery_bytes: 0,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            })
+            .await
+            .expect("create stream");
+        let expected_stream_recovery_bytes =
+            super::stored_event_recovery_bytes(&created).expect("created event charge");
+        let first_start = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: thread_id.clone(),
+            expected_stream_version: 1,
+            expected_stream_recovery_bytes,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+            },
+        };
+        let second_start = PendingEvent {
+            event_id: EventId::generate(),
+            thread_id: thread_id.clone(),
+            expected_stream_version: 1,
+            expected_stream_recovery_bytes,
+            recorded_at_ms: now_ms(),
+            event: StateEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+            },
+        };
+
+        let (left, right) = tokio::join!(first.append(first_start), second.append(second_start));
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let conflict = if let Err(error) = left {
+            error
+        } else {
+            right.expect_err("second writer must conflict")
+        };
+        assert!(matches!(
+            conflict,
+            HarnessError::StateConflict {
+                expected: 1,
+                actual: 2,
+                ..
+            }
+        ));
+        let events = StateEngine::new(first.clone())
+            .events(&thread_id)
+            .await
+            .expect("events");
+        assert_eq!(events.len(), 2);
+        let projected = super::project_events(&events)
+            .expect("valid projection")
+            .expect("thread");
+        assert_eq!(
+            projected
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::Running)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_reopens_and_marks_unfinished_turn_interrupted_once() {
+        let path = temp_database_path();
+        let thread_id;
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path).await.expect("open database"),
+            ));
+            let thread = state.create_thread().await.expect("create thread");
+            thread_id = thread.id;
+            let turn = state.start_turn(&thread_id).await.expect("start turn");
+            state
+                .append_item(
+                    &turn,
+                    Item::new(ItemKind::UserMessage {
+                        content: "before crash".to_owned(),
+                    }),
+                )
+                .await
+                .expect("append item");
+        }
+
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path)
+                    .await
+                    .expect("reopen database"),
+            ));
+            let recovered = state
+                .recover_thread(&thread_id)
+                .await
+                .expect("recover")
+                .expect("thread exists");
+            assert_eq!(recovered.turns[0].status, TurnStatus::Interrupted);
+            let count = state.events(&thread_id).await.expect("events").len();
+            state
+                .recover_thread(&thread_id)
+                .await
+                .expect("second recovery");
+            assert_eq!(state.events(&thread_id).await.expect("events").len(), count);
+        }
+
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_survives_projection_and_reopen() {
+        let path = temp_database_path();
+        let thread_id;
+        let checkpoint_id;
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path).await.expect("open database"),
+            ));
+            let thread = state.create_thread().await.expect("create thread");
+            thread_id = thread.id;
+            let checkpoint = state
+                .create_checkpoint(&thread_id, None, Some("baseline".to_owned()))
+                .await
+                .expect("checkpoint");
+            checkpoint_id = checkpoint.id;
+        }
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path)
+                    .await
+                    .expect("reopen database"),
+            ));
+            let thread = state
+                .load_thread(&thread_id)
+                .await
+                .expect("load")
+                .expect("thread exists");
+            assert_eq!(thread.checkpoints[0].id, checkpoint_id);
+            assert_eq!(thread.checkpoints[0].label.as_deref(), Some("baseline"));
+        }
+        remove_database_files(&path);
+    }
+
+    fn temp_database_path() -> PathBuf {
+        std::env::temp_dir().join(format!("y-harness-{}.db", EventId::generate()))
+    }
+
+    fn remove_database_files(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn state_event_json_is_stable_enough_for_round_trip() {
+        let event = StateEvent::ItemAppended {
+            turn_id: crate::TurnId::from_static("turn-test"),
+            item: Item::new(ItemKind::ToolResult {
+                call_id: "call".to_owned(),
+                output: json!({"ok": true}),
+                is_error: false,
+            }),
+        };
+        let encoded = serde_json::to_string(&event).expect("serialize");
+        let decoded: StateEvent = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn conversation_summary_evidence_requires_schema_two() {
+        let mut stored: StoredEvent = serde_json::from_str(include_str!(
+            "../../tests/fixtures/state-v2-summary-event.json"
+        ))
+        .expect("decode schema-2 fixture");
+        super::validate_stored_event(&stored).expect("schema-2 summary evidence");
+        stored.schema_version = 1;
+        let error =
+            super::validate_stored_event(&stored).expect_err("schema-1 cannot claim new evidence");
+        assert!(error.to_string().contains("schema-1"));
+    }
+
+    #[test]
+    fn approval_continuation_evidence_requires_schema_three() {
+        let mut stored: StoredEvent = serde_json::from_str(include_str!(
+            "../../tests/fixtures/state-v3-approval-event.json"
+        ))
+        .expect("decode schema-3 fixture");
+        super::validate_stored_event(&stored).expect("schema-3 continuation evidence");
+        stored.schema_version = 2;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-2 cannot claim continuation evidence");
+        assert!(error.to_string().contains("schema-2"));
+
+        if let StateEvent::ItemAppended { item, .. } = &mut stored.event
+            && let ItemKind::ApprovalRequested {
+                requested_by,
+                tool_origin,
+                model_request_sha256,
+                ..
+            } = &mut item.kind
+        {
+            *requested_by = None;
+            *tool_origin = None;
+            *model_request_sha256 = None;
+        }
+        super::validate_stored_event(&stored).expect("schema-2 legacy approval evidence");
+        stored.schema_version = 3;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-3 requires continuation evidence");
+        assert!(error.to_string().contains("schema-3"));
+    }
+
+    #[test]
+    fn policy_tool_origin_evidence_requires_schema_four() {
+        let mut stored: StoredEvent = serde_json::from_str(include_str!(
+            "../../tests/fixtures/state-v4-policy-event.json"
+        ))
+        .expect("decode schema-4 fixture");
+        super::validate_stored_event(&stored).expect("schema-4 Tool origin evidence");
+        stored.schema_version = 3;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-3 cannot claim Tool origin evidence");
+        assert!(error.to_string().contains("schema-3"));
+
+        if let StateEvent::ItemAppended { item, .. } = &mut stored.event
+            && let ItemKind::PolicyDecision { tool_origin, .. } = &mut item.kind
+        {
+            *tool_origin = None;
+        }
+        super::validate_stored_event(&stored).expect("schema-3 legacy Policy decision");
+        stored.schema_version = 4;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-4 requires Tool origin evidence");
+        assert!(error.to_string().contains("schema-4"));
+    }
+
+    #[test]
+    fn legacy_model_items_without_provenance_remain_readable() {
+        let assistant: ItemKind =
+            serde_json::from_str(r#"{"type":"assistant_message","content":"legacy"}"#)
+                .expect("legacy assistant item");
+        assert!(matches!(
+            assistant,
+            ItemKind::AssistantMessage {
+                model_id: None,
+                model_origin: None,
+                ..
+            }
+        ));
+
+        let tool_call: ItemKind = serde_json::from_str(
+            r#"{"type":"tool_call","call_id":"call","name":"echo","input":{}}"#,
+        )
+        .expect("legacy tool call item");
+        assert!(matches!(
+            tool_call,
+            ItemKind::ToolCall {
+                model_id: None,
+                model_origin: None,
+                ..
+            }
+        ));
+    }
+}

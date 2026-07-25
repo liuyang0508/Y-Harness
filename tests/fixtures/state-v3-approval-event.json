@@ -1,0 +1,26 @@
+{
+  "schema_version": 3,
+  "sequence": 5,
+  "event_id": "event-approval",
+  "thread_id": "thread-approval",
+  "recorded_at_ms": 5,
+  "type": "item_appended",
+  "turn_id": "turn-approval",
+  "item": {
+    "id": "item-approval",
+    "created_at_ms": 4,
+    "type": "approval_requested",
+    "approval_id": "approval-fixture",
+    "call_id": "call-fixture",
+    "tool": "fixture.tool",
+    "reason": "external effect requires approval",
+    "risk": "high",
+    "requested_by": {
+      "kind": "local_process"
+    },
+    "tool_origin": {
+      "kind": "built_in"
+    },
+    "model_request_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}

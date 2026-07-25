@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Rust 1.88 quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Select minimum Rust toolchain
+        run: rustup default 1.88.0
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Production panic boundary
+        run: |
+          cargo clippy --locked --lib --all-features -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D warnings
+      - name: Minimal surface tests
+        run: cargo test --locked --all-targets --no-default-features
+      - name: Isolated optional-feature checks
+        run: |
+          cargo check --locked --no-default-features --features https-model
+          cargo check --locked --no-default-features --features https-skill
+          cargo check --locked --no-default-features --features tls-host
+      - name: All-feature tests
+        run: cargo test --locked --all-targets --all-features
+      - name: Public API embedding
+        run: |
+          cargo run --locked --example embedded
+          cargo run --locked --example orchestrated
+      - name: Harness regression evaluation
+        run: cargo run --locked -- eval-smoke
+      - name: Public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+      - name: Publishable crate archive
+        run: cargo package --locked
+
+  portability:
+    name: Tests on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select minimum Rust toolchain
+        run: rustup default 1.88.0
+      - name: Tests
+        run: cargo test --locked --all-targets --all-features
+
+  security-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit Cargo.lock
+        run: cargo audit --deny warnings
+
+  performance-smoke:
+    name: SQLite State performance smoke gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Select minimum Rust toolchain
+        run: rustup default 1.88.0
+      - name: Run calibrated smoke workload
+        env:
+          YH_BENCH_EVENTS: "1000"
+          YH_BENCH_SAMPLES: "5"
+          YH_BENCH_MAX_APPEND_MS: "350"
+          YH_BENCH_MAX_PROJECT_MS: "15"
+          YH_BENCH_MAX_SNAPSHOT_LOAD_MS: "15"
+        run: cargo run --locked --release --bin yh-state-bench

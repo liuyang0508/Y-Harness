@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "sequence": 4,
+  "event_id": "event-summary",
+  "thread_id": "thread-summary",
+  "recorded_at_ms": 4,
+  "type": "item_appended",
+  "turn_id": "turn-summary",
+  "item": {
+    "id": "item-summary",
+    "created_at_ms": 3,
+    "type": "conversation_summary",
+    "compactor": "test.summary",
+    "covered_turns": [
+      "turn-covered"
+    ],
+    "older_omitted_turns": 0,
+    "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "estimated_tokens": 8,
+    "serialized_bytes": 32
+  }
+}

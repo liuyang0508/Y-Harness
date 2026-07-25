@@ -1,0 +1,41 @@
+{
+  "format_version": 2,
+  "requirements": [
+    {
+      "case_id": "ascii-tool-loop",
+      "grader": "exact-output",
+      "grader_origin": {
+        "kind": "built_in"
+      },
+      "minimum_score": 1.0,
+      "must_pass": true
+    },
+    {
+      "case_id": "ascii-tool-loop",
+      "grader": "state-contract",
+      "grader_origin": {
+        "kind": "built_in"
+      },
+      "minimum_score": 1.0,
+      "must_pass": true
+    },
+    {
+      "case_id": "unicode-tool-loop",
+      "grader": "exact-output",
+      "grader_origin": {
+        "kind": "built_in"
+      },
+      "minimum_score": 1.0,
+      "must_pass": true
+    },
+    {
+      "case_id": "unicode-tool-loop",
+      "grader": "state-contract",
+      "grader_origin": {
+        "kind": "built_in"
+      },
+      "minimum_score": 1.0,
+      "must_pass": true
+    }
+  ]
+}

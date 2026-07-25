@@ -1,0 +1,22 @@
+{
+  "schema_version": 4,
+  "sequence": 6,
+  "event_id": "event-policy-origin",
+  "thread_id": "thread-policy-origin",
+  "recorded_at_ms": 6,
+  "type": "item_appended",
+  "turn_id": "turn-policy-origin",
+  "item": {
+    "id": "item-policy-origin",
+    "created_at_ms": 5,
+    "type": "policy_decision",
+    "call_id": "call-fixture",
+    "tool_origin": {
+      "kind": "external",
+      "id": "fixture-tool-provider"
+    },
+    "decision": {
+      "action": "allow"
+    }
+  }
+}

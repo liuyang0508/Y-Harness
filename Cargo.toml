@@ -1,0 +1,55 @@
+[package]
+name = "y-harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A headless, embeddable agent harness runtime"
+default-run = "yh"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/liuyang0508/Y-Harness"
+homepage = "https://github.com/liuyang0508/Y-Harness"
+readme = "README.md"
+keywords = ["agent", "harness", "runtime", "llm", "orchestration"]
+categories = ["development-tools", "asynchronous"]
+
+[features]
+default = []
+https-model = ["dep:reqwest"]
+https-skill = ["dep:reqwest"]
+tls-host = ["dep:rustls", "dep:tokio-rustls"]
+
+[lib]
+name = "y_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yh"
+path = "src/main.rs"
+
+[[bin]]
+name = "yh-state-bench"
+path = "tools/state-bench.rs"
+
+[dependencies]
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast"] }
+fs2 = "=0.4.3"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"], optional = true }
+rmcp = { version = "=2.2.0", default-features = false, features = ["client", "transport-async-rw"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+semver = { version = "=1.0.28", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.11.0"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"], optional = true }
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+rcgen = "=0.14.8"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
+
+[lints.rust]
+unsafe_code = "forbid"

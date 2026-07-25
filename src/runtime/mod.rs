@@ -1,0 +1,5111 @@
+//! Agent Loop execution, policy settlement, and ordered state recording.
+
+mod control;
+mod policy;
+
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use serde_json::Value;
+use tokio::time::Instant;
+
+use crate::verification::validate_outcome;
+pub use control::TurnExecutionOptions;
+use control::{controlled, controlled_with_settlement_cancellation, deadline};
+pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngine};
+
+pub use crate::kernel::{LanguageModel, Tool};
+
+use crate::{
+    ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine, ContextSource,
+    ExecutionPhase, HarnessError, Item, ItemKind, MemoryContextRecordStatus, MemoryContextStatus,
+    MemoryScope, ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+    Observability, ObservationOutcome, PhaseObservation, PolicyDecision, StateCapacity,
+    StateEngine, Thread, ThreadId, ToolAuthorization, ToolContext, ToolRegistry, Turn, TurnId,
+    TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome, VerificationRegistry,
+    VerificationRequest, context::model_visible_items, kernel::validate_model_id,
+};
+
+const MAX_PROMPT_BYTES: usize = 1_048_576;
+const MAX_MODEL_TEXT_BYTES: usize = 1_048_576;
+const MAX_MODEL_TOOL_INPUT_BYTES: usize = 1_048_576;
+const MAX_TOOL_OUTPUT_BYTES: usize = 1_048_576;
+const MAX_MODEL_REQUEST_BYTES: usize = 16_777_216;
+const MAX_RUNTIME_ERROR_CHARS: usize = 4_096;
+const MAX_MODEL_CALL_ID_BYTES: usize = 256;
+const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 256;
+const MAX_POLICY_REASON_BYTES: usize = 4_096;
+const MAX_AGENT_STEPS: usize = 256;
+const MAX_MODEL_ROUTE_ENTRIES: usize = 16;
+const DEFAULT_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(86_400);
+const DEFAULT_MAX_CONCURRENT_TURNS: usize = 32;
+const MAX_CONCURRENT_TURNS: usize = 4_096;
+const MIN_RUNTIME_GENERAL_EVENTS: u64 = 4;
+
+/// Headless Agent Loop coordinating model, context, policy, tools, and state.
+pub struct HarnessRuntime {
+    models: ModelRoute,
+    tools: ToolRegistry,
+    policy: Arc<dyn PolicyEngine>,
+    approvals: Arc<dyn ApprovalHandler>,
+    state: StateEngine,
+    context: ContextEngine,
+    verification: VerificationRegistry,
+    observability: Observability,
+    active_threads: Mutex<BTreeSet<ThreadId>>,
+    max_concurrent_turns: usize,
+    max_steps: usize,
+}
+
+impl HarnessRuntime {
+    #[must_use]
+    /// Creates a runtime for a statically linked built-in model.
+    ///
+    /// Extension hosts should use [`Self::from_model_registry`] so the
+    /// operator-assigned model origin is retained in State evidence.
+    pub fn new(
+        model: Arc<dyn LanguageModel>,
+        tools: ToolRegistry,
+        policy: Arc<dyn PolicyEngine>,
+        state: StateEngine,
+    ) -> Self {
+        Self {
+            models: ModelRoute::built_in(model),
+            tools,
+            policy,
+            approvals: Arc::new(DenyAllApprovals),
+            state,
+            context: ContextEngine::without_memory(),
+            verification: VerificationRegistry::new(),
+            observability: Observability::new(),
+            active_threads: Mutex::new(BTreeSet::new()),
+            max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
+            max_steps: 32,
+        }
+    }
+
+    /// Creates a runtime from one validated, trust-bearing model registration.
+    pub fn from_model_registry(
+        models: &ModelRegistry,
+        model_id: &str,
+        tools: ToolRegistry,
+        policy: Arc<dyn PolicyEngine>,
+        state: StateEngine,
+    ) -> Result<Self, HarnessError> {
+        Self::from_model_registry_failover(models, &[model_id], tools, policy, state)
+    }
+
+    /// Creates a runtime with an explicit ordered Model failover route.
+    ///
+    /// Each identity must already exist in `models`. The first Model is tried
+    /// first on every step; a later Model is attempted only after an ordinary
+    /// pre-output failure. Multi-model routes use a 30-second per-attempt
+    /// timeout by default. Cancellation, the Turn deadline, or successfully
+    /// delivered provisional output stop failover.
+    pub fn from_model_registry_failover(
+        models: &ModelRegistry,
+        model_ids: &[&str],
+        tools: ToolRegistry,
+        policy: Arc<dyn PolicyEngine>,
+        state: StateEngine,
+    ) -> Result<Self, HarnessError> {
+        Ok(Self {
+            models: ModelRoute::from_registry(models, model_ids)?,
+            tools,
+            policy,
+            approvals: Arc::new(DenyAllApprovals),
+            state,
+            context: ContextEngine::without_memory(),
+            verification: VerificationRegistry::new(),
+            observability: Observability::new(),
+            active_threads: Mutex::new(BTreeSet::new()),
+            max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
+            max_steps: 32,
+        })
+    }
+
+    #[must_use]
+    /// Installs the Context Engine used before model execution.
+    pub fn with_context_engine(mut self, context: ContextEngine) -> Self {
+        self.context = context;
+        self
+    }
+
+    #[must_use]
+    /// Installs the handler used only when Policy returns `Ask`.
+    pub fn with_approval_handler(mut self, approvals: Arc<dyn ApprovalHandler>) -> Self {
+        self.approvals = approvals;
+        self
+    }
+
+    #[must_use]
+    /// Installs the ordered completion verifiers used for assistant candidates.
+    pub fn with_verification(mut self, verification: VerificationRegistry) -> Self {
+        self.verification = verification;
+        self
+    }
+
+    #[must_use]
+    /// Installs failure-isolated Runtime phase observers.
+    pub fn with_observability(mut self, observability: Observability) -> Self {
+        self.observability = observability;
+        self
+    }
+
+    #[must_use]
+    /// Sets the hard model-step budget within the supported bounded range.
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps.clamp(1, MAX_AGENT_STEPS);
+        self
+    }
+
+    /// Sets the independent deadline applied to every configured Model attempt.
+    ///
+    /// The total Turn deadline remains authoritative when it expires first.
+    /// A timed-out attempt may fall through only when no provisional output
+    /// was delivered.
+    pub fn with_model_attempt_timeout(mut self, timeout: Duration) -> Result<Self, HarnessError> {
+        if timeout < Duration::from_millis(1) || timeout > MAX_MODEL_ATTEMPT_TIMEOUT {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model attempt timeout must be 1-{} milliseconds",
+                MAX_MODEL_ATTEMPT_TIMEOUT.as_millis()
+            )));
+        }
+        self.models.attempt_timeout = Some(timeout);
+        Ok(self)
+    }
+
+    /// Sets the maximum number of Turns executing concurrently in this Runtime.
+    ///
+    /// Admission fails before any Turn state is written when the limit is
+    /// reached. Separate Runtime instances need host-level coordination.
+    pub fn with_turn_concurrency_limit(mut self, limit: usize) -> Result<Self, HarnessError> {
+        if !(1..=MAX_CONCURRENT_TURNS).contains(&limit) {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Turn concurrency limit must be 1-{MAX_CONCURRENT_TURNS}"
+            )));
+        }
+        self.max_concurrent_turns = limit;
+        Ok(self)
+    }
+
+    /// Creates and persists a new Thread.
+    pub async fn create_thread(&self) -> Result<Thread, HarnessError> {
+        self.state.create_thread().await
+    }
+
+    /// Loads a projected Thread without mutating it.
+    pub async fn load_thread(&self, thread_id: &ThreadId) -> Result<Option<Thread>, HarnessError> {
+        self.state.load_thread(thread_id).await
+    }
+
+    /// Returns journal pressure before one Thread reaches its finite boundary.
+    pub async fn thread_capacity(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<StateCapacity>, HarnessError> {
+        self.state.thread_capacity(thread_id).await
+    }
+
+    /// Recovers unfinished execution and orphans approvals it can no longer consume.
+    ///
+    /// The caller must first establish exclusive ownership of the Thread and
+    /// confirm that its previous worker has stopped. Normal Turn execution
+    /// never invokes recovery implicitly because a running Turn may belong to
+    /// another healthy Runtime sharing the same Event Store.
+    pub async fn recover_thread(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Option<Thread>, HarnessError> {
+        let recovered = self.state.recover_thread(thread_id).await?;
+        if let Some(thread) = &recovered {
+            for turn in thread
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::Interrupted)
+            {
+                self.approvals
+                    .abandon_turn(
+                        thread_id,
+                        &turn.id,
+                        "originating Turn was interrupted before approval settlement",
+                    )
+                    .await?;
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Waits for accepted failure-isolated Runtime maintenance work.
+    ///
+    /// Protocol and embedding hosts should call this only after no new Turns
+    /// can start and all accepted Turns have settled.
+    pub async fn drain_background_work(&self, timeout: Duration) -> bool {
+        self.state.drain_snapshot_maintenance(timeout).await
+    }
+
+    /// Returns authoritative ordered events for one Thread.
+    pub async fn events(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<crate::StoredEvent>, HarnessError> {
+        self.state.events(thread_id).await
+    }
+
+    /// Returns a bounded authoritative event page after one durable sequence.
+    pub async fn events_page(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::StoredEvent>, HarnessError> {
+        self.state
+            .events_page(thread_id, after_sequence, limit)
+            .await
+    }
+
+    /// Runs one Turn with an empty memory scope.
+    pub async fn run_turn(
+        &self,
+        thread_id: &ThreadId,
+        prompt: impl Into<String>,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.run_turn_with_options(thread_id, prompt, TurnExecutionOptions::default())
+            .await
+    }
+
+    /// Runs one Turn using an explicit memory isolation scope.
+    pub async fn run_turn_scoped(
+        &self,
+        thread_id: &ThreadId,
+        prompt: impl Into<String>,
+        memory_scope: MemoryScope,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.run_turn_with_options(
+            thread_id,
+            prompt,
+            TurnExecutionOptions {
+                memory_scope,
+                ..TurnExecutionOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Runs one Turn with explicit memory scope, cancellation, and deadline.
+    pub async fn run_turn_with_options(
+        &self,
+        thread_id: &ThreadId,
+        prompt: impl Into<String>,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.execute_turn(thread_id, TurnEntry::Start(prompt.into()), options)
+            .await
+    }
+
+    /// Resumes a running Turn stopped at the durable pre-Tool approval boundary.
+    ///
+    /// The caller must first establish exclusive ownership of the Thread and
+    /// confirm that its previous worker has stopped. Recovery revalidates the
+    /// exact Model request, Tool metadata, requester, and ordered State before
+    /// consuming an approval or executing the Tool.
+    pub async fn resume_approval_turn_with_options(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.execute_turn(
+            thread_id,
+            TurnEntry::ResumeApproval(turn_id.clone()),
+            options,
+        )
+        .await
+    }
+
+    async fn execute_turn(
+        &self,
+        thread_id: &ThreadId,
+        entry: TurnEntry,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.models.validate()?;
+        options
+            .approval_requester
+            .validate_current("approval requester")?;
+        let deadline = deadline(options.timeout)?;
+        let _active = self.claim_thread(thread_id)?;
+        let (mut turn, conversation_items, context_blocks, starting_step, mut tool_call_ids) =
+            match entry {
+                TurnEntry::Start(prompt) => {
+                    validate_prompt(&prompt)?;
+                    let existing = self.load_thread(thread_id).await?.ok_or_else(|| {
+                        HarnessError::State(format!("thread {thread_id} does not exist"))
+                    })?;
+                    let capacity =
+                        self.state
+                            .thread_capacity(thread_id)
+                            .await?
+                            .ok_or_else(|| {
+                                HarnessError::State(format!("thread {thread_id} does not exist"))
+                            })?;
+                    require_runtime_capacity(&capacity)?;
+                    let conversation = self.context.compile_conversation(&existing)?;
+
+                    let mut turn = self.state.start_turn(thread_id).await?;
+                    self.record(
+                        &mut turn,
+                        ItemKind::UserMessage {
+                            content: prompt.clone(),
+                        },
+                    )
+                    .await?;
+                    self.record(
+                        &mut turn,
+                        ItemKind::ConversationContext {
+                            included_turns: conversation.included_turns.clone(),
+                            dropped_turns: conversation.dropped_turns,
+                            estimated_tokens: conversation.serialized_bytes,
+                        },
+                    )
+                    .await?;
+
+                    let conversation_summary = if let Some(compactor) =
+                        self.context.conversation_compactor_name(&conversation)
+                    {
+                        match self
+                            .controlled_observed(
+                                ObservationTarget::new(
+                                    thread_id,
+                                    &turn.id,
+                                    compactor,
+                                    ExecutionPhase::Context,
+                                ),
+                                &options.cancellation,
+                                deadline,
+                                || {
+                                    self.context.compile_conversation_summary(
+                                        &conversation,
+                                        &prompt,
+                                        options.cancellation.clone(),
+                                    )
+                                },
+                            )
+                            .await
+                        {
+                            Ok(summary) => summary,
+                            Err(error) => {
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let conversation_summary_record = match conversation_summary
+                        .as_ref()
+                        .map(conversation_summary_record)
+                        .transpose()
+                    {
+                        Ok(record) => record,
+                        Err(error) => {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                    };
+                    let compilation = match self
+                        .controlled_observed(
+                            ObservationTarget::new(
+                                thread_id,
+                                &turn.id,
+                                "context-engine",
+                                ExecutionPhase::Context,
+                            ),
+                            &options.cancellation,
+                            deadline,
+                            || self.context.compile(&prompt, options.memory_scope.clone()),
+                        )
+                        .await
+                    {
+                        Ok(compilation) => compilation,
+                        Err(error) => {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                    };
+                    let compilation = match self
+                        .context
+                        .merge_conversation_summary(compilation, conversation_summary)
+                    {
+                        Ok(compilation) => compilation,
+                        Err(error) => {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(record) = conversation_summary_record {
+                        self.record(&mut turn, record).await?;
+                    }
+                    if let Some(observation) = compilation.memory {
+                        let status = match observation.status {
+                            MemoryContextStatus::Loaded => MemoryContextRecordStatus::Loaded,
+                            MemoryContextStatus::Degraded => MemoryContextRecordStatus::Degraded,
+                        };
+                        self.record(
+                            &mut turn,
+                            ItemKind::MemoryContext {
+                                provider: observation.provider,
+                                status,
+                                references: observation.references,
+                                packed_tokens: observation.packed_tokens,
+                                warnings: observation.warnings,
+                            },
+                        )
+                        .await?;
+                    }
+                    (
+                        turn,
+                        conversation.items,
+                        compilation.blocks,
+                        0,
+                        BTreeSet::new(),
+                    )
+                }
+                TurnEntry::ResumeApproval(turn_id) => {
+                    self.prepare_approval_resume(thread_id, &turn_id, &options, deadline)
+                        .await?
+                }
+            };
+
+        let model_stream = options
+            .model_event_sink
+            .clone()
+            .map_or_else(ModelStream::disabled, ModelStream::new)
+            .with_cancellation(options.cancellation.clone());
+        for step in starting_step..self.max_steps {
+            let mut items = conversation_items.clone();
+            items.extend(model_visible_items(&turn.items));
+            let request = ModelRequest {
+                thread_id: thread_id.clone(),
+                turn_id: turn.id.clone(),
+                items,
+                context: context_blocks.clone(),
+                tools: self.tools.descriptors(),
+            };
+            let model_request_sha256 = match model_request_sha256(&request) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.settle_error(&mut turn, &error).await?;
+                    return Err(error);
+                }
+            };
+
+            match self
+                .complete_model_routed(
+                    ObservationTarget::new(
+                        thread_id,
+                        &turn.id,
+                        "model-route",
+                        ExecutionPhase::Model,
+                    ),
+                    &options.cancellation,
+                    deadline,
+                    request,
+                    &model_stream,
+                    u32::try_from(step + 1).unwrap_or(u32::MAX),
+                )
+                .await
+            {
+                Ok(SettledModelOutput {
+                    model_id,
+                    model_origin,
+                    output: ModelOutput::Message { content },
+                }) => {
+                    self.record(
+                        &mut turn,
+                        ItemKind::AssistantMessage {
+                            model_id: Some(model_id),
+                            model_origin: Some(model_origin),
+                            content: content.clone(),
+                        },
+                    )
+                    .await?;
+                    let verification_request = VerificationRequest {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn.id.clone(),
+                        items: turn.items.clone(),
+                        candidate: content.clone(),
+                    };
+                    let mut retry_candidate = false;
+                    for registered in self.verification.registered() {
+                        let verifier_name = registered.descriptor.name.clone();
+                        let outcome = match self
+                            .controlled_observed(
+                                ObservationTarget::new(
+                                    thread_id,
+                                    &turn.id,
+                                    &verifier_name,
+                                    ExecutionPhase::Verification,
+                                ),
+                                &options.cancellation,
+                                deadline,
+                                || registered.verifier.verify(verification_request.clone()),
+                            )
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(
+                                error @ (HarnessError::Cancelled { .. }
+                                | HarnessError::TimedOut { .. }),
+                            ) => {
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                let error =
+                                    HarnessError::Verification(format!("{verifier_name}: {error}"));
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                        };
+                        if let Err(error) = validate_outcome(&verifier_name, &outcome) {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                        self.record(
+                            &mut turn,
+                            ItemKind::VerificationResult {
+                                verifier: verifier_name.clone(),
+                                outcome: outcome.clone(),
+                            },
+                        )
+                        .await?;
+                        if let VerificationOutcome::Failed { reason, retryable } = outcome {
+                            if retryable {
+                                retry_candidate = true;
+                            } else {
+                                let error = HarnessError::Verification(format!(
+                                    "{verifier_name}: {reason}"
+                                ));
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    if retry_candidate {
+                        continue;
+                    }
+                    self.state.finish_turn(&turn, TurnStatus::Completed).await?;
+                    turn.status = TurnStatus::Completed;
+                    return Ok(TurnOutcome {
+                        turn,
+                        final_text: content,
+                    });
+                }
+                Ok(SettledModelOutput {
+                    model_id,
+                    model_origin,
+                    output:
+                        ModelOutput::ToolCall {
+                            call_id,
+                            name,
+                            input,
+                        },
+                }) => {
+                    if !tool_call_ids.insert(call_id.clone()) {
+                        let error = HarnessError::Model(format!(
+                            "model reused Tool call id {call_id:?} within one Turn"
+                        ));
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                    self.record(
+                        &mut turn,
+                        ItemKind::ToolCall {
+                            model_id: Some(model_id),
+                            model_origin: Some(model_origin),
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        },
+                    )
+                    .await?;
+
+                    let Some(registered) = self.tools.get(&name) else {
+                        let error = HarnessError::UnknownTool(name);
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    };
+
+                    let authorization = ToolAuthorization {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn.id.clone(),
+                        call_id: call_id.clone(),
+                        descriptor: registered.descriptor.clone(),
+                        origin: registered.origin.clone(),
+                        input: input.clone(),
+                    };
+                    let decision = match self
+                        .controlled_observed(
+                            ObservationTarget::new(
+                                thread_id,
+                                &turn.id,
+                                "policy-engine",
+                                ExecutionPhase::Policy,
+                            ),
+                            &options.cancellation,
+                            deadline,
+                            || self.policy.authorize(&authorization),
+                        )
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = validate_policy_decision(&decision) {
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                    self.record(
+                        &mut turn,
+                        ItemKind::PolicyDecision {
+                            call_id: call_id.clone(),
+                            tool_origin: Some(authorization.origin.clone()),
+                            decision: decision.clone(),
+                        },
+                    )
+                    .await?;
+
+                    match decision {
+                        PolicyDecision::Allow => {}
+                        PolicyDecision::Deny { reason } => {
+                            let error = HarnessError::PolicyDenied { tool: name, reason };
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                        PolicyDecision::Ask { reason, risk } => {
+                            let request = ApprovalRequest {
+                                id: ApprovalId::generate(),
+                                requested_by: options.approval_requester.clone(),
+                                authorization,
+                                reason,
+                                risk,
+                            };
+                            self.record(
+                                &mut turn,
+                                ItemKind::ApprovalRequested {
+                                    approval_id: request.id.clone(),
+                                    call_id: call_id.clone(),
+                                    tool: name.clone(),
+                                    reason: request.reason.clone(),
+                                    risk: request.risk,
+                                    requested_by: Some(request.requested_by.clone()),
+                                    tool_origin: Some(request.authorization.origin.clone()),
+                                    model_request_sha256: Some(model_request_sha256),
+                                },
+                            )
+                            .await?;
+                            let approval = match self
+                                .controlled_observed(
+                                    ObservationTarget::new(
+                                        thread_id,
+                                        &turn.id,
+                                        "approval-handler",
+                                        ExecutionPhase::Approval,
+                                    ),
+                                    &options.cancellation,
+                                    deadline,
+                                    || self.approvals.decide(&request),
+                                )
+                                .await
+                            {
+                                Ok(approval) => approval,
+                                Err(error) => {
+                                    let abandonment = self
+                                        .approvals
+                                        .abandon_turn(
+                                            thread_id,
+                                            &turn.id,
+                                            "approval wait ended without a settlement",
+                                        )
+                                        .await;
+                                    self.settle_error(&mut turn, &error).await?;
+                                    abandonment?;
+                                    return Err(error);
+                                }
+                            };
+                            if let Err(error) = validate_approval_decision(&approval) {
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                            self.record(
+                                &mut turn,
+                                ItemKind::ApprovalDecision {
+                                    approval_id: request.id,
+                                    call_id: call_id.clone(),
+                                    decision: approval.clone(),
+                                },
+                            )
+                            .await?;
+                            if let ApprovalDecision::Deny { reason } = approval {
+                                let error = HarnessError::ApprovalDenied { tool: name, reason };
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                        }
+                    }
+
+                    self.execute_tool_call(&mut turn, &name, call_id, input, &options, deadline)
+                        .await?;
+                }
+                Err(error) => {
+                    self.settle_error(&mut turn, &error).await?;
+                    return Err(error);
+                }
+            }
+        }
+
+        let error = HarnessError::MaxSteps(self.max_steps);
+        self.settle_error(&mut turn, &error).await?;
+        Err(error)
+    }
+
+    async fn prepare_approval_resume(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+    ) -> Result<PreparedExecution, HarnessError> {
+        let thread = self
+            .load_thread(thread_id)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let capacity = self
+            .state
+            .thread_capacity(thread_id)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        require_runtime_capacity(&capacity)?;
+        let mut running = thread
+            .turns
+            .iter()
+            .filter(|turn| turn.status == TurnStatus::Running);
+        let turn = running
+            .next()
+            .filter(|turn| &turn.id == turn_id)
+            .cloned()
+            .ok_or_else(|| {
+                HarnessError::State(format!(
+                    "turn {turn_id} is not the running turn in thread {thread_id}"
+                ))
+            })?;
+        if running.next().is_some() {
+            return Err(HarnessError::State(
+                "thread projection contains multiple running turns".to_owned(),
+            ));
+        }
+        let evidence = approval_resume_evidence(&turn, &options.approval_requester)?;
+        if !self
+            .models
+            .contains(&evidence.model_id, &evidence.model_origin)
+        {
+            return Err(HarnessError::State(
+                "approval continuation Model identity or origin is absent from the configured route"
+                    .to_owned(),
+            ));
+        }
+        let registered = self.tools.get(&evidence.tool).ok_or_else(|| {
+            HarnessError::State(format!(
+                "approval continuation Tool {} is not registered",
+                evidence.tool
+            ))
+        })?;
+        if registered.origin != evidence.tool_origin {
+            return Err(HarnessError::State(
+                "approval continuation Tool origin changed after restart".to_owned(),
+            ));
+        }
+
+        let mut prior_thread = thread.clone();
+        prior_thread
+            .turns
+            .retain(|candidate| &candidate.id != turn_id);
+        let conversation = self.context.compile_conversation(&prior_thread)?;
+        let prompt = turn_prompt(&turn)?;
+        let conversation_summary =
+            if let Some(compactor) = self.context.conversation_compactor_name(&conversation) {
+                self.controlled_observed(
+                    ObservationTarget::new(thread_id, turn_id, compactor, ExecutionPhase::Context),
+                    &options.cancellation,
+                    deadline,
+                    || {
+                        self.context.compile_conversation_summary(
+                            &conversation,
+                            &prompt,
+                            options.cancellation.clone(),
+                        )
+                    },
+                )
+                .await?
+            } else {
+                None
+            };
+        let compilation = self
+            .controlled_observed(
+                ObservationTarget::new(
+                    thread_id,
+                    turn_id,
+                    "context-engine",
+                    ExecutionPhase::Context,
+                ),
+                &options.cancellation,
+                deadline,
+                || self.context.compile(&prompt, options.memory_scope.clone()),
+            )
+            .await?;
+        let compilation = self
+            .context
+            .merge_conversation_summary(compilation, conversation_summary)?;
+        let mut original_items = conversation.items.clone();
+        original_items.extend(model_visible_items(
+            &turn.items[..evidence.pending_tool_item_index],
+        ));
+        let original_request = ModelRequest {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            items: original_items,
+            context: compilation.blocks.clone(),
+            tools: self.tools.descriptors(),
+        };
+        if model_request_sha256(&original_request)? != evidence.model_request_sha256 {
+            return Err(HarnessError::State(
+                "approval continuation Model request changed after restart".to_owned(),
+            ));
+        }
+
+        let request = ApprovalRequest {
+            id: evidence.approval_id.clone(),
+            requested_by: evidence.requested_by,
+            authorization: ToolAuthorization {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                call_id: evidence.call_id.clone(),
+                descriptor: registered.descriptor.clone(),
+                origin: registered.origin.clone(),
+                input: evidence.input.clone(),
+            },
+            reason: evidence.reason,
+            risk: evidence.risk,
+        };
+        let approval = self
+            .controlled_observed(
+                ObservationTarget::new(
+                    thread_id,
+                    turn_id,
+                    "approval-handler",
+                    ExecutionPhase::Approval,
+                ),
+                &options.cancellation,
+                deadline,
+                || self.approvals.decide(&request),
+            )
+            .await?;
+        validate_approval_decision(&approval)?;
+
+        let mut turn = turn;
+        self.record(
+            &mut turn,
+            ItemKind::ApprovalDecision {
+                approval_id: evidence.approval_id,
+                call_id: evidence.call_id.clone(),
+                decision: approval.clone(),
+            },
+        )
+        .await?;
+        if let ApprovalDecision::Deny { reason } = approval {
+            let error = HarnessError::ApprovalDenied {
+                tool: evidence.tool,
+                reason,
+            };
+            self.settle_error(&mut turn, &error).await?;
+            return Err(error);
+        }
+        self.execute_tool_call(
+            &mut turn,
+            &evidence.tool,
+            evidence.call_id,
+            evidence.input,
+            options,
+            deadline,
+        )
+        .await?;
+
+        Ok((
+            turn,
+            conversation.items,
+            compilation.blocks,
+            evidence.consumed_steps,
+            evidence.tool_call_ids,
+        ))
+    }
+
+    async fn execute_tool_call(
+        &self,
+        turn: &mut Turn,
+        name: &str,
+        call_id: String,
+        input: Value,
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+    ) -> Result<(), HarnessError> {
+        let registered = self
+            .tools
+            .get(name)
+            .ok_or_else(|| HarnessError::UnknownTool(name.to_owned()))?;
+        let context = ToolContext {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.id.clone(),
+            call_id: call_id.clone(),
+            cancellation: options.cancellation.clone(),
+        };
+        match self
+            .controlled_observed(
+                ObservationTarget::new(&turn.thread_id, &turn.id, name, ExecutionPhase::Tool),
+                &options.cancellation,
+                deadline,
+                || registered.tool.execute(input, context),
+            )
+            .await
+        {
+            Ok(output) => {
+                let (output, is_error) = match validate_tool_output(&output) {
+                    Ok(()) => (output, false),
+                    Err(error) => (
+                        serde_json::json!({
+                            "error": bounded_runtime_error(&error.to_string())
+                        }),
+                        true,
+                    ),
+                };
+                self.record(
+                    turn,
+                    ItemKind::ToolResult {
+                        call_id,
+                        output,
+                        is_error,
+                    },
+                )
+                .await
+            }
+            Err(error) => {
+                if matches!(
+                    &error,
+                    HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. }
+                ) {
+                    self.settle_error(turn, &error).await?;
+                    return Err(error);
+                }
+                self.record(
+                    turn,
+                    ItemKind::ToolResult {
+                        call_id,
+                        output: serde_json::json!({
+                            "error": bounded_runtime_error(&error.to_string())
+                        }),
+                        is_error: true,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn controlled_observed<C, F, T>(
+        &self,
+        target: ObservationTarget<'_>,
+        cancellation: &crate::CancellationToken,
+        deadline: Option<Instant>,
+        operation: C,
+    ) -> Result<T, HarnessError>
+    where
+        C: FnOnce() -> F,
+        F: Future<Output = Result<T, HarnessError>>,
+    {
+        let started = Instant::now();
+        let result = controlled(cancellation, deadline, target.phase, operation).await;
+        self.observability.emit(&PhaseObservation {
+            thread_id: target.thread_id.clone(),
+            turn_id: target.turn_id.clone(),
+            phase: target.phase,
+            capability: target.capability.to_owned(),
+            duration_micros: elapsed_micros(started),
+            outcome: observation_outcome(&result),
+            model_usage: None,
+            provider_request_id: None,
+            stream_events_dropped: 0,
+        });
+        result
+    }
+
+    async fn complete_model_routed(
+        &self,
+        target: ObservationTarget<'_>,
+        cancellation: &crate::CancellationToken,
+        deadline: Option<Instant>,
+        request: ModelRequest,
+        stream: &ModelStream,
+        model_step: u32,
+    ) -> Result<SettledModelOutput, HarnessError> {
+        validate_model_request(&request)?;
+        let mut request = Some(request);
+        let total = self.models.entries.len();
+        for (index, registered) in self.models.entries.iter().enumerate() {
+            let model_id = registered.identity.get()?;
+            let (attempt_deadline, attempt_timeout_elapsed) =
+                self.models.attempt_deadline(deadline)?;
+            let attempt_request = if index + 1 == total {
+                request.take().ok_or_else(|| {
+                    HarnessError::Model("Model route lost its bounded request".to_owned())
+                })?
+            } else {
+                request
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HarnessError::Model("Model route lost its bounded request".to_owned())
+                    })?
+                    .clone()
+            };
+            let attempt_stream = stream
+                .for_step(model_step)
+                .with_cancellation(crate::CancellationToken::new());
+            let delivered_before = attempt_stream.delivered_events();
+            let settlement = self
+                .complete_model_attempt_observed(
+                    ObservationTarget::new(
+                        target.thread_id,
+                        target.turn_id,
+                        model_id,
+                        ExecutionPhase::Model,
+                    ),
+                    registered,
+                    cancellation,
+                    attempt_deadline,
+                    attempt_request,
+                    attempt_stream.clone(),
+                )
+                .await;
+            let delivered = attempt_stream
+                .delivered_events()
+                .saturating_sub(delivered_before);
+            if settlement.control == ModelAttemptControl::Cancelled
+                || (settlement.control == ModelAttemptControl::DeadlineElapsed
+                    && !attempt_timeout_elapsed)
+            {
+                return settlement.result.map(|response| SettledModelOutput {
+                    model_id: model_id.to_owned(),
+                    model_origin: registered.origin.clone(),
+                    output: response.output,
+                });
+            }
+            let result = if settlement.control == ModelAttemptControl::DeadlineElapsed {
+                Err(HarnessError::Model(format!(
+                    "Model {model_id} exceeded the configured failover attempt timeout"
+                )))
+            } else {
+                settlement.result
+            };
+            match result {
+                Ok(response) => {
+                    return Ok(SettledModelOutput {
+                        model_id: model_id.to_owned(),
+                        model_origin: registered.origin.clone(),
+                        output: response.output,
+                    });
+                }
+                Err(_) if index + 1 < total && delivered > 0 => {
+                    return Err(HarnessError::Model(format!(
+                        "Model {model_id} failed after delivering provisional output; failover was suppressed"
+                    )));
+                }
+                Err(_) if index + 1 < total => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(HarnessError::InvalidConfiguration(
+            "Model route must contain at least one Model".to_owned(),
+        ))
+    }
+
+    async fn complete_model_attempt_observed(
+        &self,
+        target: ObservationTarget<'_>,
+        registered: &RuntimeModel,
+        cancellation: &crate::CancellationToken,
+        deadline: Option<Instant>,
+        request: ModelRequest,
+        stream: ModelStream,
+    ) -> ModelAttemptSettlement {
+        let started = Instant::now();
+        let dropped_before = stream.dropped_events();
+        let provider_stream = stream.clone();
+        let controlled_result = controlled_with_settlement_cancellation(
+            cancellation,
+            stream.cancellation_token(),
+            deadline,
+            ExecutionPhase::Model,
+            || async {
+                Ok(registered
+                    .model
+                    .complete_streaming(request, provider_stream)
+                    .await)
+            },
+        )
+        .await;
+        stream.close();
+        let stream_events_dropped = stream.dropped_events().saturating_sub(dropped_before);
+        let (result, control) = match controlled_result {
+            Ok(result) => (result, ModelAttemptControl::None),
+            Err(error @ HarnessError::Cancelled { .. }) => {
+                (Err(error), ModelAttemptControl::Cancelled)
+            }
+            Err(error @ HarnessError::TimedOut { .. }) => {
+                (Err(error), ModelAttemptControl::DeadlineElapsed)
+            }
+            Err(error) => (Err(error), ModelAttemptControl::None),
+        };
+        let result = result.and_then(|response| {
+            validate_model_response(&response)?;
+            Ok(response)
+        });
+        let (model_usage, provider_request_id) = result.as_ref().map_or((None, None), |response| {
+            (response.usage.clone(), response.provider_request_id.clone())
+        });
+        self.observability.emit(&PhaseObservation {
+            thread_id: target.thread_id.clone(),
+            turn_id: target.turn_id.clone(),
+            phase: ExecutionPhase::Model,
+            capability: target.capability.to_owned(),
+            duration_micros: elapsed_micros(started),
+            outcome: observation_outcome(&result),
+            model_usage,
+            provider_request_id,
+            stream_events_dropped,
+        });
+        ModelAttemptSettlement { result, control }
+    }
+
+    fn claim_thread(&self, thread_id: &ThreadId) -> Result<ActiveThreadGuard<'_>, HarnessError> {
+        let mut active = self
+            .active_threads
+            .lock()
+            .map_err(|_| HarnessError::State("active thread lock poisoned".to_owned()))?;
+        if !active.insert(thread_id.clone()) {
+            return Err(HarnessError::State(format!(
+                "thread {thread_id} already has an active turn"
+            )));
+        }
+        if active.len() > self.max_concurrent_turns {
+            active.remove(thread_id);
+            return Err(HarnessError::RuntimeOverloaded {
+                limit: self.max_concurrent_turns,
+            });
+        }
+        Ok(ActiveThreadGuard {
+            active: &self.active_threads,
+            thread_id: thread_id.clone(),
+        })
+    }
+
+    async fn record(&self, turn: &mut Turn, kind: ItemKind) -> Result<(), HarnessError> {
+        let item = Item::new(kind);
+        match self.state.append_item(turn, item.clone()).await {
+            Ok(_) => {
+                turn.items.push(item);
+                Ok(())
+            }
+            Err(record_error) => match self.state.finish_turn(turn, TurnStatus::Failed).await {
+                Ok(_) => {
+                    turn.status = TurnStatus::Failed;
+                    Err(record_error)
+                }
+                Err(settlement_error) => Err(HarnessError::State(format!(
+                    "State Item append failed ({record_error}); terminal settlement also failed ({settlement_error})"
+                ))),
+            },
+        }
+    }
+
+    async fn settle_error(
+        &self,
+        turn: &mut Turn,
+        error: &HarnessError,
+    ) -> Result<(), HarnessError> {
+        let (item, status) = match error {
+            HarnessError::Cancelled { phase } => (
+                ItemKind::TurnStopped {
+                    reason: TurnStopReason::Cancelled,
+                    phase: *phase,
+                },
+                TurnStatus::Cancelled,
+            ),
+            HarnessError::TimedOut { phase } => (
+                ItemKind::TurnStopped {
+                    reason: TurnStopReason::TimedOut,
+                    phase: *phase,
+                },
+                TurnStatus::TimedOut,
+            ),
+            _ => (
+                ItemKind::RuntimeError {
+                    message: bounded_runtime_error(&error.to_string()),
+                },
+                TurnStatus::Failed,
+            ),
+        };
+        let settlement_item = Item::new(item);
+        match self.state.append_item(turn, settlement_item.clone()).await {
+            Ok(_) => turn.items.push(settlement_item),
+            Err(record_error) => {
+                return match self.state.finish_turn(turn, status.clone()).await {
+                    Ok(_) => {
+                        turn.status = status;
+                        Ok(())
+                    }
+                    Err(settlement_error) => Err(HarnessError::State(format!(
+                        "State settlement evidence failed ({record_error}); terminal settlement also failed ({settlement_error})"
+                    ))),
+                };
+            }
+        }
+        self.state.finish_turn(turn, status.clone()).await?;
+        turn.status = status;
+        Ok(())
+    }
+}
+
+type PreparedExecution = (Turn, Vec<Item>, Vec<ContextBlock>, usize, BTreeSet<String>);
+
+enum TurnEntry {
+    Start(String),
+    ResumeApproval(TurnId),
+}
+
+struct ApprovalResumeEvidence {
+    approval_id: ApprovalId,
+    call_id: String,
+    tool: String,
+    input: Value,
+    reason: String,
+    risk: crate::RiskLevel,
+    requested_by: crate::ApprovalActor,
+    tool_origin: crate::CapabilityOrigin,
+    model_id: String,
+    model_origin: crate::CapabilityOrigin,
+    model_request_sha256: String,
+    pending_tool_item_index: usize,
+    consumed_steps: usize,
+    tool_call_ids: BTreeSet<String>,
+}
+
+fn approval_resume_evidence(
+    turn: &Turn,
+    expected_requester: &crate::ApprovalActor,
+) -> Result<ApprovalResumeEvidence, HarnessError> {
+    let pending_tool_item_index = turn.items.len().checked_sub(3).ok_or_else(|| {
+        HarnessError::State(
+            "running Turn has no complete pre-Tool approval continuation boundary".to_owned(),
+        )
+    })?;
+    let ItemKind::ToolCall {
+        model_id: recorded_model_id,
+        model_origin: recorded_model_origin,
+        call_id,
+        name,
+        input,
+    } = &turn.items[pending_tool_item_index].kind
+    else {
+        return Err(HarnessError::State(
+            "approval continuation is not immediately preceded by its Tool call".to_owned(),
+        ));
+    };
+    let model_id = recorded_model_id.clone().ok_or_else(|| {
+        HarnessError::State(
+            "legacy approval continuation has no recorded Model identity".to_owned(),
+        )
+    })?;
+    validate_model_id(&model_id).map_err(|_| {
+        HarnessError::State("approval continuation contains an invalid Model identity".to_owned())
+    })?;
+    let model_origin = recorded_model_origin.clone().ok_or_else(|| {
+        HarnessError::State("legacy approval continuation has no recorded Model origin".to_owned())
+    })?;
+    let ItemKind::PolicyDecision {
+        call_id: policy_call_id,
+        tool_origin: policy_tool_origin,
+        decision: PolicyDecision::Ask { reason, risk },
+    } = &turn.items[pending_tool_item_index + 1].kind
+    else {
+        return Err(HarnessError::State(
+            "approval continuation has no immediately preceding Ask decision".to_owned(),
+        ));
+    };
+    let ItemKind::ApprovalRequested {
+        approval_id,
+        call_id: approval_call_id,
+        tool,
+        reason: approval_reason,
+        risk: approval_risk,
+        requested_by,
+        tool_origin,
+        model_request_sha256,
+    } = &turn.items[pending_tool_item_index + 2].kind
+    else {
+        return Err(HarnessError::State(
+            "running Turn is not paused at an approval request".to_owned(),
+        ));
+    };
+    if policy_call_id != call_id
+        || approval_call_id != call_id
+        || tool != name
+        || approval_reason != reason
+        || approval_risk != risk
+    {
+        return Err(HarnessError::State(
+            "approval continuation correlation evidence is inconsistent".to_owned(),
+        ));
+    }
+    let requested_by = requested_by.clone().ok_or_else(|| {
+        HarnessError::State(
+            "legacy approval request has no resumable requester evidence".to_owned(),
+        )
+    })?;
+    let tool_origin = tool_origin.clone().ok_or_else(|| {
+        HarnessError::State("legacy approval request has no resumable Tool origin".to_owned())
+    })?;
+    if policy_tool_origin
+        .as_ref()
+        .is_some_and(|origin| origin != &tool_origin)
+    {
+        return Err(HarnessError::State(
+            "approval continuation Policy and request Tool origins differ".to_owned(),
+        ));
+    }
+    let model_request_sha256 = model_request_sha256.clone().ok_or_else(|| {
+        HarnessError::State(
+            "legacy approval request has no resumable Model request fingerprint".to_owned(),
+        )
+    })?;
+    if &requested_by != expected_requester {
+        return Err(HarnessError::Approval(
+            "approval continuation requester differs from the original Turn actor".to_owned(),
+        ));
+    }
+
+    let mut consumed_steps = 0_usize;
+    let mut tool_call_ids = BTreeSet::new();
+    for item in &turn.items {
+        match &item.kind {
+            ItemKind::AssistantMessage { .. } => {
+                consumed_steps = consumed_steps
+                    .checked_add(1)
+                    .ok_or_else(|| HarnessError::State("model step count overflow".to_owned()))?;
+            }
+            ItemKind::ToolCall { call_id, .. } => {
+                consumed_steps = consumed_steps
+                    .checked_add(1)
+                    .ok_or_else(|| HarnessError::State("model step count overflow".to_owned()))?;
+                if !tool_call_ids.insert(call_id.clone()) {
+                    return Err(HarnessError::State(
+                        "approval continuation contains duplicate Tool call identities".to_owned(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ApprovalResumeEvidence {
+        approval_id: approval_id.clone(),
+        call_id: call_id.clone(),
+        tool: tool.clone(),
+        input: input.clone(),
+        reason: reason.clone(),
+        risk: *risk,
+        requested_by,
+        tool_origin,
+        model_id,
+        model_origin,
+        model_request_sha256,
+        pending_tool_item_index,
+        consumed_steps,
+        tool_call_ids,
+    })
+}
+
+fn turn_prompt(turn: &Turn) -> Result<String, HarnessError> {
+    let mut prompts = turn.items.iter().filter_map(|item| {
+        if let ItemKind::UserMessage { content } = &item.kind {
+            Some(content)
+        } else {
+            None
+        }
+    });
+    let prompt = prompts.next().cloned().ok_or_else(|| {
+        HarnessError::State("approval continuation Turn has no user prompt".to_owned())
+    })?;
+    if prompts.next().is_some() {
+        return Err(HarnessError::State(
+            "approval continuation Turn has multiple user prompts".to_owned(),
+        ));
+    }
+    Ok(prompt)
+}
+
+struct SettledModelOutput {
+    model_id: String,
+    model_origin: crate::CapabilityOrigin,
+    output: ModelOutput,
+}
+
+struct ModelAttemptSettlement {
+    result: Result<ModelResponse, HarnessError>,
+    control: ModelAttemptControl,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ModelAttemptControl {
+    None,
+    Cancelled,
+    DeadlineElapsed,
+}
+
+struct RuntimeModel {
+    model: Arc<dyn LanguageModel>,
+    identity: FrozenModelIdentity,
+    origin: crate::CapabilityOrigin,
+}
+
+struct ModelRoute {
+    entries: Vec<RuntimeModel>,
+    attempt_timeout: Option<Duration>,
+}
+
+impl ModelRoute {
+    fn built_in(model: Arc<dyn LanguageModel>) -> Self {
+        Self {
+            entries: vec![RuntimeModel {
+                identity: FrozenModelIdentity::capture(&model),
+                model,
+                origin: crate::CapabilityOrigin::BuiltIn,
+            }],
+            attempt_timeout: None,
+        }
+    }
+
+    fn from_registry(models: &ModelRegistry, model_ids: &[&str]) -> Result<Self, HarnessError> {
+        if model_ids.is_empty() || model_ids.len() > MAX_MODEL_ROUTE_ENTRIES {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model failover route must contain 1-{MAX_MODEL_ROUTE_ENTRIES} identities"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::with_capacity(model_ids.len());
+        for model_id in model_ids {
+            if !seen.insert(*model_id) {
+                return Err(HarnessError::InvalidConfiguration(format!(
+                    "Model failover route contains duplicate identity {model_id}"
+                )));
+            }
+            let registered = models
+                .get(model_id)
+                .ok_or_else(|| HarnessError::UnknownModel((*model_id).to_owned()))?;
+            entries.push(RuntimeModel {
+                model: registered.model.clone(),
+                identity: FrozenModelIdentity::Valid(registered.id.clone()),
+                origin: registered.origin.clone(),
+            });
+        }
+        Ok(Self {
+            entries,
+            attempt_timeout: (model_ids.len() > 1).then_some(DEFAULT_MODEL_ATTEMPT_TIMEOUT),
+        })
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        if self.entries.is_empty() || self.entries.len() > MAX_MODEL_ROUTE_ENTRIES {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model failover route must contain 1-{MAX_MODEL_ROUTE_ENTRIES} identities"
+            )));
+        }
+        for entry in &self.entries {
+            entry.identity.get()?;
+        }
+        Ok(())
+    }
+
+    fn contains(&self, model_id: &str, origin: &crate::CapabilityOrigin) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(&entry.identity, FrozenModelIdentity::Valid(id) if id == model_id)
+                && &entry.origin == origin
+        })
+    }
+
+    fn attempt_deadline(
+        &self,
+        turn_deadline: Option<Instant>,
+    ) -> Result<(Option<Instant>, bool), HarnessError> {
+        let Some(timeout) = self.attempt_timeout else {
+            return Ok((turn_deadline, false));
+        };
+        let attempt_deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            HarnessError::InvalidConfiguration(
+                "Model attempt timeout exceeds the runtime clock range".to_owned(),
+            )
+        })?;
+        if turn_deadline.is_some_and(|deadline| deadline <= attempt_deadline) {
+            Ok((turn_deadline, false))
+        } else {
+            Ok((Some(attempt_deadline), true))
+        }
+    }
+}
+
+enum FrozenModelIdentity {
+    Valid(String),
+    Invalid,
+    Panicked,
+}
+
+impl FrozenModelIdentity {
+    fn capture(model: &Arc<dyn LanguageModel>) -> Self {
+        match catch_unwind(AssertUnwindSafe(|| model.id().to_owned())) {
+            Ok(id) if validate_model_id(&id).is_ok() => Self::Valid(id),
+            Ok(_) => Self::Invalid,
+            Err(_) => Self::Panicked,
+        }
+    }
+
+    fn get(&self) -> Result<&str, HarnessError> {
+        match self {
+            Self::Valid(id) => Ok(id),
+            Self::Invalid => Err(HarnessError::InvalidCapability(
+                "model identity does not satisfy the portable contract".to_owned(),
+            )),
+            Self::Panicked => Err(HarnessError::CapabilityPanicked {
+                phase: ExecutionPhase::Model,
+            }),
+        }
+    }
+}
+
+struct ObservationTarget<'a> {
+    thread_id: &'a ThreadId,
+    turn_id: &'a TurnId,
+    capability: &'a str,
+    phase: ExecutionPhase,
+}
+
+impl<'a> ObservationTarget<'a> {
+    fn new(
+        thread_id: &'a ThreadId,
+        turn_id: &'a TurnId,
+        capability: &'a str,
+        phase: ExecutionPhase,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            capability,
+            phase,
+        }
+    }
+}
+
+fn validate_model_response(response: &ModelResponse) -> Result<(), HarnessError> {
+    if let Some(provider_request_id) = &response.provider_request_id
+        && (provider_request_id.trim().is_empty()
+            || provider_request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES
+            || provider_request_id.chars().any(char::is_control))
+    {
+        return Err(HarnessError::Model(format!(
+            "provider request id must be 1-{MAX_PROVIDER_REQUEST_ID_BYTES} non-control bytes"
+        )));
+    }
+    validate_model_output(&response.output)
+}
+
+pub(crate) fn validate_model_output(output: &ModelOutput) -> Result<(), HarnessError> {
+    match output {
+        ModelOutput::Message { content } => validate_model_message(content),
+        ModelOutput::ToolCall {
+            call_id,
+            name,
+            input,
+        } => validate_model_tool_call(call_id, name, input),
+    }
+}
+
+fn model_request_sha256(request: &ModelRequest) -> Result<String, HarnessError> {
+    validate_model_request_json_shapes(request)?;
+    crate::json::bounded_serialized_sha256(request, MAX_MODEL_REQUEST_BYTES).map_err(|failure| {
+        HarnessError::Model(match failure {
+            crate::json::BoundedJsonError::LimitExceeded => {
+                format!("model request exceeds {MAX_MODEL_REQUEST_BYTES} bytes")
+            }
+            crate::json::BoundedJsonError::CannotEncode => "cannot encode model request".to_owned(),
+        })
+    })
+}
+
+fn validate_policy_decision(decision: &PolicyDecision) -> Result<(), HarnessError> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } | PolicyDecision::Ask { reason, .. } => {
+            validate_decision_reason("Policy", reason)
+        }
+    }
+}
+
+fn validate_approval_decision(decision: &ApprovalDecision) -> Result<(), HarnessError> {
+    match decision {
+        ApprovalDecision::Approve => Ok(()),
+        ApprovalDecision::Deny { reason } => validate_decision_reason("approval", reason),
+    }
+}
+
+fn validate_decision_reason(kind: &str, reason: &str) -> Result<(), HarnessError> {
+    if reason.trim().is_empty()
+        || reason.len() > MAX_POLICY_REASON_BYTES
+        || reason.chars().any(char::is_control)
+    {
+        return Err(HarnessError::InvalidCapability(format!(
+            "{kind} reason must be 1-{MAX_POLICY_REASON_BYTES} non-control bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_prompt(prompt: &str) -> Result<(), HarnessError> {
+    if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "prompt must be 1-{MAX_PROMPT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn require_runtime_capacity(capacity: &StateCapacity) -> Result<(), HarnessError> {
+    if capacity.general_events_remaining < MIN_RUNTIME_GENERAL_EVENTS {
+        return Err(HarnessError::State(format!(
+            "Thread needs at least {MIN_RUNTIME_GENERAL_EVENTS} general-purpose events for Runtime execution; {} remain",
+            capacity.general_events_remaining
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_request(request: &ModelRequest) -> Result<(), HarnessError> {
+    validate_model_request_json_shapes(request)?;
+    crate::json::bounded_serialized_size(request, MAX_MODEL_REQUEST_BYTES).map_or_else(
+        |error| {
+            Err(match error {
+                crate::json::BoundedJsonError::LimitExceeded => HarnessError::Model(format!(
+                    "model request exceeds {MAX_MODEL_REQUEST_BYTES} bytes"
+                )),
+                crate::json::BoundedJsonError::CannotEncode => {
+                    HarnessError::Model("cannot encode model request".to_owned())
+                }
+            })
+        },
+        |_| Ok(()),
+    )
+}
+
+fn validate_model_request_json_shapes(request: &ModelRequest) -> Result<(), HarnessError> {
+    for item in &request.items {
+        let value = match &item.kind {
+            ItemKind::ToolCall { input, .. } => Some(input),
+            ItemKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        };
+        if let Some(value) = value {
+            validate_runtime_json_shape("model request Item", value, HarnessError::Model)?;
+        }
+    }
+    for tool in &request.tools {
+        validate_runtime_json_shape(
+            "model request Tool schema",
+            &tool.input_schema,
+            HarnessError::Model,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_model_message(content: &str) -> Result<(), HarnessError> {
+    if content.trim().is_empty() || content.len() > MAX_MODEL_TEXT_BYTES {
+        return Err(HarnessError::Model(format!(
+            "assistant message must be 1-{MAX_MODEL_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_tool_call(call_id: &str, name: &str, input: &Value) -> Result<(), HarnessError> {
+    if call_id.trim().is_empty()
+        || call_id.len() > MAX_MODEL_CALL_ID_BYTES
+        || call_id.chars().any(char::is_control)
+    {
+        return Err(HarnessError::Model(format!(
+            "tool call id must be 1-{MAX_MODEL_CALL_ID_BYTES} non-control bytes"
+        )));
+    }
+    if name.is_empty() || name.len() > 64 {
+        return Err(HarnessError::Model(
+            "tool name must be 1-64 bytes".to_owned(),
+        ));
+    }
+    validate_runtime_json(
+        "tool input",
+        input,
+        MAX_MODEL_TOOL_INPUT_BYTES,
+        HarnessError::Model,
+    )
+}
+
+fn validate_tool_output(output: &Value) -> Result<(), HarnessError> {
+    validate_runtime_json(
+        "tool output",
+        output,
+        MAX_TOOL_OUTPUT_BYTES,
+        HarnessError::Tool,
+    )
+}
+
+fn validate_runtime_json(
+    kind: &str,
+    value: &Value,
+    maximum: usize,
+    error: fn(String) -> HarnessError,
+) -> Result<(), HarnessError> {
+    validate_runtime_json_shape(kind, value, error)?;
+    crate::json::bounded_serialized_size(value, maximum).map_or_else(
+        |failure| {
+            Err(error(match failure {
+                crate::json::BoundedJsonError::LimitExceeded => {
+                    format!("{kind} exceeds {maximum} bytes")
+                }
+                crate::json::BoundedJsonError::CannotEncode => {
+                    format!("cannot encode {kind}")
+                }
+            }))
+        },
+        |_| Ok(()),
+    )
+}
+
+fn validate_runtime_json_shape(
+    kind: &str,
+    value: &Value,
+    error: fn(String) -> HarnessError,
+) -> Result<(), HarnessError> {
+    crate::json::validate_value_shape(value).map_err(|_| {
+        error(format!(
+            "{kind} exceeds the supported JSON depth or node count"
+        ))
+    })
+}
+
+fn bounded_runtime_error(message: &str) -> String {
+    let mut chars = message.chars();
+    let bounded = chars
+        .by_ref()
+        .take(MAX_RUNTIME_ERROR_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+fn conversation_summary_record(block: &ContextBlock) -> Result<ItemKind, HarnessError> {
+    let ContextSource::ConversationSummary {
+        compactor,
+        covered_turns,
+        older_omitted_turns,
+        source_sha256,
+        content_sha256,
+    } = &block.source
+    else {
+        return Err(HarnessError::InvalidConfiguration(
+            "Context Engine returned an invalid conversation summary source".to_owned(),
+        ));
+    };
+    Ok(ItemKind::ConversationSummary {
+        compactor: compactor.clone(),
+        covered_turns: covered_turns.clone(),
+        older_omitted_turns: *older_omitted_turns,
+        source_sha256: source_sha256.clone(),
+        content_sha256: content_sha256.clone(),
+        estimated_tokens: block.estimated_tokens,
+        serialized_bytes: block.text.len(),
+    })
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn observation_outcome<T>(result: &Result<T, HarnessError>) -> ObservationOutcome {
+    match result {
+        Ok(_) => ObservationOutcome::Success,
+        Err(HarnessError::Cancelled { .. }) => ObservationOutcome::Cancelled,
+        Err(HarnessError::TimedOut { .. }) => ObservationOutcome::TimedOut,
+        Err(_) => ObservationOutcome::Error,
+    }
+}
+
+struct ActiveThreadGuard<'a> {
+    active: &'a Mutex<BTreeSet<ThreadId>>,
+    thread_id: ThreadId,
+}
+
+impl Drop for ActiveThreadGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.thread_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeSet,
+        future::pending,
+        path::Path,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use serde_json::{Value, json};
+    use tokio::sync::Notify;
+
+    use super::{
+        AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, PolicyEngine, Tool,
+        TurnExecutionOptions, require_runtime_capacity, validate_approval_decision,
+        validate_model_request, validate_model_tool_call, validate_policy_decision,
+        validate_tool_output,
+    };
+    use crate::{
+        ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus, ApprovalRequest,
+        CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin, ContextEngine,
+        ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
+        ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
+        ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
+        ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler, ItemKind,
+        MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
+        MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
+        MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
+        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelEventSink, ModelOutput,
+        ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelUsage,
+        Observability, ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel,
+        SqliteApprovalInbox, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
+        StateEvent, StoredEvent, ThreadId, ToolAuthorization, ToolContext, ToolDescriptor,
+        ToolRegistry, TraceCollector, TurnStatus, TurnStopReason, VerificationOutcome,
+        VerificationRegistry, VerificationRequest, Verifier, VerifierDescriptor,
+    };
+
+    struct EchoTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct DriftedEchoTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn sqlite_test_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "y-harness-runtime-{label}-{}.db",
+            EventId::generate()
+        ))
+    }
+
+    fn remove_sqlite_files(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(candidate));
+        }
+    }
+
+    struct RejectFirstItemStore {
+        inner: MemoryEventStore,
+        rejected: AtomicUsize,
+    }
+
+    impl RejectFirstItemStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+                rejected: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct RejectStopEvidenceStore {
+        inner: MemoryEventStore,
+    }
+
+    impl RejectStopEvidenceStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+            }
+        }
+    }
+
+    impl EventStore for RejectStopEvidenceStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            if matches!(
+                &pending.event,
+                StateEvent::ItemAppended {
+                    item,
+                    ..
+                } if matches!(&item.kind, ItemKind::TurnStopped { .. })
+            ) {
+                return Box::pin(async {
+                    Err(HarnessError::State(
+                        "simulated stop-evidence persistence failure".to_owned(),
+                    ))
+                });
+            }
+            self.inner.append(pending)
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            after_sequence: u64,
+            limit: usize,
+            max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            self.inner
+                .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
+        }
+    }
+
+    impl EventStore for RejectFirstItemStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            if matches!(&pending.event, StateEvent::ItemAppended { .. })
+                && self.rejected.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Box::pin(async {
+                    Err(HarnessError::State(
+                        "simulated Item persistence failure".to_owned(),
+                    ))
+                });
+            }
+            self.inner.append(pending)
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            after_sequence: u64,
+            limit: usize,
+            max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            self.inner
+                .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
+        }
+    }
+
+    #[test]
+    fn policy_and_approval_reasons_are_bounded_before_state() {
+        assert!(
+            validate_policy_decision(&PolicyDecision::Ask {
+                reason: "x".repeat(super::MAX_POLICY_REASON_BYTES + 1),
+                risk: RiskLevel::High,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_approval_decision(&ApprovalDecision::Deny {
+                reason: "\n".to_owned(),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_turn_preflight_preserves_minimum_general_event_budget() {
+        let capacity = StateCapacity {
+            used_events: 999_996,
+            event_limit: 1_000_000,
+            remaining_events: 4,
+            general_events_remaining: 3,
+            terminal_event_reserve: 1,
+            used_recovery_bytes: 0,
+            recovery_byte_limit: crate::STATE_THREAD_RECOVERY_BYTE_LIMIT,
+            remaining_recovery_bytes: crate::STATE_THREAD_RECOVERY_BYTE_LIMIT,
+            general_recovery_bytes_remaining: crate::STATE_THREAD_RECOVERY_BYTE_LIMIT
+                - crate::STATE_TERMINAL_RECOVERY_BYTE_RESERVE,
+            terminal_recovery_byte_reserve: crate::STATE_TERMINAL_RECOVERY_BYTE_RESERVE,
+            level: StateCapacityLevel::Critical,
+        };
+        assert!(require_runtime_capacity(&capacity).is_err());
+        assert!(
+            require_runtime_capacity(&StateCapacity {
+                general_events_remaining: 4,
+                ..capacity
+            })
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn state_item_failure_still_durably_settles_the_turn() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(RejectFirstItemStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let error = runtime
+            .run_turn(&thread.id, "must settle")
+            .await
+            .expect_err("first Item append fails");
+        assert!(matches!(error, HarnessError::State(_)));
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread");
+        assert_eq!(projected.turns.len(), 1);
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(projected.turns[0].items.is_empty());
+    }
+
+    impl Tool for EchoTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Return the supplied text".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            }
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let text = input
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| HarnessError::Tool("missing text".to_owned()))?;
+                Ok(json!({ "text": text }))
+            })
+        }
+    }
+
+    impl Tool for DriftedEchoTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Changed after the original authorization".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": { "text": { "type": "string" } }
+                }),
+            }
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(input)
+            })
+        }
+    }
+
+    struct PendingTool;
+
+    impl Tool for PendingTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Never completes".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        fn execute<'a>(&'a self, _input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(pending())
+        }
+    }
+
+    struct PendingCountingTool {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+    }
+
+    impl Tool for PendingCountingTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Never completes after recording entry".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        fn execute<'a>(&'a self, _input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                pending().await
+            })
+        }
+    }
+
+    struct EchoModel;
+
+    struct DuplicateCallModel;
+
+    impl LanguageModel for EchoModel {
+        fn id(&self) -> &str {
+            "test/echo-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                if let Some(output) = request
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        ItemKind::ToolResult {
+                            output,
+                            is_error: false,
+                            ..
+                        } => Some(output.clone()),
+                        _ => None,
+                    })
+                {
+                    return Ok(ModelOutput::Message {
+                        content: format!("observed: {output}"),
+                    });
+                }
+
+                let prompt = request
+                    .items
+                    .iter()
+                    .find_map(|item| match &item.kind {
+                        ItemKind::UserMessage { content } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Ok(ModelOutput::ToolCall {
+                    call_id: "call-1".to_owned(),
+                    name: "echo".to_owned(),
+                    input: json!({ "text": prompt }),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for DuplicateCallModel {
+        fn id(&self) -> &str {
+            "test/duplicate-call-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Ok(ModelOutput::ToolCall {
+                    call_id: "reused-call".to_owned(),
+                    name: "echo".to_owned(),
+                    input: json!({"text": "once"}),
+                })
+            })
+        }
+    }
+
+    struct OversizedModel;
+
+    impl LanguageModel for OversizedModel {
+        fn id(&self) -> &str {
+            "test/oversized-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Ok(ModelOutput::Message {
+                    content: "x".repeat(super::MAX_MODEL_TEXT_BYTES + 1),
+                })
+            })
+        }
+    }
+
+    struct UsageModel;
+
+    struct RouteFailingModel {
+        calls: Arc<AtomicUsize>,
+        emit_delta: bool,
+    }
+
+    struct RouteSuccessModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct RecordingModelSink {
+        events: Mutex<Vec<ModelStreamEvent>>,
+    }
+
+    impl ModelEventSink for RecordingModelSink {
+        fn emit(&self, event: &ModelStreamEvent) -> Result<(), String> {
+            self.events
+                .lock()
+                .map_err(|_| "model event recorder poisoned".to_owned())?
+                .push(event.clone());
+            Ok(())
+        }
+    }
+
+    impl LanguageModel for RouteFailingModel {
+        fn id(&self) -> &str {
+            "test/route-primary"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async { Err(HarnessError::Model("primary model unavailable".to_owned())) })
+        }
+
+        fn complete_streaming<'a>(
+            &'a self,
+            _request: ModelRequest,
+            stream: ModelStream,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.emit_delta {
+                    let _ = stream.emit_text_delta("primary fragment");
+                }
+                Err(HarnessError::Model("primary model unavailable".to_owned()))
+            })
+        }
+    }
+
+    impl LanguageModel for RouteSuccessModel {
+        fn id(&self) -> &str {
+            "test/route-secondary"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ModelOutput::Message {
+                    content: "secondary result".to_owned(),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for UsageModel {
+        fn id(&self) -> &str {
+            "test/usage-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Ok(ModelOutput::Message {
+                    content: "observed".to_owned(),
+                })
+            })
+        }
+
+        fn complete_with_metadata<'a>(
+            &'a self,
+            _request: ModelRequest,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async {
+                Ok(ModelResponse {
+                    output: ModelOutput::Message {
+                        content: "observed".to_owned(),
+                    },
+                    usage: Some(ModelUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cached_input_tokens: 40,
+                        reasoning_tokens: 2,
+                        cost_microusd: Some(25),
+                    }),
+                    provider_request_id: Some("provider-request".to_owned()),
+                })
+            })
+        }
+    }
+
+    struct RecordingHistoryModel {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct StaticCompactor;
+    struct PanickingCompactor;
+
+    impl ConversationCompactor for StaticCompactor {
+        fn descriptor(&self) -> ConversationCompactorDescriptor {
+            ConversationCompactorDescriptor {
+                name: "test.static-summary".to_owned(),
+                description: "Produces a stable runtime integration summary".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            }
+        }
+
+        fn compact<'a>(
+            &'a self,
+            request: ConversationCompactionRequest,
+        ) -> HarnessFuture<'a, ConversationCompactionResponse> {
+            Box::pin(async move {
+                assert_eq!(request.turns.len(), 1);
+                Ok(ConversationCompactionResponse {
+                    summary: "An earlier request was answered.".to_owned(),
+                })
+            })
+        }
+    }
+
+    impl ConversationCompactor for PanickingCompactor {
+        fn descriptor(&self) -> ConversationCompactorDescriptor {
+            ConversationCompactorDescriptor {
+                name: "test.panicking-summary".to_owned(),
+                description: "Panics only in a Runtime isolation fixture".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            }
+        }
+
+        fn compact<'a>(
+            &'a self,
+            _request: ConversationCompactionRequest,
+        ) -> HarnessFuture<'a, ConversationCompactionResponse> {
+            Box::pin(async { panic!("sensitive compactor payload") })
+        }
+    }
+
+    impl LanguageModel for RecordingHistoryModel {
+        fn id(&self) -> &str {
+            "test/history-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let prompt = request
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        ItemKind::UserMessage { content } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.requests
+                    .lock()
+                    .map_err(|_| HarnessError::Model("request recorder poisoned".to_owned()))?
+                    .push(request);
+                Ok(ModelOutput::Message {
+                    content: format!("answer to {prompt}"),
+                })
+            })
+        }
+    }
+
+    struct OversizedTool;
+
+    impl Tool for OversizedTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "oversized".to_owned(),
+                description: "Returns an oversized value".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn execute<'a>(&'a self, _input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async { Ok(Value::String("x".repeat(super::MAX_TOOL_OUTPUT_BYTES + 1))) })
+        }
+    }
+
+    struct ToolErrorObserverModel;
+
+    impl LanguageModel for ToolErrorObserverModel {
+        fn id(&self) -> &str {
+            "test/tool-error-observer"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                if request
+                    .items
+                    .iter()
+                    .any(|item| matches!(item.kind, ItemKind::ToolResult { .. }))
+                {
+                    return Ok(ModelOutput::Message {
+                        content: "handled bounded tool error".to_owned(),
+                    });
+                }
+                Ok(ModelOutput::ToolCall {
+                    call_id: "oversized-call".to_owned(),
+                    name: "oversized".to_owned(),
+                    input: json!({}),
+                })
+            })
+        }
+    }
+
+    struct ContextModel;
+
+    impl LanguageModel for ContextModel {
+        fn id(&self) -> &str {
+            "test/context-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let text = request
+                    .context
+                    .first()
+                    .map(|block| block.text.clone())
+                    .ok_or_else(|| HarnessError::Model("missing compiled context".to_owned()))?;
+                Ok(ModelOutput::Message { content: text })
+            })
+        }
+    }
+
+    struct PendingModel {
+        entered: Arc<Notify>,
+    }
+
+    struct CancellablePendingModel {
+        cancellation_observed: Arc<AtomicUsize>,
+    }
+
+    struct PanickingModel;
+
+    struct PanickingIdentityModel;
+
+    struct CountingIdentityModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct RevisionModel;
+
+    impl LanguageModel for RevisionModel {
+        fn id(&self) -> &str {
+            "test/revision-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let revising = request.items.iter().any(|item| {
+                    matches!(
+                        &item.kind,
+                        ItemKind::VerificationResult {
+                            outcome: VerificationOutcome::Failed { .. },
+                            ..
+                        }
+                    )
+                });
+                Ok(ModelOutput::Message {
+                    content: if revising { "good" } else { "bad" }.to_owned(),
+                })
+            })
+        }
+    }
+
+    struct CandidateVerifier {
+        retryable: bool,
+    }
+
+    impl Verifier for CandidateVerifier {
+        fn descriptor(&self) -> VerifierDescriptor {
+            VerifierDescriptor {
+                name: "candidate-quality".to_owned(),
+                description: "Requires the candidate to equal good".to_owned(),
+            }
+        }
+
+        fn verify<'a>(
+            &'a self,
+            request: VerificationRequest,
+        ) -> HarnessFuture<'a, VerificationOutcome> {
+            Box::pin(async move {
+                if request.candidate == "good" {
+                    Ok(VerificationOutcome::Passed {
+                        summary: Some("candidate accepted".to_owned()),
+                    })
+                } else {
+                    Ok(VerificationOutcome::Failed {
+                        reason: "candidate must equal good".to_owned(),
+                        retryable: self.retryable,
+                    })
+                }
+            })
+        }
+    }
+
+    struct PendingVerifier;
+
+    impl Verifier for PendingVerifier {
+        fn descriptor(&self) -> VerifierDescriptor {
+            VerifierDescriptor {
+                name: "pending".to_owned(),
+                description: "Never settles".to_owned(),
+            }
+        }
+
+        fn verify<'a>(
+            &'a self,
+            _request: VerificationRequest,
+        ) -> HarnessFuture<'a, VerificationOutcome> {
+            Box::pin(pending())
+        }
+    }
+
+    impl LanguageModel for PendingModel {
+        fn id(&self) -> &str {
+            "test/pending-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                pending().await
+            })
+        }
+    }
+
+    impl LanguageModel for CancellablePendingModel {
+        fn id(&self) -> &str {
+            "test/cancellable-pending-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(pending())
+        }
+
+        fn complete_streaming<'a>(
+            &'a self,
+            _request: ModelRequest,
+            stream: ModelStream,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                let cancellation = stream.cancellation_token();
+                let observed = self.cancellation_observed.clone();
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    observed.fetch_add(1, Ordering::SeqCst);
+                });
+                pending().await
+            })
+        }
+    }
+
+    impl LanguageModel for PanickingModel {
+        fn id(&self) -> &str {
+            "test/panicking-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            panic!("sensitive model panic")
+        }
+
+        fn complete_streaming<'a>(
+            &'a self,
+            _request: ModelRequest,
+            _stream: ModelStream,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            panic!("sensitive model panic")
+        }
+    }
+
+    impl LanguageModel for PanickingIdentityModel {
+        fn id(&self) -> &str {
+            panic!("sensitive identity panic")
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Ok(ModelOutput::Message {
+                    content: "unreachable".to_owned(),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for CountingIdentityModel {
+        fn id(&self) -> &str {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            "test/counting-identity"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Ok(ModelOutput::Message {
+                    content: "done".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct ErrorPolicy;
+
+    impl PolicyEngine for ErrorPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _request: &'a ToolAuthorization,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async { Err(HarnessError::Policy("provider unavailable".to_owned())) })
+        }
+    }
+
+    struct AskPolicy;
+
+    impl PolicyEngine for AskPolicy {
+        fn authorize<'a>(
+            &'a self,
+            request: &'a ToolAuthorization,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async move {
+                assert_eq!(request.descriptor.name, "echo");
+                assert_eq!(request.call_id, "call-1");
+                Ok(PolicyDecision::Ask {
+                    reason: "operator confirmation required".to_owned(),
+                    risk: RiskLevel::High,
+                })
+            })
+        }
+    }
+
+    struct ApproveAll {
+        decisions: Arc<AtomicUsize>,
+    }
+
+    impl ApprovalHandler for ApproveAll {
+        fn decide<'a>(
+            &'a self,
+            request: &'a ApprovalRequest,
+        ) -> HarnessFuture<'a, ApprovalDecision> {
+            Box::pin(async move {
+                assert_eq!(request.authorization.descriptor.name, "echo");
+                assert_eq!(request.authorization.call_id, "call-1");
+                assert_eq!(request.risk, RiskLevel::High);
+                self.decisions.fetch_add(1, Ordering::SeqCst);
+                Ok(ApprovalDecision::Approve)
+            })
+        }
+    }
+
+    struct PendingApproval;
+
+    impl ApprovalHandler for PendingApproval {
+        fn decide<'a>(
+            &'a self,
+            _request: &'a ApprovalRequest,
+        ) -> HarnessFuture<'a, ApprovalDecision> {
+            Box::pin(pending())
+        }
+    }
+
+    struct TestMemoryProvider;
+
+    impl MemoryProvider for TestMemoryProvider {
+        fn descriptor(&self) -> MemoryProviderDescriptor {
+            MemoryProviderDescriptor {
+                name: "agent-memory-hub".to_owned(),
+                description: "test memory provider".to_owned(),
+                api_version: MEMORY_API_VERSION,
+                operations: BTreeSet::from([MemoryOperation::Search]),
+            }
+        }
+
+        fn search<'a>(
+            &'a self,
+            _request: MemorySearchRequest,
+        ) -> HarnessFuture<'a, MemorySearchResponse> {
+            Box::pin(async {
+                Ok(MemorySearchResponse {
+                    packs: vec![MemoryContextPack {
+                        reference: MemoryReference::new("mem-1"),
+                        title: Some("Remembered decision".to_owned()),
+                        text: "use the remembered decision".to_owned(),
+                        selected_view: MemoryView::Overview,
+                        detail_uri: Some("memory://items/mem-1/body".to_owned()),
+                        packed_tokens: 7,
+                        provenance: Vec::new(),
+                    }],
+                    warnings: Vec::new(),
+                })
+            })
+        }
+    }
+
+    fn registry(calls: Arc<AtomicUsize>) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(CapabilityOrigin::BuiltIn, Arc::new(EchoTool { calls }))
+            .expect("echo tool should register");
+        registry
+    }
+
+    fn runtime(
+        calls: Arc<AtomicUsize>,
+        policy: AllowListPolicy,
+        state: StateEngine,
+    ) -> HarnessRuntime {
+        HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls),
+            Arc::new(policy),
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn runs_tool_loop_and_records_ordered_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = runtime(
+            calls.clone(),
+            AllowListPolicy::deny_by_default().allow("echo"),
+            state.clone(),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "hello")
+            .await
+            .expect("turn should complete");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns.len(), 1);
+        assert_eq!(projected.turns[0], outcome.turn);
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 9);
+        assert!(matches!(
+            outcome.turn.items.as_slice(),
+            [
+                crate::Item {
+                    kind: ItemKind::UserMessage { .. },
+                    ..
+                },
+                crate::Item {
+                    kind: ItemKind::ConversationContext { .. },
+                    ..
+                },
+                crate::Item {
+                    kind: ItemKind::ToolCall { .. },
+                    ..
+                },
+                crate::Item {
+                    kind: ItemKind::PolicyDecision {
+                        tool_origin: Some(CapabilityOrigin::BuiltIn),
+                        ..
+                    },
+                    ..
+                },
+                crate::Item {
+                    kind: ItemKind::ToolResult {
+                        is_error: false,
+                        ..
+                    },
+                    ..
+                },
+                crate::Item {
+                    kind: ItemKind::AssistantMessage { .. },
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn registered_tool_origin_reaches_authoritative_policy_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let origin = CapabilityOrigin::External {
+            id: "test-tool-provider".to_owned(),
+        };
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                origin.clone(),
+                Arc::new(EchoTool {
+                    calls: calls.clone(),
+                }),
+            )
+            .expect("register external Tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "provenance")
+            .await
+            .expect("run Tool turn");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(outcome.turn.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::PolicyDecision {
+                    tool_origin: Some(tool_origin),
+                    decision: PolicyDecision::Allow,
+                    ..
+                } if tool_origin == &origin
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_identity_never_reexecutes_a_side_effect() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HarnessRuntime::new(
+            Arc::new(DuplicateCallModel),
+            registry(calls.clone()),
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "duplicate")
+            .await
+            .expect_err("duplicate Tool call id");
+
+        assert!(matches!(error, HarnessError::Model(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn policy_denial_happens_before_tool_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = runtime(
+            calls.clone(),
+            AllowListPolicy::deny_by_default(),
+            state.clone(),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "blocked")
+            .await
+            .expect_err("tool should be denied");
+
+        assert!(matches!(error, HarnessError::PolicyDenied { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 8);
+    }
+
+    #[tokio::test]
+    async fn compiled_memory_reaches_model_and_is_recorded() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let mut memories = MemoryRegistry::new();
+        memories
+            .register(
+                CapabilityOrigin::TrustedExtension {
+                    id: "agent-memory-hub".to_owned(),
+                },
+                Arc::new(TestMemoryProvider),
+            )
+            .expect("register memory");
+        let context = ContextEngine::with_memory(
+            memories,
+            MemoryContextConfig {
+                provider: "agent-memory-hub".to_owned(),
+                top_k: 5,
+                budget_tokens: 100,
+                failure_mode: MemoryFailureMode::FailTurn,
+            },
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(ContextModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state.clone(),
+        )
+        .with_context_engine(context);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "what did we decide?")
+            .await
+            .expect("turn");
+
+        assert_eq!(outcome.final_text, "use the remembered decision");
+        assert!(matches!(
+            &outcome.turn.items[2].kind,
+            ItemKind::MemoryContext {
+                status: MemoryContextRecordStatus::Loaded,
+                references,
+                packed_tokens: 7,
+                ..
+            } if references == &["mem-1"]
+        ));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 7);
+    }
+
+    #[tokio::test]
+    async fn retryable_verification_failure_returns_to_the_agent_loop() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let mut verification = VerificationRegistry::new();
+        verification
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(CandidateVerifier { retryable: true }),
+            )
+            .expect("register verifier");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state.clone(),
+        )
+        .with_verification(verification);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "produce a candidate")
+            .await
+            .expect("revised candidate");
+
+        assert_eq!(outcome.final_text, "good");
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        assert!(matches!(
+            &outcome.turn.items[3].kind,
+            ItemKind::VerificationResult {
+                outcome: VerificationOutcome::Failed {
+                    retryable: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &outcome.turn.items[5].kind,
+            ItemKind::VerificationResult {
+                outcome: VerificationOutcome::Passed { .. },
+                ..
+            }
+        ));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 9);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_verification_failure_fails_the_turn() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let mut verification = VerificationRegistry::new();
+        verification
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(CandidateVerifier { retryable: false }),
+            )
+            .expect("register verifier");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        )
+        .with_verification(verification);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "produce a candidate")
+            .await
+            .expect_err("hard verification failure");
+
+        assert!(matches!(error, HarnessError::Verification(_)));
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(matches!(
+            &projected.turns[0].items[3].kind,
+            ItemKind::VerificationResult {
+                outcome: VerificationOutcome::Failed {
+                    retryable: false,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_deadline_has_its_own_stop_phase() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let mut verification = VerificationRegistry::new();
+        verification
+            .register(CapabilityOrigin::BuiltIn, Arc::new(PendingVerifier))
+            .expect("register verifier");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        )
+        .with_verification(verification);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "verification timeout",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("verification should time out");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Verification
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Verification,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_cancellation_is_recorded_as_a_terminal_turn() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let entered = Arc::new(Notify::new());
+        let runtime = HarnessRuntime::new(
+            Arc::new(PendingModel {
+                entered: entered.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let cancellation = CancellationToken::new();
+        let cancel_from_task = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            entered.notified().await;
+            cancel_from_task.cancel();
+        });
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "cancel me",
+                TurnExecutionOptions {
+                    cancellation,
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("turn should be cancelled");
+        canceller.await.expect("canceller");
+
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Model
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Cancelled);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::Cancelled,
+                phase: ExecutionPhase::Model,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_panic_is_sanitized_and_durably_settled() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(PanickingModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let error = runtime
+            .run_turn(&thread.id, "panic safely")
+            .await
+            .expect_err("model panic");
+        assert_eq!(
+            error,
+            HarnessError::CapabilityPanicked {
+                phase: ExecutionPhase::Model
+            }
+        );
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::RuntimeError { message })
+                if message.contains("capability panicked during Model")
+                    && !message.contains("sensitive")
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_identity_is_panic_isolated_and_frozen_before_turn_state() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(PanickingIdentityModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        assert_eq!(
+            runtime
+                .run_turn(&thread.id, "cannot start")
+                .await
+                .expect_err("identity panic"),
+            HarnessError::CapabilityPanicked {
+                phase: ExecutionPhase::Model
+            }
+        );
+        assert!(
+            runtime
+                .load_thread(&thread.id)
+                .await
+                .expect("load")
+                .expect("thread")
+                .turns
+                .is_empty()
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HarnessRuntime::new(
+            Arc::new(CountingIdentityModel {
+                calls: calls.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("counting thread");
+        runtime
+            .run_turn(&thread.id, "freeze identity")
+            .await
+            .expect("counting Turn");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deadline_is_recorded_as_a_distinct_terminal_turn() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(PendingModel {
+                entered: Arc::new(Notify::new()),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "time out",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("turn should time out");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Model
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Model,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_stop_evidence_does_not_change_terminal_status() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(PendingModel {
+                entered: Arc::new(Notify::new()),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(RejectStopEvidenceStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "time out safely",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("turn should time out");
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Model
+            }
+        );
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(
+            !projected.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(&item.kind, ItemKind::TurnStopped { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_deadline_stops_instead_of_becoming_a_tool_error() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(CapabilityOrigin::BuiltIn, Arc::new(PendingTool))
+            .expect("register tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "time out in tool",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("tool should time out");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Tool
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Tool,
+            })
+        ));
+        assert!(
+            !projected.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(&item.kind, ItemKind::ToolResult { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_provider_failure_settles_the_turn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(ErrorPolicy),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "policy failure")
+            .await
+            .expect_err("policy should fail");
+
+        assert_eq!(
+            error,
+            HarnessError::Policy("provider unavailable".to_owned())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::RuntimeError { message })
+                if message == "policy error: provider unavailable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn asked_tool_executes_only_after_audited_approval() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(Arc::new(ApproveAll {
+            decisions: decisions.clone(),
+        }));
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "approve me")
+            .await
+            .expect("approved turn");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        assert!(matches!(
+            &outcome.turn.items[3].kind,
+            ItemKind::PolicyDecision {
+                tool_origin: Some(CapabilityOrigin::BuiltIn),
+                decision: PolicyDecision::Ask {
+                    risk: RiskLevel::High,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &outcome.turn.items[4].kind,
+            ItemKind::ApprovalRequested {
+                risk: RiskLevel::High,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &outcome.turn.items[5].kind,
+            ItemKind::ApprovalDecision {
+                decision: ApprovalDecision::Approve,
+                ..
+            }
+        ));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 11);
+    }
+
+    #[tokio::test]
+    async fn durable_approval_wait_resumes_after_worker_loss() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                registry(calls.clone()),
+                Arc::new(AskPolicy),
+                state.clone(),
+            )
+            .with_approval_handler(handler.clone()),
+        );
+        let thread = first.create_thread().await.expect("create thread");
+        let first_worker = {
+            let runtime = first.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "resume me").await })
+        };
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("pending approvals")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval submission");
+        let turn_id = pending.request.authorization.turn_id.clone();
+        first_worker.abort();
+        first_worker.await.expect_err("simulated worker loss");
+
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load running turn")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Running);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("independent settlement");
+
+        let actor_error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                approval_requester: ApprovalActor::Authenticated {
+                    authority: "different-authority".to_owned(),
+                    subject: "different-requester".to_owned(),
+                },
+                ..TurnExecutionOptions::default()
+            },
+        )
+        .await
+        .expect_err("requester drift must fail closed");
+        assert!(actor_error.to_string().contains("requester differs"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut drifted_tools = ToolRegistry::new();
+        drifted_tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(DriftedEchoTool {
+                    calls: calls.clone(),
+                }),
+            )
+            .expect("drifted Tool registration");
+        let drifted = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            drifted_tools,
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone());
+        let drift_error = drifted
+            .resume_approval_turn_with_options(
+                &thread.id,
+                &turn_id,
+                TurnExecutionOptions::default(),
+            )
+            .await
+            .expect_err("Tool descriptor drift must fail closed");
+        assert!(drift_error.to_string().contains("Model request changed"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .load_thread(&thread.id)
+                .await
+                .expect("load after drift")
+                .expect("thread")
+                .turns[0]
+                .status,
+            TurnStatus::Running
+        );
+
+        let resumed = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler)
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect("resume approval boundary");
+
+        assert_eq!(resumed.turn.id, turn_id);
+        assert_eq!(resumed.turn.status, TurnStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(resumed.final_text.contains("resume me"));
+        assert_eq!(
+            resumed
+                .turn
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, ItemKind::ApprovalDecision { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            resumed
+                .turn
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, ItemKind::ToolResult { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_approval_wait_resumes_after_store_reopen() {
+        let state_path = sqlite_test_path("resume-state");
+        let approval_path = sqlite_test_path("resume-approval");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&state_path)
+                .await
+                .expect("open first State store"),
+        ));
+        let first_inbox = Arc::new(
+            SqliteApprovalInbox::open(&approval_path)
+                .await
+                .expect("open first Approval Inbox"),
+        );
+        let first_handler = Arc::new(
+            InboxApprovalHandler::new(first_inbox.clone(), Duration::from_millis(10))
+                .expect("first approval handler"),
+        );
+        let first = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                registry(calls.clone()),
+                Arc::new(AskPolicy),
+                first_state.clone(),
+            )
+            .with_approval_handler(first_handler.clone()),
+        );
+        let thread = first.create_thread().await.expect("create SQLite thread");
+        let first_worker = tokio::spawn({
+            let runtime = first.clone();
+            let thread_id = thread.id.clone();
+            async move { runtime.run_turn(&thread_id, "resume from SQLite").await }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = first_inbox
+                    .pending(1)
+                    .await
+                    .expect("poll SQLite approvals")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("SQLite approval submission");
+        let turn_id = pending.request.authorization.turn_id.clone();
+        first_worker.abort();
+        first_worker.await.expect_err("simulated process loss");
+        drop(first);
+        drop(first_handler);
+        drop(first_state);
+        drop(first_inbox);
+
+        let reopened_inbox = Arc::new(
+            SqliteApprovalInbox::open(&approval_path)
+                .await
+                .expect("reopen Approval Inbox"),
+        );
+        reopened_inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "sqlite-approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle reopened approval");
+        let reopened_state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&state_path)
+                .await
+                .expect("reopen State store"),
+        ));
+        let resumed = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            reopened_state.clone(),
+        )
+        .with_approval_handler(Arc::new(
+            InboxApprovalHandler::new(reopened_inbox.clone(), Duration::from_millis(10))
+                .expect("reopened approval handler"),
+        ))
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect("resume from reopened SQLite stores");
+
+        assert_eq!(resumed.turn.status, TurnStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(reopened_state);
+        drop(reopened_inbox);
+        remove_sqlite_files(&state_path);
+        remove_sqlite_files(&approval_path);
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_post_approval_unknown_tool_boundary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let mut first_tools = ToolRegistry::new();
+        first_tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(PendingCountingTool {
+                    calls: calls.clone(),
+                    entered: entered.clone(),
+                }),
+            )
+            .expect("register pending Tool");
+        let first = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                first_tools,
+                Arc::new(AskPolicy),
+                state.clone(),
+            )
+            .with_approval_handler(handler.clone()),
+        );
+        let thread = first.create_thread().await.expect("create thread");
+        let first_worker = tokio::spawn({
+            let runtime = first.clone();
+            let thread_id = thread.id.clone();
+            async move { runtime.run_turn(&thread_id, "do not replay").await }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("poll approval")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval request");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("Tool entry");
+        first_worker.abort();
+        first_worker.await.expect_err("simulated loss in Tool");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load uncertain boundary")
+            .expect("thread");
+        let turn_id = projected.turns[0].id.clone();
+        assert_eq!(projected.turns[0].status, TurnStatus::Running);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::ApprovalDecision {
+                decision: ApprovalDecision::Approve,
+                ..
+            })
+        ));
+
+        let mut resumed_tools = ToolRegistry::new();
+        resumed_tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(PendingCountingTool {
+                    calls: calls.clone(),
+                    entered,
+                }),
+            )
+            .expect("register recovery Tool");
+        let error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            resumed_tools,
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler)
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect_err("unknown Tool boundary must not replay");
+        assert!(error.to_string().contains("preceded by its Tool call"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .load_thread(&thread.id)
+                .await
+                .expect("reload uncertain boundary")
+                .expect("thread")
+                .turns[0]
+                .status,
+            TurnStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_is_denied_when_no_approval_handler_is_installed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "default deny")
+            .await
+            .expect_err("ask must not auto-approve");
+
+        assert!(matches!(error, HarnessError::ApprovalDenied { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(matches!(
+            &projected.turns[0].items[4].kind,
+            ItemKind::ApprovalRequested { .. }
+        ));
+        assert!(matches!(
+            &projected.turns[0].items[5].kind,
+            ItemKind::ApprovalDecision {
+                decision: ApprovalDecision::Deny { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_orphans_a_durable_approval_from_an_abandoned_runtime() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                registry(calls.clone()),
+                Arc::new(AskPolicy),
+                state.clone(),
+            )
+            .with_approval_handler(Arc::new(
+                InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                    .expect("inbox handler"),
+            )),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            async move { runtime.run_turn(&thread_id, "wait durably").await }
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("poll durable approval")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval request timeout");
+        task.abort();
+        assert!(task.await.expect_err("aborted runtime").is_cancelled());
+
+        let recovered_runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("recovery handler"),
+        ));
+        let recovered = recovered_runtime
+            .recover_thread(&thread.id)
+            .await
+            .expect("recover")
+            .expect("thread");
+        assert_eq!(recovered.turns[0].status, TurnStatus::Interrupted);
+        let record = inbox
+            .get(&pending.request.id)
+            .await
+            .expect("read orphan")
+            .expect("approval");
+        assert!(matches!(
+            record.status,
+            ApprovalRecordStatus::Orphaned { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_execution_never_interrupts_another_runtime_owner() {
+        let store = Arc::new(MemoryEventStore::new());
+        let entered = Arc::new(Notify::new());
+        let first = Arc::new(HarnessRuntime::new(
+            Arc::new(PendingModel {
+                entered: entered.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(store.clone()),
+        ));
+        let second = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(store),
+        );
+        let thread = first.create_thread().await.expect("create thread");
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let first = first.clone();
+            let thread_id = thread.id.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                first
+                    .run_turn_with_options(
+                        &thread_id,
+                        "first owner",
+                        TurnExecutionOptions {
+                            cancellation,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("first model entered");
+
+        let error = second
+            .run_turn(&thread.id, "competing owner")
+            .await
+            .expect_err("a live Turn must not be recovered implicitly");
+        assert!(
+            matches!(&error, HarnessError::State(message) if message.contains("already has a running turn"))
+        );
+        let projected = second
+            .load_thread(&thread.id)
+            .await
+            .expect("load contested thread")
+            .expect("thread");
+        assert_eq!(projected.turns.len(), 1);
+        assert_eq!(projected.turns[0].status, TurnStatus::Running);
+
+        cancellation.cancel();
+        assert_eq!(
+            running
+                .await
+                .expect("first task")
+                .expect_err("first Turn cancelled"),
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Model
+            }
+        );
+        let settled = second
+            .load_thread(&thread.id)
+            .await
+            .expect("load settled thread")
+            .expect("thread");
+        assert_eq!(settled.turns.len(), 1);
+        assert_eq!(settled.turns[0].status, TurnStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn runtime_concurrency_admission_is_bounded_before_state_mutation() {
+        let entered = Arc::new(Notify::new());
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(PendingModel {
+                    entered: entered.clone(),
+                }),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_turn_concurrency_limit(1)
+            .expect("concurrency limit"),
+        );
+        let first_thread = runtime.create_thread().await.expect("first thread");
+        let second_thread = runtime.create_thread().await.expect("second thread");
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = first_thread.id.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "hold admission",
+                        TurnExecutionOptions {
+                            cancellation,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("first model entered");
+
+        assert_eq!(
+            runtime
+                .run_turn(&second_thread.id, "must shed")
+                .await
+                .expect_err("second Turn must be rejected"),
+            HarnessError::RuntimeOverloaded { limit: 1 }
+        );
+        let untouched = runtime
+            .load_thread(&second_thread.id)
+            .await
+            .expect("load second thread")
+            .expect("second thread");
+        assert!(untouched.turns.is_empty());
+
+        cancellation.cancel();
+        assert_eq!(
+            running
+                .await
+                .expect("first task")
+                .expect_err("first Turn cancellation"),
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Model
+            }
+        );
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert_eq!(
+            runtime
+                .run_turn_with_options(
+                    &second_thread.id,
+                    "admitted after release",
+                    TurnExecutionOptions {
+                        cancellation: stopped,
+                        ..TurnExecutionOptions::default()
+                    },
+                )
+                .await
+                .expect_err("pre-cancelled Turn"),
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Context
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_deadline_has_its_own_stop_phase() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(Arc::new(PendingApproval));
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "approval timeout",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("approval should time out");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Approval
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Approval,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_model_output_is_rejected_before_state_growth() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(OversizedModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let error = runtime
+            .run_turn(&thread.id, "bounded")
+            .await
+            .expect_err("oversized output must fail");
+        assert!(matches!(error, HarnessError::Model(_)));
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert_eq!(projected.turns[0].items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn model_usage_and_phase_latency_reach_observability_only() {
+        let collector = Arc::new(TraceCollector::new(8).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("register observer");
+        let runtime = HarnessRuntime::new(
+            Arc::new(UsageModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("create thread");
+        runtime
+            .run_turn(&thread.id, "usage")
+            .await
+            .expect("observed turn");
+
+        let records = collector.snapshot();
+        assert!(records.iter().any(|record| {
+            record.phase == ExecutionPhase::Context && record.outcome == ObservationOutcome::Success
+        }));
+        let model = records
+            .iter()
+            .find(|record| record.phase == ExecutionPhase::Model)
+            .expect("model observation");
+        assert_eq!(model.capability, "test/usage-model");
+        assert_eq!(
+            model.provider_request_id.as_deref(),
+            Some("provider-request")
+        );
+        assert_eq!(
+            model
+                .model_usage
+                .as_ref()
+                .and_then(|usage| usage.cost_microusd),
+            Some(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_selected_model_origin_reaches_authoritative_state() {
+        let origin = CapabilityOrigin::External {
+            id: "test-provider".to_owned(),
+        };
+        let mut models = ModelRegistry::new();
+        models
+            .register(origin.clone(), Arc::new(UsageModel))
+            .expect("register model");
+        let runtime = HarnessRuntime::from_model_registry(
+            &models,
+            "test/usage-model",
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("select registered model");
+        let thread = runtime.create_thread().await.expect("create thread");
+        let outcome = runtime
+            .run_turn(&thread.id, "provenance")
+            .await
+            .expect("run turn");
+
+        assert!(matches!(
+            &outcome.turn.items[2].kind,
+            ItemKind::AssistantMessage {
+                model_id,
+                model_origin,
+                content,
+            } if model_id.as_deref() == Some("test/usage-model")
+                && model_origin.as_ref() == Some(&origin)
+                && content == "observed"
+        ));
+    }
+
+    #[test]
+    fn model_failover_route_rejects_empty_duplicate_and_unknown_identities() {
+        let mut models = ModelRegistry::new();
+        models
+            .register(CapabilityOrigin::BuiltIn, Arc::new(UsageModel))
+            .expect("register model");
+
+        assert!(matches!(
+            HarnessRuntime::from_model_registry_failover(
+                &models,
+                &[],
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            ),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            HarnessRuntime::from_model_registry_failover(
+                &models,
+                &["test/usage-model", "test/usage-model"],
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            ),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            HarnessRuntime::from_model_registry_failover(
+                &models,
+                &["test/missing-model"],
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            ),
+            Err(HarnessError::UnknownModel(id)) if id == "test/missing-model"
+        ));
+        let runtime = HarnessRuntime::from_model_registry(
+            &models,
+            "test/usage-model",
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("single Model route");
+        assert!(matches!(
+            runtime.with_model_attempt_timeout(Duration::ZERO),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_failover_records_each_attempt_and_settled_provenance() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_origin = CapabilityOrigin::External {
+            id: "primary-provider".to_owned(),
+        };
+        let secondary_origin = CapabilityOrigin::TrustedExtension {
+            id: "secondary-provider".to_owned(),
+        };
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                primary_origin,
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls.clone(),
+                    emit_delta: false,
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                secondary_origin.clone(),
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("register secondary");
+        let collector = Arc::new(TraceCollector::new(16).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("observer");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("failover route")
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("thread");
+        let outcome = runtime
+            .run_turn(&thread.id, "route")
+            .await
+            .expect("secondary settles");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+        assert!(outcome.turn.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::AssistantMessage {
+                    model_id,
+                    model_origin,
+                    content,
+                } if model_id.as_deref() == Some("test/route-secondary")
+                    && model_origin.as_ref() == Some(&secondary_origin)
+                    && content == "secondary result"
+            )
+        }));
+        let attempts = collector
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.phase == ExecutionPhase::Model)
+            .map(|record| (record.capability, record.outcome))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [
+                ("test/route-primary".to_owned(), ObservationOutcome::Error),
+                (
+                    "test/route-secondary".to_owned(),
+                    ObservationOutcome::Success
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_failover_stops_after_delivered_provisional_output() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "primary-provider".to_owned(),
+                },
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls.clone(),
+                    emit_delta: true,
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "secondary-provider".to_owned(),
+                },
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("register secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("failover route");
+        let sink = Arc::new(RecordingModelSink::default());
+        let thread = runtime.create_thread().await.expect("thread");
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "streamed route",
+                TurnExecutionOptions {
+                    model_event_sink: Some(sink.clone()),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("delivered output must suppress failover");
+
+        assert!(error.to_string().contains("failover was suppressed"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sink.events.lock().expect("events").as_slice(),
+            [ModelStreamEvent::TextDelta {
+                model_step: 1,
+                delta: "primary fragment".to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_attempt_timeout_cancels_primary_and_reaches_secondary() {
+        let cancellation_observed = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "pending-provider".to_owned(),
+                },
+                Arc::new(CancellablePendingModel {
+                    cancellation_observed: cancellation_observed.clone(),
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "secondary-provider".to_owned(),
+                },
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("register secondary");
+        let collector = Arc::new(TraceCollector::new(16).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("observer");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/cancellable-pending-model", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("failover route")
+        .with_model_attempt_timeout(Duration::from_millis(5))
+        .expect("attempt timeout")
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("thread");
+        let outcome = runtime
+            .run_turn(&thread.id, "timeout failover")
+            .await
+            .expect("secondary settles");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellation_observed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt cancellation");
+
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+        assert!(outcome.turn.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::AssistantMessage { model_id, .. }
+                    if model_id.as_deref() == Some("test/route-secondary")
+            )
+        }));
+        let attempts = collector
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.phase == ExecutionPhase::Model)
+            .map(|record| (record.capability, record.outcome))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [
+                (
+                    "test/cancellable-pending-model".to_owned(),
+                    ObservationOutcome::TimedOut
+                ),
+                (
+                    "test/route-secondary".to_owned(),
+                    ObservationOutcome::Success
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_failover_never_crosses_the_turn_deadline() {
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "pending-provider".to_owned(),
+                },
+                Arc::new(PendingModel {
+                    entered: Arc::new(Notify::new()),
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "secondary-provider".to_owned(),
+                },
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("register secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/pending-model", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("failover route");
+        let thread = runtime.create_thread().await.expect("thread");
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "deadline",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("Turn deadline must stop the route");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Model
+            }
+        );
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn approval_resume_requires_the_recorded_failover_model_in_the_route() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "primary-provider".to_owned(),
+                },
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls.clone(),
+                    emit_delta: false,
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                CapabilityOrigin::TrustedExtension {
+                    id: "echo-provider".to_owned(),
+                },
+                Arc::new(EchoModel),
+            )
+            .expect("register secondary");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = Arc::new(
+            HarnessRuntime::from_model_registry_failover(
+                &models,
+                &["test/route-primary", "test/echo-model"],
+                registry(tool_calls.clone()),
+                Arc::new(AskPolicy),
+                state.clone(),
+            )
+            .expect("failover route")
+            .with_approval_handler(handler.clone()),
+        );
+        let thread = first.create_thread().await.expect("thread");
+        let first_worker = tokio::spawn({
+            let runtime = first.clone();
+            let thread_id = thread.id.clone();
+            async move { runtime.run_turn(&thread_id, "route approval").await }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("pending approvals")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval request");
+        let turn_id = pending.request.authorization.turn_id.clone();
+        first_worker.abort();
+        first_worker.await.expect_err("simulated worker loss");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+
+        let missing = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary"],
+            registry(tool_calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .expect("reduced route")
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect_err("recorded secondary must remain configured");
+        assert!(
+            missing
+                .to_string()
+                .contains("absent from the configured route")
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+
+        let resumed = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/echo-model"],
+            registry(tool_calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .expect("restored route")
+        .with_approval_handler(handler)
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect("resume with exact Model provenance");
+
+        assert_eq!(resumed.turn.status, TurnStatus::Completed);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn later_turn_receives_bounded_model_visible_thread_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(RecordingHistoryModel {
+                requests: requests.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        runtime
+            .run_turn(&thread.id, "first")
+            .await
+            .expect("first turn");
+        let second = runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second turn");
+
+        let requests = requests.lock().expect("recorded requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::UserMessage { content } if content == "first"
+            )
+        }));
+        assert!(requests[1].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::AssistantMessage { content, .. } if content == "answer to first"
+            )
+        }));
+        assert!(
+            !requests[1]
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::ConversationContext { .. }))
+        );
+        assert!(matches!(
+            &second.turn.items[1].kind,
+            ItemKind::ConversationContext {
+                included_turns,
+                dropped_turns: 0,
+                ..
+            } if included_turns.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn semantic_summary_is_observed_and_never_replaces_authoritative_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut compactors = ConversationCompactorRegistry::new();
+        compactors
+            .register(CapabilityOrigin::BuiltIn, Arc::new(StaticCompactor))
+            .expect("register compactor");
+        let context = ContextEngine::without_memory()
+            .with_conversation_config(ConversationContextConfig {
+                max_turns: 1,
+                budget_tokens: 65_536,
+                budget_bytes: 65_536,
+            })
+            .expect("conversation config")
+            .with_conversation_compactor(
+                compactors,
+                ConversationCompactionConfig {
+                    compactor: "test.static-summary".to_owned(),
+                    max_input_turns: 1,
+                    input_budget_bytes: 65_536,
+                    output_budget_tokens: 1_024,
+                    output_budget_bytes: 4_096,
+                },
+            )
+            .expect("compactor selection");
+        let collector = Arc::new(TraceCollector::new(64).expect("trace collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("trace", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("register trace collector");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RecordingHistoryModel {
+                requests: requests.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_context_engine(context)
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("create thread");
+        let first = runtime
+            .run_turn(&thread.id, "first")
+            .await
+            .expect("first turn");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second turn");
+        runtime
+            .run_turn(&thread.id, "third")
+            .await
+            .expect("third turn");
+
+        {
+            let requests = requests.lock().expect("recorded requests");
+            let third_request = &requests[2];
+            assert!(!third_request.items.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::UserMessage { content } if content == "first"
+                )
+            }));
+            assert!(third_request.items.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::UserMessage { content } if content == "second"
+                )
+            }));
+            assert!(matches!(
+                &third_request.context[0].source,
+                ContextSource::ConversationSummary {
+                    compactor,
+                    covered_turns,
+                    older_omitted_turns: 0,
+                    ..
+                } if compactor == "test.static-summary"
+                    && covered_turns == &[first.turn.id.clone()]
+            ));
+        }
+
+        let authoritative = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load state")
+            .expect("thread");
+        assert!(authoritative.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::UserMessage { content } if content == "first"
+            )
+        }));
+        assert!(authoritative.turns[2].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::ConversationSummary {
+                    compactor,
+                    covered_turns,
+                    older_omitted_turns: 0,
+                    source_sha256,
+                    content_sha256,
+                    estimated_tokens,
+                    serialized_bytes,
+                } if compactor == "test.static-summary"
+                    && covered_turns == &[first.turn.id.clone()]
+                    && source_sha256.len() == 64
+                    && content_sha256.len() == 64
+                    && *estimated_tokens > 0
+                    && *serialized_bytes > 0
+            )
+        }));
+        assert!(collector.snapshot().iter().any(|record| {
+            record.phase == ExecutionPhase::Context
+                && record.capability == "test.static-summary"
+                && record.outcome == ObservationOutcome::Success
+        }));
+    }
+
+    #[tokio::test]
+    async fn semantic_compactor_panic_is_sanitized_and_durably_settled() {
+        let mut compactors = ConversationCompactorRegistry::new();
+        compactors
+            .register(CapabilityOrigin::BuiltIn, Arc::new(PanickingCompactor))
+            .expect("register compactor");
+        let context = ContextEngine::without_memory()
+            .with_conversation_config(ConversationContextConfig {
+                max_turns: 1,
+                budget_tokens: 65_536,
+                budget_bytes: 65_536,
+            })
+            .expect("conversation config")
+            .with_conversation_compactor(
+                compactors,
+                ConversationCompactionConfig {
+                    compactor: "test.panicking-summary".to_owned(),
+                    max_input_turns: 1,
+                    input_budget_bytes: 65_536,
+                    output_budget_tokens: 1_024,
+                    output_budget_bytes: 4_096,
+                },
+            )
+            .expect("compactor selection");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RecordingHistoryModel {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_context_engine(context);
+        let thread = runtime.create_thread().await.expect("create thread");
+        runtime
+            .run_turn(&thread.id, "first")
+            .await
+            .expect("first turn");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second turn");
+        let error = runtime
+            .run_turn(&thread.id, "third")
+            .await
+            .expect_err("compactor panic");
+
+        assert_eq!(
+            error,
+            HarnessError::CapabilityPanicked {
+                phase: ExecutionPhase::Context
+            }
+        );
+        assert!(!error.to_string().contains("sensitive"));
+        let authoritative = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load state")
+            .expect("thread");
+        let failed = &authoritative.turns[2];
+        assert_eq!(failed.status, TurnStatus::Failed);
+        assert!(failed.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::RuntimeError { message }
+                    if !message.contains("sensitive")
+                        && message.contains("capability panicked during Context")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_output_becomes_a_bounded_model_visible_error() {
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(CapabilityOrigin::BuiltIn, Arc::new(OversizedTool))
+            .expect("register oversized tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(ToolErrorObserverModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("oversized")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let outcome = runtime
+            .run_turn(&thread.id, "bounded tool output")
+            .await
+            .expect("turn");
+
+        let result = outcome
+            .turn
+            .items
+            .iter()
+            .find_map(|item| match &item.kind {
+                ItemKind::ToolResult {
+                    output,
+                    is_error: true,
+                    ..
+                } => Some(output),
+                _ => None,
+            })
+            .expect("bounded Tool error");
+        assert!(result.to_string().len() < 1_024);
+    }
+
+    #[tokio::test]
+    async fn invalid_embedded_prompt_is_rejected_before_turn_creation() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(UsageModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let error = runtime
+            .run_turn(&thread.id, " ")
+            .await
+            .expect_err("empty prompt");
+        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert!(projected.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_approval_requester_is_rejected_before_turn_creation() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(UsageModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state,
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "valid prompt",
+                TurnExecutionOptions {
+                    approval_requester: ApprovalActor::Authenticated {
+                        authority: " ".to_owned(),
+                        subject: "operator".to_owned(),
+                    },
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("invalid requester");
+        assert!(matches!(error, HarnessError::Approval(_)));
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert!(projected.turns.is_empty());
+    }
+
+    #[test]
+    fn model_and_tool_json_shape_is_bounded_before_serialization() {
+        let mut nested = Value::Null;
+        for _ in 0..=crate::json::MAX_JSON_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        assert!(matches!(
+            validate_model_tool_call("call-1", "tool", &nested),
+            Err(HarnessError::Model(_))
+        ));
+        assert!(matches!(
+            validate_tool_output(&nested),
+            Err(HarnessError::Tool(_))
+        ));
+        let request = ModelRequest {
+            thread_id: ThreadId::generate(),
+            turn_id: crate::TurnId::generate(),
+            items: vec![crate::Item::new(ItemKind::ToolCall {
+                model_id: Some("test/model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                call_id: "call-1".to_owned(),
+                name: "tool".to_owned(),
+                input: nested,
+            })],
+            context: Vec::new(),
+            tools: Vec::new(),
+        };
+        assert!(matches!(
+            validate_model_request(&request),
+            Err(HarnessError::Model(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_tool_names_are_rejected() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = registry(calls.clone());
+        let error = registry
+            .register(CapabilityOrigin::BuiltIn, Arc::new(EchoTool { calls }))
+            .expect_err("duplicate must fail");
+        assert_eq!(error, HarnessError::DuplicateCapability("echo".to_owned()));
+    }
+}

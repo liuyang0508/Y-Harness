@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "Y-Harness $GITHUB_REF_NAME" \
+              --notes-file docs/release-notes-v0.1.0.md
+
+  unix-binaries:
+    name: Binary on ${{ matrix.os }}
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install release toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Build
+        run: cargo +1.88.0 build --locked --release --features https-model --bin yh
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          host="$(rustc +1.88.0 -vV | sed -n 's/^host: //p')"
+          archive="y-harness-${GITHUB_REF_NAME}-${host}.tar.gz"
+          mkdir -p dist/package
+          cp target/release/yh README.md LICENSE-MIT LICENSE-APACHE dist/package/
+          tar -C dist/package -czf "dist/${archive}" .
+          shasum -a 256 "dist/${archive}" >"dist/${archive}.sha256"
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/${archive}" "dist/${archive}.sha256" --clobber
+
+  windows-binary:
+    name: Binary on windows-latest
+    needs: release
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install release toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Build
+        run: cargo +1.88.0 build --locked --release --features https-model --bin yh
+      - name: Package and upload
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hostTriple = ((rustc +1.88.0 -vV | Select-String '^host: ').Line -replace '^host: ', '')
+          $archive = "y-harness-$env:GITHUB_REF_NAME-$hostTriple.zip"
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item target/release/yh.exe, README.md, LICENSE-MIT, LICENSE-APACHE dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Set-Content -NoNewline "dist/$archive.sha256"
+          gh release upload "$env:GITHUB_REF_NAME" `
+            "dist/$archive" "dist/$archive.sha256" --clobber
