@@ -67,7 +67,7 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
 ```
 
 The all-feature workspace run contains 253 passing library tests, 1 CLI
-configuration test, 7 Engine process/service tests, 8 TUI unit/render tests,
+configuration test, 7 Engine process/service tests, 10 TUI unit/render tests,
 and 2 local private-gateway TLS integration tests. The demo and configured
 PTY smoke gates submit real Turns, verify durable State, and check
 alternate-screen and bracketed-paste restoration. One additional 64 MiB

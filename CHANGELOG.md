@@ -18,7 +18,8 @@ Initial public baseline:
   migration commands, and regression evaluation;
 - independently installable `yh-tui` full-screen product client over Protocol
   v10, with authoritative State projection, streaming, cancellation, and
-  read-only Approval/Task inspection;
+  read-only Approval/Task inspection, config preflight, and bounded Engine
+  startup diagnostics;
 - MIT OR Apache-2.0 licensing.
 
 Supported evidence is limited to the exact release commit and CI platforms.

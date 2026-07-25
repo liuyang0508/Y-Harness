@@ -28,6 +28,9 @@ Install and run the optional full-screen terminal product:
 yh-tui --demo
 ```
 
+The checkout also includes a local demo `y-harness.json`, so
+`yh-tui --config y-harness.json` works directly from the repository root.
+
 Create and validate a persistent Harness service:
 
 ```bash

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  }
+}

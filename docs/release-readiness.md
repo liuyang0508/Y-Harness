@@ -9,10 +9,10 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 253 library, 1 CLI, 7 Engine process/service, 8 TUI unit/render, and 2 private-gateway TLS integration tests | passing |
+| Deterministic tests | 253 library, 1 CLI, 7 Engine process/service, 10 TUI unit/render, and 2 private-gateway TLS integration tests | passing |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, clean-room crate verification | 163 files, 1.9 MiB unpacked / 433.0 KiB compressed; passing |
+| Distribution package | `cargo package --locked -p y-harness`, clean-room crate verification | 164 files, 1.9 MiB unpacked / 433.3 KiB compressed; passing |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 286 locked crates | passing |
 | State performance | 1,000 events, 5 samples, SQLite WAL + FULL | 68.51 ms append; 2.64 ms full projection; 2.12 ms snapshot load |

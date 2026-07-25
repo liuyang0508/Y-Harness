@@ -12,6 +12,7 @@ use std::{
     ffi::OsString,
     io::{self, IsTerminal},
     path::PathBuf,
+    process::ExitCode,
 };
 
 use app::App;
@@ -38,7 +39,17 @@ enum Mode {
 }
 
 #[tokio::main]
-async fn main() -> MainResult<()> {
+async fn main() -> ExitCode {
+    match entry().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn entry() -> MainResult<()> {
     match parse_options(env::args_os().skip(1))? {
         Action::Help => {
             print_help();
