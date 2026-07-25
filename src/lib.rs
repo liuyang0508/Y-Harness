@@ -74,7 +74,7 @@ pub use memory::{
 #[cfg(feature = "https-model")]
 pub use model::{
     HttpModelRequest, HttpModelResponse, HttpModelTransport, HttpsJsonModel, HttpsJsonModelConfig,
-    ReqwestHttpModelTransport,
+    OpenAiResponsesModel, OpenAiResponsesModelConfig, ReqwestHttpModelTransport,
 };
 pub use observability::{
     Observability, ObservationOutcome, Observer, PhaseObservation, RegisteredObserver,
@@ -124,7 +124,7 @@ pub use state::{
 };
 pub use transport::{
     McpClient, McpToolDescriptor, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
-    mcp_client, register_mcp_tools,
+    mcp_client, register_mcp_tools, register_selected_mcp_tools,
 };
 #[cfg(feature = "tls-host")]
 pub use transport::{TlsJsonlServer, TlsJsonlServerConfig, TlsJsonlServerReport};

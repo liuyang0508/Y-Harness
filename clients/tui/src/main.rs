@@ -180,8 +180,9 @@ mod tests {
     use super::{Action, Mode, parse_options};
 
     #[test]
-    fn options_keep_demo_and_config_explicit() {
-        let action = parse_options([OsString::from("--demo")].into_iter()).expect("parse demo");
+    fn options_keep_demo_and_config_explicit()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let action = parse_options([OsString::from("--demo")].into_iter())?;
         assert!(matches!(
             action,
             Action::Run(super::Options {
@@ -190,16 +191,18 @@ mod tests {
             })
         ));
 
-        let error = parse_options(
+        let error = match parse_options(
             [
                 OsString::from("--demo"),
                 OsString::from("--config"),
                 OsString::from("project.json"),
             ]
             .into_iter(),
-        )
-        .err()
-        .expect("reject conflicting mode");
+        ) {
+            Ok(_) => return Err("conflicting modes were accepted".into()),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("mutually exclusive"));
+        Ok(())
     }
 }

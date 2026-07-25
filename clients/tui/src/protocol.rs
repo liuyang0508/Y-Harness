@@ -303,32 +303,31 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn response_limit_excludes_the_jsonl_delimiter() {
+    async fn response_limit_excludes_the_jsonl_delimiter() -> super::ClientResult<()> {
         let mut exact = BufReader::new(&b"1234\n"[..]);
-        assert_eq!(
-            read_bounded_line_with_limit(&mut exact, 4)
-                .await
-                .expect("accept exact frame"),
-            b"1234"
-        );
+        assert_eq!(read_bounded_line_with_limit(&mut exact, 4).await?, b"1234");
 
         let mut oversized = BufReader::new(&b"12345\n"[..]);
-        let error = read_bounded_line_with_limit(&mut oversized, 4)
-            .await
-            .expect_err("reject oversized frame");
+        let error = match read_bounded_line_with_limit(&mut oversized, 4).await {
+            Ok(_) => return Err("oversized frame was accepted".into()),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("exceeds 4 bytes"));
+        Ok(())
     }
 
     #[test]
-    fn missing_config_fails_before_engine_spawn() {
-        let error = ProtocolClient::spawn(
+    fn missing_config_fails_before_engine_spawn() -> super::ClientResult<()> {
+        let error = match ProtocolClient::spawn(
             OsStr::new("engine-that-must-not-run"),
             EngineMode::Config(Path::new("missing-y-harness.json")),
-        )
-        .err()
-        .expect("reject missing config");
+        ) {
+            Ok(_) => return Err("missing config was accepted".into()),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("Engine config does not exist"));
         assert!(error.to_string().contains("yh-tui --demo"));
+        Ok(())
     }
 
     #[test]

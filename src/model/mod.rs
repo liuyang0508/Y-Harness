@@ -1,5 +1,9 @@
 //! Production-facing model adapters kept outside the kernel contract.
 
+mod openai_responses;
+
+pub use openai_responses::{OpenAiResponsesModel, OpenAiResponsesModelConfig};
+
 use std::{fmt, sync::Arc, time::Duration};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};

@@ -58,6 +58,10 @@ direction:
   concurrency/time/body retention, pooled connections, client-safe errors, and
   an exclusive bounded enterprise-CA trust mode with no ambient roots plus an
   optional non-serializable mTLS client identity;
+- an optional direct OpenAI Responses adapter with environment-backed API-key
+  resolution, pooled HTTPS, `store: false`, bounded JSON/SSE decoding, exact
+  function-call translation, provider usage evidence, and provider-side
+  parallel Tool calls disabled so Runtime retains scheduling authority;
 - opt-in exact NDJSON model-gateway streaming with incremental linear decoding,
   bounded frames/deltas/total bytes, exactly one mandatory final typed response,
   and no behavior change for requests without a provisional-event sink;
@@ -224,7 +228,9 @@ direction:
   filters advertised capabilities, and trusts only local-process callers by
   default;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
-  deterministic demo, and persistent stdio service commands;
+  deterministic demo, persistent stdio service commands, explicitly launched
+  shell-free JSON Tools, exact-selected MCP Tools, and Agent Memory Hub Context
+  assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
   v10, with authoritative Thread projection, bounded provisional streaming,
@@ -251,7 +257,8 @@ direction:
 
 Snapshot archival, distributed orchestration coordination, lease/fenced remote
 approval continuation, unknown Tool-effect reconciliation, Model load
-balancing/circuit breaking, direct vendor model adapters, Linux/Windows
+balancing/circuit breaking, additional direct vendor model adapters,
+Linux/Windows
 sandbox brokers, Skill catalogs/private registry authentication and append-only
 transparency-log consistency,
 streaming large-dataset Evaluation reports, and certificate subject/SAN

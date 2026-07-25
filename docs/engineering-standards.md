@@ -296,6 +296,17 @@ YH_HTTPS_MODEL_TOKEN=<token> \
 cargo test --all-features --test https_json_model -- --ignored
 ```
 
+The direct OpenAI Responses adapter has a separate credentialed live gate:
+
+```bash
+YH_OPENAI_MODEL=<explicit-model-id> \
+OPENAI_API_KEY=<token> \
+cargo test --all-features --test openai_responses -- --ignored
+```
+
+The model ID is always supplied by the operator. Tests and release automation
+must not silently replace it with a moving vendor default.
+
 Any durable schema change additionally requires the fixture, crash, migration,
 backup, rollback, mixed-version, and maximum-size evidence defined in
 [`compatibility.md`](compatibility.md). Until that evidence exists, the writer

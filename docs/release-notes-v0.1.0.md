@@ -11,6 +11,10 @@ It ships an embeddable Rust Core/Runtime, Protocol v10 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
+The persistent service can assemble an optional direct OpenAI Responses
+Provider, shell-free JSON-command Tools, exact-selected MCP Tools, and Agent
+Memory Hub Context without moving Policy or State authority into a client or
+provider.
 
 ## Start
 
@@ -45,8 +49,10 @@ the documented backup-first migration commands.
   tested strong OS sandbox broker.
 - Network protocol exposure requires the mandatory-mTLS host; the stdio JSONL
   service is not a raw Internet server.
-- Direct vendor model adapters and a live vendor Gateway certification are not
-  included.
+- OpenAI Responses is the only direct vendor model adapter. Its mapping and
+  transport tests are local; a live API pass remains environment-gated.
+  Reasoning-model function calls that require opaque output replay fail before
+  Tool execution until State has a durable origin-bound continuation contract.
 - SQLite offers single-host durability and multi-process CAS, not multi-node
   consensus or distributed high availability.
 - Workspace cleanup cannot guarantee recovery after power loss or hostile

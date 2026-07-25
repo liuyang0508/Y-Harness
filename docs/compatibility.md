@@ -32,11 +32,16 @@ client-protocol surface. Capabilities are separately negotiated; a disabled
 capability is not implied by its schema coordinate.
 
 Service configuration schema 1 is bounded to 65,536 bytes, rejects unknown
-fields, and keeps credentials as environment-backed secret references.
-`data_directory` and an optional exclusive CA file must remain inside the
-configuration project root. A future incompatible configuration shape requires
-a new root schema coordinate and an explicit operator migration; it is never
-guessed from fields.
+fields, and keeps credentials as environment-backed secret references. Its
+optional service-assembly fields add direct OpenAI Responses, shell-free JSON
+Tools, exact-selected stdio MCP Tools, and Agent Memory Hub Context without
+changing the meaning of an existing field. External process launch is explicit,
+child environments are copied only by configured host-variable name, and MCP
+catalog discovery alone grants no Tool authority. `data_directory` and an
+optional exclusive CA file must remain inside the configuration project root.
+A future incompatible configuration shape requires a new root schema
+coordinate and an explicit operator migration; it is never guessed from
+fields.
 
 Skill API `1` keeps the original package digest and publisher-signature bytes.
 Signed packages may add an optional signed transparency receipt; publisher

@@ -20,11 +20,14 @@ Initial public baseline:
   v10, with authoritative State projection, streaming, cancellation, and
   read-only Approval/Task inspection, config preflight, and bounded Engine
   startup diagnostics;
+- governed persistent-service assembly for direct OpenAI Responses, shell-free
+  JSON-command Tools, exact-selected MCP Tools, and Agent Memory Hub Context,
+  preserving Runtime-owned Policy, State, and sequential Tool scheduling;
 - MIT OR Apache-2.0 licensing.
 
 Supported evidence is limited to the exact release commit and CI platforms.
-Linux and Windows do not yet have strong OS sandbox brokers. Direct vendor
-model adapters are outside this release; use the exact HTTPS Model Gateway v2
-contract or embed a `LanguageModel`. SQLite coordination is single-host, not
-distributed consensus. See [release readiness](docs/release-readiness.md) for
-the complete boundary.
+Linux and Windows do not yet have strong OS sandbox brokers. OpenAI Responses
+is the only direct vendor adapter; other vendors use the exact HTTPS Model
+Gateway v2 contract or an embedded `LanguageModel`. SQLite coordination is
+single-host, not distributed consensus. See
+[release readiness](docs/release-readiness.md) for the complete boundary.

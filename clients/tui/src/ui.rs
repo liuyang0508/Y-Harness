@@ -940,13 +940,12 @@ mod tests {
     }
 
     #[test]
-    fn full_screen_renders_engine_projection_and_boundary() {
+    fn full_screen_renders_engine_projection_and_boundary() -> Result<(), std::convert::Infallible>
+    {
         let backend = TestBackend::new(120, 32);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut terminal = Terminal::new(backend)?;
         let app = App::test_fixture();
-        terminal
-            .draw(|frame| render(frame, &app))
-            .expect("render full-screen TUI");
+        terminal.draw(|frame| render(frame, &app))?;
         let screen = terminal
             .backend()
             .buffer()
@@ -958,16 +957,15 @@ mod tests {
         assert!(screen.contains("Design a safe Harness"));
         assert!(screen.contains("Keep clients behind Protocol v10"));
         assert!(screen.contains("Activity"));
+        Ok(())
     }
 
     #[test]
-    fn undersized_terminal_renders_a_safe_fallback() {
+    fn undersized_terminal_renders_a_safe_fallback() -> Result<(), std::convert::Infallible> {
         let backend = TestBackend::new(50, 12);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut terminal = Terminal::new(backend)?;
         let app = App::test_fixture();
-        terminal
-            .draw(|frame| render(frame, &app))
-            .expect("render undersized fallback");
+        terminal.draw(|frame| render(frame, &app))?;
         let screen = terminal
             .backend()
             .buffer()
@@ -976,5 +974,6 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("needs at least 60×18"));
+        Ok(())
     }
 }

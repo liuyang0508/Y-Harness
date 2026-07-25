@@ -117,6 +117,13 @@ pub struct MemoryContextConfig {
     pub failure_mode: MemoryFailureMode,
 }
 
+impl MemoryContextConfig {
+    /// Validates provider identity and retrieval budgets before Runtime startup.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_memory_config(self)
+    }
+}
+
 /// Deterministic whole-Turn history-window policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationContextConfig {

@@ -30,6 +30,25 @@ yh-tui --demo
 
 The checkout also includes a local demo `y-harness.json`, so
 `yh-tui --config y-harness.json` works directly from the repository root.
+That file deliberately uses the deterministic `local/demo` model and makes no
+network request.
+
+Run the same TUI against a real OpenAI Responses model:
+
+```bash
+cp config/y-harness.openai.example.json y-harness.local.json
+# Set one model ID available to your OpenAI project in y-harness.local.json.
+export OPENAI_API_KEY='...'
+yh doctor y-harness.local.json
+yh-tui --config y-harness.local.json
+```
+
+The API key is resolved from the named environment variable and never stored
+in configuration or State. The adapter sends `store: false`, disables
+provider-side parallel function calls, and keeps Tool execution, Policy, and
+State inside Y-Harness. Configured shell-free JSON Tools, selected MCP Tools,
+and Agent Memory Hub remain optional; see the
+[Chinese quick start](docs/quickstart.zh-CN.md).
 
 Create and validate a persistent Harness service:
 

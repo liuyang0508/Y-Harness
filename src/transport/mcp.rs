@@ -106,13 +106,52 @@ pub async fn register_mcp_tools(
     namespace: &str,
     client: Arc<dyn McpClient>,
 ) -> Result<Vec<String>, HarnessError> {
+    register_mcp_catalog(registry, origin, namespace, client, None).await
+}
+
+/// Discovers one MCP catalog and registers only an explicit remote-name set.
+///
+/// Every requested name must exist. Selection and registration are atomic, so
+/// a stale or partially matching catalog never grants a subset accidentally.
+pub async fn register_selected_mcp_tools(
+    registry: &mut ToolRegistry,
+    origin: CapabilityOrigin,
+    namespace: &str,
+    client: Arc<dyn McpClient>,
+    remote_names: &[String],
+) -> Result<Vec<String>, HarnessError> {
+    validate_registry_growth("selected MCP tool", 0, remote_names.len())?;
+    let mut selected = BTreeSet::new();
+    for name in remote_names {
+        validate_mcp_tool_name(name)?;
+        if !selected.insert(name.clone()) {
+            return Err(HarnessError::Mcp(format!(
+                "selected MCP tool {name} is duplicated"
+            )));
+        }
+    }
+    register_mcp_catalog(registry, origin, namespace, client, Some(&selected)).await
+}
+
+async fn register_mcp_catalog(
+    registry: &mut ToolRegistry,
+    origin: CapabilityOrigin,
+    namespace: &str,
+    client: Arc<dyn McpClient>,
+    selected: Option<&BTreeSet<String>>,
+) -> Result<Vec<String>, HarnessError> {
     validate_capability_origin(&origin)?;
     validate_capability_name("MCP namespace", namespace)?;
     let discovered = client.list_tools().await?;
     validate_registry_growth("MCP tool", 0, discovered.len())?;
     let mut staged = Vec::with_capacity(discovered.len());
     let mut names = Vec::with_capacity(discovered.len());
+    let mut matched = BTreeSet::new();
     for remote in discovered {
+        if selected.is_some_and(|selected| !selected.contains(&remote.name)) {
+            continue;
+        }
+        matched.insert(remote.name.clone());
         crate::json::validate_value_shape(&remote.input_schema).map_err(|_| {
             HarnessError::Mcp(
                 "MCP tool schema exceeds the supported JSON depth or node count".to_owned(),
@@ -146,6 +185,15 @@ pub async fn register_mcp_tools(
         });
         staged.push((origin.clone(), tool));
         names.push(registry_name);
+    }
+    if let Some(selected) = selected {
+        let missing = selected.difference(&matched).cloned().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(HarnessError::Mcp(format!(
+                "selected MCP tools are missing: {}",
+                missing.join(", ")
+            )));
+        }
     }
     names.sort();
     registry.register_batch(staged)?;
@@ -864,7 +912,7 @@ mod tests {
     use super::{
         BoundedLineReader, MAX_MCP_PROCESS_CONCURRENCY, McpClient, McpToolDescriptor,
         StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, register_mcp_tools,
-        tool_result_value,
+        register_selected_mcp_tools, tool_result_value,
     };
     use crate::{
         AllowListPolicy, CapabilityOrigin, HarnessError, HarnessFuture, HarnessRuntime,
@@ -1204,5 +1252,60 @@ mod tests {
 
         assert!(error.to_string().contains("depth or node count"));
         assert!(tools.descriptors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_mcp_registration_is_exact_and_atomic() {
+        let client: Arc<dyn McpClient> = Arc::new(FakeMcpClient {
+            tools: vec![
+                McpToolDescriptor {
+                    name: "read".to_owned(),
+                    description: Some("Read".to_owned()),
+                    input_schema: json!({"type": "object"}),
+                },
+                McpToolDescriptor {
+                    name: "write".to_owned(),
+                    description: Some("Write".to_owned()),
+                    input_schema: json!({"type": "object"}),
+                },
+            ],
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut tools = ToolRegistry::new();
+        assert_eq!(
+            register_selected_mcp_tools(
+                &mut tools,
+                CapabilityOrigin::BuiltIn,
+                "files",
+                client,
+                &["read".to_owned()],
+            )
+            .await
+            .expect("selected tools"),
+            ["files.read"]
+        );
+        assert!(tools.get("files.write").is_none());
+
+        let missing: Arc<dyn McpClient> = Arc::new(FakeMcpClient {
+            tools: vec![McpToolDescriptor {
+                name: "read".to_owned(),
+                description: Some("Read".to_owned()),
+                input_schema: json!({"type": "object"}),
+            }],
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut empty = ToolRegistry::new();
+        assert!(
+            register_selected_mcp_tools(
+                &mut empty,
+                CapabilityOrigin::BuiltIn,
+                "files",
+                missing,
+                &["missing".to_owned()],
+            )
+            .await
+            .is_err()
+        );
+        assert!(empty.descriptors().is_empty());
     }
 }

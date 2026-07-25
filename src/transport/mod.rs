@@ -6,7 +6,7 @@ mod tls_jsonl;
 
 pub use mcp::{
     McpClient, McpToolDescriptor, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
-    mcp_client, register_mcp_tools,
+    mcp_client, register_mcp_tools, register_selected_mcp_tools,
 };
 #[cfg(feature = "tls-host")]
 pub use tls_jsonl::{TlsJsonlServer, TlsJsonlServerConfig, TlsJsonlServerReport};

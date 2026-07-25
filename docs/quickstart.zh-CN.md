@@ -2,7 +2,8 @@
 
 Y-Harness 是通用 Agent Harness 引擎，不是绑定某个业务的聊天客户端。
 最短体验路径使用内置确定性模型；真实模型通过精确版本的 HTTPS JSON
-Gateway 或宿主自定义 `LanguageModel` 接入。
+Gateway、可选 OpenAI Responses Provider 或宿主自定义
+`LanguageModel` 接入。
 
 ## 1. 安装
 
@@ -131,7 +132,73 @@ python3 /path/to/Y-Harness/examples/task_worker_client.py \
 Worker 身份不允许在请求中自报。stdio 使用 `local-process`；mTLS
 网络宿主使用客户端叶证书的 SHA-256 指纹。租约时间只取服务端时钟。
 
-## 6. 接入真实模型 Gateway
+## 6. 直接接入 OpenAI Responses
+
+复制直接 Provider 配置，但必须把模板中的模型占位符改为当前项目
+实际可用的明确模型 ID：
+
+```bash
+cp /path/to/Y-Harness/config/y-harness.openai.example.json y-harness.json
+export OPENAI_API_KEY='replace-with-real-secret'
+yh doctor y-harness.json
+yh-tui --config y-harness.json
+```
+
+配置只保存 Secret 引用和环境变量名，不保存 API Key。Provider 固定
+访问 OpenAI 官方 HTTPS Responses endpoint，禁用 redirect、proxy、
+retry 和 referer，发送 `store: false`，并把响应 Token 使用量和
+`x-request-id` 作为可观测证据返回。
+
+流式文本经过有界 SSE 解码进入 TUI，但最终 Response 才是权威结果。
+Provider 发送 `parallel_tool_calls: false`：OpenAI 只负责提出函数调用，
+Tool 调度、Policy、State 和重试仍由 Y-Harness 唯一负责。这与
+[OpenAI 官方 Function Calling 流程](https://developers.openai.com/api/docs/guides/function-calling#the-tool-calling-flow)
+一致。
+
+当前 State schema 尚未保存 OpenAI 推理模型在 `store: false` 下要求
+重放的厂商私有 reasoning continuation。因此，普通最终文本可用；
+若函数调用响应同时携带该续接项，引擎会在任何 Tool 副作用之前明确
+失败。不会静默丢弃它再伪装成完整工具循环。该边界遵循
+[OpenAI 手工管理历史必须重放 output items 的说明](https://developers.openai.com/api/docs/guides/latest-model)。
+完整支持需要先引入有界、来源绑定、可持久化的 Provider Continuation
+契约及 State 迁移证据。
+
+没有 `OPENAI_API_KEY` 和明确模型 ID 时，Y-Harness 不猜测凭据或默认
+模型，也不会把 demo 响应伪装成真实调用。
+
+## 7. 装配 Tool、MCP 与 Agent Memory Hub
+
+`tools` 可以注册 shell-free JSON command。引擎清空子进程继承环境，
+只传配置中按名称映射的宿主环境变量，并要求显式选择
+`unrestricted` 或 macOS Seatbelt：
+
+```text
+Model ToolCall
+  → Tool Registry
+  → Policy
+  → Process Broker
+  → JSON request on stdin
+  ← one JSON result on stdout
+```
+
+完整配置见
+[`y-harness.openai-command.macos.example.json`](../config/y-harness.openai-command.macos.example.json)，
+最小 Tool 程序见
+[`json_tool_uppercase.py`](../examples/json_tool_uppercase.py)。
+
+每个 MCP server 也必须显式声明启动权限。若要把 MCP Tool 暴露给
+模型，`tools.allow` 必须逐个列出远端 Tool 名；目录缺少任一选定项时
+整批注册失败，不会部分授权。注册后的 Tool 仍经过普通 Policy 和
+State 路径。
+
+Agent Memory Hub 可以复用同一受监管 MCP session，作为
+`MemoryProvider` 注入 Context，而无需把 Memory Hub 的 Python 模块、
+Markdown 或索引格式导入 Y-Harness。macOS 生产模板见
+[`y-harness.openai-amh.macos.example.json`](../config/y-harness.openai-amh.macos.example.json)。
+`yh doctor` 会启动并健康检查配置的 Memory Provider，然后有界关闭
+MCP session。
+
+## 8. 接入自有模型 Gateway
 
 复制生产配置模板：
 
@@ -153,10 +220,11 @@ yh serve y-harness.json
 
 Gateway 必须实现
 [`protocol.md`](protocol.md) 所述的精确 Model Gateway v2 契约。
-Y-Harness 不伪装不同厂商 API 具有相同语义；厂商适配应放在 Gateway
-或宿主 Provider 中。
+除明确实现的 OpenAI Responses Provider 外，Y-Harness 不伪装不同
+厂商 API 具有相同语义；其他厂商适配应放在 Gateway 或宿主 Provider
+中。
 
-## 7. 作为 Rust 引擎嵌入
+## 9. 作为 Rust 引擎嵌入
 
 最小 Agent Loop：
 
@@ -174,12 +242,14 @@ cargo run --locked --example orchestrated
 [`examples/embedded.rs`](../examples/embedded.rs) 和
 [`examples/orchestrated.rs`](../examples/orchestrated.rs)。
 
-## 8. 安全与产品边界
+## 10. 安全与产品边界
 
 - `serve` 是持久化 stdio 服务，适合由进程主管或受信宿主启动。
 - 网络暴露必须使用现有 mandatory-mTLS host，不能把裸 JSONL socket
   直接当成生产网络服务。
 - 默认 Policy 拒绝未注册 Tool；演示配置只允许内置 `echo`。
+- 配置中的 JSON command Tool 和逐项选中的 MCP Tool 才会进入允许
+  列表；发现目录本身不授予执行权限。
 - Workspace Provider 默认拒绝文件系统 Task。
 - 目录隔离和 Git Worktree 不是 OS 沙箱；不可信执行器必须继续经过
   Process Broker。

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "open_ai_responses",
+    "id": "openai/default",
+    "model": "replace-with-an-available-model-id",
+    "api_key_secret_reference": "openai/default",
+    "api_key_environment": "OPENAI_API_KEY",
+    "request_timeout_ms": 120000,
+    "connect_timeout_ms": 10000,
+    "max_response_bytes": 4194304,
+    "max_concurrency": 16
+  },
+  "mcp_servers": [
+    {
+      "id": "agent-memory-hub",
+      "command": "/absolute/path/to/agent-memory-hub/agent_runtime_kit/mcp/server.sh",
+      "args": [],
+      "current_directory": "/absolute/path/to/agent-memory-hub/agent_runtime_kit/mcp",
+      "environment_from_host": {
+        "PATH": "PATH",
+        "LANG": "LANG",
+        "BRAIN_DIR": "YH_AMH_BRAIN_DIR",
+        "MEMORY_HUB_EMBEDDING_OFFLINE": "YH_AMH_EMBEDDING_OFFLINE",
+        "PYTHONDONTWRITEBYTECODE": "YH_AMH_NO_BYTECODE",
+        "TMPDIR": "YH_AMH_TMPDIR"
+      },
+      "request_timeout_ms": 45000,
+      "launch": {
+        "type": "macos_seatbelt",
+        "max_concurrency": 1,
+        "writable_roots": [
+          "/absolute/path/to/agent-memory-hub-brain",
+          "/absolute/path/to/temporary-directory"
+        ],
+        "network_access": "deny"
+      },
+      "tools": {
+        "namespace": "amh",
+        "allow": [
+          "brain_stats"
+        ]
+      }
+    }
+  ],
+  "memory": {
+    "type": "agent_memory_hub",
+    "mcp_server": "agent-memory-hub",
+    "top_k": 8,
+    "budget_tokens": 2000,
+    "failure_mode": "degrade"
+  }
+}
