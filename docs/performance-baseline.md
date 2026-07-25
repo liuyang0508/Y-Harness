@@ -5,7 +5,7 @@ claim.
 
 ## Reference environment
 
-- Date: 2026-07-25
+- Date: 2026-07-26
 - CPU: Apple M4 Pro (`arm64`)
 - OS: macOS 15.7.3
 - Rust: 1.88.0 (`aarch64-apple-darwin`)
@@ -38,14 +38,16 @@ cargo run --release --bin yh-state-bench
 | 1,000 | schema-3 approval-continuation baseline, 5 samples | 68.074 ms | 14,690 | 2.942 ms | 5.547 ms | 2.384 ms |
 | 1,000 | schema-4 Policy Tool-origin baseline, 5 samples | 65.461 ms | 15,276 | 2.797 ms | 5.192 ms | 2.267 ms |
 | 1,000 | protocol-v10 release recheck, 5 samples | 70.265 ms | 14,232 | 2.692 ms | 5.287 ms | 2.257 ms |
+| 1,000 | schema-5 Provider Continuation baseline, 5 samples | 71.967 ms | 13,895 | 2.639 ms | 5.134 ms | 2.215 ms |
 
 At 1,000 events the current path reduced append time by about 87.8% and
 increased throughput by about 8.2×. Full projection remains linear and is still
 performed for authoritative reads and recovery.
 
-The last four rows include one additional transactional recovery-accounting
+The last six rows include one additional transactional recovery-accounting
 update per append and validate State through byte-bounded pages. The latest
-row rechecks the unchanged State path after the protocol-v10 slice. It remains
+row rechecks the State path after adding bounded Provider Continuation
+evidence. It remains
 inside the existing local regression thresholds; historical rows are retained
 to make safety costs and machine variance visible.
 
@@ -92,7 +94,9 @@ This single local sample was measured on the reference environment on
 2026-07-25. It proves bounded completion at the supported fixture size; it is
 not a stable latency SLA. Schema 2 → 4 and schema 3 → 4 use the same complete
 backup and streaming fingerprint path and have separate crash-at-each-phase
-tests.
+tests. Schema 5 reuses that backup-first, immutable-history path for
+schema-1/2/3/4 sources; its maximum-size migration is not relabeled as measured
+by this historical schema-4 fixture.
 
 ## Approval Inbox schema migration workload
 

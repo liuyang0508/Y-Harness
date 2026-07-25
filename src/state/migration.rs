@@ -21,7 +21,6 @@ use crate::{EventId, HarnessError, sqlite::bounded_text};
 
 const FIRST_STATE_EVENT_SCHEMA_VERSION: u32 = 1;
 const FIRST_METADATA_STATE_EVENT_SCHEMA_VERSION: u32 = 2;
-const PREVIOUS_STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MIN_MIGRATION_WORKING_BYTES: u64 = 1_048_576;
 const STATE_METADATA_TABLE: &str = "state_store_metadata";
 const BACKUP_MANIFEST_TABLE: &str = "y_harness_migration_backup";
@@ -128,7 +127,7 @@ pub(super) fn validate_or_bootstrap_store(connection: &Connection) -> Result<(),
         Some((event_schema, snapshot_schema))
             if (FIRST_METADATA_STATE_EVENT_SCHEMA_VERSION..STATE_EVENT_SCHEMA_VERSION)
                 .contains(&event_schema)
-                && snapshot_schema == PREVIOUS_STATE_SNAPSHOT_SCHEMA_VERSION =>
+                && legacy_snapshot_schema(event_schema) == Some(snapshot_schema) =>
         {
             return Err(migration_required());
         }
@@ -687,7 +686,7 @@ fn migration_source(connection: &Connection) -> Result<MigrationSource, HarnessE
         Some((event_schema, snapshot_schema))
             if (FIRST_METADATA_STATE_EVENT_SCHEMA_VERSION..STATE_EVENT_SCHEMA_VERSION)
                 .contains(&event_schema)
-                && snapshot_schema == PREVIOUS_STATE_SNAPSHOT_SCHEMA_VERSION =>
+                && legacy_snapshot_schema(event_schema) == Some(snapshot_schema) =>
         {
             Ok(MigrationSource {
                 event_schema,
@@ -698,6 +697,14 @@ fn migration_source(connection: &Connection) -> Result<MigrationSource, HarnessE
         Some((event_schema, snapshot_schema)) => Err(HarnessError::State(format!(
             "unsupported SQLite State migration source event_schema={event_schema}, snapshot_schema={snapshot_schema}"
         ))),
+    }
+}
+
+fn legacy_snapshot_schema(event_schema: u32) -> Option<u32> {
+    match event_schema {
+        2 | 3 => Some(3),
+        4 => Some(4),
+        _ => None,
     }
 }
 
@@ -929,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn migration_advances_metadata_schemas_without_rewriting_history() {
-        for legacy_schema in [2_u32, 3_u32] {
+        for legacy_schema in [2_u32, 3_u32, 4_u32] {
             let source = fixture_path(&format!("source-v{legacy_schema}"));
             let backup = fixture_path(&format!("backup-v{legacy_schema}"));
             create_metadata_fixture(&source, legacy_schema);
@@ -973,7 +980,13 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .expect("backup coordinates");
-            assert_eq!(backup_coordinates, (i64::from(legacy_schema), 3));
+            assert_eq!(
+                backup_coordinates,
+                (
+                    i64::from(legacy_schema),
+                    i64::from(super::legacy_snapshot_schema(legacy_schema).expect("snapshot"))
+                )
+            );
             cleanup(&source);
             cleanup(&backup);
         }
@@ -1002,7 +1015,7 @@ mod tests {
 
     #[test]
     fn metadata_migration_restarts_after_every_phase() {
-        for legacy_schema in [2_u32, 3_u32] {
+        for legacy_schema in [2_u32, 3_u32, 4_u32] {
             for phase in ["after_preflight", "after_backup", "before_commit"] {
                 let source = fixture_path(&format!("v{legacy_schema}-{phase}"));
                 let backup = fixture_path(&format!("v{legacy_schema}-{phase}-backup"));
@@ -1345,7 +1358,8 @@ mod tests {
     }
 
     fn create_metadata_fixture(path: &PathBuf, event_schema: u32) {
-        assert!((2..=3).contains(&event_schema));
+        let snapshot_schema =
+            super::legacy_snapshot_schema(event_schema).expect("supported legacy coordinate");
         create_v1_fixture(path);
         let connection = Connection::open(path).expect("open metadata fixture");
         connection
@@ -1359,7 +1373,7 @@ mod tests {
                 INSERT INTO {STATE_METADATA_TABLE} (key, value)
                     VALUES ('event_schema', {event_schema});
                 INSERT INTO {STATE_METADATA_TABLE} (key, value)
-                    VALUES ('snapshot_schema', 3);
+                    VALUES ('snapshot_schema', {snapshot_schema});
                 "
             ))
             .expect("advance metadata fixture");

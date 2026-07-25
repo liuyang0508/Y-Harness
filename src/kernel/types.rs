@@ -15,6 +15,8 @@ use serde_json::Value;
 use crate::{CancellationToken, ContextBlock};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_MODEL_CONTINUATION_ITEMS: usize = 64;
+const MAX_MODEL_CONTINUATION_BYTES: usize = 1_048_576;
 
 /// Boxed asynchronous result used by object-safe capability contracts.
 pub type HarnessFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HarnessError>> + Send + 'a>>;
@@ -204,6 +206,15 @@ pub enum ItemKind {
         model_origin: Option<crate::CapabilityOrigin>,
         /// Message text.
         content: String,
+    },
+    /// Opaque provider state required to continue a model response safely.
+    ProviderContinuation {
+        /// Registered model identity that produced the continuation.
+        model_id: String,
+        /// Trust-bearing origin of the registered model.
+        model_origin: crate::CapabilityOrigin,
+        /// Provider-formatted, non-executable continuation capsule.
+        continuation: ModelContinuation,
     },
     /// Model-requested tool invocation.
     ToolCall {
@@ -574,6 +585,81 @@ pub struct ModelUsage {
     pub cost_microusd: Option<u64>,
 }
 
+/// Bounded provider-formatted state needed to continue a model response.
+///
+/// The Harness treats these items as opaque data. A model adapter owns the
+/// format-specific validation and replay rules; the Runtime binds the capsule
+/// to the registered model identity and origin before it enters durable State.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ModelContinuation {
+    format: String,
+    items: Vec<Value>,
+}
+
+impl ModelContinuation {
+    /// Creates a validated continuation capsule from ordered provider items.
+    pub fn new(format: impl Into<String>, items: Vec<Value>) -> Result<Self, HarnessError> {
+        let continuation = Self {
+            format: format.into(),
+            items,
+        };
+        continuation.validate()?;
+        Ok(continuation)
+    }
+
+    /// Returns the provider-owned format coordinate.
+    #[must_use]
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    /// Returns the ordered opaque provider items.
+    #[must_use]
+    pub fn items(&self) -> &[Value] {
+        &self.items
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HarnessError> {
+        let valid_format = !self.format.is_empty()
+            && self.format.len() <= 64
+            && self.format.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '_' | '-' | '.')
+            });
+        if !valid_format {
+            return Err(HarnessError::Model(
+                "model continuation format must be 1-64 lowercase portable ASCII bytes".to_owned(),
+            ));
+        }
+        if self.items.is_empty() || self.items.len() > MAX_MODEL_CONTINUATION_ITEMS {
+            return Err(HarnessError::Model(format!(
+                "model continuation must contain 1-{MAX_MODEL_CONTINUATION_ITEMS} items"
+            )));
+        }
+        for item in &self.items {
+            crate::json::validate_value_shape(item).map_err(|_| {
+                HarnessError::Model(
+                    "model continuation exceeds the supported JSON depth or node count".to_owned(),
+                )
+            })?;
+        }
+        crate::json::bounded_serialized_size(self, MAX_MODEL_CONTINUATION_BYTES).map_err(
+            |failure| {
+                HarnessError::Model(match failure {
+                    crate::json::BoundedJsonError::LimitExceeded => {
+                        format!("model continuation exceeds {MAX_MODEL_CONTINUATION_BYTES} bytes")
+                    }
+                    crate::json::BoundedJsonError::CannotEncode => {
+                        "cannot encode model continuation".to_owned()
+                    }
+                })
+            },
+        )?;
+        Ok(())
+    }
+}
+
 /// Model decision plus optional provider evidence.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelResponse {
@@ -583,6 +669,9 @@ pub struct ModelResponse {
     pub usage: Option<ModelUsage>,
     /// Optional opaque provider request identity for support correlation.
     pub provider_request_id: Option<String>,
+    /// Optional provider state that must precede this decision on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ModelContinuation>,
 }
 
 /// Provisional model output emitted before the authoritative response settles.
@@ -604,6 +693,7 @@ impl From<ModelOutput> for ModelResponse {
             output,
             usage: None,
             provider_request_id: None,
+            continuation: None,
         }
     }
 }
@@ -922,4 +1012,34 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS, ModelContinuation};
+
+    #[test]
+    fn model_continuation_enforces_format_count_and_size_bounds() {
+        ModelContinuation::new("provider.reasoning-v1", vec![json!({"opaque": "state"})])
+            .expect("valid continuation");
+
+        assert!(ModelContinuation::new("Provider/V1", vec![json!({})]).is_err());
+        assert!(ModelContinuation::new("provider.v1", Vec::new()).is_err());
+        assert!(
+            ModelContinuation::new(
+                "provider.v1",
+                vec![Value::Null; MAX_MODEL_CONTINUATION_ITEMS + 1],
+            )
+            .is_err()
+        );
+        assert!(
+            ModelContinuation::new(
+                "provider.v1",
+                vec![Value::String("x".repeat(MAX_MODEL_CONTINUATION_BYTES))],
+            )
+            .is_err()
+        );
+    }
 }

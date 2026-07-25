@@ -9,14 +9,14 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 258 library, 2 CLI, 7 Engine process/service, 10 TUI unit/render, and 2 private-gateway TLS integration tests | passing |
+| Deterministic tests | 264 library, 2 CLI, 7 Engine process/service, 10 TUI unit/render, and 2 private-gateway TLS integration tests | passing |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, clean-room crate verification | 171 files, 2.0 MiB unpacked / 449.8 KiB compressed; passing |
+| Distribution package | `cargo package --locked -p y-harness`, clean-room crate verification | current candidate passing locally; exact clean-tree package rechecked before commit handoff |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 286 locked crates | passing |
-| State performance | 1,000 events, 5 samples, SQLite WAL + FULL | 68.51 ms append; 2.64 ms full projection; 2.12 ms snapshot load |
-| State migration | schema 1 → 4, 17,946 immutable events / 67,103,745 recovery bytes | 290.506 ms; schema-1/2/3 sources, backup-first, coordinate- and SHA-256-bound, restartable |
+| State performance | 1,000 events, 5 samples, SQLite WAL + FULL | 71.97 ms append; 2.64 ms full projection; 2.22 ms snapshot load |
+| State migration | schemas 1/2/3/4 → 5, immutable-history backup-first path | schema-1/2/3/4 sources, coordinate- and SHA-256-bound, restartable; prior maximum-size schema-4 measurement retained as historical evidence |
 | Approval migration | schema 1 → 2, 256 records / 133,038,080 record bytes | 844.781 ms; backup-first, SHA-256-bound, restartable |
 | JSON authority | 64-level / 65,536-node structural guards plus bounded streaming serialization | passing across embedded, durable, process, MCP, model, evaluation, and trace paths |
 | Secret hygiene | bounded source-tree pattern scan | no matches |
@@ -25,16 +25,16 @@ not release-ready while any blocking row remains open.
 | Persistent stdio MCP launch | default-deny authority, bounded unrestricted mode, macOS Seatbelt option, absolute working directory, Unix process-group settlement | sandboxed Agent Memory Hub round trip passing locally |
 | Encrypted network host | generated CA/server/client mTLS round trip and unauthenticated rejection | passing |
 | Private model gateway trust | generated private CA plus authenticated and mTLS HTTPS round trips | passing |
-| Direct OpenAI Responses adapter | fixed official HTTPS endpoint, environment Secret, `store: false`, sequential function calls, bounded JSON/SSE, usage/request provenance | local mapping and streaming tests passing; live API environment-gated; reasoning-model Tool continuation fails closed |
+| Direct OpenAI Responses adapter | fixed official HTTPS endpoint, environment Secret, `store: false`, explicit encrypted-reasoning inclusion, sequential function calls, bounded JSON/SSE, usage/request provenance, origin-bound continuation | local mapping, streaming, persistence, replay, completed-chain release, tamper, and cross-model-failover suppression tests passing; live API environment-gated |
 | Configured capability assembly | shell-free JSON Tools, exact-selected MCP Tools, explicit process authority, Agent Memory Hub health/Context wiring | local adapter tests and real sandboxed Agent Memory Hub service health pass |
 | Model provider failover | explicit 1–16 identity route, bounded per-attempt timeout with cancel-before-drop cleanup, per-attempt Trace, settled-provider State provenance, stream and total-deadline safety | passing |
 | Task orchestration execution | bounded public TaskExecutor scheduler, dependency progress, timeout/panic isolation, exact-lease settlement, stale-result cancellation, fenced paged Mailbox | passing with memory and SQLite coordinator contracts |
 | Task workspace lifecycle | default deny, exact-attempt Provider lease, bounded prepare/release, cleanup-before-settlement, concurrent local isolation, marker/path replacement guards, detached pinned Git Worktree through Process Broker | passing with local directories and real local Git |
-| Task worker protocol | protocol-v10 conditional discovery, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests |
+| Task worker protocol | protocol-v11 conditional discovery, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests |
 | Harness regression evaluation | format-2, origin-bound 2-case × 2-grader end-to-end Runtime suite and exact baseline | `yh eval-smoke` passing; machine-readable and nonzero on regression |
 | Public API embedding | standalone zero-network hosts run a Policy-controlled Model/Tool loop and a durable fenced Task DAG through public contracts | `embedded` and `orchestrated` examples passing |
 
-The local performance figures were measured on 2026-07-25 and are environment
+The local performance figures were measured on 2026-07-26 and are environment
 specific. CI uses deliberately wider smoke thresholds to detect catastrophic
 regression without pretending hosted runners are stable benchmark machines.
 
@@ -79,13 +79,12 @@ boundary remain explicit.
 - An authenticated, exact-versioned HTTPS JSON model-gateway adapter and
   zeroizing credential-reference surface exist. Its opt-in NDJSON mode decodes
   bounded provisional deltas and requires a final typed response. A direct
-  OpenAI Responses adapter additionally provides bounded JSON/SSE and
-  Harness-owned sequential function calling. Other direct vendor adapters are
-  not implemented. Ignored environment-gated Gateway and OpenAI tests define
-  the remaining external evidence; local schema tests are not relabeled as a
-  live vendor pass. With `store: false`, reasoning-model function calls that
-  require replaying opaque provider output fail before Tool execution because
-  schema 4 has no origin-bound durable Provider Continuation item.
+  OpenAI Responses adapter additionally provides bounded JSON/SSE,
+  Harness-owned sequential function calling, and schema-5 origin-bound replay
+  of encrypted reasoning items under `store: false`. Other direct vendor
+  adapters are not implemented. Ignored environment-gated Gateway and OpenAI
+  tests define the remaining external evidence; local schema tests are not
+  relabeled as a live vendor pass.
 - SQLite coordination provides single-host recovery and multi-process CAS, not
   multi-node consensus or distributed availability. Normal Turn startup is
   fenced from interrupting another Runtime's live Turn; explicit recovery still
@@ -122,7 +121,7 @@ boundary remain explicit.
   omitted slice. Derived blocks carry coverage and source/content fingerprints,
   remain non-authoritative, and never replace State history. State schema 2
   introduced bounded content-free compactor/coverage/digest/size evidence and
-  schema 4 retains it after crash-tested backup-first migration. Summary-body
+  schema 5 retains it after crash-tested backup-first migration. Summary-body
   persistence, exact replay/caching, and generic semantic-faithfulness
   verification are not implemented.
 - Journal-anchored snapshots accelerate recovery, opt-in automatic maintenance

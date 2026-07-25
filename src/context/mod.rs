@@ -773,6 +773,7 @@ fn is_model_visible(item: &Item) -> bool {
         item.kind,
         ItemKind::UserMessage { .. }
             | ItemKind::AssistantMessage { .. }
+            | ItemKind::ProviderContinuation { .. }
             | ItemKind::ToolCall { .. }
             | ItemKind::ToolResult { .. }
             | ItemKind::VerificationResult { .. }
@@ -784,6 +785,11 @@ fn validate_conversation_items_json(items: &[Item]) -> Result<(), HarnessError> 
 }
 
 fn validate_conversation_item_json(item: &Item) -> Result<(), HarnessError> {
+    if let ItemKind::ProviderContinuation { continuation, .. } = &item.kind {
+        continuation
+            .validate()
+            .map_err(|error| HarnessError::InvalidConfiguration(error.to_string()))?;
+    }
     let value = match &item.kind {
         ItemKind::ToolCall { input, .. } => Some(input),
         ItemKind::ToolResult { output, .. } => Some(output),

@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v10 projections.
+//! Product TUI state derived exclusively from Protocol v11 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -870,7 +870,7 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_fixture() -> Self {
+    pub(crate) fn test_fixture() -> Result<Self, y_harness::HarnessError> {
         let mut thread = Thread::new();
         let mut turn = y_harness::Turn::new(thread.id.clone());
         turn.status = TurnStatus::Completed;
@@ -878,14 +878,25 @@ impl App {
             content: "Design a safe Harness".to_owned(),
         }));
         turn.items
+            .push(y_harness::Item::new(ItemKind::ProviderContinuation {
+                model_id: "fixture/model".to_owned(),
+                model_origin: y_harness::CapabilityOrigin::BuiltIn,
+                continuation: y_harness::ModelContinuation::new(
+                    "fixture.reasoning.v1",
+                    vec![serde_json::json!({
+                        "opaque": "never-render-this-ciphertext"
+                    })],
+                )?,
+            }));
+        turn.items
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v10.".to_owned(),
+                content: "Keep clients behind Protocol v11.".to_owned(),
             }));
         thread.turns.push(turn);
         let now = Instant::now();
-        Self {
+        Ok(Self {
             server: "Y-Harness Engineering".to_owned(),
             engine_version: "0.1.0".to_owned(),
             capabilities: BTreeSet::from([
@@ -921,7 +932,7 @@ impl App {
             event_cursor: 1,
             last_operation_poll: now,
             last_refresh: now,
-        }
+        })
     }
 }
 
@@ -971,6 +982,14 @@ fn describe_event(event: &StoredEvent) -> String {
             ItemKind::AssistantMessage { model_id, .. } => {
                 format!("Assistant · {}", model_id.as_deref().unwrap_or("legacy"))
             }
+            ItemKind::ProviderContinuation {
+                model_id,
+                continuation,
+                ..
+            } => format!(
+                "Provider continuation · {model_id} · {}",
+                continuation.format()
+            ),
             ItemKind::ToolCall { name, .. } => format!("Tool call · {name}"),
             ItemKind::PolicyDecision { .. } => "Policy decision".to_owned(),
             ItemKind::ApprovalRequested { tool, .. } => format!("Approval requested · {tool}"),

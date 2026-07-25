@@ -132,7 +132,7 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-4 writer, and no mutation of authoritative history or
+  current schema-5 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
 - transport-independent prompt, Context block/aggregate, Tool output, Model
   request, error, and Agent Loop hard bounds;
@@ -148,6 +148,10 @@ direction:
   release, records every attempt in Observability, writes the settled Model
   identity/origin to State, and never crosses cancellation, the Turn deadline,
   or successfully delivered provisional output;
+- a bounded, non-executable Provider Continuation contract that Runtime binds
+  to the settled Model identity/origin, persists before the corresponding
+  decision, filters per model attempt, and uses to suppress unsafe failover
+  inside an unfinished Tool chain;
 - a persistent stdio MCP transport behind a provider-neutral client port, with
   a mandatory default-deny launch authority, explicit bounded unrestricted
   opt-in, reusable macOS Seatbelt write/network isolation, an exact absolute
@@ -205,13 +209,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v10 negotiation with protocol-v2's asymmetric 2 MiB request/16 MiB
+- protocol-v11 negotiation with protocol-v2's asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
   explicit Token Counter and Conversation Compactor API coordinate; protocol
-  10 retains schema-4 Policy-to-Tool-origin evidence and attributed approvals,
-  while adding bounded Task record/claim pages, server-clock leases, principal-
-  derived worker ownership, exact fencing, and conflict-only CAS retries;
+  11 retains bounded Task record/claim pages, server-clock leases, principal-
+  derived worker ownership, exact fencing, and conflict-only CAS retries while
+  adding schema-5 Provider Continuation evidence;
 - initialization-time compatibility coordinates for engine, State event,
   snapshot, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
   Conversation Compactor API, Secret API, Skill API, model-gateway API, and

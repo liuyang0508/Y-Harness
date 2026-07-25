@@ -18,9 +18,9 @@ pub(crate) use types::now_ms;
 pub use types::{
     ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId, Checkpoint,
     CheckpointId, EventId, ExecutionPhase, HarnessError, HarnessFuture, Item, ItemKind,
-    MemoryContextRecordStatus, ModelOutput, ModelRequest, ModelResponse, ModelStreamEvent,
-    ModelUsage, OperationId, PendingEvent, PolicyDecision, RiskLevel, StateEvent, StoredEvent,
-    TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId, ToolAuthorization,
-    ToolContext, ToolDescriptor, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome,
+    MemoryContextRecordStatus, ModelContinuation, ModelOutput, ModelRequest, ModelResponse,
+    ModelStreamEvent, ModelUsage, OperationId, PendingEvent, PolicyDecision, RiskLevel, StateEvent,
+    StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId,
+    ToolAuthorization, ToolContext, ToolDescriptor, Turn, TurnId, TurnOutcome, TurnStatus,
+    TurnStopReason, VerificationOutcome,
 };

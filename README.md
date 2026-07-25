@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v10 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v11 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -94,7 +94,7 @@ The repository currently ships two separately installable packages:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v10 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v11 |
 
 ## Architecture
 
@@ -158,7 +158,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v10 specification](docs/protocol.md).
+[client protocol v11 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 and OpenCode live in the
@@ -309,15 +309,15 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-4 writer
+introduced bounded content-free evidence, and the current schema-5 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1, schema-2, and schema-3 SQLite databases require an offline,
+Populated schema-1, schema-2, schema-3, and schema-4 SQLite databases require an offline,
 backup-first migration before the current Runtime opens them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v4.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v5.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -331,6 +331,13 @@ runtime denies `ask` by default when no approval handler is installed. State
 schema 4 binds every Policy decision—including deny and ask—to the exact
 trust-bearing origin of the registered Tool, so authorization provenance does
 not disappear when execution is refused, deferred, or fails.
+
+State schema 5 additionally records bounded, non-executable Provider
+Continuation Items. Runtime binds each capsule to the Model registration that
+actually produced it, filters capsules by exact Model identity and origin, and
+keeps an unfinished Tool chain on that Model instead of unsafe cross-provider
+failover. The direct OpenAI adapter uses this path to replay encrypted
+reasoning items with `store: false`.
 
 For asynchronous human workflows, a provider-neutral Approval Inbox supports
 idempotent submission, a deterministic oldest-first 16-record pending window,
@@ -476,10 +483,11 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v10 preserves the 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v11 preserves the 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
-coordinates, attributed approvals, schema-3 continuation evidence, and
-schema-4 Policy-to-Tool-origin provenance. When a host installs a Task
+coordinates, attributed approvals, schema-3 approval continuation evidence,
+schema-4 Policy-to-Tool-origin provenance, and schema-5 Provider Continuation
+evidence. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
 transport-authenticated worker claim, heartbeat, messaging, completion, and
 failure commands. Worker ownership is derived from the local-process boundary
@@ -566,7 +574,7 @@ yh-tui --demo
 
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 streams Turns, polls and forgets Operations, and projects paginated State,
-Approval, and Task views only through Protocol v10. It is implemented in
+Approval, and Task views only through Protocol v11. It is implemented in
 [`clients/tui`](clients/tui) and can be omitted without changing the engine.
 
 Agent Memory Hub is the first-party reference integration for governed

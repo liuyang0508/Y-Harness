@@ -7,14 +7,16 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v10 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v11 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
 The persistent service can assemble an optional direct OpenAI Responses
 Provider, shell-free JSON-command Tools, exact-selected MCP Tools, and Agent
 Memory Hub Context without moving Policy or State authority into a client or
-provider.
+provider. Schema 5 adds bounded, origin-bound Provider Continuation so
+stateless OpenAI reasoning Tool loops can replay encrypted reasoning state
+without transferring Tool authority to the vendor.
 
 ## Start
 
@@ -34,11 +36,11 @@ yh serve
 - Rust crate: `0.1.0`
 - optional TUI package: `0.1.0`
 - service configuration: `1`
-- client protocol: `10`
-- State event/snapshot schema: `4` / `4`
+- client protocol: `11`
+- State event/snapshot schema: `5` / `5`
 - Approval Inbox schema: `2`
 - Task Coordinator schema: `1`
-- HTTPS Model Gateway API: `2`
+- HTTPS Model Gateway API: `3`
 
 Before upgrading older State or Approval databases, stop all writers and use
 the documented backup-first migration commands.
@@ -51,8 +53,9 @@ the documented backup-first migration commands.
   service is not a raw Internet server.
 - OpenAI Responses is the only direct vendor model adapter. Its mapping and
   transport tests are local; a live API pass remains environment-gated.
-  Reasoning-model function calls that require opaque output replay fail before
-  Tool execution until State has a durable origin-bound continuation contract.
+  Schema-5 origin-bound continuation handles replayable encrypted reasoning;
+  a function call whose reasoning state is not replayable still fails before
+  Tool execution.
 - SQLite offers single-host durability and multi-process CAS, not multi-node
   consensus or distributed high availability.
 - Workspace cleanup cannot guarantee recovery after power loss or hostile

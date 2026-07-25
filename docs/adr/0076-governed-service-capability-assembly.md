@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-25
+- Superseded in part by: [ADR 0077](0077-origin-bound-provider-continuation.md)
 
 ## Context
 
@@ -54,7 +55,7 @@ The product path can now be:
 
 ```text
 TUI
-  → Protocol v10
+  → Protocol v11
   → Runtime
   → OpenAI Responses
   → governed JSON/MCP Tool
@@ -66,10 +67,9 @@ The demo remains deterministic and zero-network, but documentation must label
 it honestly. A real OpenAI call still requires operator credentials, an
 explicit available model ID, and the ignored live integration gate; local
 schema and transport tests do not substitute for that external evidence.
-Reasoning-model Tool continuation remains unsupported until an origin-bound,
-bounded, durable provider-continuation contract and its State migration
-evidence exist. Ordinary final text remains supported, and unsupported Tool
-continuation is rejected before side effects.
+The reasoning-model Tool limitation recorded by this decision was subsequently
+resolved by ADR 0077 through an origin-bound, bounded, durable continuation
+contract. Unreplayable provider state still fails before side effects.
 
 This ADR does not add OpenAI hosted tools, vendor-side conversation ownership,
 automatic MCP catalog trust, shell strings, inherited child environments,

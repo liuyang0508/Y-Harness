@@ -54,7 +54,7 @@ F1 或 ?         打开帮助
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v10 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v11 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -80,9 +80,9 @@ my-harness/
 默认配置使用本地演示模型。`doctor` 验证配置版本、模型构造、凭据、
 Provider 权限和数据目录边界，但不会打开或创建数据库。
 
-## 4. 运行 Protocol v10 服务
+## 4. 运行 Protocol v11 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v10 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v11 帧：
 
 ```bash
 yh serve y-harness.json
@@ -93,7 +93,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"10","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"11","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 
@@ -155,13 +155,13 @@ Tool 调度、Policy、State 和重试仍由 Y-Harness 唯一负责。这与
 [OpenAI 官方 Function Calling 流程](https://developers.openai.com/api/docs/guides/function-calling#the-tool-calling-flow)
 一致。
 
-当前 State schema 尚未保存 OpenAI 推理模型在 `store: false` 下要求
-重放的厂商私有 reasoning continuation。因此，普通最终文本可用；
-若函数调用响应同时携带该续接项，引擎会在任何 Tool 副作用之前明确
-失败。不会静默丢弃它再伪装成完整工具循环。该边界遵循
-[OpenAI 手工管理历史必须重放 output items 的说明](https://developers.openai.com/api/docs/guides/latest-model)。
-完整支持需要先引入有界、来源绑定、可持久化的 Provider Continuation
-契约及 State 迁移证据。
+State schema 5 会保存 OpenAI 推理模型在 `store: false` 下要求重放的
+加密 reasoning continuation。Runtime 把它绑定到实际完成请求的模型
+身份与来源，在 Tool 结果后的下一步锁定该模型，并在发送新请求前按
+来源过滤其他 Provider 的私有状态。Tool 调度、Policy、Approval 与
+State 权威仍全部属于 Y-Harness。若函数调用携带无法重放的 reasoning
+项，引擎仍会在任何 Tool 副作用之前明确失败。该边界遵循
+[OpenAI 手工管理历史必须重放 output items 的说明](https://developers.openai.com/api/docs/guides/latest-model#update-api-and-model-parameters)。
 
 没有 `OPENAI_API_KEY` 和明确模型 ID 时，Y-Harness 不猜测凭据或默认
 模型，也不会把 demo 响应伪装成真实调用。

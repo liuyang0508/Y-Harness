@@ -131,7 +131,7 @@ internals or read Engine storage directly.
 - Compactor execution uses the ordinary Context deadline, cancellation,
   construction/poll/drop panic isolation, content-free observation, and durable
   failed settlement. State schema 2 introduced bounded content-free provenance,
-  retained by schema 4, but never the generated summary body.
+  retained by schema 5, but never the generated summary body.
 - A populated legacy State store never migrates during ordinary open. Explicit
   migration must validate exact versions and capacity, create a durable
   no-clobber backup, remain restartable, preserve historical event bytes and

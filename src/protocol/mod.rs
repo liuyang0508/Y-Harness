@@ -37,7 +37,7 @@ use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "10";
+pub const PROTOCOL_VERSION: &str = "11";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -2043,12 +2043,13 @@ mod tests {
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
         ApprovalRecordStatus, ApprovalRequest, CapabilityOrigin, EventStore, HarnessFuture,
         HarnessRuntime, InboxApprovalHandler, Item, ItemKind, LanguageModel, MemoryApprovalInbox,
-        MemoryEventStore, MemoryScope, MemoryTaskCoordinator, ModelEventSink, ModelOutput,
-        ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent,
-        PolicyDecision, PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel,
-        StateEngine, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, ThreadId, Tool, ToolAuthorization,
-        ToolContext, ToolDescriptor, ToolRegistry, TurnId, TurnStatus, WorkspaceMode,
+        MemoryEventStore, MemoryScope, MemoryTaskCoordinator, ModelContinuation, ModelEventSink,
+        ModelOutput, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, OperationId,
+        PendingEvent, PolicyDecision, PolicyEngine, RiskLevel, SnapshotMaintenanceConfig,
+        StateCapacityLevel, StateEngine, StateSnapshot, StoredEvent, TaskCompletion,
+        TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId,
+        ThreadId, Tool, ToolAuthorization, ToolContext, ToolDescriptor, ToolRegistry, TurnId,
+        TurnStatus, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2355,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_ten_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_eleven_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2363,14 +2364,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "10",
+                "protocol_version": "11",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "10",
+                "protocol_version": "11",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2379,7 +2380,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "10",
+                "protocol_version": "11",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2401,7 +2402,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "10",
+                "protocol_version": "11",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2429,6 +2430,33 @@ mod tests {
                     "id": "fixture-tool-provider"
                 },
                 "decision": { "action": "allow" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemKind::ProviderContinuation {
+                model_id: "openai/default".to_owned(),
+                model_origin: CapabilityOrigin::BuiltIn,
+                continuation: ModelContinuation::new(
+                    "openai.responses.reasoning.v1",
+                    vec![json!({
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    })],
+                )
+                .expect("continuation"),
+            })
+            .expect("encode schema-5 Provider continuation evidence"),
+            json!({
+                "type": "provider_continuation",
+                "model_id": "openai/default",
+                "model_origin": {"kind": "built_in"},
+                "continuation": {
+                    "format": "openai.responses.reasoning.v1",
+                    "items": [{
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    }]
+                }
             })
         );
 

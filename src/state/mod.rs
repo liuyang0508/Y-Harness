@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 4;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 5;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -59,7 +59,7 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Validated, disposable projection cache anchored to the event journal.
@@ -2280,6 +2280,19 @@ fn validate_checkpoint_label(label: Option<&str>) -> Result<(), HarnessError> {
 
 fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
     match &item.kind {
+        crate::ItemKind::ProviderContinuation {
+            model_id,
+            model_origin,
+            continuation,
+        } => {
+            crate::kernel::validate_model_id(model_id)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+            crate::kernel::validate_capability_origin(model_origin)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+            continuation
+                .validate()
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+        }
         crate::ItemKind::ConversationSummary {
             compactor,
             covered_turns,
@@ -2366,6 +2379,13 @@ fn validate_state_event_schema(
         return Ok(());
     };
     match kind {
+        ItemKind::ProviderContinuation { .. } => {
+            if schema_version < 5 {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} cannot contain Provider continuation evidence"
+                )));
+            }
+        }
         ItemKind::PolicyDecision { tool_origin, .. } => {
             if schema_version >= 4 && tool_origin.is_none() {
                 return Err(HarnessError::State(format!(
@@ -2691,8 +2711,8 @@ mod tests {
         SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
     };
     use crate::{
-        EventId, HarnessError, HarnessFuture, Item, ItemKind, PendingEvent, StateEvent,
-        StoredEvent, ThreadId, TurnId, TurnStatus, kernel::now_ms,
+        CapabilityOrigin, EventId, HarnessError, HarnessFuture, Item, ItemKind, ModelContinuation,
+        PendingEvent, StateEvent, StoredEvent, ThreadId, TurnId, TurnStatus, kernel::now_ms,
     };
 
     struct LyingAppendStore;
@@ -3635,6 +3655,21 @@ mod tests {
                 )
                 .await
                 .expect("append item");
+            state
+                .append_item(
+                    &turn,
+                    Item::new(ItemKind::ProviderContinuation {
+                        model_id: "test/crash-model".to_owned(),
+                        model_origin: CapabilityOrigin::BuiltIn,
+                        continuation: ModelContinuation::new(
+                            "test.provider.reasoning.v1",
+                            vec![json!({"opaque": "ciphertext"})],
+                        )
+                        .expect("continuation"),
+                    }),
+                )
+                .await
+                .expect("append continuation");
         }
 
         {
@@ -3649,6 +3684,15 @@ mod tests {
                 .expect("recover")
                 .expect("thread exists");
             assert_eq!(recovered.turns[0].status, TurnStatus::Interrupted);
+            assert!(matches!(
+                &recovered.turns[0].items[1].kind,
+                ItemKind::ProviderContinuation {
+                    model_id,
+                    model_origin: CapabilityOrigin::BuiltIn,
+                    continuation,
+                } if model_id == "test/crash-model"
+                    && continuation.format() == "test.provider.reasoning.v1"
+            ));
             let count = state.events(&thread_id).await.expect("events").len();
             state
                 .recover_thread(&thread_id)
@@ -3784,6 +3828,34 @@ mod tests {
         stored.schema_version = 4;
         let error = super::validate_stored_event(&stored)
             .expect_err("schema-4 requires Tool origin evidence");
+        assert!(error.to_string().contains("schema-4"));
+    }
+
+    #[test]
+    fn provider_continuation_evidence_requires_schema_five() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            event_id: EventId::from_static("event-continuation"),
+            thread_id: ThreadId::from_static("thread-continuation"),
+            recorded_at_ms: 1,
+            event: StateEvent::ItemAppended {
+                turn_id: TurnId::from_static("turn-continuation"),
+                item: Item::new(ItemKind::ProviderContinuation {
+                    model_id: "test/continuation-model".to_owned(),
+                    model_origin: CapabilityOrigin::BuiltIn,
+                    continuation: ModelContinuation::new(
+                        "test.provider.reasoning.v1",
+                        vec![json!({"opaque": "ciphertext"})],
+                    )
+                    .expect("continuation"),
+                }),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-5 continuation evidence");
+        stored.schema_version = 4;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-4 cannot claim continuation evidence");
         assert!(error.to_string().contains("schema-4"));
     }
 

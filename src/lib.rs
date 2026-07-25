@@ -56,12 +56,12 @@ pub use execution::{
 pub use kernel::{
     ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId, CancellationToken,
     CapabilityOrigin, Checkpoint, CheckpointId, EventId, ExecutionPhase, HarnessError,
-    HarnessFuture, Item, ItemKind, MemoryContextRecordStatus, ModelEventSink, ModelOutput,
-    ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelUsage,
-    OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool, RiskLevel,
-    StateEvent, StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId,
-    ToolAuthorization, ToolContext, ToolDescriptor, ToolRegistry, Turn, TurnId, TurnOutcome,
-    TurnStatus, TurnStopReason, VerificationOutcome,
+    HarnessFuture, Item, ItemKind, MemoryContextRecordStatus, ModelContinuation, ModelEventSink,
+    ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent,
+    ModelUsage, OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool,
+    RiskLevel, StateEvent, StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread,
+    ThreadId, ToolAuthorization, ToolContext, ToolDescriptor, ToolRegistry, Turn, TurnId,
+    TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -133,4 +133,4 @@ pub use verification::{
 };
 
 /// Exact HTTPS JSON model-gateway contract version.
-pub const MODEL_GATEWAY_API_VERSION: &str = "2";
+pub const MODEL_GATEWAY_API_VERSION: &str = "3";

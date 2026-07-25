@@ -1,10 +1,10 @@
-# Client protocol v10
+# Client protocol v11
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"10"` is exact. Every request carries that value, and a peer
+Protocol version `"11"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "10",
+  "protocol_version": "11",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "10",
+  "protocol_version": "11",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "10",
+  "protocol_version": "11",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "10",
+  "protocol_version": "11",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "10",
+  "protocol_version": "11",
   "body": {
     "status": "success",
     "result": {
@@ -441,6 +441,32 @@ origin of the registered Tool evaluated by Policy:
 }
 ```
 
+State event schema 5 adds a bounded, non-executable Provider Continuation Item
+bound to the exact registered Model identity and origin:
+
+```json
+{
+  "type": "provider_continuation",
+  "model_id": "openai/default",
+  "model_origin": {
+    "kind": "built_in"
+  },
+  "continuation": {
+    "format": "openai.responses.reasoning.v1",
+    "items": [
+      {
+        "type": "reasoning",
+        "encrypted_content": "<opaque>"
+      }
+    ]
+  }
+}
+```
+
+Clients must treat `continuation.items` as opaque provider state. Product UIs
+should not render its body. Runtime routing and provider adapters, rather than
+clients, validate and replay it.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -455,7 +481,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v10 value |
+| Boundary | Protocol v11 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -486,7 +512,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"10"` |
+| `unsupported_version` | Request protocol is not exactly `"11"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -505,7 +531,8 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-4 Tool-origin evidence, all 23 method tags, and their permission
+schema-5 Provider Continuation evidence, schema-4 Tool-origin evidence, all 23
+method tags, and their permission
 mapping. Task integration tests prove conditional discovery, bounded cursor
 paging, principal-derived ownership, cross-principal fencing, server-clock
 heartbeat, messaging, terminal recovery, and explicit-revision cancellation.

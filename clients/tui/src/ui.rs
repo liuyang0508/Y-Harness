@@ -301,6 +301,16 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
             ));
             append_multiline(lines, content, Color::White);
         }
+        ItemKind::ProviderContinuation {
+            model_id,
+            continuation,
+            ..
+        } => {
+            lines.push(Line::styled(
+                format!("◇ PROVIDER STATE · {model_id} · {}", continuation.format()),
+                Style::default().fg(MUTED),
+            ));
+        }
         ItemKind::ToolCall { name, input, .. } => {
             lines.push(Line::styled(
                 format!("▶ TOOL · {name}"),
@@ -714,7 +724,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v10.",
+            "Approvals and Tasks are accessed exclusively through Protocol v11.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -940,11 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn full_screen_renders_engine_projection_and_boundary() -> Result<(), std::convert::Infallible>
+    fn full_screen_renders_engine_projection_and_boundary() -> Result<(), Box<dyn std::error::Error>>
     {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend)?;
-        let app = App::test_fixture();
+        let app = App::test_fixture()?;
         terminal.draw(|frame| render(frame, &app))?;
         let screen = terminal
             .backend()
@@ -955,16 +965,19 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("Y-HARNESS"));
         assert!(screen.contains("Design a safe Harness"));
-        assert!(screen.contains("Keep clients behind Protocol v10"));
+        assert!(screen.contains("PROVIDER STATE"));
+        assert!(screen.contains("fixture.reasoning.v1"));
+        assert!(!screen.contains("never-render-this-ciphertext"));
+        assert!(screen.contains("Keep clients behind Protocol v11"));
         assert!(screen.contains("Activity"));
         Ok(())
     }
 
     #[test]
-    fn undersized_terminal_renders_a_safe_fallback() -> Result<(), std::convert::Infallible> {
+    fn undersized_terminal_renders_a_safe_fallback() -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend)?;
-        let app = App::test_fixture();
+        let app = App::test_fixture()?;
         terminal.draw(|frame| render(frame, &app))?;
         let screen = terminal
             .backend()

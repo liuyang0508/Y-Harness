@@ -24,11 +24,13 @@ pub use crate::kernel::{LanguageModel, Tool};
 use crate::{
     ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine, ContextSource,
     ExecutionPhase, HarnessError, Item, ItemKind, MemoryContextRecordStatus, MemoryContextStatus,
-    MemoryScope, ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
-    Observability, ObservationOutcome, PhaseObservation, PolicyDecision, StateCapacity,
-    StateEngine, Thread, ThreadId, ToolAuthorization, ToolContext, ToolRegistry, Turn, TurnId,
-    TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome, VerificationRegistry,
-    VerificationRequest, context::model_visible_items, kernel::validate_model_id,
+    MemoryScope, ModelContinuation, ModelOutput, ModelRegistry, ModelRequest, ModelResponse,
+    ModelStream, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
+    StateCapacity, StateEngine, Thread, ThreadId, ToolAuthorization, ToolContext, ToolRegistry,
+    Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
+    VerificationRegistry, VerificationRequest,
+    context::model_visible_items,
+    kernel::{validate_capability_origin, validate_model_id},
 };
 
 const MAX_PROMPT_BYTES: usize = 1_048_576;
@@ -525,8 +527,20 @@ impl HarnessRuntime {
                 Ok(SettledModelOutput {
                     model_id,
                     model_origin,
+                    continuation,
                     output: ModelOutput::Message { content },
                 }) => {
+                    if let Some(continuation) = continuation {
+                        self.record(
+                            &mut turn,
+                            ItemKind::ProviderContinuation {
+                                model_id: model_id.clone(),
+                                model_origin: model_origin.clone(),
+                                continuation,
+                            },
+                        )
+                        .await?;
+                    }
                     self.record(
                         &mut turn,
                         ItemKind::AssistantMessage {
@@ -611,6 +625,7 @@ impl HarnessRuntime {
                 Ok(SettledModelOutput {
                     model_id,
                     model_origin,
+                    continuation,
                     output:
                         ModelOutput::ToolCall {
                             call_id,
@@ -624,6 +639,17 @@ impl HarnessRuntime {
                         ));
                         self.settle_error(&mut turn, &error).await?;
                         return Err(error);
+                    }
+                    if let Some(continuation) = continuation {
+                        self.record(
+                            &mut turn,
+                            ItemKind::ProviderContinuation {
+                                model_id: model_id.clone(),
+                                model_origin: model_origin.clone(),
+                                continuation,
+                            },
+                        )
+                        .await?;
                     }
                     self.record(
                         &mut turn,
@@ -1067,13 +1093,35 @@ impl HarnessRuntime {
         model_step: u32,
     ) -> Result<SettledModelOutput, HarnessError> {
         validate_model_request(&request)?;
+        let continuation_target = pending_provider_continuation_target(&request.items)?;
+        let candidates = self
+            .models
+            .entries
+            .iter()
+            .filter(|registered| {
+                continuation_target.as_ref().is_none_or(|target| {
+                    matches!(
+                        &registered.identity,
+                        FrozenModelIdentity::Valid(id) if id == &target.model_id
+                    ) && registered.origin == target.model_origin
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(target) = &continuation_target
+            && candidates.is_empty()
+        {
+            return Err(HarnessError::State(format!(
+                "provider continuation requires unavailable Model {} from its recorded origin",
+                target.model_id
+            )));
+        }
         let mut request = Some(request);
-        let total = self.models.entries.len();
-        for (index, registered) in self.models.entries.iter().enumerate() {
+        let total = candidates.len();
+        for (index, registered) in candidates.into_iter().enumerate() {
             let model_id = registered.identity.get()?;
             let (attempt_deadline, attempt_timeout_elapsed) =
                 self.models.attempt_deadline(deadline)?;
-            let attempt_request = if index + 1 == total {
+            let mut attempt_request = if index + 1 == total {
                 request.take().ok_or_else(|| {
                     HarnessError::Model("Model route lost its bounded request".to_owned())
                 })?
@@ -1085,6 +1133,7 @@ impl HarnessRuntime {
                     })?
                     .clone()
             };
+            retain_model_continuations(&mut attempt_request, model_id, &registered.origin);
             let attempt_stream = stream
                 .for_step(model_step)
                 .with_cancellation(crate::CancellationToken::new());
@@ -1115,6 +1164,7 @@ impl HarnessRuntime {
                     model_id: model_id.to_owned(),
                     model_origin: registered.origin.clone(),
                     output: response.output,
+                    continuation: response.continuation,
                 });
             }
             let result = if settlement.control == ModelAttemptControl::DeadlineElapsed {
@@ -1130,6 +1180,7 @@ impl HarnessRuntime {
                         model_id: model_id.to_owned(),
                         model_origin: registered.origin.clone(),
                         output: response.output,
+                        continuation: response.continuation,
                     });
                 }
                 Err(_) if index + 1 < total && delivered > 0 => {
@@ -1471,10 +1522,116 @@ fn turn_prompt(turn: &Turn) -> Result<String, HarnessError> {
     Ok(prompt)
 }
 
+#[derive(Clone, Debug)]
+struct ProviderContinuationTarget {
+    model_id: String,
+    model_origin: crate::CapabilityOrigin,
+}
+
+fn pending_provider_continuation_target(
+    items: &[Item],
+) -> Result<Option<ProviderContinuationTarget>, HarnessError> {
+    let Some((tool_index, call_id, tool_model_id, tool_model_origin)) =
+        items.iter().enumerate().rev().find_map(|(index, item)| {
+            if let ItemKind::ToolCall {
+                model_id,
+                model_origin,
+                call_id,
+                ..
+            } = &item.kind
+            {
+                Some((index, call_id, model_id, model_origin))
+            } else {
+                None
+            }
+        })
+    else {
+        return Ok(None);
+    };
+    if !items[tool_index + 1..].iter().any(|item| {
+        matches!(
+            &item.kind,
+            ItemKind::ToolResult {
+                call_id: result_call_id,
+                ..
+            } if result_call_id == call_id
+        )
+    }) {
+        return Ok(None);
+    }
+    if items[tool_index + 1..].iter().any(|item| {
+        matches!(
+            item.kind,
+            ItemKind::UserMessage { .. } | ItemKind::AssistantMessage { .. }
+        )
+    }) {
+        return Ok(None);
+    }
+    let chain_start = items[..tool_index]
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item.kind,
+                ItemKind::UserMessage { .. } | ItemKind::AssistantMessage { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let Some((continuation_model_id, continuation_model_origin)) = items[chain_start..tool_index]
+        .iter()
+        .rev()
+        .find_map(|item| {
+            if let ItemKind::ProviderContinuation {
+                model_id,
+                model_origin,
+                ..
+            } = &item.kind
+            {
+                Some((model_id, model_origin))
+            } else {
+                None
+            }
+        })
+    else {
+        return Ok(None);
+    };
+    let (Some(tool_model_id), Some(tool_model_origin)) = (tool_model_id, tool_model_origin) else {
+        return Err(HarnessError::State(
+            "provider continuation Tool call has no recorded Model provenance".to_owned(),
+        ));
+    };
+    if tool_model_id != continuation_model_id || tool_model_origin != continuation_model_origin {
+        return Err(HarnessError::State(
+            "provider continuation and Tool call Model provenance differ".to_owned(),
+        ));
+    }
+    Ok(Some(ProviderContinuationTarget {
+        model_id: continuation_model_id.clone(),
+        model_origin: continuation_model_origin.clone(),
+    }))
+}
+
+fn retain_model_continuations(
+    request: &mut ModelRequest,
+    model_id: &str,
+    model_origin: &crate::CapabilityOrigin,
+) {
+    request.items.retain(|item| {
+        !matches!(
+            &item.kind,
+            ItemKind::ProviderContinuation {
+                model_id: continuation_model_id,
+                model_origin: continuation_model_origin,
+                ..
+            } if continuation_model_id != model_id || continuation_model_origin != model_origin
+        )
+    });
+}
+
 struct SettledModelOutput {
     model_id: String,
     model_origin: crate::CapabilityOrigin,
     output: ModelOutput,
+    continuation: Option<ModelContinuation>,
 }
 
 struct ModelAttemptSettlement {
@@ -1641,6 +1798,9 @@ fn validate_model_response(response: &ModelResponse) -> Result<(), HarnessError>
             "provider request id must be 1-{MAX_PROVIDER_REQUEST_ID_BYTES} non-control bytes"
         )));
     }
+    if let Some(continuation) = &response.continuation {
+        continuation.validate()?;
+    }
     validate_model_output(&response.output)
 }
 
@@ -1733,6 +1893,17 @@ pub(crate) fn validate_model_request(request: &ModelRequest) -> Result<(), Harne
 
 fn validate_model_request_json_shapes(request: &ModelRequest) -> Result<(), HarnessError> {
     for item in &request.items {
+        if let ItemKind::ProviderContinuation {
+            model_id,
+            model_origin,
+            continuation,
+        } = &item.kind
+        {
+            validate_model_id(model_id).map_err(|error| HarnessError::Model(error.to_string()))?;
+            validate_capability_origin(model_origin)
+                .map_err(|error| HarnessError::Model(error.to_string()))?;
+            continuation.validate()?;
+        }
         let value = match &item.kind {
             ItemKind::ToolCall { input, .. } => Some(input),
             ItemKind::ToolResult { output, .. } => Some(output),
@@ -1921,9 +2092,9 @@ mod tests {
         MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
         MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
         MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
-        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelEventSink, ModelOutput,
-        ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelUsage,
-        Observability, ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel,
+        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
+        ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent,
+        ModelUsage, Observability, ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel,
         SqliteApprovalInbox, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
         StateEvent, StoredEvent, ThreadId, ToolAuthorization, ToolContext, ToolDescriptor,
         ToolRegistry, TraceCollector, TurnStatus, TurnStopReason, VerificationOutcome,
@@ -2192,6 +2363,14 @@ mod tests {
 
     struct DuplicateCallModel;
 
+    struct ContinuationModel {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct ContinuationFailingModel {
+        calls: Arc<AtomicUsize>,
+    }
+
     impl LanguageModel for EchoModel {
         fn id(&self) -> &str {
             "test/echo-model"
@@ -2245,6 +2424,108 @@ mod tests {
                     call_id: "reused-call".to_owned(),
                     name: "echo".to_owned(),
                     input: json!({"text": "once"}),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for ContinuationModel {
+        fn id(&self) -> &str {
+            "test/continuation-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                self.complete_with_metadata(request)
+                    .await
+                    .map(|response| response.output)
+            })
+        }
+
+        fn complete_with_metadata<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                let has_tool_result = request
+                    .items
+                    .iter()
+                    .any(|item| matches!(item.kind, ItemKind::ToolResult { .. }));
+                self.requests
+                    .lock()
+                    .expect("continuation requests")
+                    .push(request.clone());
+                if has_tool_result {
+                    let continuation = request.items.iter().find_map(|item| {
+                        if let ItemKind::ProviderContinuation { continuation, .. } = &item.kind {
+                            Some(continuation)
+                        } else {
+                            None
+                        }
+                    });
+                    if continuation.is_none_or(|continuation| {
+                        continuation.format() != "test.provider.reasoning.v1"
+                    }) {
+                        return Err(HarnessError::Model(
+                            "provider continuation was not replayed".to_owned(),
+                        ));
+                    }
+                    return Ok(ModelResponse::from(ModelOutput::Message {
+                        content: "continued after tool".to_owned(),
+                    }));
+                }
+                Ok(ModelResponse {
+                    output: ModelOutput::ToolCall {
+                        call_id: "continuation-call".to_owned(),
+                        name: "echo".to_owned(),
+                        input: json!({"text": "continued"}),
+                    },
+                    usage: None,
+                    provider_request_id: Some("provider-step-1".to_owned()),
+                    continuation: Some(ModelContinuation::new(
+                        "test.provider.reasoning.v1",
+                        vec![json!({"opaque": "ciphertext"})],
+                    )?),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for ContinuationFailingModel {
+        fn id(&self) -> &str {
+            "test/route-primary"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Err(HarnessError::Model(
+                    "continuation model unavailable".to_owned(),
+                ))
+            })
+        }
+
+        fn complete_with_metadata<'a>(
+            &'a self,
+            _request: ModelRequest,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Err(HarnessError::Model(
+                        "continuation model unavailable".to_owned(),
+                    ));
+                }
+                Ok(ModelResponse {
+                    output: ModelOutput::ToolCall {
+                        call_id: "continuation-failover-call".to_owned(),
+                        name: "echo".to_owned(),
+                        input: json!({"text": "stay pinned"}),
+                    },
+                    usage: None,
+                    provider_request_id: Some("provider-step-1".to_owned()),
+                    continuation: Some(ModelContinuation::new(
+                        "test.provider.reasoning.v1",
+                        vec![json!({"opaque": "ciphertext"})],
+                    )?),
                 })
             })
         }
@@ -2361,6 +2642,7 @@ mod tests {
                         cost_microusd: Some(25),
                     }),
                     provider_request_id: Some("provider-request".to_owned()),
+                    continuation: None,
                 })
             })
         }
@@ -2851,6 +3133,183 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[tokio::test]
+    async fn provider_continuation_is_durable_and_replayed_through_the_tool_loop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(ContinuationModel {
+                requests: requests.clone(),
+            }),
+            registry(calls.clone()),
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "continue safely")
+            .await
+            .expect("continuation turn");
+
+        assert_eq!(outcome.final_text, "continued after tool");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.lock().expect("requests").len(), 2);
+        let continuation_index = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::ProviderContinuation { .. }))
+            .expect("durable continuation");
+        let tool_index = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::ToolCall { .. }))
+            .expect("tool call");
+        assert!(continuation_index < tool_index);
+        assert!(matches!(
+            &outcome.turn.items[continuation_index].kind,
+            ItemKind::ProviderContinuation {
+                model_id,
+                model_origin: CapabilityOrigin::BuiltIn,
+                continuation,
+            } if model_id == "test/continuation-model"
+                && continuation.format() == "test.provider.reasoning.v1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_continuation_suppresses_cross_model_failover() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "primary-provider".to_owned(),
+                },
+                Arc::new(ContinuationFailingModel {
+                    calls: primary_calls.clone(),
+                }),
+            )
+            .expect("register primary");
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "secondary-provider".to_owned(),
+                },
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("register secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/route-secondary"],
+            registry(tool_calls.clone()),
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("failover route");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "do not cross providers")
+            .await
+            .expect_err("continuation failure must not reach secondary");
+
+        assert!(error.to_string().contains("continuation model unavailable"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+    }
+
+    #[test]
+    fn provider_continuation_rejects_tool_call_provenance_tampering() {
+        let items = vec![
+            crate::Item::new(ItemKind::UserMessage {
+                content: "tampered".to_owned(),
+            }),
+            crate::Item::new(ItemKind::ProviderContinuation {
+                model_id: "test/continuation-model".to_owned(),
+                model_origin: CapabilityOrigin::BuiltIn,
+                continuation: ModelContinuation::new(
+                    "test.provider.reasoning.v1",
+                    vec![json!({"opaque": "ciphertext"})],
+                )
+                .expect("continuation"),
+            }),
+            crate::Item::new(ItemKind::ToolCall {
+                model_id: Some("test/other-model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                call_id: "tampered-call".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({}),
+            }),
+            crate::Item::new(ItemKind::ToolResult {
+                call_id: "tampered-call".to_owned(),
+                output: json!({"ok": true}),
+                is_error: false,
+            }),
+        ];
+
+        let error =
+            super::pending_provider_continuation_target(&items).expect_err("provenance mismatch");
+        assert!(error.to_string().contains("provenance differ"));
+    }
+
+    #[test]
+    fn provider_continuation_does_not_pin_a_later_user_turn() {
+        let items = vec![
+            crate::Item::new(ItemKind::UserMessage {
+                content: "first turn".to_owned(),
+            }),
+            crate::Item::new(ItemKind::ProviderContinuation {
+                model_id: "test/continuation-model".to_owned(),
+                model_origin: CapabilityOrigin::BuiltIn,
+                continuation: ModelContinuation::new(
+                    "test.provider.reasoning.v1",
+                    vec![json!({"opaque": "ciphertext"})],
+                )
+                .expect("continuation"),
+            }),
+            crate::Item::new(ItemKind::ToolCall {
+                model_id: Some("test/continuation-model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                call_id: "completed-call".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({}),
+            }),
+            crate::Item::new(ItemKind::ToolResult {
+                call_id: "completed-call".to_owned(),
+                output: json!({"ok": true}),
+                is_error: false,
+            }),
+            crate::Item::new(ItemKind::AssistantMessage {
+                model_id: Some("test/continuation-model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                content: "first turn complete".to_owned(),
+            }),
+            crate::Item::new(ItemKind::UserMessage {
+                content: "second turn".to_owned(),
+            }),
+        ];
+
+        assert!(
+            super::pending_provider_continuation_target(&items)
+                .expect("completed chain")
+                .is_none()
+        );
     }
 
     #[tokio::test]

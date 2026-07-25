@@ -135,6 +135,33 @@ track when all of these are true:
 Passing Y-Harness's own regression suite is necessary but cannot satisfy this
 rule.
 
+## First executable deterministic fault case
+
+`CF-001 provider-continuation-tool-replay` is the first pre-registered local
+fault case. It models a stateless reasoning provider that returns opaque state
+before a Tool call.
+
+The oracle requires all of the following:
+
+- the capsule is bounded and durably ordered before the Tool call;
+- Runtime, not the provider, stamps the actual Model identity and origin;
+- the authorized Tool side effect executes exactly once;
+- the Tool result's next model step receives the exact capsule;
+- failure of the bound Model cannot escape to a different failover Model;
+- a completed Tool chain cannot pin a later user Turn;
+- provenance tampering fails closed; and
+- SQLite reopen retains the capsule without replaying an uncertain effect.
+
+Y-Harness executes this oracle in
+`runtime::tests::provider_continuation_is_durable_and_replayed_through_the_tool_loop`,
+`runtime::tests::provider_continuation_suppresses_cross_model_failover`,
+`runtime::tests::provider_continuation_does_not_pin_a_later_user_turn`,
+`runtime::tests::provider_continuation_rejects_tool_call_provenance_tampering`,
+`state::tests::sqlite_reopens_and_marks_unfinished_turn_interrupted_once`, and
+the OpenAI request/response mapping tests. These are Y-Harness regression
+results only. Released-product adapters and raw cross-product results do not
+exist yet, so `CF-001` supports no superiority claim.
+
 ## Implementation order
 
 The shortest path to credible comparison is:
@@ -148,6 +175,7 @@ The shortest path to credible comparison is:
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
-Provider continuation for reasoning/tool calls, Linux and Windows containment,
-and live external integration evidence are prerequisites for broad
-superiority claims, not documentation follow-ups.
+Provider continuation for reasoning/tool calls is now implemented and locally
+fault-tested in Y-Harness. Released-product execution of that case, Linux and
+Windows containment, and live external integration evidence remain
+prerequisites for broad superiority claims, not documentation follow-ups.

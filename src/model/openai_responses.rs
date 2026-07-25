@@ -8,12 +8,13 @@ use tokio::sync::Semaphore;
 
 use super::authorization_header;
 use crate::{
-    HarnessError, HarnessFuture, ItemKind, LanguageModel, ModelOutput, ModelRequest, ModelResponse,
-    ModelStream, ModelUsage, SecretProvider, SecretReference, SecretRequest,
-    kernel::validate_model_id,
+    HarnessError, HarnessFuture, ItemKind, LanguageModel, ModelContinuation, ModelOutput,
+    ModelRequest, ModelResponse, ModelStream, ModelUsage, SecretProvider, SecretReference,
+    SecretRequest, kernel::validate_model_id,
 };
 
 const OPENAI_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const OPENAI_REASONING_CONTINUATION_FORMAT: &str = "openai.responses.reasoning.v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 4_194_304;
@@ -269,6 +270,9 @@ fn build_request_body(
             ItemKind::AssistantMessage { content, .. } => {
                 input.push(json!({"role": "assistant", "content": content}));
             }
+            ItemKind::ProviderContinuation { continuation, .. } => {
+                append_reasoning_continuation(&mut input, continuation)?;
+            }
             ItemKind::ToolCall {
                 call_id,
                 name,
@@ -334,6 +338,7 @@ fn build_request_body(
     let mut root = Map::from_iter([
         ("model".to_owned(), Value::String(model.to_owned())),
         ("input".to_owned(), Value::Array(input)),
+        ("include".to_owned(), json!(["reasoning.encrypted_content"])),
         ("store".to_owned(), Value::Bool(false)),
         ("parallel_tool_calls".to_owned(), Value::Bool(false)),
         ("stream".to_owned(), Value::Bool(streaming)),
@@ -476,7 +481,8 @@ fn decode_response_value(
         .ok_or_else(|| HarnessError::Model("OpenAI response has no output array".to_owned()))?;
     let mut text = String::new();
     let mut function_call = None;
-    let mut requires_opaque_continuation = false;
+    let mut continuation_items = Vec::new();
+    let mut has_unreplayable_reasoning = false;
     for item in output {
         let Some(item) = item.as_object() else {
             return Err(HarnessError::Model(
@@ -504,13 +510,23 @@ fn decode_response_value(
                     input,
                 });
             }
-            Some("reasoning") => requires_opaque_continuation = true,
+            Some("reasoning") => {
+                if item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| !content.is_empty())
+                {
+                    continuation_items.push(Value::Object(item.clone()));
+                } else {
+                    has_unreplayable_reasoning = true;
+                }
+            }
             _ => {}
         }
     }
-    if function_call.is_some() && requires_opaque_continuation {
+    if function_call.is_some() && has_unreplayable_reasoning {
         return Err(HarnessError::Model(
-            "OpenAI function call requires opaque reasoning continuation that this State schema cannot preserve"
+            "OpenAI function call contains reasoning that cannot be replayed with store disabled"
                 .to_owned(),
         ));
     }
@@ -528,11 +544,49 @@ fn decode_response_value(
             ));
         }
     };
+    let continuation = if continuation_items.is_empty() {
+        None
+    } else {
+        Some(ModelContinuation::new(
+            OPENAI_REASONING_CONTINUATION_FORMAT,
+            continuation_items,
+        )?)
+    };
     Ok(ModelResponse {
         output,
         usage: decode_usage(object.get("usage")),
         provider_request_id,
+        continuation,
     })
+}
+
+fn append_reasoning_continuation(
+    input: &mut Vec<Value>,
+    continuation: &ModelContinuation,
+) -> Result<(), HarnessError> {
+    if continuation.format() != OPENAI_REASONING_CONTINUATION_FORMAT {
+        return Err(HarnessError::Model(format!(
+            "OpenAI adapter cannot replay continuation format {}",
+            continuation.format()
+        )));
+    }
+    for item in continuation.items() {
+        let object = item.as_object().ok_or_else(|| {
+            HarnessError::Model("OpenAI reasoning continuation item must be an object".to_owned())
+        })?;
+        if object.get("type").and_then(Value::as_str) != Some("reasoning")
+            || object
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(HarnessError::Model(
+                "OpenAI reasoning continuation item is not replayable".to_owned(),
+            ));
+        }
+        input.push(item.clone());
+    }
+    Ok(())
 }
 
 struct OpenAiSseDecoder {
@@ -767,8 +821,9 @@ mod tests {
 
     use super::{OpenAiSseDecoder, build_request_body, decode_response};
     use crate::{
-        CapabilityOrigin, ContextBlock, ContextSource, Item, ItemKind, MemoryView, ModelEventSink,
-        ModelOutput, ModelRequest, ModelStream, ModelStreamEvent, ThreadId, ToolDescriptor, TurnId,
+        CapabilityOrigin, ContextBlock, ContextSource, Item, ItemKind, MemoryView,
+        ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelStream,
+        ModelStreamEvent, ThreadId, ToolDescriptor, TurnId,
     };
 
     #[derive(Default)]
@@ -791,6 +846,19 @@ mod tests {
             items: vec![
                 Item::new(ItemKind::UserMessage {
                     content: "weather?".to_owned(),
+                }),
+                Item::new(ItemKind::ProviderContinuation {
+                    model_id: "openai/test".to_owned(),
+                    model_origin: CapabilityOrigin::BuiltIn,
+                    continuation: ModelContinuation::new(
+                        super::OPENAI_REASONING_CONTINUATION_FORMAT,
+                        vec![json!({
+                            "type": "reasoning",
+                            "id": "reasoning-1",
+                            "encrypted_content": "opaque"
+                        })],
+                    )
+                    .expect("continuation"),
                 }),
                 Item::new(ItemKind::ToolCall {
                     model_id: Some("openai/test".to_owned()),
@@ -831,13 +899,16 @@ mod tests {
         let encoded = build_request_body("model-explicit", &request(), false).expect("request");
         let root: Value = serde_json::from_slice(&encoded).expect("json");
         assert_eq!(root["model"], "model-explicit");
+        assert_eq!(root["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(root["store"], false);
         assert_eq!(root["parallel_tool_calls"], false);
         assert_eq!(root["stream"], false);
         assert_eq!(root["instructions"], "Be concise.");
         assert_eq!(root["tools"][0]["name"], "weather");
-        assert_eq!(root["input"][1]["type"], "function_call");
-        assert_eq!(root["input"][2]["type"], "function_call_output");
+        assert_eq!(root["input"][1]["type"], "reasoning");
+        assert_eq!(root["input"][1]["encrypted_content"], "opaque");
+        assert_eq!(root["input"][2]["type"], "function_call");
+        assert_eq!(root["input"][3]["type"], "function_call_output");
     }
 
     #[test]
@@ -872,6 +943,7 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 3);
         assert_eq!(usage.reasoning_tokens, 2);
         assert_eq!(response.provider_request_id.as_deref(), Some("request-1"));
+        assert!(response.continuation.is_none());
     }
 
     #[test]
@@ -910,11 +982,15 @@ mod tests {
         .expect_err("reject parallel calls");
         assert!(error.to_string().contains("multiple function calls"));
 
-        let error = decode_response(
+        let response = decode_response(
             &serde_json::to_vec(&json!({
                 "status": "completed",
                 "output": [
-                    {"type": "reasoning", "encrypted_content": "opaque"},
+                    {
+                        "type": "reasoning",
+                        "id": "reasoning-2",
+                        "encrypted_content": "opaque"
+                    },
                     {
                         "type": "function_call",
                         "call_id": "call-2",
@@ -926,8 +1002,32 @@ mod tests {
             .expect("encode"),
             None,
         )
-        .expect_err("reject unpreserved reasoning continuation");
-        assert!(error.to_string().contains("opaque reasoning continuation"));
+        .expect("preserve reasoning continuation");
+        let continuation = response.continuation.expect("continuation");
+        assert_eq!(
+            continuation.format(),
+            super::OPENAI_REASONING_CONTINUATION_FORMAT
+        );
+        assert_eq!(continuation.items()[0]["encrypted_content"], "opaque");
+
+        let error = decode_response(
+            &serde_json::to_vec(&json!({
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "encrypted_content": null},
+                    {
+                        "type": "function_call",
+                        "call_id": "call-3",
+                        "name": "weather",
+                        "arguments": "{}"
+                    }
+                ]
+            }))
+            .expect("encode"),
+            None,
+        )
+        .expect_err("reject unreplayable reasoning");
+        assert!(error.to_string().contains("cannot be replayed"));
     }
 
     #[test]

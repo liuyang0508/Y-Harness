@@ -11,9 +11,9 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"10"` | exact `Initialize` request/response |
-| State events | `4` | per-event durable envelope; reads schemas 1, 2, 3, and 4 |
-| State snapshots | `4` | cache body; incompatible caches are discarded |
+| Client protocol | `"11"` | exact `Initialize` request/response |
+| State events | `5` | per-event durable envelope; reads schemas 1 through 5 |
+| State snapshots | `5` | cache body; incompatible caches are discarded |
 | Approval Inbox | `2` | per-record durable body after explicit migration |
 | Task Coordinator | `1` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
@@ -23,7 +23,7 @@ upgrade support that has not been tested.
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `1` | exact descriptor registration |
 | Skill package API | `"1"` | exact manifest validation |
-| HTTPS model gateway API | `"2"` | exact request/response header |
+| HTTPS model gateway API | `"3"` | exact request/response header |
 
 `Initialize` advertises the engine version and Runtime-facing durable/API
 coordinates above, including the Workspace Provider API implemented by
@@ -49,6 +49,12 @@ policy decides whether absence is accepted. This does not change how an
 existing receipt-free package is decoded or how its publisher signature is
 verified.
 
+HTTPS model gateway API `3` preserves API 2's transport rules and adds the
+optional bounded `continuation` field to `ModelResponse` plus the
+`provider_continuation` request Item. Gateways must treat the capsule as
+provider-formatted non-executable data and return only formats they can safely
+replay.
+
 HTTPS model gateway API `2` preserves API 1's JSON/NDJSON settlement rules and
 adds the opt-in `conversation_summary` Context-source shape. A gateway sees that
 shape only when its host selected a semantic compactor, but the exact request
@@ -58,6 +64,13 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `11` preserves all protocol-v10 commands, framing, paging, and
+authority semantics. It advances the advertised State event/snapshot and Model
+Gateway coordinates and permits `GetEvents` and Thread results to carry
+schema-5 origin-bound Provider Continuation Items. Protocol-v10 clients must
+fail exact initialization rather than decode opaque provider state
+permissively.
 
 Client protocol `10` preserves protocol-v9 Turn, State, Operation, and Approval
 commands. It adds optional durable Task Graph administration plus
@@ -108,6 +121,12 @@ Client protocol `3` added exact recovery-byte fields to the protocol-v2
 Thread-capacity result. Protocol versions remain exact rather than rolling
 field negotiation.
 
+State event schema `5` adds the bounded `provider_continuation` Item. The
+Runtime binds it to the exact registered Model identity and origin that
+settled the response; provider adapters own format-specific replay. Schema-5
+readers accept immutable schema-1/2/3/4 history, and the schema-5 writer emits
+only schema 5.
+
 State event schema `4` adds the registered Tool origin to every
 `policy_decision`, including allow, deny, and ask. This records what Policy
 actually evaluated even when Tool execution never begins. Schema-4 readers
@@ -124,7 +143,9 @@ State event schema `2` added content-free `conversation_summary` evidence. Its
 body remains ephemeral Context; original conversation Items remain immutable
 schema-1 or schema-2 events.
 
-State snapshot schema `4` admits Policy-to-Tool-origin evidence. Older
+State snapshot schema `5` admits Provider Continuation evidence. Older
+snapshots are disposable and are ignored. State snapshot schema `4` admits
+Policy-to-Tool-origin evidence. Older
 snapshots are disposable and are ignored. State snapshot schema `3` admitted
 schema-3 approval continuation evidence. State snapshot schema `2` was the
 first coordinate to include the exact recovery charge of its journal prefix.
@@ -183,27 +204,28 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1, 2, and 3 are supported migration sources. Populated SQLite
+State schemas 1, 2, 3, and 4 are supported migration sources. Populated SQLite
 stores at any of those coordinates require the explicit backup-first command
-below before a schema-4 Runtime can open them:
+below before a schema-5 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v4.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v5.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
 disk space, creates and validates a no-clobber SQLite backup, then adds or
 advances event and disposable-snapshot writer metadata in one immediate
 transaction. Historical event JSON and schema labels are never rewritten. An
-interrupted schema-1, schema-2, or schema-3 run can reuse its validated backup.
+interrupted schema-1, schema-2, schema-3, or schema-4 run can reuse its
+validated backup.
 
-The schema-4 reader/new writer decision is asymmetric:
+The schema-5 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1, schema-2, and schema-3 events remain readable;
-- old reader + new writer: unsupported and fails on schema-4 metadata or Items;
+  schema-1, schema-2, schema-3, and schema-4 events remain readable;
+- old reader + new writer: unsupported and fails on schema-5 metadata or Items;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-4 event
+- downgrade: supported only by restoring the backup before any schema-5 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -212,7 +234,9 @@ for the immutable-history migration design, plus
 [ADR 0065](adr/0065-fingerprinted-pre-tool-approval-resumption.md) for the
 schema-3 continuation boundary and
 [ADR 0068](adr/0068-durable-policy-tool-origin-provenance.md) for schema-4
-authorization provenance.
+authorization provenance, plus
+[ADR 0077](adr/0077-origin-bound-provider-continuation.md) for schema-5
+Provider Continuation.
 
 Approval Inbox schema 1 is independently migrated with:
 
@@ -257,9 +281,9 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 4 reads
-immutable schema-1, schema-2, and schema-3 history after explicit store
-migration.
+durable schema support windows are declared per release. State schema 5 reads
+immutable schema-1, schema-2, schema-3, and schema-4 history after explicit
+store migration.
 Approval reads only schema 2 in normal operation; its migration tool alone
 reads schema 1.
 
