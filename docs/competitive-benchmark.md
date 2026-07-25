@@ -1,0 +1,153 @@
+# Competitive Harness benchmark
+
+This protocol defines the evidence required before Y-Harness may claim better
+runtime effect than Codex, Claude Code, Pi Agent Harness, Hermes Agent, or
+OpenCode. It is a pre-registration document, not a benchmark result.
+
+## Claim boundary
+
+Architecture and product effect are different claims:
+
+- an architecture claim is supported by public contracts, invariants, code
+  review, and focused tests;
+- an effect claim is supported by controlled tasks executed through the real
+  products or public Harness interfaces;
+- a source-code reconstruction is never used as the executable Claude Code
+  baseline; the released product is the baseline;
+- repository size, feature count, test count, language choice, and local unit
+  coverage do not establish answer quality.
+
+Until this protocol has executable adapters and checked-in results, the only
+permitted statement is: **Y-Harness has implemented a governed local baseline;
+comparative effectiveness is unverified.**
+
+## Two tracks
+
+The benchmark keeps two questions separate.
+
+### Harness-control track
+
+Measure the Harness contribution with as many variables fixed as the products
+permit:
+
+- identical model and exact model version;
+- identical provider endpoint, credentials class, reasoning effort,
+  temperature, output limit, and provider tool settings;
+- identical repository or artifact snapshot;
+- identical system/developer task instructions;
+- identical Tool schemas and deterministic Tool fixtures;
+- identical filesystem, network, process, and approval authority;
+- identical context and monetary budgets;
+- identical hardware class and network region;
+- clean state before every run.
+
+If a product cannot accept one of these controls, the difference is recorded
+and the run cannot support a pure Harness-effect claim.
+
+### Product-default track
+
+Run each released product with its recommended default model and configuration.
+This measures the product bundle, not the Harness alone. Results must say
+“product-default” and must not be used to attribute a gain to Y-Harness
+architecture.
+
+## Workloads
+
+Each workload is versioned, deterministic where possible, and paired with a
+machine-checkable oracle.
+
+| Area | Required workload |
+|---|---|
+| Context | retrieve facts across long histories; preserve tool call/result pairs; recover from text, image, and tool-output overflow |
+| Agent Loop | multi-step tool use, steering during execution, cancellation, provider timeout, retry, failover, and truncated tool arguments |
+| Tool Runtime | sequential and parallel-safe calls, exclusive calls, malformed input, oversized result, timeout, descendant cleanup, and sandbox escape probes |
+| State | kill at every settlement boundary, reopen state, resume permitted work, and prove uncertain effects are not replayed |
+| Memory | same corpus and query set, scoped retrieval, provenance, poisoned-memory rejection, and downstream task gain |
+| Skills | discovery, exact version selection, collision, tampering, revocation, dependency failure, and offline-cache behavior |
+| Policy | allow/deny/ask, changed arguments after approval, restart while waiting, competing decisions, self-approval, and secret redaction |
+| Orchestration | dependency DAG, bounded concurrency, sub-Agent failure, stale worker, mailbox ordering, workspace cleanup, and orphan reconciliation |
+| Verification | incomplete-but-plausible answers, retryable correction, false completion, verifier failure, and hard completion rejection |
+| Observability | event order, correlation, redaction, exporter failure, bounded retention, and measured instrumentation overhead |
+| Evaluation | missing cases, grader failure, baseline drift, origin replacement, reproducibility, and report validation |
+
+Coding tasks may be one workload family, but they do not define the Harness
+boundary. Research, data transformation, long-running operations, and
+permission-sensitive tasks are also required.
+
+## Metrics
+
+Primary metrics:
+
+- oracle-verified task success;
+- false-completion rate;
+- unsafe or unauthorized side effects;
+- duplicate or replayed uncertain effects;
+- successful recovery after injected failure;
+- exact Tool-call and Tool-result integrity.
+
+Secondary metrics:
+
+- total provider input/output/reasoning/cache tokens;
+- provider cost under one recorded price table;
+- time to first useful event, wall-clock completion latency, and p95 latency;
+- peak resident memory and persistent-state growth;
+- approval count and unnecessary approval rate;
+- context compaction count and post-compaction answer accuracy;
+- crash, hang, and manual-intervention rate.
+
+The benchmark does not collapse safety and correctness into one opaque score.
+Raw per-case outcomes and traces are retained before any summary.
+
+## Execution rules
+
+1. Pin every Harness/product build, adapter, model, task suite, Tool fixture,
+   and repository snapshot by immutable identity.
+2. Record unsupported controls before execution. Never silently substitute a
+   different model, tool, permission, or sandbox.
+3. Use isolated workspaces and fresh durable state for independent trials.
+4. Treat provider throttling and infrastructure failures separately from
+   Harness failures, while retaining both in the report.
+5. Run deterministic fault tests once per exact build and stochastic model
+   tasks at least ten times per cell. Publish sample count, median, p95, and a
+   confidence interval for task success.
+6. Preserve failed runs. Excluding a run requires a predeclared infrastructure
+   rule and a recorded reason.
+7. Grade blinded outputs where a model judge is unavoidable. Deterministic
+   oracles take precedence over LLM judges.
+8. Publish the exact authority granted to each process. A broader sandbox is a
+   different benchmark cell.
+9. Keep benchmark adapters outside the semantic Core. They consume public
+   protocols or released CLIs like any other client.
+
+## Superiority rule
+
+“Y-Harness outperforms X” is allowed only for a named benchmark version and
+track when all of these are true:
+
+- Y-Harness is non-inferior on unauthorized side effects, uncertain-effect
+  replay, and false completion;
+- its oracle-verified task success is statistically better on the
+  pre-registered primary workload aggregate;
+- no critical workload family regresses beyond its declared threshold;
+- cost and latency changes are reported, not hidden by the success aggregate;
+- exact artifacts and raw results are available for reproduction.
+
+Passing Y-Harness's own regression suite is necessary but cannot satisfy this
+rule.
+
+## Implementation order
+
+The shortest path to credible comparison is:
+
+1. add a versioned external-run result format and one released-CLI adapter;
+2. implement deterministic failure-injection Tool fixtures and state-recovery
+   cases;
+3. add Pi, OpenCode, Hermes, Codex, and released Claude Code adapters without
+   importing their code;
+4. run the Harness-control track with one mutually supported model;
+5. add product-default and stochastic task suites only after deterministic
+   parity is reproducible.
+
+Provider continuation for reasoning/tool calls, Linux and Windows containment,
+and live external integration evidence are prerequisites for broad
+superiority claims, not documentation follow-ups.

@@ -163,6 +163,9 @@ The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 and OpenCode live in the
 [reference architecture analysis](docs/reference-analysis.md).
+The controlled same-model and product-default rules required for any
+“outperforms” claim live in the
+[competitive Harness benchmark](docs/competitive-benchmark.md).
 Current proof and open blockers are tracked in
 [Release readiness](docs/release-readiness.md). Exact pre-1.0 wire, persistence,
 API, and migration rules live in the

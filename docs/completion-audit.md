@@ -102,6 +102,12 @@ automation are complete locally. A public release still requires green remote
 CI on the exact commit and the explicitly scoped platform/external-integration
 limitations listed in [`release-readiness.md`](release-readiness.md).
 
+This completion audit is an internal contract-coverage statement, not evidence
+that Y-Harness produces better results than another Harness or product. Such a
+claim additionally requires the controlled, source-pinned protocol in
+[`competitive-benchmark.md`](competitive-benchmark.md); no comparative result
+has been produced yet.
+
 “No bugs” is not a verifiable permanent state. The enforceable completion rule
 is zero known critical/high defects plus named, reproducible evidence for every
 supported claim.
