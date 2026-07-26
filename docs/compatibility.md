@@ -23,7 +23,7 @@ upgrade support that has not been tested.
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `1` | exact descriptor registration |
 | Skill package API | `"1"` | exact manifest validation |
-| HTTPS model gateway API | `"3"` | exact request/response header |
+| HTTPS model gateway API | `"4"` | exact request/response header |
 
 `Initialize` advertises the engine version and Runtime-facing durable/API
 coordinates above, including the Workspace Provider API implemented by
@@ -48,6 +48,11 @@ Signed packages may add an optional signed transparency receipt; publisher
 policy decides whether absence is accepted. This does not change how an
 existing receipt-free package is decoded or how its publisher signature is
 verified.
+
+HTTPS model gateway API `4` preserves API 3's transport rules and replaces
+`ModelUsage.cost_microusd` with exact integer `cost_usd_ticks` at ten billion
+ticks per USD. Gateways must omit unavailable, partial, or inexact cost rather
+than round it, and API-3 bodies are not reinterpreted under the new unit.
 
 HTTPS model gateway API `3` preserves API 2's transport rules and adds the
 optional bounded `continuation` field to `ModelResponse` plus the

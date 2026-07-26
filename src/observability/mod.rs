@@ -322,7 +322,7 @@ mod tests {
                 output_tokens: 2,
                 cached_input_tokens: 3,
                 reasoning_tokens: 1,
-                cost_microusd: Some(5),
+                cost_usd_ticks: Some(50_000),
             }),
             provider_request_id: Some("request-test".to_owned()),
             stream_events_dropped: 0,

@@ -133,4 +133,10 @@ pub use verification::{
 };
 
 /// Exact HTTPS JSON model-gateway contract version.
-pub const MODEL_GATEWAY_API_VERSION: &str = "3";
+pub const MODEL_GATEWAY_API_VERSION: &str = "4";
+
+/// Exact model-cost scale used by [`ModelUsage`].
+///
+/// One US dollar equals ten billion ticks. Provider adapters must not round
+/// an unavailable or more precise amount into this scale.
+pub const MODEL_COST_USD_TICKS_PER_USD: u64 = 10_000_000_000;

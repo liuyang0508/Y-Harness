@@ -3217,7 +3217,7 @@ mod tests {
                         output_tokens: 10,
                         cached_input_tokens: 40,
                         reasoning_tokens: 2,
-                        cost_microusd: Some(25),
+                        cost_usd_ticks: Some(250_000),
                     }),
                     provider_request_id: Some("provider-request".to_owned()),
                     continuation: None,
@@ -5393,8 +5393,8 @@ mod tests {
             model
                 .model_usage
                 .as_ref()
-                .and_then(|usage| usage.cost_microusd),
-            Some(25)
+                .and_then(|usage| usage.cost_usd_ticks),
+            Some(250_000)
         );
     }
 

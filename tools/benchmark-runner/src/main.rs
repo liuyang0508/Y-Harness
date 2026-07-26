@@ -140,6 +140,8 @@ struct ProductSettlement {
     product_api_duration_ms: Option<u64>,
     num_turns: u64,
     actual_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_cost_usd_ticks: Option<u64>,
     result_subtype: Option<String>,
     stdout_bytes: usize,
     stdout_sha256: String,
@@ -454,6 +456,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
                             product_api_duration_ms: Some(normalized.duration_api_ms),
                             num_turns: normalized.num_turns,
                             actual_cost_usd: Some(normalized.total_cost_usd),
+                            actual_cost_usd_ticks: None,
                             result_subtype: normalized.subtype,
                             stdout_bytes: output.stdout.len(),
                             stdout_sha256,

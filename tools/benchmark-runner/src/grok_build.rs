@@ -6,6 +6,7 @@ const ADAPTER_VERSION: &str = "grok-build-json-v1";
 const RUN_FORMAT_VERSION: u32 = 3;
 const MAX_TURNS: u64 = 1;
 const MAX_MODELS: usize = 64;
+const USD_TICKS_PER_USD: f64 = 10_000_000_000.0;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,9 +43,15 @@ struct NormalizedResult {
     is_error: bool,
     subtype: String,
     num_turns: u64,
-    actual_cost_usd: Option<f64>,
+    cost: Option<ValidatedCost>,
     observed_models: Vec<String>,
     raw: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ValidatedCost {
+    usd: f64,
+    ticks: u64,
 }
 
 struct PromptFile {
@@ -197,13 +204,17 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                 match normalize_result(&output.stdout) {
                     Ok(normalized) => {
                         let observed_models = normalized.observed_models.clone();
+                        let (actual_cost_usd, actual_cost_usd_ticks) = normalized
+                            .cost
+                            .map_or((None, None), |cost| (Some(cost.usd), Some(cost.ticks)));
                         let settlement = ProductSettlement {
                             exit_code: output.code,
                             wall_time_ms,
                             product_duration_ms: None,
                             product_api_duration_ms: None,
                             num_turns: normalized.num_turns,
-                            actual_cost_usd: normalized.actual_cost_usd,
+                            actual_cost_usd,
+                            actual_cost_usd_ticks,
                             result_subtype: Some(normalized.subtype),
                             stdout_bytes: output.stdout.len(),
                             stdout_sha256,
@@ -432,7 +443,7 @@ fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
             is_error: true,
             subtype: "error".to_owned(),
             num_turns,
-            actual_cost_usd: validated_cost(object, incomplete)?,
+            cost: validated_cost(object, incomplete)?,
             observed_models: observed_models(object, true, incomplete)?,
             raw: value,
         });
@@ -468,13 +479,13 @@ fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
     let stop_reason = object
         .get("stopReason")
         .and_then(Value::as_str)
-        .expect("validated stopReason")
+        .ok_or_else(|| "successful Grok Build result has no stopReason".to_owned())?
         .to_owned();
     Ok(NormalizedResult {
         is_error: false,
         subtype: stop_reason,
         num_turns,
-        actual_cost_usd: validated_cost(object, incomplete)?,
+        cost: validated_cost(object, incomplete)?,
         observed_models: observed_models(object, incomplete, incomplete)?,
         raw: value,
     })
@@ -569,17 +580,22 @@ fn observed_models(
 fn validated_cost(
     object: &serde_json::Map<String, Value>,
     incomplete: bool,
-) -> AppResult<Option<f64>> {
+) -> AppResult<Option<ValidatedCost>> {
     let cost = object
         .get("total_cost_usd")
         .map(|value| nonnegative_f64(value, "total_cost_usd"))
         .transpose()?;
     let ticks = object
         .get("total_cost_usd_ticks")
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| "Grok Build total_cost_usd_ticks must be nonnegative".to_owned())
+        .map(|value| -> AppResult<u64> {
+            let ticks = value.as_u64().ok_or_else(|| {
+                "Grok Build total_cost_usd_ticks must be a nonnegative integer".to_owned()
+            })?;
+            i64::try_from(ticks).map_err(|_| {
+                "Grok Build total_cost_usd_ticks exceeds the product's signed integer range"
+                    .to_owned()
+            })?;
+            Ok(ticks)
         })
         .transpose()?;
     if cost.is_some() != ticks.is_some() {
@@ -588,7 +604,18 @@ fn validated_cost(
     if incomplete && cost.is_some() {
         return Err("Grok Build incomplete usage must omit total cost".to_owned());
     }
-    Ok(cost)
+    match (cost, ticks) {
+        (Some(usd), Some(ticks)) => {
+            if usd != ticks as f64 / USD_TICKS_PER_USD {
+                return Err(
+                    "Grok Build total_cost_usd does not match total_cost_usd_ticks".to_owned(),
+                );
+            }
+            Ok(Some(ValidatedCost { usd, ticks }))
+        }
+        (None, None) => Ok(None),
+        _ => unreachable!("cost fields were checked for paired presence"),
+    }
 }
 
 fn nonnegative_f64(value: &Value, kind: &str) -> AppResult<f64> {
@@ -692,7 +719,13 @@ mod tests {
         assert!(!normalized.is_error);
         assert_eq!(normalized.subtype, "EndTurn");
         assert_eq!(normalized.observed_models, ["grok-4.5"]);
-        assert_eq!(normalized.actual_cost_usd, Some(0.000001));
+        assert_eq!(
+            normalized.cost,
+            Some(ValidatedCost {
+                usd: 0.000001,
+                ticks: 10_000
+            })
+        );
     }
 
     #[test]
@@ -702,7 +735,24 @@ mod tests {
         assert!(normalized.is_error);
         assert_eq!(normalized.num_turns, 0);
         assert!(normalized.observed_models.is_empty());
-        assert_eq!(normalized.actual_cost_usd, None);
+        assert_eq!(normalized.cost, None);
+    }
+
+    #[test]
+    fn mismatched_float_and_exact_cost_are_rejected() {
+        let error = normalize_result(
+            br#"{
+              "text":"ok","stopReason":"end_turn","sessionId":"s","requestId":"r",
+              "num_turns":1,
+              "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
+              "modelUsage":{"grok-4.5":{"inputTokens":1,"outputTokens":1,"modelCalls":1}},
+              "total_cost_usd":0.000002,
+              "total_cost_usd_ticks":10000
+            }"#,
+        )
+        .err()
+        .expect("mismatched cost evidence must fail");
+        assert!(error.contains("does not match"));
     }
 
     #[test]

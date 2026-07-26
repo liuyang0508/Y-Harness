@@ -39,8 +39,10 @@ cost, not zero.
   Memory, planning, Subagents, questions, web Tools, and automatic updates.
 - Preserve product errors as evidence. Validate success and failure envelopes,
   bounded IDs/text, Turn count, usage, observed Model identities, and paired
-  dollar/tick cost. If usage or cost is incomplete, reject reported cost
-  floats and serialize actual cost as `null`.
+  dollar/tick cost at 10 billion ticks per USD. Retain both representations
+  and reject disagreement between them. If usage or cost is incomplete, reject
+  reported cost fields and serialize actual cost as `null` without a tick
+  field.
 - Declare session persistence, MCP meta-tools, project instructions, lack of a
   hard spend fence, caller-asserted workspace identity, and unverified product
   sandbox behavior as unsupported controls.

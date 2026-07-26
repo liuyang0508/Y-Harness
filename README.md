@@ -656,10 +656,11 @@ available, and the broker reports that scoped guarantee rather than claiming
 full filesystem isolation.
 
 Runtime phase observations expose content-free timing and settlement classes.
-Model providers may additionally report token usage, cost, and an opaque
-request ID; the Runtime never invents missing accounting data. Observer errors
-and panics are isolated from Turn settlement, and the reference collector has a
-hard capacity with explicit drop counters.
+Model providers may additionally report token usage, exact integer cost at ten
+billion USD ticks per dollar, and an opaque request ID; unavailable, partial,
+or inexact cost stays absent. The Runtime never invents missing accounting
+data. Observer errors and panics are isolated from Turn settlement, and the
+reference collector has a hard capacity with explicit drop counters.
 
 Verify it:
 

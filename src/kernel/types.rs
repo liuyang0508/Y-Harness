@@ -620,8 +620,11 @@ pub struct ModelUsage {
     pub cached_input_tokens: u64,
     /// Provider-reported reasoning tokens.
     pub reasoning_tokens: u64,
-    /// Optional provider-calculated cost in millionths of one US dollar.
-    pub cost_microusd: Option<u64>,
+    /// Optional exact provider cost in [`crate::MODEL_COST_USD_TICKS_PER_USD`] ticks per USD.
+    ///
+    /// Adapters must omit this when the provider reports an incomplete cost or
+    /// when conversion to this integer scale would require rounding.
+    pub cost_usd_ticks: Option<u64>,
 }
 
 /// Bounded provider-formatted state needed to continue a model response.
@@ -1062,7 +1065,9 @@ pub fn now_ms() -> u64 {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS, ModelContinuation};
+    use super::{
+        MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS, ModelContinuation, ModelUsage,
+    };
 
     #[test]
     fn model_continuation_enforces_format_count_and_size_bounds() {
@@ -1085,5 +1090,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn model_usage_serializes_exact_cost_ticks_without_reinterpreting_legacy_cost() {
+        let usage = ModelUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_input_tokens: 3,
+            reasoning_tokens: 1,
+            cost_usd_ticks: Some(12_345),
+        };
+        let encoded = serde_json::to_value(&usage).expect("serialize usage");
+        assert_eq!(encoded["cost_usd_ticks"], 12_345);
+        assert!(encoded.get("cost_microusd").is_none());
+
+        let legacy: ModelUsage = serde_json::from_value(json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cached_input_tokens": 3,
+            "reasoning_tokens": 1,
+            "cost_microusd": 12_345
+        }))
+        .expect("legacy cost is safely ignored");
+        assert_eq!(legacy.cost_usd_ticks, None);
     }
 }

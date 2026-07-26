@@ -786,7 +786,7 @@ fn decode_usage(value: Option<&Value>) -> Option<ModelUsage> {
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cost_microusd: None,
+        cost_usd_ticks: None,
     })
 }
 

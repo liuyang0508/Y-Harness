@@ -7,8 +7,8 @@ turning it into a comparative score. They are produced by the independent
 - format 1 is the original Claude Code single-result envelope;
 - format 2 adds explicit unavailable product metrics for the Codex JSONL
   envelope without weakening strict format-1 readers;
-- format 3 adds Grok Build's headless JSON controls, optional complete cost,
-  and observed Model usage.
+- format 3 adds Grok Build's headless JSON controls, optional complete cost
+  with its exact integer tick evidence, and observed Model usage.
 
 ## Top-level contract
 
@@ -26,7 +26,9 @@ turning it into a comparative score. They are produced by the independent
 - product-reported total/API duration and actual cost; format 1 requires
   numbers, format 2 uses exact `null` when Codex does not expose them, and
   format 3 preserves Grok Build cost only when the product marks it complete;
-  an adapter must never infer them;
+  complete format-3 settlements add `actual_cost_usd_ticks`, where
+  `10_000_000_000` ticks equal one USD, and reject disagreement with the
+  product's float projection; an adapter must never infer these fields;
 - the validated Turn count represented by the retained product envelope;
 - result subtype;
 - byte counts and SHA-256 for stdout and stderr;
@@ -92,8 +94,9 @@ ACLs as an unsupported control.
 Grok Build's `read_file` and always-on MCP meta-tools remain visible, and the
 product persists its session beneath the isolated Grok home. Format 3 records
 those limitations, the requested reasoning effort and Turn ceiling, and the
-product sandbox. It derives observed Models only from `modelUsage`; absent or
-partial cost remains `null`, never zero.
+product sandbox. It derives observed Models only from `modelUsage`; a complete
+cost retains both the float projection and exact integer ticks. Absent or
+partial cost remains `null`, never zero, and has no tick field.
 
 ## Evidence
 

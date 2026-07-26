@@ -142,8 +142,11 @@ allowlist. Grok Build's always-on MCP meta-tools and session persistence remain
 declared unsupported controls.
 
 External-run format 3 preserves Grok Build's observed `modelUsage`, Turn count,
-and cost only when the product reports complete cost. Missing or partial cost
-remains `null`; the requested Model is never copied into observed Models.
+and cost only when the product reports complete cost. Complete cost includes
+`actual_cost_usd_ticks` at exactly 10 billion ticks per USD and is rejected if
+the product's float projection disagrees. Missing or partial cost remains
+`null` with no tick field; the requested Model is never copied into observed
+Models.
 There is no checked-in live Grok Build result yet, so this adapter provides
 contract evidence only.
 

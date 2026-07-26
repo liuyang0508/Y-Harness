@@ -164,6 +164,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                             product_api_duration_ms: None,
                             num_turns: 1,
                             actual_cost_usd: None,
+                            actual_cost_usd_ticks: None,
                             result_subtype: Some(normalized.subtype.to_owned()),
                             stdout_bytes: output.stdout.len(),
                             stdout_sha256,
