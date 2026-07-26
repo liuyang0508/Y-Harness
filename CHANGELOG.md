@@ -2,6 +2,14 @@
 
 All notable changes to Y-Harness are documented in this file.
 
+## Unreleased
+
+- added a bounded Codex `exec --json` adapter to the independent external
+  benchmark runner, preserving JSONL evidence while recording unavailable
+  product metrics as unavailable rather than inferred;
+- pinned Grok/xAI model, prompt, SDK, and protocol sources as supplemental
+  provider-side evidence without misclassifying them as an open Harness.
+
 ## 0.1.0 - 2026-07-25
 
 Initial public baseline:

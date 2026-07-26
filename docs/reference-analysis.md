@@ -44,6 +44,36 @@ and Hermes at
 These newer coordinates are used only for the delta findings below; they do not
 silently relabel observations made against the earlier baseline.
 
+## Supplemental Grok/xAI evidence: X-side, not an open Harness
+
+The Grok sources are relevant to `Agent = LLM × Harness`, but they do not
+belong in the five-project Harness-source baseline. The following official xAI
+snapshots were inspected separately:
+
+| Source | Snapshot | What it establishes | What it does not establish |
+|---|---|---|---|
+| Grok-1 | [`7050ed2`](https://github.com/xai-org/grok-1/tree/7050ed204b8206bb8645c7b7bbef7252f79561b0) | Apache-2.0 JAX loading/sampling example and Grok-1 open weights; the README explicitly describes an intentionally inefficient correctness implementation | production Grok Agent Loop, State, Memory, Policy, Tool Runtime, orchestration, or clients |
+| Grok prompts | [`a7c186f`](https://github.com/xai-org/grok-prompts/tree/a7c186f5ccac95875c0041aed60398f6ecb6d6c7) | AGPL-3.0 prompt snapshots for named Grok product/model surfaces | the code that compiles context, executes Tools, persists state, or validates completion |
+| xAI Python SDK | [`4358bc2`](https://github.com/xai-org/xai-sdk-python/tree/4358bc235e8641ba5f0cb54599675d098385d4bf) | official synchronous/asynchronous gRPC client behavior | server implementation or production Harness internals |
+| xAI protobufs | [`af1be87`](https://github.com/xai-org/xai-proto/tree/af1be87b733dc177c0857fbd624f1ff12128fbd2) | versioned public provider contracts for tools, remote MCP, continuation, encrypted content, bounded agentic turns, and multi-agent model requests | which component owns effects, recovery, authorization, or durable truth inside xAI |
+
+Three useful design inputs follow without copying product semantics:
+
+1. Grok-1 is an optional Model/runtime target, not evidence about the Harness
+   multiplier.
+2. Public prompt snapshots are benchmark coordinates and behavioral hypotheses,
+   not substitutes for Runtime source.
+3. Provider-managed Tools, remote MCP, opaque continuation, and multi-agent
+   requests must be represented as provider-origin effects with explicit
+   authority and evidence. They must never be mislabeled as Harness-executed
+   Tools merely because the provider protocol uses similar nouns.
+
+Y-Harness may add xAI as a direct Model provider and Grok as a controlled model
+cell. A production Grok comparison remains product-default evidence unless a
+released, auditable Harness surface permits the same controls. No current
+source-level superiority claim against the Grok Harness is possible because
+that Harness source is not present in these repositories.
+
 ## 2026-07-26 Turn-steering delta
 
 This delta applies “take the strengths, reject the liabilities” at mechanism

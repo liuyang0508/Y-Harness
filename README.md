@@ -96,7 +96,7 @@ and two non-runtime benchmark tools:
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
 | `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v12 |
-| `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapter outside the semantic Core |
+| `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
 ## Architecture
@@ -161,11 +161,14 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v11 specification](docs/protocol.md).
+[client protocol v12 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 and OpenCode live in the
 [reference architecture analysis](docs/reference-analysis.md).
+That analysis also tracks Grok/xAI open Model, prompt, SDK, and protocol
+snapshots as supplemental provider-side evidence, not as open production
+Harness source.
 The controlled same-model and product-default rules required for any
 “outperforms” claim live in the
 [competitive Harness benchmark](docs/competitive-benchmark.md).

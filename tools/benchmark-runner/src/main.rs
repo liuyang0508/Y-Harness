@@ -1,5 +1,7 @@
 //! Released-product benchmark adapters kept outside the Harness semantic core.
 
+mod codex;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -17,7 +19,7 @@ use y_harness::{
     ProcessOutput, ProcessRequest,
 };
 
-const EXTERNAL_RUN_FORMAT_VERSION: u32 = 1;
+const CLAUDE_RUN_FORMAT_VERSION: u32 = 1;
 const CLAUDE_ADAPTER_VERSION: &str = "claude-code-json-v1";
 const MAX_SPEC_BYTES: u64 = 2_097_152;
 const MAX_OUTPUT_BYTES: usize = 2_097_152;
@@ -93,7 +95,7 @@ struct RunCoordinate {
 struct RunControls {
     track: &'static str,
     claim_eligible: bool,
-    profile: ClaudeProfile,
+    profile: &'static str,
     requested_model: String,
     observed_models: Vec<String>,
     prompt_sha256: String,
@@ -103,7 +105,7 @@ struct RunControls {
     process_isolation: ProcessIsolation,
     inherited_environment_names: Vec<String>,
     timeout_ms: u64,
-    requested_max_budget_usd: f64,
+    requested_max_budget_usd: Option<f64>,
     unsupported_controls: Vec<&'static str>,
 }
 
@@ -127,10 +129,10 @@ enum RunExecution {
 struct ProductSettlement {
     exit_code: Option<i32>,
     wall_time_ms: u64,
-    product_duration_ms: u64,
-    product_api_duration_ms: u64,
+    product_duration_ms: Option<u64>,
+    product_api_duration_ms: Option<u64>,
     num_turns: u64,
-    actual_cost_usd: f64,
+    actual_cost_usd: Option<f64>,
     result_subtype: Option<String>,
     stdout_bytes: usize,
     stdout_sha256: String,
@@ -191,18 +193,21 @@ async fn run() -> AppResult<ExternalRunReport> {
         .and_then(|value| value.into_string().ok())
         .ok_or_else(usage)?;
     let spec_path = arguments.next().map(PathBuf::from).ok_or_else(usage)?;
-    if arguments.next().is_some() || adapter != "claude-code" {
+    if arguments.next().is_some() {
         return Err(usage());
     }
-    let spec = read_spec(&spec_path)?;
-    execute_claude(spec).await
+    match adapter.as_str() {
+        "claude-code" => execute_claude(read_claude_spec(&spec_path)?).await,
+        "codex" => codex::execute(codex::read_spec(&spec_path)?).await,
+        _ => Err(usage()),
+    }
 }
 
 fn usage() -> String {
-    "usage: yh-bench claude-code <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex> <run-spec.json>".to_owned()
 }
 
-fn read_spec(path: &Path) -> AppResult<ClaudeRunSpec> {
+fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("cannot inspect run spec: {error}"))?;
     if !metadata.is_file() || metadata.len() > MAX_SPEC_BYTES {
@@ -216,47 +221,34 @@ fn read_spec(path: &Path) -> AppResult<ClaudeRunSpec> {
             "run spec must be a file no larger than {MAX_SPEC_BYTES} bytes"
         ));
     }
-    let spec: ClaudeRunSpec =
-        serde_json::from_slice(&bytes).map_err(|error| format!("invalid run spec: {error}"))?;
+    Ok(bytes)
+}
+
+fn read_claude_spec(path: &Path) -> AppResult<ClaudeRunSpec> {
+    let spec: ClaudeRunSpec = serde_json::from_slice(&read_spec_bytes(path)?)
+        .map_err(|error| format!("invalid Claude Code run spec: {error}"))?;
     validate_spec(&spec)?;
     Ok(spec)
 }
 
 fn validate_spec(spec: &ClaudeRunSpec) -> AppResult<()> {
-    if spec.format_version != EXTERNAL_RUN_FORMAT_VERSION {
-        return Err(format!(
-            "unsupported run spec format {}; expected {EXTERNAL_RUN_FORMAT_VERSION}",
-            spec.format_version
-        ));
-    }
-    validate_id("run_id", &spec.run_id)?;
-    validate_id("benchmark_version", &spec.benchmark_version)?;
-    validate_id("case_id", &spec.case_id)?;
-    validate_text("expected_cli_version", &spec.expected_cli_version)?;
-    if !is_lower_sha256(&spec.expected_product_executable_sha256) {
-        return Err(
-            "expected_product_executable_sha256 must be 64 lowercase hexadecimal bytes".to_owned(),
-        );
-    }
-    validate_text("workspace_snapshot", &spec.workspace_snapshot)?;
-    validate_text("model", &spec.model)?;
-    if spec.system_prompt.trim().is_empty()
-        || spec.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES
-        || spec
-            .system_prompt
-            .chars()
-            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
-    {
-        return Err(format!(
-            "system_prompt must be 1-{MAX_SYSTEM_PROMPT_BYTES} non-control bytes"
-        ));
-    }
-    if spec.prompt.trim().is_empty() || spec.prompt.len() > MAX_PROMPT_BYTES {
-        return Err(format!("prompt must be 1-{MAX_PROMPT_BYTES} bytes"));
-    }
-    if !(1..=MAX_TIMEOUT_MS).contains(&spec.timeout_ms) {
-        return Err(format!("timeout_ms must be 1-{MAX_TIMEOUT_MS}"));
-    }
+    validate_common_spec(
+        spec.format_version,
+        CLAUDE_RUN_FORMAT_VERSION,
+        &spec.run_id,
+        &spec.benchmark_version,
+        &spec.case_id,
+        &spec.expected_cli_version,
+        &spec.expected_product_executable_sha256,
+        &spec.program,
+        &spec.workspace,
+        &spec.workspace_snapshot,
+        &spec.model,
+        &spec.system_prompt,
+        &spec.prompt,
+        spec.timeout_ms,
+        &spec.inherit_environment,
+    )?;
     if !spec.max_budget_usd.is_finite()
         || spec.max_budget_usd <= 0.0
         || spec.max_budget_usd > MAX_BUDGET_USD
@@ -265,18 +257,71 @@ fn validate_spec(spec: &ClaudeRunSpec) -> AppResult<()> {
             "max_budget_usd must be > 0 and <= {MAX_BUDGET_USD}"
         ));
     }
-    if spec.inherit_environment.len() > MAX_ENVIRONMENT_NAMES {
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_common_spec(
+    format_version: u32,
+    expected_format_version: u32,
+    run_id: &str,
+    benchmark_version: &str,
+    case_id: &str,
+    expected_cli_version: &str,
+    expected_product_executable_sha256: &str,
+    program: &Path,
+    workspace: &Path,
+    workspace_snapshot: &str,
+    model: &str,
+    system_prompt: &str,
+    prompt: &str,
+    timeout_ms: u64,
+    inherit_environment: &[String],
+) -> AppResult<()> {
+    if format_version != expected_format_version {
+        return Err(format!(
+            "unsupported run spec format {format_version}; expected {expected_format_version}"
+        ));
+    }
+    validate_id("run_id", run_id)?;
+    validate_id("benchmark_version", benchmark_version)?;
+    validate_id("case_id", case_id)?;
+    validate_text("expected_cli_version", expected_cli_version)?;
+    if !is_lower_sha256(expected_product_executable_sha256) {
+        return Err(
+            "expected_product_executable_sha256 must be 64 lowercase hexadecimal bytes".to_owned(),
+        );
+    }
+    validate_text("workspace_snapshot", workspace_snapshot)?;
+    validate_text("model", model)?;
+    if system_prompt.trim().is_empty()
+        || system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES
+        || system_prompt
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(format!(
+            "system_prompt must be 1-{MAX_SYSTEM_PROMPT_BYTES} non-control bytes"
+        ));
+    }
+    if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+        return Err(format!("prompt must be 1-{MAX_PROMPT_BYTES} bytes"));
+    }
+    if !(1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(format!("timeout_ms must be 1-{MAX_TIMEOUT_MS}"));
+    }
+    if inherit_environment.len() > MAX_ENVIRONMENT_NAMES {
         return Err(format!(
             "inherit_environment exceeds {MAX_ENVIRONMENT_NAMES} names"
         ));
     }
     let mut names = BTreeSet::new();
-    for name in &spec.inherit_environment {
+    for name in inherit_environment {
         if !valid_environment_name(name) || !names.insert(name) {
             return Err("inherit_environment contains an invalid or duplicate name".to_owned());
         }
     }
-    if !spec.program.is_absolute() || !spec.workspace.is_absolute() {
+    if !program.is_absolute() || !workspace.is_absolute() {
         return Err("program and workspace must be absolute paths".to_owned());
     }
     Ok(())
@@ -342,7 +387,8 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
             spec.expected_product_executable_sha256, product_executable_sha256
         ));
     }
-    let cli_version = read_cli_version(&broker, &program, &workspace, &environment).await?;
+    let cli_version =
+        read_cli_version(&broker, &program, &workspace, &environment, "Claude Code").await?;
     if cli_version != spec.expected_cli_version {
         return Err(format!(
             "Claude Code version mismatch: expected {:?}, observed {:?}",
@@ -396,10 +442,10 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
                         let settlement = ProductSettlement {
                             exit_code: output.code,
                             wall_time_ms,
-                            product_duration_ms: normalized.duration_ms,
-                            product_api_duration_ms: normalized.duration_api_ms,
+                            product_duration_ms: Some(normalized.duration_ms),
+                            product_api_duration_ms: Some(normalized.duration_api_ms),
                             num_turns: normalized.num_turns,
-                            actual_cost_usd: normalized.total_cost_usd,
+                            actual_cost_usd: Some(normalized.total_cost_usd),
                             result_subtype: normalized.subtype,
                             stdout_bytes: output.stdout.len(),
                             stdout_sha256,
@@ -451,7 +497,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
     }
 
     Ok(ExternalRunReport {
-        format_version: EXTERNAL_RUN_FORMAT_VERSION,
+        format_version: CLAUDE_RUN_FORMAT_VERSION,
         adapter: AdapterEvidence {
             name: CLAUDE_ADAPTER_VERSION,
             version: env!("CARGO_PKG_VERSION"),
@@ -472,7 +518,10 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
         controls: RunControls {
             track: "adapter_conformance",
             claim_eligible: false,
-            profile: spec.profile,
+            profile: match spec.profile {
+                ClaudeProfile::Bare => "bare",
+                ClaudeProfile::Product => "product",
+            },
             requested_model: spec.model,
             observed_models,
             prompt_sha256,
@@ -482,7 +531,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
             process_isolation: isolation,
             inherited_environment_names: spec.inherit_environment,
             timeout_ms: spec.timeout_ms,
-            requested_max_budget_usd: spec.max_budget_usd,
+            requested_max_budget_usd: Some(spec.max_budget_usd),
             unsupported_controls,
         },
         execution,
@@ -521,6 +570,7 @@ async fn read_cli_version(
     program: &Path,
     workspace: &Path,
     environment: &BTreeMap<String, String>,
+    product: &str,
 ) -> AppResult<String> {
     let output = broker
         .execute(
@@ -537,15 +587,17 @@ async fn read_cli_version(
             CancellationToken::new(),
         )
         .await
-        .map_err(|error| format!("Claude Code version probe failed: {error}"))?;
+        .map_err(|error| format!("{product} version probe failed: {error}"))?;
     if !output.success || output.stdout_truncated || output.stderr_truncated {
-        return Err("Claude Code version probe did not settle successfully".to_owned());
+        return Err(format!(
+            "{product} version probe did not settle successfully"
+        ));
     }
     let version = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "Claude Code version output is not UTF-8".to_owned())?
+        .map_err(|_| format!("{product} version output is not UTF-8"))?
         .trim()
         .to_owned();
-    validate_text("observed Claude Code version", &version)?;
+    validate_text("observed CLI version", &version)?;
     Ok(version)
 }
 
@@ -708,13 +760,13 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ClaudeProfile, ClaudeRunSpec, EXTERNAL_RUN_FORMAT_VERSION, claude_arguments,
+        CLAUDE_RUN_FORMAT_VERSION, ClaudeProfile, ClaudeRunSpec, claude_arguments,
         normalize_claude_result, validate_spec,
     };
 
     fn valid_spec() -> ClaudeRunSpec {
         ClaudeRunSpec {
-            format_version: EXTERNAL_RUN_FORMAT_VERSION,
+            format_version: CLAUDE_RUN_FORMAT_VERSION,
             run_id: "run-1".to_owned(),
             benchmark_version: "adapter-probe-v1".to_owned(),
             case_id: "fixed-output".to_owned(),
@@ -747,7 +799,7 @@ mod tests {
         validate_spec(&spec).expect("valid spec");
         spec.format_version += 1;
         assert!(validate_spec(&spec).is_err());
-        spec.format_version = EXTERNAL_RUN_FORMAT_VERSION;
+        spec.format_version = CLAUDE_RUN_FORMAT_VERSION;
         spec.inherit_environment
             .push("ANTHROPIC_API_KEY".to_owned());
         assert!(validate_spec(&spec).is_err());

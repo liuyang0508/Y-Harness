@@ -21,11 +21,18 @@ Until released products have executed the same versioned workloads under
 declared controls, the only permitted statement is: **Y-Harness has implemented
 a governed local baseline; comparative effectiveness is unverified.**
 
-External-run format 1 and the first released Claude Code CLI adapter now exist,
-with one checked-in real `adapter_conformance` result. That result has
+External-run formats 1/2 and released Claude Code and Codex CLI adapter
+contracts now
+exist, with one checked-in real Claude Code `adapter_conformance` result. That
+result has
 `claim_eligible: false`: it proves the bounded adapter can execute and preserve
 the product envelope, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
+
+Grok/xAI open repositories are tracked separately as Model, prompt, SDK, and
+provider-protocol evidence. They do not publish the production Grok Harness,
+so they neither become a source-level Harness baseline nor establish a Grok
+product-default cell. See [`reference-analysis.md`](reference-analysis.md).
 
 ## Two tracks
 
@@ -234,16 +241,17 @@ The shortest path to credible comparison is:
 2. implement deterministic failure-injection Tool fixtures and state-recovery
    cases; the first crash-after-effect fixture and oracle are complete, while
    released-product restart drivers and the remaining fault matrix are open;
-3. add Pi, OpenCode, Hermes, Codex, and released Claude Code adapters without
-   importing their code;
+3. continue adding Pi, OpenCode, and Hermes adapters without importing their
+   code; the Claude Code adapter has one real conformance record, while the
+   Codex adapter has bounded contract tests but no live record;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
 Provider continuation and durable safe-boundary steering are implemented and
 locally fault-tested in Y-Harness. The first real released-product adapter
-record and first controller-owned fault fixture are also preserved, but no
-cross-product fault case has run. Execution of CF-001/CF-002/CF-003 across
-products, Linux and Windows containment, and live external integration
-evidence remain prerequisites for broad superiority claims, not documentation
-follow-ups.
+record, a second source-pinned adapter contract, and the first
+controller-owned fault fixture are preserved, but no cross-product fault case
+has run. Execution of CF-001/CF-002/CF-003 across products, Linux and Windows
+containment, and live external integration evidence remain prerequisites for
+broad superiority claims, not documentation follow-ups.
