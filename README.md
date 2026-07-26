@@ -657,10 +657,12 @@ full filesystem isolation.
 
 Runtime phase observations expose content-free timing and settlement classes.
 Model providers may additionally report token usage, exact integer cost at ten
-billion USD ticks per dollar, and an opaque request ID; unavailable, partial,
-or inexact cost stays absent. The Runtime never invents missing accounting
-data. Observer errors and panics are isolated from Turn settlement, and the
-reference collector has a hard capacity with explicit drop counters.
+billion USD ticks per dollar, the Provider-reported settled Model, and an
+opaque request ID; unavailable, partial, or inexact evidence stays absent. The
+registered Model remains routing and continuation authority, and the Runtime
+never invents missing accounting data. Observer errors and panics are isolated
+from Turn settlement, and the reference collector has a hard capacity with
+explicit drop counters.
 
 Verify it:
 

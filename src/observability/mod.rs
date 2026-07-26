@@ -58,6 +58,9 @@ pub struct PhaseObservation {
     pub outcome: ObservationOutcome,
     /// Provider-reported model usage when available.
     pub model_usage: Option<ModelUsage>,
+    /// Provider-reported model identity when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
     /// Opaque bounded provider request ID when available.
     pub provider_request_id: Option<String>,
     /// Provisional provider events rejected during this phase.
@@ -219,14 +222,17 @@ fn observation_metadata_is_bounded(observation: &PhaseObservation) -> bool {
         !value.is_empty()
             && value.len() <= MAX_OBSERVATION_ID_BYTES
             && !value.chars().any(char::is_control)
-    }) && observation
-        .provider_request_id
-        .as_ref()
-        .is_none_or(|value| {
-            !value.is_empty()
-                && value.len() <= MAX_OBSERVATION_ID_BYTES
-                && !value.chars().any(char::is_control)
-        })
+    }) && [
+        observation.provider_model.as_deref(),
+        observation.provider_request_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|value| {
+        !value.is_empty()
+            && value.len() <= MAX_OBSERVATION_ID_BYTES
+            && !value.chars().any(char::is_control)
+    })
 }
 
 /// Writes stored events as newline-delimited JSON without changing State.
@@ -324,6 +330,7 @@ mod tests {
                 reasoning_tokens: 1,
                 cost_usd_ticks: Some(50_000),
             }),
+            provider_model: Some("provider/model-v2".to_owned()),
             provider_request_id: Some("request-test".to_owned()),
             stream_events_dropped: 0,
         }
@@ -367,6 +374,13 @@ mod tests {
 
         assert!(collector.snapshot().is_empty());
         assert_eq!(observability.dropped_observations(), 1);
+
+        oversized.capability = "test/model".to_owned();
+        oversized.provider_model = Some("x".repeat(super::MAX_OBSERVATION_ID_BYTES + 1));
+        observability.emit(&oversized);
+
+        assert!(collector.snapshot().is_empty());
+        assert_eq!(observability.dropped_observations(), 2);
     }
 
     #[tokio::test]

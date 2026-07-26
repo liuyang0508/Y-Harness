@@ -139,7 +139,7 @@ The result type is `initialized`:
         "conversation_compactor_api": 1,
         "secret_api": 1,
         "skill_api": "1",
-        "model_gateway_api": "4",
+        "model_gateway_api": "5",
         "workspace_provider_api": "1"
       }
     }

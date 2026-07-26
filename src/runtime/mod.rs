@@ -40,7 +40,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 1_048_576;
 const MAX_MODEL_REQUEST_BYTES: usize = 16_777_216;
 const MAX_RUNTIME_ERROR_CHARS: usize = 4_096;
 const MAX_MODEL_CALL_ID_BYTES: usize = 256;
-const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 256;
+const MAX_PROVIDER_EVIDENCE_ID_BYTES: usize = 256;
 const MAX_POLICY_REASON_BYTES: usize = 4_096;
 const MAX_AGENT_STEPS: usize = 256;
 const MAX_MODEL_ROUTE_ENTRIES: usize = 16;
@@ -1226,6 +1226,7 @@ impl HarnessRuntime {
             duration_micros: elapsed_micros(started),
             outcome: observation_outcome(&result),
             model_usage: None,
+            provider_model: None,
             provider_request_id: None,
             stream_events_dropped: 0,
         });
@@ -1387,9 +1388,14 @@ impl HarnessRuntime {
             validate_model_response(&response)?;
             Ok(response)
         });
-        let (model_usage, provider_request_id) = result.as_ref().map_or((None, None), |response| {
-            (response.usage.clone(), response.provider_request_id.clone())
-        });
+        let (model_usage, provider_model, provider_request_id) =
+            result.as_ref().map_or((None, None, None), |response| {
+                (
+                    response.usage.clone(),
+                    response.provider_model.clone(),
+                    response.provider_request_id.clone(),
+                )
+            });
         self.observability.emit(&PhaseObservation {
             thread_id: target.thread_id.clone(),
             turn_id: target.turn_id.clone(),
@@ -1398,6 +1404,7 @@ impl HarnessRuntime {
             duration_micros: elapsed_micros(started),
             outcome: observation_outcome(&result),
             model_usage,
+            provider_model,
             provider_request_id,
             stream_events_dropped,
         });
@@ -2141,14 +2148,23 @@ impl<'a> ObservationTarget<'a> {
     }
 }
 
-fn validate_model_response(response: &ModelResponse) -> Result<(), HarnessError> {
+pub(crate) fn validate_model_response(response: &ModelResponse) -> Result<(), HarnessError> {
+    if let Some(provider_model) = &response.provider_model
+        && (provider_model.trim().is_empty()
+            || provider_model.len() > MAX_PROVIDER_EVIDENCE_ID_BYTES
+            || provider_model.chars().any(char::is_control))
+    {
+        return Err(HarnessError::Model(format!(
+            "provider model must be 1-{MAX_PROVIDER_EVIDENCE_ID_BYTES} non-control bytes"
+        )));
+    }
     if let Some(provider_request_id) = &response.provider_request_id
         && (provider_request_id.trim().is_empty()
-            || provider_request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES
+            || provider_request_id.len() > MAX_PROVIDER_EVIDENCE_ID_BYTES
             || provider_request_id.chars().any(char::is_control))
     {
         return Err(HarnessError::Model(format!(
-            "provider request id must be 1-{MAX_PROVIDER_REQUEST_ID_BYTES} non-control bytes"
+            "provider request id must be 1-{MAX_PROVIDER_EVIDENCE_ID_BYTES} non-control bytes"
         )));
     }
     if let Some(continuation) = &response.continuation {
@@ -2504,9 +2520,10 @@ mod tests {
 
     use super::{
         AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, MAX_PENDING_STEERING,
-        MAX_PENDING_STEERING_BYTES, PolicyEngine, Tool, TurnExecutionOptions,
-        require_runtime_capacity, validate_approval_decision, validate_model_request,
-        validate_model_tool_call, validate_policy_decision, validate_tool_output,
+        MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES, PolicyEngine, Tool,
+        TurnExecutionOptions, require_runtime_capacity, validate_approval_decision,
+        validate_model_request, validate_model_response, validate_model_tool_call,
+        validate_policy_decision, validate_tool_output,
     };
     use crate::{
         ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus, ApprovalRequest,
@@ -2949,6 +2966,7 @@ mod tests {
                         input: json!({"text": "continued"}),
                     },
                     usage: None,
+                    provider_model: None,
                     provider_request_id: Some("provider-step-1".to_owned()),
                     continuation: Some(ModelContinuation::new(
                         "test.provider.reasoning.v1",
@@ -2989,6 +3007,7 @@ mod tests {
                         input: json!({"text": "stay pinned"}),
                     },
                     usage: None,
+                    provider_model: None,
                     provider_request_id: Some("provider-step-1".to_owned()),
                     continuation: Some(ModelContinuation::new(
                         "test.provider.reasoning.v1",
@@ -3219,6 +3238,7 @@ mod tests {
                         reasoning_tokens: 2,
                         cost_usd_ticks: Some(250_000),
                     }),
+                    provider_model: Some("provider/settled-v2".to_owned()),
                     provider_request_id: Some("provider-request".to_owned()),
                     continuation: None,
                 })
@@ -5385,6 +5405,7 @@ mod tests {
             .find(|record| record.phase == ExecutionPhase::Model)
             .expect("model observation");
         assert_eq!(model.capability, "test/usage-model");
+        assert_eq!(model.provider_model.as_deref(), Some("provider/settled-v2"));
         assert_eq!(
             model.provider_request_id.as_deref(),
             Some("provider-request")
@@ -5396,6 +5417,17 @@ mod tests {
                 .and_then(|usage| usage.cost_usd_ticks),
             Some(250_000)
         );
+    }
+
+    #[test]
+    fn provider_model_evidence_is_bounded_before_observation() {
+        let mut response = ModelResponse::from(ModelOutput::Message {
+            content: "unused".to_owned(),
+        });
+        response.provider_model = Some("x".repeat(MAX_PROVIDER_EVIDENCE_ID_BYTES + 1));
+
+        let error = validate_model_response(&response).expect_err("oversized provider model");
+        assert!(error.to_string().contains("provider model"));
     }
 
     #[tokio::test]

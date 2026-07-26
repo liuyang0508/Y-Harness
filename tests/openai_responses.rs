@@ -46,5 +46,6 @@ async fn direct_openai_responses_round_trip() {
         response.output,
         ModelOutput::Message { ref content } if !content.trim().is_empty()
     ));
+    assert!(response.provider_model.is_some());
     assert!(response.provider_request_id.is_some());
 }

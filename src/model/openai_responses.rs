@@ -552,12 +552,15 @@ fn decode_response_value(
             continuation_items,
         )?)
     };
-    Ok(ModelResponse {
+    let response = ModelResponse {
         output,
         usage: decode_usage(object.get("usage")),
+        provider_model: Some(required_string(object, "model", "OpenAI response")?),
         provider_request_id,
         continuation,
-    })
+    };
+    crate::runtime::validate_model_response(&response)?;
+    Ok(response)
 }
 
 fn append_reasoning_continuation(
@@ -916,6 +919,7 @@ mod tests {
         let response = decode_response(
             serde_json::to_vec(&json!({
                 "status": "completed",
+                "model": "gpt-test-2026-01-01",
                 "output": [{
                     "type": "message",
                     "content": [{"type": "output_text", "text": "hello"}]
@@ -942,8 +946,26 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.cached_input_tokens, 3);
         assert_eq!(usage.reasoning_tokens, 2);
+        assert_eq!(
+            response.provider_model.as_deref(),
+            Some("gpt-test-2026-01-01")
+        );
         assert_eq!(response.provider_request_id.as_deref(), Some("request-1"));
         assert!(response.continuation.is_none());
+
+        let error = decode_response(
+            &serde_json::to_vec(&json!({
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }]
+            }))
+            .expect("encode"),
+            None,
+        )
+        .expect_err("completed response must report its model");
+        assert!(error.to_string().contains("no model"));
     }
 
     #[test]
@@ -957,6 +979,7 @@ mod tests {
         let response = decode_response(
             &serde_json::to_vec(&json!({
                 "status": "completed",
+                "model": "gpt-test-2026-01-01",
                 "output": [call.clone()]
             }))
             .expect("encode"),
@@ -974,6 +997,7 @@ mod tests {
         let error = decode_response(
             &serde_json::to_vec(&json!({
                 "status": "completed",
+                "model": "gpt-test-2026-01-01",
                 "output": [call.clone(), call]
             }))
             .expect("encode"),
@@ -985,6 +1009,7 @@ mod tests {
         let response = decode_response(
             &serde_json::to_vec(&json!({
                 "status": "completed",
+                "model": "gpt-test-2026-01-01",
                 "output": [
                     {
                         "type": "reasoning",
@@ -1013,6 +1038,7 @@ mod tests {
         let error = decode_response(
             &serde_json::to_vec(&json!({
                 "status": "completed",
+                "model": "gpt-test-2026-01-01",
                 "output": [
                     {"type": "reasoning", "encrypted_content": null},
                     {
@@ -1042,7 +1068,7 @@ mod tests {
             .expect("first chunk");
         decoder
             .push(
-                b"lo\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n",
+                b"lo\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"model\":\"gpt-test-2026-01-01\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n",
             )
             .expect("second chunk");
         let response = decoder.finish().expect("final response");
@@ -1051,6 +1077,10 @@ mod tests {
             ModelOutput::Message {
                 content: "hello".to_owned()
             }
+        );
+        assert_eq!(
+            response.provider_model.as_deref(),
+            Some("gpt-test-2026-01-01")
         );
         assert_eq!(response.provider_request_id.as_deref(), Some("request-2"));
         assert_eq!(

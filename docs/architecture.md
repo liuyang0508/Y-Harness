@@ -256,9 +256,10 @@ direction:
   Policy/approval authorization, and settle uncertain retries through one
   stable idempotency key;
 - content-free Runtime phase observations with monotonic latency, settlement
-  class, provider-reported model accounting, failure isolation, and bounded
-  local collection capped at 65,536 records; oversized observation identities
-  are rejected before observer delivery or retention;
+  class, distinct registered and Provider-reported Model identities, model
+  accounting, failure isolation, and bounded local collection capped at 65,536
+  records; oversized observation identities are rejected before observer
+  delivery or retention;
 - deterministic CLI demonstration with no provider credentials.
 
 Snapshot archival, distributed orchestration coordination, lease/fenced remote

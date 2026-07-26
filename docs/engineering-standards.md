@@ -207,7 +207,8 @@ internals or read Engine storage directly.
   length and reject an over-limit value before converting it to Rust `String`.
   Decoded schema and domain validation remain mandatory.
 - Default phase observations contain no prompt, context, model content, or Tool
-  payload. Model usage and cost are reported only when supplied by a provider.
+  payload. Provider Model identity, usage, and cost are reported only when
+  supplied by a provider and never replace registered Model authority.
 - Observer errors, panics, backpressure, and capacity loss cannot alter Agent
   Loop settlement and must be exposed through explicit drop counters.
 - Provisional model streams are application content, never Observability

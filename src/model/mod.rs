@@ -472,8 +472,7 @@ impl HttpsJsonModel {
         if response_body.provider_request_id.is_none() {
             response_body.provider_request_id = response.provider_request_id;
         }
-        validate_provider_request_id(response_body.provider_request_id.as_deref())?;
-        crate::runtime::validate_model_output(&response_body.output)?;
+        crate::runtime::validate_model_response(&response_body)?;
         Ok(response_body)
     }
 }
@@ -793,8 +792,7 @@ fn parse_stream_frame(
             let _ = stream.emit_text_delta(delta);
         }
         ModelGatewayStreamFrame::Response { response } => {
-            validate_provider_request_id(response.provider_request_id.as_deref())?;
-            crate::runtime::validate_model_output(&response.output)?;
+            crate::runtime::validate_model_response(&response)?;
             *final_response = Some(response);
         }
     }
@@ -1016,9 +1014,10 @@ mod tests {
 
     #[tokio::test]
     async fn sends_bounded_authenticated_gateway_contract() {
-        let response = ModelResponse::from(ModelOutput::Message {
+        let mut response = ModelResponse::from(ModelOutput::Message {
             content: "done".to_owned(),
         });
+        response.provider_model = Some("provider/model-v2".to_owned());
         let transport = Arc::new(RecordingTransport {
             recorded: Mutex::new(Vec::new()),
             api_version: Some(MODEL_GATEWAY_API_VERSION.to_owned()),
@@ -1050,6 +1049,10 @@ mod tests {
         assert_eq!(
             response.provider_request_id.as_deref(),
             Some("gateway-request")
+        );
+        assert_eq!(
+            response.provider_model.as_deref(),
+            Some("provider/model-v2")
         );
         let recorded = transport.recorded.lock().expect("recorded");
         assert_eq!(recorded.len(), 1);
@@ -1198,6 +1201,17 @@ mod tests {
             )
             .is_err()
         );
+
+        let mut invalid_model = ModelResponse::from(ModelOutput::Message {
+            content: "untrusted".to_owned(),
+        });
+        invalid_model.provider_model = Some("\n".to_owned());
+        let invalid_model_frame = serde_json::to_vec(&json!({
+            "type": "response",
+            "response": invalid_model
+        }))
+        .expect("frame");
+        assert!(parse_stream_frame(&invalid_model_frame, &stream, &mut 0, &mut None,).is_err());
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub use verification::{
 };
 
 /// Exact HTTPS JSON model-gateway contract version.
-pub const MODEL_GATEWAY_API_VERSION: &str = "4";
+pub const MODEL_GATEWAY_API_VERSION: &str = "5";
 
 /// Exact model-cost scale used by [`ModelUsage`].
 ///

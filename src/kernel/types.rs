@@ -709,6 +709,12 @@ pub struct ModelResponse {
     pub output: ModelOutput,
     /// Provider-reported accounting; the Runtime never invents missing usage.
     pub usage: Option<ModelUsage>,
+    /// Optional Provider-reported model identity that settled this call.
+    ///
+    /// This is evidence only. It never replaces the registered Model identity
+    /// used for routing, Policy, continuation binding, or durable provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
     /// Optional opaque provider request identity for support correlation.
     pub provider_request_id: Option<String>,
     /// Optional provider state that must precede this decision on replay.
@@ -739,6 +745,7 @@ impl From<ModelOutput> for ModelResponse {
         Self {
             output,
             usage: None,
+            provider_model: None,
             provider_request_id: None,
             continuation: None,
         }
