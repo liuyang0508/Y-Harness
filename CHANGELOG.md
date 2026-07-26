@@ -7,8 +7,9 @@ All notable changes to Y-Harness are documented in this file.
 - added a bounded Codex `exec --json` adapter to the independent external
   benchmark runner, preserving JSONL evidence while recording unavailable
   product metrics as unavailable rather than inferred;
-- pinned Grok/xAI model, prompt, SDK, and protocol sources as supplemental
-  provider-side evidence without misclassifying them as an open Harness.
+- added Grok Build's official Rust Agent/Harness source as an audited baseline,
+  while keeping the Grok 4.5 Model coordinate distinct from supporting xAI
+  weights, prompt, SDK, and protocol evidence.
 
 ## 0.1.0 - 2026-07-25
 

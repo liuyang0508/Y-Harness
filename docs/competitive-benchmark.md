@@ -1,8 +1,9 @@
 # Competitive Harness benchmark
 
 This protocol defines the evidence required before Y-Harness may claim better
-runtime effect than Codex, Claude Code, Pi Agent Harness, Hermes Agent, or
-OpenCode. It is a pre-registration document, not a benchmark result.
+runtime effect than Codex, Claude Code, Pi Agent Harness, Hermes Agent,
+OpenCode, or Grok Build. It is a pre-registration document, not a benchmark
+result.
 
 ## Claim boundary
 
@@ -29,10 +30,13 @@ result has
 the product envelope, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
 
-Grok/xAI open repositories are tracked separately as Model, prompt, SDK, and
-provider-protocol evidence. They do not publish the production Grok Harness,
-so they neither become a source-level Harness baseline nor establish a Grok
-product-default cell. See [`reference-analysis.md`](reference-analysis.md).
+Grok Build is an official open-source coding Agent, TUI, and Harness, so it is
+a source-level baseline. Grok 4.5 remains a separate Model coordinate and is
+the audited Grok Build snapshot's checked-in default. A released Grok Build
+run may enter the product-default track; it enters the Harness-control track
+only when the same Model and authority controls can actually be fixed. No Grok
+Build adapter or comparative result is claimed yet. See
+[`reference-analysis.md`](reference-analysis.md).
 
 ## Two tracks
 

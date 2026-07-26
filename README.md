@@ -164,11 +164,11 @@ The language-neutral wire contract lives in the
 [client protocol v12 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
-and OpenCode live in the
+OpenCode, and Grok Build live in the
 [reference architecture analysis](docs/reference-analysis.md).
-That analysis also tracks Grok/xAI open Model, prompt, SDK, and protocol
-snapshots as supplemental provider-side evidence, not as open production
-Harness source.
+That analysis keeps Grok Build, the open Agent/Harness product, distinct from
+its current Grok 4.5 default Model and from supporting xAI Model, prompt, SDK,
+and protocol snapshots.
 The controlled same-model and product-default rules required for any
 “outperforms” claim live in the
 [competitive Harness benchmark](docs/competitive-benchmark.md).

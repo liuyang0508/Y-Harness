@@ -1,14 +1,14 @@
 # Reference architecture analysis
 
 This document records how Y-Harness Engineering derives architectural lessons
-from Pi Agent Harness, Claude Code, Codex, Hermes Agent, and OpenCode. It is a
-design-input audit, not a feature-parity checklist and not an endorsement of
-every implementation choice in those projects.
+from Pi Agent Harness, Claude Code, Codex, Hermes Agent, OpenCode, and Grok
+Build. It is a design-input audit, not a feature-parity checklist and not an
+endorsement of every implementation choice in those projects.
 
 The baseline source snapshot was reviewed on 2026-07-25 and the Turn-steering
-delta on 2026-07-26. Every source observation below links to an immutable
-commit. The repositories were inspected locally from shallow checkouts; their
-full test suites were not executed as part of this audit.
+and Grok Build deltas on 2026-07-26. Every source observation below links to an
+immutable commit. The repositories were inspected locally from shallow
+checkouts; their full test suites were not executed as part of this audit.
 
 Evidence has three levels:
 
@@ -36,6 +36,7 @@ it or treat it as proof of Anthropic's private implementation.
 | Pi Agent Harness | [`5bc1c2c`](https://github.com/earendil-works/pi/tree/5bc1c2c0a6f07e00e8c240304182f213ab8d311f) | official public source supplied for this audit, MIT |
 | Hermes Agent | [`689b51b`](https://github.com/NousResearch/hermes-agent/tree/689b51bef68f9ec95b638121bb9c7fefa3703fb2) | official public source, MIT |
 | OpenCode | [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b) | official public source, MIT |
+| Grok Build | [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2) | official public source periodically synced from the SpaceXAI monorepo, Apache-2.0 |
 
 The 2026-07-26 delta additionally pins current Codex at
 [`61a4488`](https://github.com/openai/codex/tree/61a44880a85d2fd0d8770908dea5733495e571c8)
@@ -44,11 +45,28 @@ and Hermes at
 These newer coordinates are used only for the delta findings below; they do not
 silently relabel observations made against the earlier baseline.
 
-## Supplemental Grok/xAI evidence: X-side, not an open Harness
+## Grok Build: open Harness source; Grok 4.5: Model coordinate
 
-The Grok sources are relevant to `Agent = LLM × Harness`, but they do not
-belong in the five-project Harness-source baseline. The following official xAI
-snapshots were inspected separately:
+[SpaceXAI's release announcement](https://x.ai/news/grok-build-open-source)
+explicitly publishes Grok Build as its coding agent, TUI, and Harness. The
+official repository contains the Rust CLI/TUI and agent runtime, including
+context assembly, model sampling, Tool dispatch, workspace/checkpoint support,
+Skills, Plugins, Hooks, MCP, and Subagents. Snapshot `47348d1` records
+SpaceXAI monorepo source revision
+`d02693a856a54f1030695b36b91d276e96b30b23` in `SOURCE_REV`.
+
+The names must remain separate:
+
+- **Grok Build** is the open Agent/Harness product and source baseline;
+- **Grok 4.5** is the Model ID and the
+  [checked-in default model](https://github.com/xai-org/grok-build/blob/47348d13ec4508dcfe440e34c6d511bb02998fb2/crates/codegen/xai-grok-models/default_models.json)
+  for that product at the audited snapshot;
+- neither fact makes the Grok 4.5 model weights open source or establishes
+  that this repository contains the consumer Grok application's entire
+  production stack.
+
+The following official xAI snapshots remain useful supporting evidence rather
+than substitutes for the Grok Build runtime:
 
 | Source | Snapshot | What it establishes | What it does not establish |
 |---|---|---|---|
@@ -57,22 +75,24 @@ snapshots were inspected separately:
 | xAI Python SDK | [`4358bc2`](https://github.com/xai-org/xai-sdk-python/tree/4358bc235e8641ba5f0cb54599675d098385d4bf) | official synchronous/asynchronous gRPC client behavior | server implementation or production Harness internals |
 | xAI protobufs | [`af1be87`](https://github.com/xai-org/xai-proto/tree/af1be87b733dc177c0857fbd624f1ff12128fbd2) | versioned public provider contracts for tools, remote MCP, continuation, encrypted content, bounded agentic turns, and multi-agent model requests | which component owns effects, recovery, authorization, or durable truth inside xAI |
 
-Three useful design inputs follow without copying product semantics:
+Four useful design inputs follow without copying product semantics:
 
-1. Grok-1 is an optional Model/runtime target, not evidence about the Harness
-   multiplier.
-2. Public prompt snapshots are benchmark coordinates and behavioral hypotheses,
-   not substitutes for Runtime source.
-3. Provider-managed Tools, remote MCP, opaque continuation, and multi-agent
+1. Grok Build is a source-level Harness baseline. Its Rust composition root,
+   agent runtime, TUI, Tool, workspace, state, extension, and ACP boundaries are
+   auditable mechanisms, not merely product claims.
+2. Grok 4.5 is a controlled Model or product-default coordinate. It must not be
+   conflated with the Grok Build Harness when attributing benchmark outcomes.
+3. Grok-1 weights and public prompt snapshots are separate Model-side evidence,
+   not substitutes for the current Grok Build Runtime.
+4. Provider-managed Tools, remote MCP, opaque continuation, and multi-agent
    requests must be represented as provider-origin effects with explicit
    authority and evidence. They must never be mislabeled as Harness-executed
    Tools merely because the provider protocol uses similar nouns.
 
-Y-Harness may add xAI as a direct Model provider and Grok as a controlled model
-cell. A production Grok comparison remains product-default evidence unless a
-released, auditable Harness surface permits the same controls. No current
-source-level superiority claim against the Grok Harness is possible because
-that Harness source is not present in these repositories.
+Y-Harness may add xAI as a direct Model provider, Grok 4.5 as a controlled
+Model cell, and released Grok Build as an external benchmark adapter. Source
+comparison is now possible; superiority is still unproven until both systems
+run the same versioned workloads under declared controls.
 
 ## 2026-07-26 Turn-steering delta
 
@@ -87,7 +107,7 @@ level. Similar names do not establish equivalent semantics.
 | Current Hermes restarts after steering crosses an in-flight response, and its recovery code copies SQLite/WAL/SHM before canonical rebuild and integrity checks. | A response sampled from old context is stale; recovery must preserve evidence before repair. | Crossed Model messages and Tool calls are discarded, their provisional stream step is invalidated, and steering is applied before resampling. | This delta does not copy Hermes's large parent-object loop, mutable learned-skill behavior, or claim that Y-Harness already matches its recovery breadth. |
 | OpenCode's CLI runtime serializes queued ordinary prompts and allows client editing/removal. | Product-side queue UX can remain independent from Runtime semantics. | The TUI maps input during an active Turn to the engine's typed steering command. | An editable client queue is not Runtime steering authority and cannot replace durable acceptance evidence. |
 
-The resulting Y-Harness mechanism is not a union of five feature lists.
+The resulting Y-Harness mechanism is not a union of six feature lists.
 `SteeringQueued` records accepted actor-attributed input, while
 `SteeringApplied` records the exact FIFO safe boundary at which it became Model
 context. Completion is forbidden while queued input remains. A per-active-Turn
@@ -108,19 +128,20 @@ recovery are still unmeasured.
 | Codex | `run_turn` owns the sampling/tool/follow-up loop and captures one step view for context and advertised tools. A Rust core supports TUI, exec, and a typed app-server protocol. Tool routing records lifecycle outcomes, and the sandbox manager selects macOS Seatbelt, Linux seccomp/bubblewrap, or Windows restricted-token execution independently from approval policy. SQLite state, recovery, skills, plugins, memories, multi-agent paths, and OpenTelemetry are distinct crates or modules. | Rust semantic core, client/runtime separation, versioned asynchronous protocol, Thread/Turn/Item state, explicit approval, process-broker isolation, skills/MCP, and worktree-aware orchestration. | Coding-agent behavior stays outside Core. Process-local operation state is not durable truth. Remote recovery cannot take over a Turn without an external lease and fencing authority. |
 | Hermes Agent | One `AIAgent` serves CLI, gateway, ACP, batch, cron, and API entry points. The source has extensive provider normalization, retry/error classification, context compression, SQLite/FTS session storage, checkpoints, approvals, many execution environments, memory/context plugins, trajectories, and observer hooks. The extracted `conversation_loop.py` still drives a large parent-object state surface, showing useful production handling and a coupling cost at the same time. | General-purpose rather than coding-only scope, shared core across entry points, Memory and Context provider ports, profiles/scopes, provider neutrality, and trajectories as Evaluation evidence. Error taxonomies and provider quirks become adapter conformance cases. | Messaging adapters, provider configuration, mutable skill learning, and application commands do not belong in the microkernel. Import-time self-registration and ambient plugin authority are not accepted extension contracts. |
 | OpenCode | The current tree separates Effect-based services, normalized `LLMEvent` streams, session processing, permissions, tools, providers, plugins, MCP, SQLite schemas/migrations, event-backed session projection, control-plane/worktree code, SDKs, TUI, web, and desktop clients. The permission service keeps pending approvals process-local, while the newer core state uses SQLite and explicit projection code. | Headless core plus typed service boundary, streaming events, provider/tool registries, permission checks, durable projection, and multiple clients over one semantic runtime. | Coding modes, local-server assumptions, and desktop/web product policy do not define Harness semantics. In-process plugins do not receive ambient engine authority by installation alone. Pending approvals and transient stream state cannot become authoritative recovery state. |
+| Grok Build | A Rust composition root separates the full-screen TUI, agent runtime, Tools, workspace/checkpoints, model sampling, chat state, SQLite journal, MCP, Skills, Plugins, Hooks, Subagents, ACP, sandboxing, telemetry, and headless entry points. The public tree is a periodic monorepo sync rather than the complete monorepo. | Rust client/runtime separation, explicit product composition root, local-first provider configuration, ACP embedding, extension breadth, and concrete recovery/UX mechanisms become source-audited design inputs and benchmark cases. | Grok 4.5 defaults, coding workflows, TUI policy, hosted-service assumptions, and product extension semantics do not become Core contracts. A large generated crate closure is not copied as Y-Harness's module topology. |
 
 ## Source-level competitive findings
 
 | Layer | Strongest observed lessons | Y-Harness position after this audit |
 |---|---|---|
-| Context Engine | Claude Code and Codex have multiple compaction/recovery paths shaped by real provider failures. OpenCode now models context epochs; Pi keeps compaction understandable; Hermes handles wide provider variance and prompt caching. | Deterministic whole-Turn selection, independent byte/token bounds, and provenance are credible local strengths. Semantic faithfulness, provider cache behavior, media overflow recovery, and long-session quality are not competitively proven. |
-| Agent Loop | Pi has the clearest small generic loop. Codex captures a consistent per-step view. Claude Code has mature streaming fallback and orphan-result cleanup. Hermes has broad retry/failover classification. OpenCode converges runtimes on one event stream. | Durable settlement, deadlines, cancellation, and explicit recovery are implemented, but the direct-provider path and production fault matrix are much narrower. |
-| Tool Runtime | Codex has the strongest public cross-platform sandbox implementation. Claude Code shows mature concurrent/exclusive tool scheduling. Hermes has the broadest execution-environment catalog. OpenCode and Pi have low-friction extension paths. | Policy-governed registration and fail-closed process authority are strong design choices. Linux/Windows containment, tool breadth, provider-hosted tools, and hostile-process tests remain material gaps. |
+| Context Engine | Claude Code and Codex have multiple compaction/recovery paths shaped by real provider failures. OpenCode now models context epochs; Pi keeps compaction understandable; Hermes handles wide provider variance and prompt caching; Grok Build exposes concrete prompt, compaction, and recap paths. | Deterministic whole-Turn selection, independent byte/token bounds, and provenance are credible local strengths. Semantic faithfulness, provider cache behavior, media overflow recovery, and long-session quality are not competitively proven. |
+| Agent Loop | Pi has the clearest small generic loop. Codex captures a consistent per-step view. Claude Code has mature streaming fallback and orphan-result cleanup. Hermes has broad retry/failover classification. OpenCode converges runtimes on one event stream. Grok Build adds a substantial Rust product loop with interjection and long-running task behavior. | Durable settlement, deadlines, cancellation, and explicit recovery are implemented, but the direct-provider path and production fault matrix are much narrower. |
+| Tool Runtime | Codex has the strongest public cross-platform sandbox implementation. Claude Code shows mature concurrent/exclusive tool scheduling. Hermes has the broadest execution-environment catalog. OpenCode and Pi have low-friction extension paths. Grok Build combines local and hosted Tools with a broad Rust extension surface. | Policy-governed registration and fail-closed process authority are strong design choices. Linux/Windows containment, tool breadth, provider-hosted tools, and hostile-process tests remain material gaps. |
 | State Engine | Codex, OpenCode, and Hermes all have substantial SQLite schemas, migrations, and recovery behavior; OpenCode now has event-backed session projection. Pi deliberately supports lighter JSONL/in-memory session stores. | Typed append-only authority, CAS, bounded recovery, snapshots, and backup-first migrations are implemented. Archival, blob offload, remote ownership, and long-running production evidence are open. |
 | Memory Engine | Hermes exposes several provider plugins. Codex and Claude Code integrate product memory. | The Agent Memory Hub boundary is a genuine differentiator, but retrieval quality and end-to-end outcome gain require shared benchmarks, not architecture claims. |
-| Skill Engine | Codex and Claude Code have marketplace/plugin product flows; OpenCode pulls remote skills; Pi packages skills/extensions; Hermes ships a large catalog. | Signature, revocation, receipts, exact pins, and bounded resolution are strong governance primitives. Discovery UX, private registry, cache/mirror, dependency acquisition, and ecosystem size lag. |
+| Skill Engine | Codex and Claude Code have marketplace/plugin product flows; OpenCode pulls remote skills; Pi packages skills/extensions; Hermes ships a large catalog; Grok Build exposes Skills, Plugins, Hooks, and marketplace code in one product runtime. | Signature, revocation, receipts, exact pins, and bounded resolution are strong governance primitives. Discovery UX, private registry, cache/mirror, dependency acquisition, and ecosystem size lag. |
 | Policy Engine | Codex separates approval from OS sandboxing and supports managed requirements. Claude Code has rich permission matching/classification. OpenCode has concise rule evaluation. Hermes covers approvals across CLI/gateway surfaces. | Durable attributed approvals and fingerprint-bound continuation are stronger than an in-memory prompt. Human/tenant identity, signed receipts, role policy, remote continuation, and cross-platform containment are open. |
-| Orchestration | Codex and Claude Code expose mature multi-agent/product workflows. OpenCode has subagents and worktree/control-plane code. Hermes has delegation across many surfaces. Pi has simple steering/follow-up semantics. | Task DAGs, leases, fencing, mailbox, and workspace lifecycle are architecturally substantial. Multi-node consensus, durable orphan reaping, remote executors, and comparative task success are not proven. |
+| Orchestration | Codex and Claude Code expose mature multi-agent/product workflows. OpenCode has subagents and worktree/control-plane code. Hermes has delegation across many surfaces. Pi has simple steering/follow-up semantics. Grok Build exposes Subagents, workflows, goals, worktrees, and long-running task paths. | Task DAGs, leases, fencing, mailbox, and workspace lifecycle are architecturally substantial. Multi-node consensus, durable orphan reaping, remote executors, and comparative task success are not proven. |
 | Verification | Claude Code has stop hooks and verification-oriented skills; Codex has review/hook paths; Hermes records verification evidence. | Verification is a first-class engine layer rather than only a prompt convention. Its real-world graders and false-completion rate still need competitive measurement. |
 | Observability | Codex has OpenTelemetry modules and rich runtime events. Hermes has a versioned observer contract. OpenCode uses Effect/OTel. Claude Code and Pi expose extensive events. | Failure-isolated, content-free evidence is privacy-conscious and bounded. Exporter breadth, distributed traces, operator UX, and overhead comparisons are open. |
 | Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner, not a competitive result. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
@@ -163,7 +184,7 @@ approval continuation, and unknown Tool effects are constrained by
 
 ### Context is compiled, not concatenated ad hoc
 
-All five references expose some combination of instructions, session history,
+All six references expose some combination of instructions, session history,
 compression, skills, memory, or provider conversion. Y-Harness turns those
 inputs into a deterministic Context compilation phase with independent token
 and byte limits, whole-Turn selection, explicit Memory provenance, and optional
