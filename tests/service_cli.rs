@@ -57,7 +57,54 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains("protocol: 12"));
     assert!(report.contains("model: local/demo"));
+    assert!(report.contains("skills: 0"));
     assert!(report.contains("status: ok"));
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn doctor_loads_exact_project_skills_and_rejects_content_tampering() {
+    let project = isolated_project("project-skill");
+    fs::create_dir_all(project.join("skills")).expect("create Skill directory");
+    let config_path = project.join("y-harness.json");
+    let package_path = project.join("skills/concise-assistant.skill.json");
+    fs::write(
+        &config_path,
+        include_bytes!("../config/y-harness.skill.example.json"),
+    )
+    .expect("write Skill config");
+    fs::write(
+        &package_path,
+        include_bytes!("../examples/skills/concise-assistant.skill.json"),
+    )
+    .expect("write Skill package");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run Skill doctor");
+    assert!(
+        doctor.status.success(),
+        "Skill doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
+    assert!(report.contains("skills: 1"));
+    assert!(report.contains("status: ok"));
+
+    let tampered = fs::read_to_string(&package_path)
+        .expect("read Skill")
+        .replace("Answer clearly", "Answer vaguely");
+    fs::write(&package_path, tampered).expect("tamper Skill package");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run tampered Skill doctor");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("digest"));
+
     fs::remove_dir_all(project).expect("remove isolated project");
 }
 

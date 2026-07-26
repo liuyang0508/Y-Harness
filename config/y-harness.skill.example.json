@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "skills": {
+    "package_files": [
+      "skills/concise-assistant.skill.json"
+    ],
+    "activate": [
+      {
+        "name": "concise-assistant",
+        "version": "1.0.0"
+      }
+    ],
+    "budget_tokens": 256
+  }
+}

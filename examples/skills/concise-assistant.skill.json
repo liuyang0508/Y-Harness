@@ -1,0 +1,14 @@
+{
+  "manifest": {
+    "api_version": "1",
+    "name": "concise-assistant",
+    "version": "1.0.0",
+    "description": "Keep responses clear, concise, and explicit about uncertainty.",
+    "estimated_tokens": 32,
+    "dependencies": [],
+    "required_tools": []
+  },
+  "instructions": "Answer clearly and concisely. Distinguish verified facts from assumptions, and state uncertainty explicitly.",
+  "resources": {},
+  "content_sha256": "0ddd1d0af09a2ea5bc0166943f62b579eb3335a9c3919824ecf43864881fa460"
+}

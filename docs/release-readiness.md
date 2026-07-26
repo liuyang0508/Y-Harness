@@ -113,9 +113,12 @@ boundary remain explicit.
 - Publisher and transparency-log keys now support live validity and immutable
   revocation, and signed receipts bind log/entry/time metadata to the exact
   package and publisher signature. Exact pin-bound public HTTPS acquisition is
-  available behind `https-skill`. Catalog discovery, authenticated private
-  registries, dependency acquisition, caching/offline mirrors, a live external
-  source pass, threshold signatures, durable trust-policy distribution, and
+  available behind `https-skill`. The reference service can explicitly load
+  and activate digest-verified declarative packages from inside its
+  operator-controlled project. A `yh skill install` command, directory
+  discovery, hot reload, catalog discovery, authenticated private registries,
+  dependency acquisition, caching/offline mirrors, a live external source
+  pass, threshold signatures, durable trust-policy distribution, and
   append-only transparency-log inclusion/consistency/gossip are not
   implemented.
 - Conversation history preserves a deterministic raw whole-Turn suffix and can

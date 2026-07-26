@@ -198,7 +198,34 @@ Markdown 或索引格式导入 Y-Harness。macOS 生产模板见
 `yh doctor` 会启动并健康检查配置的 Memory Provider，然后有界关闭
 MCP session。
 
-## 8. 接入自有模型 Gateway
+## 8. 加载项目自定义 Skill
+
+参考服务可以加载项目目录内的声明式 Skill 包，不需要修改或重新编译
+Y-Harness：
+
+```bash
+mkdir -p skills
+cp /path/to/Y-Harness/examples/skills/concise-assistant.skill.json \
+  skills/concise-assistant.skill.json
+cp /path/to/Y-Harness/config/y-harness.skill.example.json y-harness.json
+yh doctor y-harness.json
+```
+
+`package_files` 只声明可用包，`activate` 另外精确声明本次启用的名称和
+版本；磁盘上存在文件不会自动授权。所有路径必须留在配置项目目录内，
+包内容摘要、依赖、所需 Tools 和总 Token 预算会在服务接收 Turn 前
+完成验证。Skill 只向 Context 提供声明式 instructions/resources，不能
+执行代码或绕过 Tool Policy。
+
+项目文件属于操作员直接信任的配置输入，不等价于第三方发布者签名。
+从网络或不可信来源取得的包仍应使用 Skill Engine 已有的签名
+`External` 路径。当前尚无 `yh skill install`、目录自动发现、市场或
+热加载；修改配置或包后需重启服务。
+
+演示模型保持确定性，不用于证明模型遵循 instructions；真实 Provider
+会通过普通 `ModelRequest.context` 接收已解析 Skill。
+
+## 9. 接入自有模型 Gateway
 
 复制生产配置模板：
 
@@ -219,12 +246,12 @@ yh serve y-harness.json
 重新混入系统或 WebPKI 根证书。
 
 Gateway 必须实现
-[`protocol.md`](protocol.md) 所述的精确 Model Gateway v2 契约。
+[`protocol.md`](protocol.md) 所述的精确 Model Gateway v5 契约。
 除明确实现的 OpenAI Responses Provider 外，Y-Harness 不伪装不同
 厂商 API 具有相同语义；其他厂商适配应放在 Gateway 或宿主 Provider
 中。
 
-## 9. 作为 Rust 引擎嵌入
+## 10. 作为 Rust 引擎嵌入
 
 最小 Agent Loop：
 
@@ -242,7 +269,7 @@ cargo run --locked --example orchestrated
 [`examples/embedded.rs`](../examples/embedded.rs) 和
 [`examples/orchestrated.rs`](../examples/orchestrated.rs)。
 
-## 10. 安全与产品边界
+## 11. 安全与产品边界
 
 - `serve` 是持久化 stdio 服务，适合由进程主管或受信宿主启动。
 - 网络暴露必须使用现有 mandatory-mTLS host，不能把裸 JSONL socket

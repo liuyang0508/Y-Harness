@@ -18,10 +18,11 @@ use y_harness::{
     JsonProcessConfig, LanguageModel, LocalProcessBroker, MacOsSeatbeltBroker, McpClient,
     MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
     ModelRegistry, NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolHandler,
-    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
-    SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine, StdioMcpClient,
-    StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator,
-    ToolDescriptor, ToolRegistry, register_selected_mcp_tools, serve_stdio,
+    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SkillEngine,
+    SkillId, SkillPackage, SkillRegistry, SqliteApprovalInbox, SqliteEventStore,
+    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
+    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ToolDescriptor, ToolRegistry,
+    register_selected_mcp_tools, serve_stdio,
 };
 
 #[cfg(feature = "https-model")]
@@ -35,6 +36,7 @@ use super::{CliResult, DemoModel, EchoTool};
 const CONFIG_FILE: &str = "y-harness.json";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 65_536;
+const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 16_777_216;
 #[cfg(feature = "https-model")]
 const MAX_CA_BYTES: u64 = 1_048_576;
 
@@ -50,6 +52,8 @@ struct ServiceConfig {
     mcp_servers: Vec<ServiceMcpServerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<ServiceMemoryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skills: Option<ServiceSkillsConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -61,6 +65,7 @@ impl Default for ServiceConfig {
             tools: Vec::new(),
             mcp_servers: Vec::new(),
             memory: None,
+            skills: None,
         }
     }
 }
@@ -155,6 +160,15 @@ struct ServiceMcpToolsConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillsConfig {
+    package_files: Vec<String>,
+    activate: Vec<SkillId>,
+    #[serde(default = "default_skill_budget_tokens")]
+    budget_tokens: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServiceProcessLaunchConfig {
     Unrestricted {
@@ -209,6 +223,7 @@ struct ConfiguredCapabilities {
     context: ContextEngine,
     mcp_clients: BTreeMap<String, Arc<StdioMcpClient>>,
     memory_health: Option<MemoryHealthStatus>,
+    skill_count: usize,
 }
 
 /// Creates a no-clobber local project configuration.
@@ -278,6 +293,7 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     println!("model: {}", model.id);
     println!("tools: {}", capabilities.tools.descriptors().len());
     println!("mcp servers: {}", capabilities.mcp_clients.len());
+    println!("skills: {}", capabilities.skill_count);
     if let Some(status) = &capabilities.memory_health {
         println!("memory: agent-memory-hub ({status:?})");
     } else {
@@ -306,6 +322,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         context,
         mcp_clients,
         memory_health: _,
+        skill_count: _,
     } = capabilities;
     let state = StateEngine::new(Arc::new(
         SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
@@ -465,7 +482,7 @@ async fn build_capabilities(
         }
     }
 
-    let (context, memory_health) = match &loaded.config.memory {
+    let (mut context, memory_health) = match &loaded.config.memory {
         None => (ContextEngine::without_memory(), None),
         Some(ServiceMemoryConfig::AgentMemoryHub {
             mcp_server,
@@ -513,6 +530,13 @@ async fn build_capabilities(
             (ContextEngine::with_memory(memories, config), health)
         }
     };
+    let skill_count = if let Some(resolved) = load_project_skills(loaded, &tools)? {
+        let count = resolved.skills.len();
+        context = context.with_skills(resolved);
+        count
+    } else {
+        0
+    };
 
     Ok(ConfiguredCapabilities {
         tools,
@@ -520,7 +544,41 @@ async fn build_capabilities(
         context,
         mcp_clients: clients,
         memory_health,
+        skill_count,
     })
+}
+
+fn load_project_skills(
+    loaded: &LoadedConfig,
+    tools: &ToolRegistry,
+) -> CliResult<Option<y_harness::ResolvedSkillSet>> {
+    let Some(config) = &loaded.config.skills else {
+        return Ok(None);
+    };
+    if config.package_files.is_empty() || config.activate.is_empty() {
+        return Err("skills requires non-empty package_files and activate lists".into());
+    }
+
+    let mut registry = SkillRegistry::new();
+    for configured in &config.package_files {
+        let path = resolve_project_file(&loaded.root, configured)?;
+        let encoded = read_bounded(&path, MAX_SKILL_PACKAGE_FILE_BYTES, "Skill package")?;
+        let package: SkillPackage = serde_json::from_slice(&encoded)
+            .map_err(|_| format!("Skill package is malformed: {}", path.display()))?;
+        let origin = CapabilityOrigin::TrustedExtension {
+            id: format!(
+                "project-skill/{}@{}",
+                package.manifest.name, package.manifest.version
+            ),
+        };
+        registry.register(origin, package)?;
+    }
+
+    Ok(Some(SkillEngine::new(registry).resolve(
+        &config.activate,
+        tools,
+        config.budget_tokens,
+    )?))
 }
 
 fn build_mcp_launch_authority(
@@ -864,7 +922,6 @@ fn resolve_data_directory(root: &Path, configured: &str) -> CliResult<PathBuf> {
     Ok(root.join(path))
 }
 
-#[cfg(feature = "https-model")]
 fn resolve_project_file(root: &Path, configured: &str) -> CliResult<PathBuf> {
     let relative = resolve_data_directory(root, configured)?;
     let canonical = fs::canonicalize(&relative)?;
@@ -937,6 +994,10 @@ const fn default_memory_budget_tokens() -> usize {
     2_000
 }
 
+const fn default_skill_budget_tokens() -> usize {
+    8_192
+}
+
 const fn default_tool_timeout_ms() -> u64 {
     30_000
 }
@@ -989,5 +1050,9 @@ mod tests {
             "../../config/y-harness.openai-command.macos.example.json"
         ))
         .expect("OpenAI plus JSON command Tool example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.skill.example.json"
+        ))
+        .expect("project Skill example config");
     }
 }

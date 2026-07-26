@@ -13,7 +13,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Tool Runtime | typed registry, configured shell-free JSON Tools, exact-selected MCP Tools, default-deny bounded MCP launch, Unix process-group settlement, reusable macOS sandbox, explicit compensation | `src/execution`, `src/transport/mcp.rs`, ADRs 0013/0036/0043/0054/0056/0062/0066/0076 | local baseline passing; escape-resistant Linux plus Linux/Windows persistent containment open |
 | State Engine | typed journal, memory/SQLite stores, CAS, checkpoints, snapshots, capacity/recovery bounds, schema-1/2/3/4/5 to schema-6 backup-first migration, origin-bound Provider Continuation, durable safe-boundary Steering | `src/state`, schema-1/2/3/4/5 migration fixtures, continuation and Steering fault tests, ADRs 0061/0065/0068/0077/0078 | local baseline passing; archival/offload open |
 | Memory Engine | versioned provider port, scoped provenance, Agent Memory Hub MCP adapter and configured Context assembly | `src/memory`, service host, unit tests and environment-gated real MCP test | adapter, service health probe, and sandboxed local round trip passing; remote CI environment-gated |
-| Skill Engine | exact dependency graph, budgets, signatures, live revocation, transparency receipts, pinned HTTPS source | `src/skill`, ADRs 0009/0014/0032/0033 | local baseline passing; catalog/private registry open |
+| Skill Engine | exact dependency graph, budgets, signatures, live revocation, transparency receipts, pinned HTTPS source, explicit project-configured package activation | `src/skill`, service host, ADRs 0009/0014/0032/0033/0085 | local baseline and project service path passing; catalog/private registry open |
 | Policy Engine | deny/allow/ask, risk class, attributed durable approval, restart-safe inbox, CAS, exact-actor separation of duty, fingerprinted continuation, backup-first schema migration | `src/runtime/policy.rs`, `src/approval`, restart/drift tests, ADRs 0007/0024/0049–0051/0063/0065 | local baseline passing; human/tenant roles and signed receipts open |
 | Orchestration | bounded DAG, executable TaskExecutor scheduler, dependency concurrency, timeout/panic isolation, leases/fencing, paged TaskMailbox messaging, default-deny Workspace Provider lifecycle, isolated local directories, pinned detached Git Worktrees, Artifacts, memory and SQLite coordination, serviceable authenticated worker protocol | `src/orchestration`, `src/protocol/task.rs`, `examples/orchestrated.rs`, ADRs 0011/0019/0052/0053/0071/0072/0073/0074 | embedded and protocol worker lifecycles passing for single-host/multiprocess coordination; multi-node consensus and durable orphan reconciliation open |
 | Verification | typed completion gates, retryable correction, hard failure settlement | `src/verification`, Runtime verification tests, ADR 0008 | local baseline passing |
@@ -27,7 +27,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Headless embeddable Rust core | public contracts in `src/lib.rs`; zero-default build; external-view examples execute a Policy-controlled Model/Tool loop and a fenced Task DAG | compiled and run locally; CI-gated |
 | Reference-project derivation | primary-source comparison, immutable open-source snapshots, adopted/rejected decisions, code/ADR mapping in `reference-analysis.md` | documented and link-checked locally |
 | Serviceable typed protocol | language-neutral v12 specification, exact envelope and schema-6 compatibility coordinates, negotiation, async Turn operations, exact-ID Steering, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS tests; passing locally |
-| Engine CLI | `yh init/doctor/serve`, durable State/Approval/Task databases, deterministic demo, direct OpenAI Responses, JSON/MCP Tool and Agent Memory Hub assembly, `src/reference_cli`, process tests | installed-binary and restart tests passing locally; live OpenAI API environment-gated |
+| Engine CLI | `yh init/doctor/serve`, durable State/Approval/Task databases, deterministic demo, direct OpenAI Responses, JSON/MCP Tool, project Skill and Agent Memory Hub assembly, `src/reference_cli`, process tests | installed-binary, project Skill integrity, and restart tests passing locally; live OpenAI API environment-gated |
 | Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v12-only child transport, exact-ID active-Turn Steering, invalidated provisional-output handling, content-free continuation rendering, TestBackend render tests, real PTY Turn | independently installable; local unit/lint/PTY gates passing |
 | Competitive benchmark tools | independent `y-harness-benchmark-runner` and `y-harness-fault-fixture` packages; bounded shell-free Claude Code JSON, Codex JSONL, and Grok Build headless JSON adapters; exact binary coordinates; external-run formats 1/2/3; deterministic stdio MCP crash-after-effect fixture and durable oracle | 19 adapter/fixture tests plus one real `claim_eligible: false` Claude conformance result; Codex and Grok Build have no live records and no comparative case exists |
 | Install and operator path | Cargo-backed no-side-effect install script, strict config template, Chinese quick start, real language-neutral Task Worker, acceptance checklist | clean-prefix install and revision-6 worker lifecycle passing locally |
@@ -39,7 +39,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 
 ## Local gate evidence
 
-The following commands passed on 2026-07-26 with Rust 1.88:
+The following commands passed on 2026-07-27 with Rust 1.88:
 
 ```bash
 git diff --check
@@ -67,8 +67,8 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
   /isolated/project/y-harness.json
 ```
 
-The all-feature workspace run contains 274 passing library tests, 2 CLI
-configuration tests, 7 Engine process/service tests, 10 TUI unit/render tests,
+The all-feature workspace run contains 276 passing library tests, 2 CLI
+configuration tests, 8 Engine process/service tests, 10 TUI unit/render tests,
 and 2 local private-gateway TLS integration tests. The demo and configured
 PTY smoke gates submit real Turns, verify durable State, and check
 alternate-screen and bracketed-paste restoration. One additional 64 MiB

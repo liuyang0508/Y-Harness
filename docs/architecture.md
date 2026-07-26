@@ -235,11 +235,11 @@ direction:
   default;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service commands, explicitly launched
-  shell-free JSON Tools, exact-selected MCP Tools, and Agent Memory Hub Context
-  assembly;
+  shell-free JSON Tools, exact-selected MCP Tools, explicitly activated
+  digest-verified project Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v10, with authoritative Thread projection, bounded provisional streaming,
+  v12, with authoritative Thread projection, bounded provisional streaming,
   cancellation, event paging, and read-only Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command

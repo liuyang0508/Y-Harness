@@ -432,6 +432,16 @@ fetch-and-register path performs all live trust checks before mutation.
 Catalog discovery, authenticated private registries, caching, and recursive
 dependency fetching are not implied.
 
+The reference service also accepts explicitly listed project-local Skill
+package files and exact activation identities. Each path must remain below the
+configuration project root, every package is digest-verified, dependencies and
+required Tools resolve before startup, and the resolved instructions enter the
+ordinary Context Engine. Project files are operator-trusted inputs rather than
+third-party publisher attestations; network packages still require the signed
+external path. See
+[`y-harness.skill.example.json`](config/y-harness.skill.example.json) and
+[ADR 0085](docs/adr/0085-project-configured-declarative-skills.md).
+
 Evaluation is a separate comparison layer: validated cases run through an
 `EvaluationTarget` with engine-owned cancellation and deadlines. Cases and
 graders execute with independently bounded concurrency; panics, timeouts, and
