@@ -44,6 +44,16 @@ jobs:
             -D clippy::expect_used \
             -D clippy::panic \
             -D warnings
+          cargo clippy --locked -p y-harness-benchmark-runner --bin yh-bench -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D warnings
+          cargo clippy --locked -p y-harness-fault-fixture --bin yh-fault-fixture -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D warnings
       - name: Minimal surface tests
         run: cargo test --locked --workspace --all-targets --no-default-features
       - name: Isolated optional-feature checks

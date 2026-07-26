@@ -1,0 +1,23 @@
+[package]
+name = "y-harness-fault-fixture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[[bin]]
+name = "yh-fault-fixture"
+path = "src/main.rs"
+
+[dependencies]
+fs2 = "=0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "=0.11.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+y-harness = { path = "../..", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"

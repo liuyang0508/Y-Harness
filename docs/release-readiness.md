@@ -32,7 +32,7 @@ not release-ready while any blocking row remains open.
 | Task workspace lifecycle | default deny, exact-attempt Provider lease, bounded prepare/release, cleanup-before-settlement, concurrent local isolation, marker/path replacement guards, detached pinned Git Worktree through Process Broker | passing with local directories and real local Git |
 | Task worker protocol | protocol-v12 conditional discovery, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests |
 | Harness regression evaluation | format-2, origin-bound 2-case × 2-grader end-to-end Runtime suite and exact baseline | `yh eval-smoke` passing; machine-readable and nonzero on regression |
-| Released-product evidence adapter | external-run format 1; exact adapter/product hashes; bounded Claude Code JSON process; requested/observed model and cost separation | 4 tests and one real Claude Code 2.1.143 conformance record passing; explicitly ineligible for comparison claims |
+| Released-product evidence tools | external-run format 1; exact adapter/product hashes; bounded Claude Code JSON process; requested/observed model and cost separation; exact-pinned MCP crash-after-effect fixture with durable oracle | 8 tests and one real Claude Code 2.1.143 conformance record passing; explicitly ineligible for comparison claims |
 | Public API embedding | standalone zero-network hosts run a Policy-controlled Model/Tool loop and a durable fenced Task DAG through public contracts | `embedded` and `orchestrated` examples passing |
 
 The local performance figures were measured on 2026-07-26 and are environment

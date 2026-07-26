@@ -2708,6 +2708,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "y-harness-fault-fixture"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "y-harness",
+]
+
+[[package]]
 name = "y-harness-tui"
 version = "0.1.0"
 dependencies = [

@@ -200,6 +200,31 @@ Those tests establish Y-Harness invariants only. Released-product adapters have
 not yet executed `CF-002`, so no relative correctness, latency, or
 answer-quality claim follows.
 
+## Third executable deterministic fault case
+
+`CF-003 uncertain-non-idempotent-tool-effect` presents a released product with
+one destructive, non-idempotent stdio MCP Tool. The first valid call durably
+records its synthetic effect and terminates the Tool server before returning a
+result.
+
+The independent oracle requires all of the following:
+
+- fixture executable, semantic spec, operation, payload, and journal are
+  fingerprinted;
+- preparation never replaces prior evidence;
+- invocation and effect records are ordered, independently synchronized, and
+  bounded;
+- no disconnected Tool call is retried implicitly;
+- one invocation produces exactly one uncertain effect;
+- any second invocation is reported separately from a second committed
+  effect; and
+- partial, reordered, mismatched, active, or oversized journals fail closed.
+
+`yh-fault-fixture` and its real official-client integration test now execute
+this fixture contract. Released-product restart drivers have not executed it,
+so the observation remains `claim_eligible: false`. See
+[`fault-fixtures.md`](fault-fixtures.md).
+
 ## Implementation order
 
 The shortest path to credible comparison is:
@@ -207,7 +232,8 @@ The shortest path to credible comparison is:
 1. ~~add a versioned external-run result format and one released-CLI adapter;~~
    completed for format 1 plus Claude Code adapter conformance;
 2. implement deterministic failure-injection Tool fixtures and state-recovery
-   cases;
+   cases; the first crash-after-effect fixture and oracle are complete, while
+   released-product restart drivers and the remaining fault matrix are open;
 3. add Pi, OpenCode, Hermes, Codex, and released Claude Code adapters without
    importing their code;
 4. run the Harness-control track with one mutually supported model;
@@ -216,7 +242,8 @@ The shortest path to credible comparison is:
 
 Provider continuation and durable safe-boundary steering are implemented and
 locally fault-tested in Y-Harness. The first real released-product adapter
-record is also preserved, but no cross-product fault case has run. Execution
-of CF-001/CF-002 across products, Linux and Windows containment, and live
-external integration evidence remain prerequisites for broad superiority
-claims, not documentation follow-ups.
+record and first controller-owned fault fixture are also preserved, but no
+cross-product fault case has run. Execution of CF-001/CF-002/CF-003 across
+products, Linux and Windows containment, and live external integration
+evidence remain prerequisites for broad superiority claims, not documentation
+follow-ups.

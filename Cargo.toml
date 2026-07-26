@@ -1,5 +1,5 @@
 [workspace]
-members = ["clients/tui", "tools/benchmark-runner"]
+members = ["clients/tui", "tools/benchmark-runner", "tools/fault-fixture"]
 resolver = "3"
 
 [package]

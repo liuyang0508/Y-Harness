@@ -90,13 +90,14 @@ engine through its public contract. Clients do not open engine databases,
 construct providers, own authoritative Agent state, or bypass Policy.
 
 The repository currently ships two separately installable runtime packages
-and one non-runtime benchmark tool:
+and two non-runtime benchmark tools:
 
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
 | `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v12 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapter outside the semantic Core |
+| `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
 ## Architecture
 

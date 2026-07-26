@@ -53,3 +53,6 @@ individual provider call can settle above the requested value before the CLI
 returns `error_max_budget_usd`. Reports therefore preserve both
 `requested_max_budget_usd` and `actual_cost_usd`; callers must not treat the
 requested value as a hard pre-spend fence.
+
+Deterministic Tool fault injection has its own dependency and evidence
+boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).
