@@ -1,0 +1,26 @@
+{
+  "type": "result",
+  "subtype": "error_max_budget_usd",
+  "duration_ms": 7102,
+  "duration_api_ms": 0,
+  "is_error": true,
+  "num_turns": 1,
+  "stop_reason": "end_turn",
+  "session_id": "fixture-session",
+  "total_cost_usd": 0.056875,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "modelUsage": {
+    "MiniMax-M2.7": {
+      "inputTokens": 0,
+      "outputTokens": 46,
+      "costUSD": 0.056875
+    }
+  },
+  "permission_denials": [],
+  "errors": [
+    "Reached maximum budget"
+  ]
+}

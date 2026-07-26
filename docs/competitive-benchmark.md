@@ -17,9 +17,15 @@ Architecture and product effect are different claims:
 - repository size, feature count, test count, language choice, and local unit
   coverage do not establish answer quality.
 
-Until this protocol has executable adapters and checked-in results, the only
-permitted statement is: **Y-Harness has implemented a governed local baseline;
-comparative effectiveness is unverified.**
+Until released products have executed the same versioned workloads under
+declared controls, the only permitted statement is: **Y-Harness has implemented
+a governed local baseline; comparative effectiveness is unverified.**
+
+External-run format 1 and the first released Claude Code CLI adapter now exist,
+with one checked-in real `adapter_conformance` result. That result has
+`claim_eligible: false`: it proves the bounded adapter can execute and preserve
+the product envelope, not that either Harness is better. See
+[`external-run-format.md`](external-run-format.md).
 
 ## Two tracks
 
@@ -198,7 +204,8 @@ answer-quality claim follows.
 
 The shortest path to credible comparison is:
 
-1. add a versioned external-run result format and one released-CLI adapter;
+1. ~~add a versioned external-run result format and one released-CLI adapter;~~
+   completed for format 1 plus Claude Code adapter conformance;
 2. implement deterministic failure-injection Tool fixtures and state-recovery
    cases;
 3. add Pi, OpenCode, Hermes, Codex, and released Claude Code adapters without
@@ -207,8 +214,9 @@ The shortest path to credible comparison is:
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
-Provider continuation and durable safe-boundary steering are now implemented
-and locally fault-tested in Y-Harness. Released-product execution of those
-cases, Linux and Windows containment, and live external integration evidence
-remain prerequisites for broad superiority claims, not documentation
-follow-ups.
+Provider continuation and durable safe-boundary steering are implemented and
+locally fault-tested in Y-Harness. The first real released-product adapter
+record is also preserved, but no cross-product fault case has run. Execution
+of CF-001/CF-002 across products, Linux and Windows containment, and live
+external integration evidence remain prerequisites for broad superiority
+claims, not documentation follow-ups.

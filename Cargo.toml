@@ -1,5 +1,5 @@
 [workspace]
-members = ["clients/tui"]
+members = ["clients/tui", "tools/benchmark-runner"]
 resolver = "3"
 
 [package]
