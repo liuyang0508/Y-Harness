@@ -39,15 +39,16 @@ cargo run --release --bin yh-state-bench
 | 1,000 | schema-4 Policy Tool-origin baseline, 5 samples | 65.461 ms | 15,276 | 2.797 ms | 5.192 ms | 2.267 ms |
 | 1,000 | protocol-v10 release recheck, 5 samples | 70.265 ms | 14,232 | 2.692 ms | 5.287 ms | 2.257 ms |
 | 1,000 | schema-5 Provider Continuation baseline, 5 samples | 71.967 ms | 13,895 | 2.639 ms | 5.134 ms | 2.215 ms |
+| 1,000 | schema-6 safe-boundary Steering baseline, 5 samples | 76.981 ms | 12,990 | 2.837 ms | 5.470 ms | 2.360 ms |
 
-At 1,000 events the current path reduced append time by about 87.8% and
-increased throughput by about 8.2×. Full projection remains linear and is still
+At 1,000 events the current path reduced append time by about 86.6% and
+increased throughput by about 7.5×. Full projection remains linear and is still
 performed for authoritative reads and recovery.
 
 The last six rows include one additional transactional recovery-accounting
 update per append and validate State through byte-bounded pages. The latest
-row rechecks the State path after adding bounded Provider Continuation
-evidence. It remains
+row rechecks the State path after adding durable Steering evidence and the
+completed-Turn pending-input fence. It remains
 inside the existing local regression thresholds; historical rows are retained
 to make safety costs and machine variance visible.
 
@@ -94,9 +95,9 @@ This single local sample was measured on the reference environment on
 2026-07-25. It proves bounded completion at the supported fixture size; it is
 not a stable latency SLA. Schema 2 → 4 and schema 3 → 4 use the same complete
 backup and streaming fingerprint path and have separate crash-at-each-phase
-tests. Schema 5 reuses that backup-first, immutable-history path for
-schema-1/2/3/4 sources; its maximum-size migration is not relabeled as measured
-by this historical schema-4 fixture.
+tests. Schema 6 reuses that backup-first, immutable-history path for
+schema-1/2/3/4/5 sources; its maximum-size migration is not relabeled as
+measured by this historical schema-4 fixture.
 
 ## Approval Inbox schema migration workload
 

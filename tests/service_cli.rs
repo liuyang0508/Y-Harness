@@ -55,7 +55,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
-    assert!(report.contains("protocol: 11"));
+    assert!(report.contains("protocol: 12"));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("status: ok"));
     fs::remove_dir_all(project).expect("remove isolated project");

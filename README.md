@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v11 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v12 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -94,7 +94,7 @@ The repository currently ships two separately installable packages:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v11 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v12 |
 
 ## Architecture
 
@@ -309,15 +309,16 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-5 writer
+introduced bounded content-free evidence, and the current schema-6 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1, schema-2, schema-3, and schema-4 SQLite databases require an offline,
-backup-first migration before the current Runtime opens them:
+Populated schema-1, schema-2, schema-3, schema-4, and schema-5 SQLite databases
+require an offline, backup-first migration before the current Runtime opens
+them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v5.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v6.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -338,6 +339,13 @@ actually produced it, filters capsules by exact Model identity and origin, and
 keeps an unfinished Tool chain on that Model instead of unsafe cross-provider
 failover. The direct OpenAI adapter uses this path to replay encrypted
 reasoning items with `store: false`.
+
+State schema 6 records accepted Turn steering separately from its safe-boundary
+application. The caller must name the exact active Turn; acceptance is durable
+and actor-attributed before acknowledgement. If steering crosses Model
+inference, Runtime invalidates provisional output, discards the stale response,
+applies the queued input FIFO, and samples again. A stale Tool call never
+executes, and a Turn cannot complete with accepted input still pending.
 
 For asynchronous human workflows, a provider-neutral Approval Inbox supports
 idempotent submission, a deterministic oldest-first 16-record pending window,
@@ -483,11 +491,13 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v11 preserves the 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v12 preserves the 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
-schema-4 Policy-to-Tool-origin provenance, and schema-5 Provider Continuation
-evidence. When a host installs a Task
+schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
+schema-6 durable safe-boundary Turn steering. Steering requires the exact
+active Turn, invalidates crossed provisional Model output, and never executes
+a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
 transport-authenticated worker claim, heartbeat, messaging, completion, and
 failure commands. Worker ownership is derived from the local-process boundary
@@ -574,7 +584,9 @@ yh-tui --demo
 
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 streams Turns, polls and forgets Operations, and projects paginated State,
-Approval, and Task views only through Protocol v11. It is implemented in
+Approval, and Task views only through Protocol v12. Input submitted during an
+active Turn uses the engine's exact-ID steering command rather than a TUI-owned
+execution queue. It is implemented in
 [`clients/tui`](clients/tui) and can be omitted without changing the engine.
 
 Agent Memory Hub is the first-party reference integration for governed

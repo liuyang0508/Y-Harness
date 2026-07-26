@@ -22,12 +22,12 @@ use tokio::{
 
 use crate::isolation::isolate_future;
 use crate::{
-    APPROVAL_INBOX_SCHEMA_VERSION, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
-    ApprovalRecord, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, HarnessError,
-    HarnessRuntime, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope, ModelEventSink,
-    ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, StoredEvent,
-    TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
+    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId,
+    ApprovalInbox, ApprovalRecord, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
+    HarnessError, HarnessRuntime, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope,
+    ModelEventSink, ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
+    StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
     TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
     TaskMessagePage, Thread, ThreadId, TurnExecutionOptions, TurnId,
     WORKSPACE_PROVIDER_API_VERSION,
@@ -37,7 +37,7 @@ use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "11";
+pub const PROTOCOL_VERSION: &str = "12";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -64,7 +64,7 @@ const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 22] = [
+const PROTOCOL_PERMISSIONS: [&str; 23] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -75,6 +75,7 @@ const PROTOCOL_PERMISSIONS: [&str; 22] = [
     "thread.events",
     "thread.get",
     "turn.start",
+    "turn.steer",
     "approval.get",
     "approval.pending",
     "approval.settle",
@@ -130,6 +131,15 @@ pub enum ProtocolCommand {
         memory_scope: MemoryScope,
         /// Optional total external-work deadline.
         timeout_ms: Option<u64>,
+    },
+    /// Queues durable additional input for one exact active Turn.
+    SteerTurn {
+        /// Existing Thread identity.
+        thread_id: String,
+        /// Exact active Turn observed by the caller.
+        expected_turn_id: String,
+        /// Correction or additional instruction.
+        content: String,
     },
     /// Polls one asynchronous operation.
     GetOperation {
@@ -293,6 +303,7 @@ impl ProtocolCommand {
             Self::GetThread { .. } => "thread.get",
             Self::GetThreadCapacity { .. } => "thread.capacity",
             Self::StartTurn { .. } => "turn.start",
+            Self::SteerTurn { .. } => "turn.steer",
             Self::GetOperation { .. } => "operation.get",
             Self::GetOperationEvents { .. } => "operation.events",
             Self::CancelOperation { .. } => "operation.cancel",
@@ -350,14 +361,18 @@ impl ProtocolPrincipal {
         }
     }
 
-    fn approval_actor(&self) -> ApprovalActor {
+    fn actor_identity(&self) -> ActorIdentity {
         match self {
-            Self::LocalProcess => ApprovalActor::LocalProcess,
-            Self::MtlsCertificate { sha256 } => ApprovalActor::Authenticated {
+            Self::LocalProcess => ActorIdentity::LocalProcess,
+            Self::MtlsCertificate { sha256 } => ActorIdentity::Authenticated {
                 authority: "mtls-certificate-sha256".to_owned(),
                 subject: sha256.clone(),
             },
         }
+    }
+
+    fn approval_actor(&self) -> ApprovalActor {
+        self.actor_identity()
     }
 
     fn task_worker_identity(&self) -> String {
@@ -513,6 +528,13 @@ pub enum ProtocolResult {
     TurnStarted {
         /// Pollable operation identity.
         operation_id: OperationId,
+    },
+    /// Durable steering submission acknowledgement.
+    TurnSteered {
+        /// Runtime-generated steering identity.
+        steering_id: SteeringId,
+        /// Exact Turn that accepted the input.
+        turn_id: TurnId,
     },
     /// Current operation projection.
     Operation {
@@ -814,6 +836,7 @@ impl ModelEventSink for OperationEventBuffer {
             .map_err(|_| "operation event buffer lock poisoned".to_owned())?;
         let bytes = match event {
             ModelStreamEvent::TextDelta { delta, .. } => delta.len(),
+            ModelStreamEvent::StepInvalidated { .. } => 0,
         };
         let sequence = inner
             .next_sequence
@@ -836,6 +859,7 @@ impl ModelEventSink for OperationEventBuffer {
             };
             let evicted_bytes = match &evicted.event {
                 ModelStreamEvent::TextDelta { delta, .. } => delta.len(),
+                ModelStreamEvent::StepInvalidated { .. } => 0,
             };
             inner.retained_bytes = inner.retained_bytes.saturating_sub(evicted_bytes);
             inner.dropped_through_sequence = Some(evicted.sequence);
@@ -1024,6 +1048,7 @@ impl ProtocolHandler {
                     "thread.events".to_owned(),
                     "thread.get".to_owned(),
                     "turn.start".to_owned(),
+                    "turn.steer".to_owned(),
                 ];
                 if self.approvals.is_some() {
                     capabilities.extend([
@@ -1195,6 +1220,32 @@ impl ProtocolHandler {
                     lifecycle.settled.notify_waiters();
                 });
                 Ok(ProtocolResult::TurnStarted { operation_id })
+            }
+            ProtocolCommand::SteerTurn {
+                thread_id,
+                expected_turn_id,
+                content,
+            } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                validate_opaque_id("expected_turn_id", &expected_turn_id)?;
+                if content.trim().is_empty() || content.len() > MAX_PROMPT_BYTES {
+                    return Err(HarnessError::Protocol(format!(
+                        "steering content must be 1-{MAX_PROMPT_BYTES} bytes"
+                    )));
+                }
+                let receipt = self
+                    .runtime
+                    .steer_turn(
+                        &ThreadId::from_string(thread_id),
+                        &TurnId::from_string(expected_turn_id),
+                        content,
+                        principal.actor_identity(),
+                    )
+                    .await?;
+                Ok(ProtocolResult::TurnSteered {
+                    steering_id: receipt.steering_id,
+                    turn_id: receipt.turn_id,
+                })
             }
             ProtocolCommand::GetOperation { operation_id } => {
                 validate_opaque_id("operation_id", &operation_id)?;
@@ -2356,7 +2407,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_eleven_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twelve_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2364,14 +2415,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "11",
+                "protocol_version": "12",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "11",
+                "protocol_version": "12",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2380,7 +2431,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "11",
+                "protocol_version": "12",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2402,7 +2453,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "11",
+                "protocol_version": "12",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2459,6 +2510,28 @@ mod tests {
                 }
             })
         );
+        assert_eq!(
+            serde_json::to_value(ItemKind::SteeringQueued {
+                steering_id: crate::SteeringId::from_static("steering-fixture"),
+                submitted_by: crate::ActorIdentity::LocalProcess,
+                content: "correct course".to_owned(),
+            })
+            .expect("encode schema-6 steering evidence"),
+            json!({
+                "type": "steering_queued",
+                "steering_id": "steering-fixture",
+                "submitted_by": {"kind": "local_process"},
+                "content": "correct course"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ModelStreamEvent::StepInvalidated { model_step: 3 })
+                .expect("encode provisional-step invalidation"),
+            json!({
+                "type": "step_invalidated",
+                "model_step": 3
+            })
+        );
 
         let commands = [
             (ProtocolCommand::Initialize {}, "initialize", "initialize"),
@@ -2490,6 +2563,15 @@ mod tests {
                 },
                 "start_turn",
                 "turn.start",
+            ),
+            (
+                ProtocolCommand::SteerTurn {
+                    thread_id: "thread-fixture".to_owned(),
+                    expected_turn_id: "turn-fixture".to_owned(),
+                    content: "correct course".to_owned(),
+                },
+                "steer_turn",
+                "turn.steer",
             ),
             (
                 ProtocolCommand::GetOperation {
@@ -3342,6 +3424,147 @@ mod tests {
                 .await
                 .body,
             ProtocolResponseBody::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn steering_protocol_requires_the_exact_running_turn_and_persists_acceptance() {
+        let handler = handler(Arc::new(PendingModel));
+        let thread_id = match handler
+            .handle(request("create-steering", ProtocolCommand::CreateThread {}))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let operation_id = match handler
+            .handle(request(
+                "start-steering",
+                ProtocolCommand::StartTurn {
+                    thread_id: thread_id.to_string(),
+                    prompt: "initial".to_owned(),
+                    memory_scope: Default::default(),
+                    timeout_ms: Some(10_000),
+                },
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let mut running_turn_id = None;
+        for _ in 0..100 {
+            let loaded = handler
+                .handle(request(
+                    "load-running-steering",
+                    ProtocolCommand::GetThread {
+                        thread_id: thread_id.to_string(),
+                    },
+                ))
+                .await;
+            if let ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Thread {
+                        thread: Some(thread),
+                    },
+            } = loaded.body
+                && let Some(turn) = thread.turns.last()
+                && turn.status == TurnStatus::Running
+            {
+                running_turn_id = Some(turn.id.clone());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let running_turn_id = running_turn_id.expect("worker did not expose a running Turn");
+
+        let stale = handler
+            .handle(request(
+                "steer-stale",
+                ProtocolCommand::SteerTurn {
+                    thread_id: thread_id.to_string(),
+                    expected_turn_id: "turn-stale".to_owned(),
+                    content: "must not be accepted".to_owned(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            stale.body,
+            ProtocolResponseBody::Error { error }
+                if error.message.contains("active turn is")
+        ));
+
+        let accepted = handler
+            .handle(request(
+                "steer-current",
+                ProtocolCommand::SteerTurn {
+                    thread_id: thread_id.to_string(),
+                    expected_turn_id: running_turn_id.to_string(),
+                    content: "correct course".to_owned(),
+                },
+            ))
+            .await;
+        let steering_id = match accepted.body {
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::TurnSteered {
+                        steering_id,
+                        turn_id,
+                    },
+            } => {
+                assert_eq!(turn_id, running_turn_id);
+                steering_id
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let loaded = handler
+            .handle(request(
+                "load-steered",
+                ProtocolCommand::GetThread {
+                    thread_id: thread_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            loaded.body,
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Thread {
+                        thread: Some(thread)
+                    }
+            } if thread.turns.last().is_some_and(|turn| {
+                turn.items.iter().any(|item| matches!(
+                    &item.kind,
+                    ItemKind::SteeringQueued {
+                        steering_id: persisted,
+                        submitted_by: ApprovalActor::LocalProcess,
+                        content,
+                    } if persisted == &steering_id && content == "correct course"
+                ))
+            })
+        ));
+
+        let cancelled = handler
+            .handle(request(
+                "cancel-steering",
+                ProtocolCommand::CancelOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            cancelled.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Cancellation { accepted: true, .. }
+            }
         ));
     }
 

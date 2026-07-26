@@ -11,7 +11,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Context Engine | deterministic blocks, whole-Turn history, memory packs, registered Token Counters and semantic Compactors, independent byte/token budgets, derived-summary provenance and failure modes | `src/context`, Context and Runtime compaction tests, ADRs 0021/0059/0060/0061/0064 | local baseline passing |
 | Agent Loop | bounded model/tool/verification loop, explicit ordered and attempt-deadlined Model failover, cancellation, deadlines, concurrency admission, explicit recovery, fingerprinted pre-Tool approval resume | `src/runtime`, failover/provenance and Memory/SQLite restart tests, ADRs 0065/0070 | local baseline passing; remote takeover awaits fencing |
 | Tool Runtime | typed registry, configured shell-free JSON Tools, exact-selected MCP Tools, default-deny bounded MCP launch, Unix process-group settlement, reusable macOS sandbox, explicit compensation | `src/execution`, `src/transport/mcp.rs`, ADRs 0013/0036/0043/0054/0056/0062/0066/0076 | local baseline passing; escape-resistant Linux plus Linux/Windows persistent containment open |
-| State Engine | typed journal, memory/SQLite stores, CAS, checkpoints, snapshots, capacity/recovery bounds, schema-1/2/3/4 to schema-5 backup-first migration, origin-bound Provider Continuation | `src/state`, schema-1/2/3/4 migration fixtures, continuation reopen/tamper tests, ADRs 0061/0065/0068/0077 | local baseline passing; archival/offload open |
+| State Engine | typed journal, memory/SQLite stores, CAS, checkpoints, snapshots, capacity/recovery bounds, schema-1/2/3/4/5 to schema-6 backup-first migration, origin-bound Provider Continuation, durable safe-boundary Steering | `src/state`, schema-1/2/3/4/5 migration fixtures, continuation and Steering fault tests, ADRs 0061/0065/0068/0077/0078 | local baseline passing; archival/offload open |
 | Memory Engine | versioned provider port, scoped provenance, Agent Memory Hub MCP adapter and configured Context assembly | `src/memory`, service host, unit tests and environment-gated real MCP test | adapter, service health probe, and sandboxed local round trip passing; remote CI environment-gated |
 | Skill Engine | exact dependency graph, budgets, signatures, live revocation, transparency receipts, pinned HTTPS source | `src/skill`, ADRs 0009/0014/0032/0033 | local baseline passing; catalog/private registry open |
 | Policy Engine | deny/allow/ask, risk class, attributed durable approval, restart-safe inbox, CAS, exact-actor separation of duty, fingerprinted continuation, backup-first schema migration | `src/runtime/policy.rs`, `src/approval`, restart/drift tests, ADRs 0007/0024/0049–0051/0063/0065 | local baseline passing; human/tenant roles and signed receipts open |
@@ -26,9 +26,9 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 |---|---|---|
 | Headless embeddable Rust core | public contracts in `src/lib.rs`; zero-default build; external-view examples execute a Policy-controlled Model/Tool loop and a fenced Task DAG | compiled and run locally; CI-gated |
 | Reference-project derivation | primary-source comparison, immutable open-source snapshots, adopted/rejected decisions, code/ADR mapping in `reference-analysis.md` | documented and link-checked locally |
-| Serviceable typed protocol | language-neutral v11 specification, exact envelope and schema-5 compatibility coordinates, negotiation, async Turn operations, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS tests; passing locally |
+| Serviceable typed protocol | language-neutral v12 specification, exact envelope and schema-6 compatibility coordinates, negotiation, async Turn operations, exact-ID Steering, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS tests; passing locally |
 | Engine CLI | `yh init/doctor/serve`, durable State/Approval/Task databases, deterministic demo, direct OpenAI Responses, JSON/MCP Tool and Agent Memory Hub assembly, `src/reference_cli`, process tests | installed-binary and restart tests passing locally; live OpenAI API environment-gated |
-| Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v11-only child transport, content-free continuation rendering, TestBackend render tests, real PTY Turn | independently installable; local unit/lint/PTY gates passing |
+| Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v12-only child transport, exact-ID active-Turn Steering, invalidated provisional-output handling, content-free continuation rendering, TestBackend render tests, real PTY Turn | independently installable; local unit/lint/PTY gates passing |
 | Install and operator path | Cargo-backed no-side-effect install script, strict config template, Chinese quick start, real language-neutral Task Worker, acceptance checklist | clean-prefix install and revision-6 worker lifecycle passing locally |
 | MCP tools | official SDK client plus atomic namespaced Tool registration | passing locally |
 | Agent Memory Hub | first-party provider adapter over persistent stdio MCP | live local round trip passing; CI environment-gated |
@@ -66,7 +66,7 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
   /isolated/project/y-harness.json
 ```
 
-The all-feature workspace run contains 264 passing library tests, 2 CLI
+The all-feature workspace run contains 274 passing library tests, 2 CLI
 configuration tests, 7 Engine process/service tests, 10 TUI unit/render tests,
 and 2 local private-gateway TLS integration tests. The demo and configured
 PTY smoke gates submit real Turns, verify durable State, and check

@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v11 projections.
+//! Product TUI state derived exclusively from Protocol v12 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -136,6 +136,7 @@ impl App {
             "thread.events",
             "thread.get",
             "turn.start",
+            "turn.steer",
         ] {
             if !capabilities.contains(required) {
                 return Err(io::Error::other(format!(
@@ -402,7 +403,34 @@ impl App {
             return self.run_command(client, &submitted).await;
         }
         if self.active.is_some() {
-            self.set_error("A Turn is already running; Esc cancels it");
+            self.refresh_thread(client).await?;
+            let mut running = self
+                .thread
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::Running);
+            let turn_id = running
+                .next()
+                .map(|turn| turn.id.clone())
+                .ok_or_else(|| io::Error::other("active operation has not created its Turn yet"))?;
+            if running.next().is_some() {
+                return Err(io::Error::other("Thread contains multiple running Turns").into());
+            }
+            match client
+                .call(ProtocolCommand::SteerTurn {
+                    thread_id: self.thread.id.to_string(),
+                    expected_turn_id: turn_id.to_string(),
+                    content: submitted,
+                })
+                .await?
+            {
+                ProtocolResult::TurnSteered { .. } => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.set_notice("Steering durably queued for the active Turn");
+                }
+                result => return Err(unexpected("steer Turn", result)),
+            }
             return Ok(());
         }
         let result = client
@@ -602,10 +630,19 @@ impl App {
             {
                 active.stream_gap_through = Some(dropped);
                 active.cursor = dropped;
+                active.provisional.clear();
+                active.provisional_truncated = false;
             }
             for event in events {
-                let ModelStreamEvent::TextDelta { delta, .. } = event.event;
-                append_provisional(active, &delta);
+                match event.event {
+                    ModelStreamEvent::TextDelta { delta, .. } => {
+                        append_provisional(active, &delta);
+                    }
+                    ModelStreamEvent::StepInvalidated { .. } => {
+                        active.provisional.clear();
+                        active.provisional_truncated = false;
+                    }
+                }
                 active.cursor = event.sequence;
             }
             if let Some(next) = next {
@@ -888,11 +925,23 @@ impl App {
                     })],
                 )?,
             }));
+        let steering_id = y_harness::SteeringId::from_static("steering-fixture");
+        turn.items
+            .push(y_harness::Item::new(ItemKind::SteeringQueued {
+                steering_id: steering_id.clone(),
+                submitted_by: y_harness::ActorIdentity::LocalProcess,
+                content: "Prefer the durable boundary.".to_owned(),
+            }));
+        turn.items
+            .push(y_harness::Item::new(ItemKind::SteeringApplied {
+                steering_id,
+                content: "Prefer the durable boundary.".to_owned(),
+            }));
         turn.items
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v11.".to_owned(),
+                content: "Keep clients behind Protocol v12.".to_owned(),
             }));
         thread.turns.push(turn);
         let now = Instant::now();
@@ -979,6 +1028,8 @@ fn describe_event(event: &StoredEvent) -> String {
         ),
         StateEvent::ItemAppended { item, .. } => match &item.kind {
             ItemKind::UserMessage { .. } => "User message".to_owned(),
+            ItemKind::SteeringQueued { .. } => "Steering queued".to_owned(),
+            ItemKind::SteeringApplied { .. } => "Steering applied".to_owned(),
             ItemKind::AssistantMessage { model_id, .. } => {
                 format!("Assistant · {}", model_id.as_deref().unwrap_or("legacy"))
             }

@@ -214,7 +214,7 @@ pub async fn run_eval_smoke() -> CliResult<()> {
 /// Prints the reference binary command surface.
 pub fn print_help() {
     println!(
-        "Y-Harness\n\nUsage:\n  yh init [directory]\n  yh doctor [config]\n  yh serve [config]\n  yh demo [message]\n  yh serve-demo\n  yh eval-smoke\n  yh state-migrate <database> <backup>\n  yh approval-migrate <database> <backup>\n  yh --version\n  yh --help\n\n`init` creates a no-clobber local project; config defaults to y-harness.json.\n`doctor` validates config, model authority, credentials, and storage boundaries.\n`serve` opens durable State, Approval, and Task SQLite stores and speaks Protocol v11 JSONL over stdin/stdout.\nDemo and evaluation commands are local and perform no network requests.\nMigration commands require all corresponding writers to be stopped and never overwrite their backup.\nThe optional full-screen product is installed separately as `yh-tui`."
+        "Y-Harness\n\nUsage:\n  yh init [directory]\n  yh doctor [config]\n  yh serve [config]\n  yh demo [message]\n  yh serve-demo\n  yh eval-smoke\n  yh state-migrate <database> <backup>\n  yh approval-migrate <database> <backup>\n  yh --version\n  yh --help\n\n`init` creates a no-clobber local project; config defaults to y-harness.json.\n`doctor` validates config, model authority, credentials, and storage boundaries.\n`serve` opens durable State, Approval, and Task SQLite stores and speaks Protocol v12 JSONL over stdin/stdout.\nDemo and evaluation commands are local and perform no network requests.\nMigration commands require all corresponding writers to be stopped and never overwrite their backup.\nThe optional full-screen product is installed separately as `yh-tui`."
     );
 }
 

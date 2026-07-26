@@ -54,14 +54,14 @@ pub use execution::{
     ProcessIsolation, ProcessOutput, ProcessRequest, ToolCompensator,
 };
 pub use kernel::{
-    ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId, CancellationToken,
-    CapabilityOrigin, Checkpoint, CheckpointId, EventId, ExecutionPhase, HarnessError,
-    HarnessFuture, Item, ItemKind, MemoryContextRecordStatus, ModelContinuation, ModelEventSink,
-    ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent,
-    ModelUsage, OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool,
-    RiskLevel, StateEvent, StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread,
-    ThreadId, ToolAuthorization, ToolContext, ToolDescriptor, ToolRegistry, Turn, TurnId,
-    TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
+    ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
+    CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId, EventId, ExecutionPhase,
+    HarnessError, HarnessFuture, Item, ItemKind, MemoryContextRecordStatus, ModelContinuation,
+    ModelEventSink, ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+    ModelStreamEvent, ModelUsage, OperationId, PendingEvent, PolicyDecision, RegisteredModel,
+    RegisteredTool, RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId,
+    TaskLeaseId, TaskMessageId, Thread, ThreadId, ToolAuthorization, ToolContext, ToolDescriptor,
+    ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -98,7 +98,7 @@ pub use protocol::{
 };
 pub use runtime::{
     AllowListPolicy, ApprovalHandler, DenyAllApprovals, HarnessRuntime, LanguageModel,
-    PolicyEngine, Tool, TurnExecutionOptions,
+    PolicyEngine, SteeringReceipt, Tool, TurnExecutionOptions,
 };
 pub use secret::{
     EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretProvider,

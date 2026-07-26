@@ -162,6 +162,38 @@ the OpenAI request/response mapping tests. These are Y-Harness regression
 results only. Released-product adapters and raw cross-product results do not
 exist yet, so `CF-001` supports no superiority claim.
 
+## Second executable deterministic fault case
+
+`CF-002 crossed-response-turn-steering` models additional user input arriving
+while a Model is producing a final message or Tool call.
+
+The oracle requires all of the following:
+
+- acceptance requires the caller's exact active Turn identity;
+- acknowledgement follows a durable, actor-attributed queue record;
+- a response sampled from pre-steering context is never committed as current;
+- provisional text from that response is explicitly invalidated;
+- a Tool call crossed before its effect never executes;
+- Tool call/result adjacency remains structurally valid;
+- queued input becomes Model-visible only through an exact FIFO application
+  record at a safe boundary;
+- completion with unapplied steering fails closed; and
+- pending count and bytes are bounded.
+
+Y-Harness executes the local oracle in
+`runtime::tests::steering_is_durable_fenced_and_invalidates_a_crossed_model_response`,
+`runtime::tests::steering_crossing_model_inference_discards_a_stale_tool_call`,
+`runtime::tests::steering_before_the_tool_effect_preserves_call_result_structure_without_execution`,
+`runtime::tests::steering_pending_count_and_bytes_are_bounded_before_durable_acceptance`,
+`runtime::tests::steering_remains_open_across_a_retryable_verification_gate`,
+`runtime::tests::failed_steering_application_preserves_the_pending_runtime_projection`,
+`state::tests::state_authority_enforces_steering_correlation_order_and_completion_fence`,
+and
+`protocol::tests::steering_protocol_requires_the_exact_running_turn_and_persists_acceptance`.
+Those tests establish Y-Harness invariants only. Released-product adapters have
+not yet executed `CF-002`, so no relative correctness, latency, or
+answer-quality claim follows.
+
 ## Implementation order
 
 The shortest path to credible comparison is:
@@ -175,7 +207,8 @@ The shortest path to credible comparison is:
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
-Provider continuation for reasoning/tool calls is now implemented and locally
-fault-tested in Y-Harness. Released-product execution of that case, Linux and
-Windows containment, and live external integration evidence remain
-prerequisites for broad superiority claims, not documentation follow-ups.
+Provider continuation and durable safe-boundary steering are now implemented
+and locally fault-tested in Y-Harness. Released-product execution of those
+cases, Linux and Windows containment, and live external integration evidence
+remain prerequisites for broad superiority claims, not documentation
+follow-ups.

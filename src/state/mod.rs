@@ -5,7 +5,7 @@ mod migration;
 pub use migration::{StateMigrationReport, StateMigrationStatus};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Write},
     path::Path,
     sync::{
@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 5;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 6;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -59,7 +59,8 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Validated, disposable projection cache anchored to the event journal.
@@ -1172,6 +1173,15 @@ impl StateEngine {
 
     /// Appends an Item after validating that its Turn is still running.
     pub async fn append_item(&self, turn: &Turn, item: Item) -> Result<StoredEvent, HarnessError> {
+        if matches!(
+            item.kind,
+            ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. }
+        ) {
+            let thread = self.load_thread(&turn.thread_id).await?.ok_or_else(|| {
+                HarnessError::State(format!("thread {} does not exist", turn.thread_id))
+            })?;
+            validate_steering_append(&thread, &turn.id, &item)?;
+        }
         let mut head = self.require_stream_head(&turn.thread_id).await?;
         if require_running_head(&head, &turn.id).is_err() {
             head = self.refresh_stream_head(&turn.thread_id).await?;
@@ -1199,6 +1209,27 @@ impl StateEngine {
             return Err(HarnessError::State(
                 "cannot finish a turn with running status".to_owned(),
             ));
+        }
+        if status == TurnStatus::Completed {
+            let thread = self.load_thread(&turn.thread_id).await?.ok_or_else(|| {
+                HarnessError::State(format!("thread {} does not exist", turn.thread_id))
+            })?;
+            let projected = thread
+                .turns
+                .iter()
+                .find(|candidate| candidate.id == turn.id)
+                .ok_or_else(|| {
+                    HarnessError::State(format!(
+                        "turn {} does not belong to thread {}",
+                        turn.id, turn.thread_id
+                    ))
+                })?;
+            if has_pending_steering(projected)? {
+                return Err(HarnessError::State(format!(
+                    "cannot complete turn {} with unapplied steering",
+                    turn.id
+                )));
+            }
         }
         let mut head = self.require_stream_head(&turn.thread_id).await?;
         if require_running_head(&head, &turn.id).is_err() {
@@ -1986,6 +2017,9 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
             }
         }
     }
+    if let Some(thread) = thread {
+        validate_steering_projection(thread)?;
+    }
     Ok(())
 }
 
@@ -2165,6 +2199,7 @@ fn validate_projected_thread(
             "State snapshot contains overlapping running Turns".to_owned(),
         ));
     }
+    validate_steering_projection(thread)?;
 
     let mut checkpoint_ids = BTreeSet::new();
     for checkpoint in &thread.checkpoints {
@@ -2280,6 +2315,22 @@ fn validate_checkpoint_label(label: Option<&str>) -> Result<(), HarnessError> {
 
 fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
     match &item.kind {
+        crate::ItemKind::SteeringQueued {
+            steering_id,
+            submitted_by,
+            content,
+        } => {
+            validate_state_id("steering", steering_id.as_str())?;
+            submitted_by.validate_current_state("State steering actor")?;
+            validate_steering_content(content)?;
+        }
+        crate::ItemKind::SteeringApplied {
+            steering_id,
+            content,
+        } => {
+            validate_state_id("steering", steering_id.as_str())?;
+            validate_steering_content(content)?;
+        }
         crate::ItemKind::ProviderContinuation {
             model_id,
             model_origin,
@@ -2379,6 +2430,13 @@ fn validate_state_event_schema(
         return Ok(());
     };
     match kind {
+        ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
+            if schema_version < 6 {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} cannot contain Turn steering evidence"
+                )));
+            }
+        }
         ItemKind::ProviderContinuation { .. } => {
             if schema_version < 5 {
                 return Err(HarnessError::State(format!(
@@ -2420,6 +2478,164 @@ fn validate_state_event_schema(
         _ => {}
     }
     Ok(())
+}
+
+fn validate_steering_content(content: &str) -> Result<(), HarnessError> {
+    if content.trim().is_empty() || content.len() > MAX_STEERING_CONTENT_BYTES {
+        return Err(HarnessError::State(format!(
+            "steering content must be 1-{MAX_STEERING_CONTENT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_steering_projection(thread: &Thread) -> Result<(), HarnessError> {
+    let mut all_ids = BTreeSet::new();
+    for turn in &thread.turns {
+        let mut queued = VecDeque::new();
+        for item in &turn.items {
+            match &item.kind {
+                ItemKind::SteeringQueued {
+                    steering_id,
+                    content,
+                    ..
+                } => {
+                    if !all_ids.insert(steering_id.clone()) {
+                        return Err(HarnessError::State(format!(
+                            "duplicate steering identity {steering_id}"
+                        )));
+                    }
+                    queued.push_back((steering_id.clone(), content.clone()));
+                }
+                ItemKind::SteeringApplied {
+                    steering_id,
+                    content,
+                } => {
+                    let Some((queued_id, queued_content)) = queued.pop_front() else {
+                        return Err(HarnessError::State(format!(
+                            "applied steering {steering_id} has no earlier queue record"
+                        )));
+                    };
+                    if queued_id != *steering_id {
+                        return Err(HarnessError::State(format!(
+                            "applied steering {steering_id} violates queue order"
+                        )));
+                    }
+                    if queued_content != *content {
+                        return Err(HarnessError::State(format!(
+                            "applied steering {steering_id} changed its queued content"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if turn.status == TurnStatus::Completed && !queued.is_empty() {
+            return Err(HarnessError::State(format!(
+                "completed turn {} contains unapplied steering",
+                turn.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_steering_append(
+    thread: &Thread,
+    turn_id: &TurnId,
+    item: &Item,
+) -> Result<(), HarnessError> {
+    let turn = thread
+        .turns
+        .iter()
+        .find(|turn| &turn.id == turn_id)
+        .ok_or_else(|| {
+            HarnessError::State(format!("steering references unknown turn {turn_id}"))
+        })?;
+    let mut queued = pending_steering(turn)?;
+    match &item.kind {
+        ItemKind::SteeringQueued { steering_id, .. } => {
+            if thread
+                .turns
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .any(|item| {
+                    matches!(
+                        &item.kind,
+                        ItemKind::SteeringQueued {
+                            steering_id: existing,
+                            ..
+                        } if existing == steering_id
+                    )
+                })
+            {
+                return Err(HarnessError::State(format!(
+                    "duplicate steering identity {steering_id}"
+                )));
+            }
+        }
+        ItemKind::SteeringApplied {
+            steering_id,
+            content,
+        } => {
+            let Some((queued_id, queued_content)) = queued.pop_front() else {
+                return Err(HarnessError::State(format!(
+                    "applied steering {steering_id} has no pending queue record"
+                )));
+            };
+            if queued_id != *steering_id {
+                return Err(HarnessError::State(format!(
+                    "applied steering {steering_id} violates queue order"
+                )));
+            }
+            if queued_content != *content {
+                return Err(HarnessError::State(format!(
+                    "applied steering {steering_id} changed its queued content"
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn pending_steering(turn: &Turn) -> Result<VecDeque<(crate::SteeringId, String)>, HarnessError> {
+    let mut queued = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    for item in &turn.items {
+        match &item.kind {
+            ItemKind::SteeringQueued {
+                steering_id,
+                content,
+                ..
+            } => {
+                if !seen.insert(steering_id.clone()) {
+                    return Err(HarnessError::State(format!(
+                        "duplicate steering identity {steering_id}"
+                    )));
+                }
+                queued.push_back((steering_id.clone(), content.clone()));
+            }
+            ItemKind::SteeringApplied { steering_id, .. } => {
+                let Some((queued_id, _)) = queued.pop_front() else {
+                    return Err(HarnessError::State(format!(
+                        "applied steering {steering_id} has no earlier queue record"
+                    )));
+                };
+                if queued_id != *steering_id {
+                    return Err(HarnessError::State(format!(
+                        "applied steering {steering_id} violates queue order"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(queued)
+}
+
+fn has_pending_steering(turn: &Turn) -> Result<bool, HarnessError> {
+    Ok(!pending_steering(turn)?.is_empty())
 }
 
 fn is_lower_sha256(value: &str) -> bool {
@@ -2711,8 +2927,9 @@ mod tests {
         SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
     };
     use crate::{
-        CapabilityOrigin, EventId, HarnessError, HarnessFuture, Item, ItemKind, ModelContinuation,
-        PendingEvent, StateEvent, StoredEvent, ThreadId, TurnId, TurnStatus, kernel::now_ms,
+        ActorIdentity, CapabilityOrigin, EventId, HarnessError, HarnessFuture, Item, ItemKind,
+        ModelContinuation, PendingEvent, StateEvent, SteeringId, StoredEvent, ThreadId, TurnId,
+        TurnStatus, kernel::now_ms,
     };
 
     struct LyingAppendStore;
@@ -3089,6 +3306,104 @@ mod tests {
             .await
             .expect_err("retention boundary");
         assert!(matches!(error, HarnessError::State(_)));
+    }
+
+    #[tokio::test]
+    async fn state_authority_enforces_steering_correlation_order_and_completion_fence() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        let steering_id = SteeringId::from_static("steering-first");
+
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringApplied {
+                    steering_id: steering_id.clone(),
+                    content: "first".to_owned(),
+                }),
+            )
+            .await
+            .expect_err("application without a durable queue record");
+        assert!(error.to_string().contains("no pending queue record"));
+
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringQueued {
+                    steering_id: steering_id.clone(),
+                    submitted_by: ActorIdentity::LocalProcess,
+                    content: "first".to_owned(),
+                }),
+            )
+            .await
+            .expect("queue steering");
+
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringQueued {
+                    steering_id: steering_id.clone(),
+                    submitted_by: ActorIdentity::LocalProcess,
+                    content: "duplicate".to_owned(),
+                }),
+            )
+            .await
+            .expect_err("duplicate identity");
+        assert!(error.to_string().contains("duplicate steering identity"));
+
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringApplied {
+                    steering_id: SteeringId::from_static("steering-second"),
+                    content: "first".to_owned(),
+                }),
+            )
+            .await
+            .expect_err("out-of-order application");
+        assert!(error.to_string().contains("violates queue order"));
+
+        let error = state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringApplied {
+                    steering_id: steering_id.clone(),
+                    content: "changed".to_owned(),
+                }),
+            )
+            .await
+            .expect_err("content mutation");
+        assert!(error.to_string().contains("changed its queued content"));
+
+        let error = state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect_err("completion with pending steering");
+        assert!(error.to_string().contains("with unapplied steering"));
+
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::SteeringApplied {
+                    steering_id,
+                    content: "first".to_owned(),
+                }),
+            )
+            .await
+            .expect("apply matching steering");
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("complete after steering application");
+
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread exists");
+        assert_eq!(projected.turns[0].items.len(), 2);
+        assert_eq!(projected.turns[0].status, TurnStatus::Completed);
     }
 
     #[tokio::test]
@@ -3857,6 +4172,30 @@ mod tests {
         let error = super::validate_stored_event(&stored)
             .expect_err("schema-4 cannot claim continuation evidence");
         assert!(error.to_string().contains("schema-4"));
+    }
+
+    #[test]
+    fn steering_evidence_requires_schema_six() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            event_id: EventId::from_static("event-steering"),
+            thread_id: ThreadId::from_static("thread-steering"),
+            recorded_at_ms: 1,
+            event: StateEvent::ItemAppended {
+                turn_id: TurnId::from_static("turn-steering"),
+                item: Item::new(ItemKind::SteeringQueued {
+                    steering_id: SteeringId::from_static("steering-schema"),
+                    submitted_by: ActorIdentity::LocalProcess,
+                    content: "correct course".to_owned(),
+                }),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-6 steering evidence");
+        stored.schema_version = 5;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-5 cannot claim steering evidence");
+        assert!(error.to_string().contains("schema-5"));
     }
 
     #[test]

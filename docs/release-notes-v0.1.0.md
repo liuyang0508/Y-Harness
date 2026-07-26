@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v11 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v12 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -17,6 +17,8 @@ Memory Hub Context without moving Policy or State authority into a client or
 provider. Schema 5 adds bounded, origin-bound Provider Continuation so
 stateless OpenAI reasoning Tool loops can replay encrypted reasoning state
 without transferring Tool authority to the vendor.
+Schema 6 adds durable, actor-attributed, exact-Turn steering with crossed
+response invalidation and safe Tool boundaries.
 
 ## Start
 
@@ -36,8 +38,8 @@ yh serve
 - Rust crate: `0.1.0`
 - optional TUI package: `0.1.0`
 - service configuration: `1`
-- client protocol: `11`
-- State event/snapshot schema: `5` / `5`
+- client protocol: `12`
+- State event/snapshot schema: `6` / `6`
 - Approval Inbox schema: `2`
 - Task Coordinator schema: `1`
 - HTTPS Model Gateway API: `3`

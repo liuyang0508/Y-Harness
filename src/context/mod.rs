@@ -757,11 +757,7 @@ impl ContextEngine {
 }
 
 pub(crate) fn model_visible_items(items: &[Item]) -> Vec<Item> {
-    items
-        .iter()
-        .filter(|item| is_model_visible(item))
-        .cloned()
-        .collect()
+    items.iter().filter_map(model_visible_item).collect()
 }
 
 fn has_model_visible_items(items: &[Item]) -> bool {
@@ -772,12 +768,40 @@ fn is_model_visible(item: &Item) -> bool {
     matches!(
         item.kind,
         ItemKind::UserMessage { .. }
+            | ItemKind::SteeringApplied { .. }
             | ItemKind::AssistantMessage { .. }
             | ItemKind::ProviderContinuation { .. }
             | ItemKind::ToolCall { .. }
             | ItemKind::ToolResult { .. }
             | ItemKind::VerificationResult { .. }
     )
+}
+
+fn model_visible_item(item: &Item) -> Option<Item> {
+    match &item.kind {
+        ItemKind::SteeringApplied { content, .. } => Some(Item {
+            id: item.id.clone(),
+            created_at_ms: item.created_at_ms,
+            kind: ItemKind::UserMessage {
+                content: content.clone(),
+            },
+        }),
+        ItemKind::UserMessage { .. }
+        | ItemKind::AssistantMessage { .. }
+        | ItemKind::ProviderContinuation { .. }
+        | ItemKind::ToolCall { .. }
+        | ItemKind::ToolResult { .. }
+        | ItemKind::VerificationResult { .. } => Some(item.clone()),
+        ItemKind::SteeringQueued { .. }
+        | ItemKind::PolicyDecision { .. }
+        | ItemKind::ApprovalRequested { .. }
+        | ItemKind::ApprovalDecision { .. }
+        | ItemKind::MemoryContext { .. }
+        | ItemKind::ConversationContext { .. }
+        | ItemKind::ConversationSummary { .. }
+        | ItemKind::RuntimeError { .. }
+        | ItemKind::TurnStopped { .. } => None,
+    }
 }
 
 fn validate_conversation_items_json(items: &[Item]) -> Result<(), HarnessError> {
@@ -1015,13 +1039,14 @@ mod tests {
         ConversationCompactorRegistry, ConversationContextConfig, MAX_CONTEXT_BLOCK_BYTES,
         MAX_CONTEXT_BLOCKS, MAX_MEMORY_REFERENCE_BYTES, MemoryContextConfig, MemoryContextStatus,
         MemoryFailureMode, TOKEN_COUNTER_API_VERSION, TokenCounter, TokenCounterDescriptor,
-        TokenCounterRegistry, validate_pack,
+        TokenCounterRegistry, model_visible_items, validate_pack,
     };
     use crate::{
-        CancellationToken, CapabilityOrigin, HarnessError, HarnessFuture, Item, ItemKind,
-        MEMORY_API_VERSION, MemoryContextPack, MemoryContextRecordStatus, MemoryOperation,
-        MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry, MemoryScope,
-        MemorySearchRequest, MemorySearchResponse, MemoryView, Thread, Turn, TurnStatus,
+        ActorIdentity, CancellationToken, CapabilityOrigin, HarnessError, HarnessFuture, Item,
+        ItemKind, MEMORY_API_VERSION, MemoryContextPack, MemoryContextRecordStatus,
+        MemoryOperation, MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
+        MemoryScope, MemorySearchRequest, MemorySearchResponse, MemoryView, SteeringId, Thread,
+        Turn, TurnStatus,
     };
 
     struct TestProvider {
@@ -1353,6 +1378,28 @@ mod tests {
         assert!(matches!(
             &compiled.items[1].kind,
             ItemKind::UserMessage { content } if content == "newest"
+        ));
+    }
+
+    #[test]
+    fn only_applied_steering_becomes_model_visible_user_input() {
+        let steering_id = SteeringId::from_static("steering-context");
+        let queued = Item::new(ItemKind::SteeringQueued {
+            steering_id: steering_id.clone(),
+            submitted_by: ActorIdentity::LocalProcess,
+            content: "queued".to_owned(),
+        });
+        let applied = Item::new(ItemKind::SteeringApplied {
+            steering_id,
+            content: "applied".to_owned(),
+        });
+
+        let projected = model_visible_items(&[queued, applied.clone()]);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, applied.id);
+        assert!(matches!(
+            &projected[0].kind,
+            ItemKind::UserMessage { content } if content == "applied"
         ));
     }
 

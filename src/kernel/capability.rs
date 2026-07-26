@@ -222,6 +222,19 @@ impl ModelStream {
         self.cancellation.clone()
     }
 
+    pub(crate) fn invalidate_step(&self, model_step: u32) {
+        let Some(sink) = &self.state.sink else {
+            return;
+        };
+        let event = ModelStreamEvent::StepInvalidated { model_step };
+        let result = catch_unwind(AssertUnwindSafe(|| sink.emit(&event)));
+        if matches!(result, Ok(Ok(()))) {
+            self.state.delivered_events.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.state.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.gate.close();
     }

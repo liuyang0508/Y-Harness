@@ -132,7 +132,7 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-5 writer, and no mutation of authoritative history or
+  current schema-6 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
 - transport-independent prompt, Context block/aggregate, Tool output, Model
   request, error, and Agent Loop hard bounds;
@@ -209,13 +209,15 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v11 negotiation with protocol-v2's asymmetric 2 MiB request/16 MiB
+- protocol-v12 negotiation with protocol-v2's asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
   explicit Token Counter and Conversation Compactor API coordinate; protocol
-  11 retains bounded Task record/claim pages, server-clock leases, principal-
-  derived worker ownership, exact fencing, and conflict-only CAS retries while
-  adding schema-5 Provider Continuation evidence;
+  12 retains protocol 11's bounded Task record/claim pages, server-clock
+  leases, principal-derived worker ownership, exact fencing, conflict-only CAS
+  retries, and schema-5 Provider Continuation evidence while adding exact-ID,
+  actor-attributed schema-6 safe-boundary Turn steering and provisional-step
+  invalidation;
 - initialization-time compatibility coordinates for engine, State event,
   snapshot, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
   Conversation Compactor API, Secret API, Skill API, model-gateway API, and

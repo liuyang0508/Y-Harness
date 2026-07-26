@@ -704,6 +704,7 @@ fn legacy_snapshot_schema(event_schema: u32) -> Option<u32> {
     match event_schema {
         2 | 3 => Some(3),
         4 => Some(4),
+        5 => Some(5),
         _ => None,
     }
 }
@@ -936,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn migration_advances_metadata_schemas_without_rewriting_history() {
-        for legacy_schema in [2_u32, 3_u32, 4_u32] {
+        for legacy_schema in [2_u32, 3_u32, 4_u32, 5_u32] {
             let source = fixture_path(&format!("source-v{legacy_schema}"));
             let backup = fixture_path(&format!("backup-v{legacy_schema}"));
             create_metadata_fixture(&source, legacy_schema);
@@ -1015,7 +1016,7 @@ mod tests {
 
     #[test]
     fn metadata_migration_restarts_after_every_phase() {
-        for legacy_schema in [2_u32, 3_u32, 4_u32] {
+        for legacy_schema in [2_u32, 3_u32, 4_u32, 5_u32] {
             for phase in ["after_preflight", "after_backup", "before_commit"] {
                 let source = fixture_path(&format!("v{legacy_schema}-{phase}"));
                 let backup = fixture_path(&format!("v{legacy_schema}-{phase}-backup"));

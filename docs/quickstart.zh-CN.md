@@ -54,7 +54,7 @@ F1 或 ?         打开帮助
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v11 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v12 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -80,9 +80,9 @@ my-harness/
 默认配置使用本地演示模型。`doctor` 验证配置版本、模型构造、凭据、
 Provider 权限和数据目录边界，但不会打开或创建数据库。
 
-## 4. 运行 Protocol v11 服务
+## 4. 运行 Protocol v12 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v11 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v12 帧：
 
 ```bash
 yh serve y-harness.json
@@ -93,7 +93,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"11","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"12","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 

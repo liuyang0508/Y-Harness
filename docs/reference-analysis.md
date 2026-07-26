@@ -5,10 +5,10 @@ from Pi Agent Harness, Claude Code, Codex, Hermes Agent, and OpenCode. It is a
 design-input audit, not a feature-parity checklist and not an endorsement of
 every implementation choice in those projects.
 
-The source snapshot was reviewed on 2026-07-25. Every source observation below
-links to an immutable commit. The repositories were inspected locally from
-shallow checkouts; their full test suites were not executed as part of this
-audit.
+The baseline source snapshot was reviewed on 2026-07-25 and the Turn-steering
+delta on 2026-07-26. Every source observation below links to an immutable
+commit. The repositories were inspected locally from shallow checkouts; their
+full test suites were not executed as part of this audit.
 
 Evidence has three levels:
 
@@ -36,6 +36,38 @@ it or treat it as proof of Anthropic's private implementation.
 | Pi Agent Harness | [`5bc1c2c`](https://github.com/earendil-works/pi/tree/5bc1c2c0a6f07e00e8c240304182f213ab8d311f) | official public source supplied for this audit, MIT |
 | Hermes Agent | [`689b51b`](https://github.com/NousResearch/hermes-agent/tree/689b51bef68f9ec95b638121bb9c7fefa3703fb2) | official public source, MIT |
 | OpenCode | [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b) | official public source, MIT |
+
+The 2026-07-26 delta additionally pins current Codex at
+[`61a4488`](https://github.com/openai/codex/tree/61a44880a85d2fd0d8770908dea5733495e571c8)
+and Hermes at
+[`6ab5d2d`](https://github.com/NousResearch/hermes-agent/tree/6ab5d2df2a5748f23ba7557ec527fac628720a22).
+These newer coordinates are used only for the delta findings below; they do not
+silently relabel observations made against the earlier baseline.
+
+## 2026-07-26 Turn-steering delta
+
+This delta applies “take the strengths, reject the liabilities” at mechanism
+level. Similar names do not establish equivalent semantics.
+
+| Source mechanism | Useful invariant extracted | Y-Harness adoption | Rejected or still open |
+|---|---|---|---|
+| Pi drains a small steering queue between assistant/tool steps and a follow-up queue when the loop would stop. | New input belongs at explicit loop boundaries rather than in arbitrary provider callbacks. | Pending steering is drained at Model and Tool safe boundaries. | Pi's process-local callback queue is not durable authority; Y-Harness does not inherit its session model or coding-product surface. |
+| The Claude reconstruction has scoped/priority queues and preserves Tool-call/result adjacency before inserting ordinary input. | Provider history must never be malformed merely to make an interactive queue feel immediate. | A superseded Tool call receives a synthetic error result before steering becomes model-visible. | Reconstructed code is not copied. Priority tiers are deferred until a real engine-level requirement justifies their semantics and bounds. |
+| Current Codex requires an exact active Turn ID and separates current-step input from later mail. | A stale client must not redirect whichever Turn happens to be running. | Protocol 12 requires `thread_id` plus exact `expected_turn_id`; a mismatch writes nothing. | Codex's process-local queue is not treated as recoverable State, and its coding-agent product behavior is not a Core contract. |
+| Current Hermes restarts after steering crosses an in-flight response, and its recovery code copies SQLite/WAL/SHM before canonical rebuild and integrity checks. | A response sampled from old context is stale; recovery must preserve evidence before repair. | Crossed Model messages and Tool calls are discarded, their provisional stream step is invalidated, and steering is applied before resampling. | This delta does not copy Hermes's large parent-object loop, mutable learned-skill behavior, or claim that Y-Harness already matches its recovery breadth. |
+| OpenCode's CLI runtime serializes queued ordinary prompts and allows client editing/removal. | Product-side queue UX can remain independent from Runtime semantics. | The TUI maps input during an active Turn to the engine's typed steering command. | An editable client queue is not Runtime steering authority and cannot replace durable acceptance evidence. |
+
+The resulting Y-Harness mechanism is not a union of five feature lists.
+`SteeringQueued` records accepted actor-attributed input, while
+`SteeringApplied` records the exact FIFO safe boundary at which it became Model
+context. Completion is forbidden while queued input remains. A per-active-Turn
+control lock serializes Runtime acceptance with ordinary recording, while the
+append-only State compare-and-swap remains authoritative. See
+[ADR 0078](adr/0078-durable-safe-boundary-turn-steering.md).
+
+This is a source-supported architecture result, not a comparative effectiveness
+result. Cross-product steering correctness, latency, answer quality, and
+recovery are still unmeasured.
 
 ## Comparison
 
@@ -221,6 +253,7 @@ engine-owned invariants:
 
 - [Provenance, incompleteness, build, and use limitations of the supplied reconstruction at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/README.md)
 - [Reconstructed query loop at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/src/query.ts)
+- [Reconstructed scoped message queue at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/src/utils/messageQueueManager.ts)
 - [Reconstructed streaming tool scheduler at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/src/services/tools/StreamingToolExecutor.ts)
 - [Reconstructed tool permission/execution path at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/src/services/tools/toolExecution.ts)
 - [Reconstructed compaction path at `3da94d5`](https://github.com/liuyang0508/claude-code-source-code/blob/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f/src/services/compact/autoCompact.ts)
@@ -239,6 +272,9 @@ engine-owned invariants:
 - [SQLite migrations at `4c43465`](https://github.com/openai/codex/blob/4c43465133428898aa84f0bfc02c306ed65fb66a/codex-rs/state/src/migrations.rs)
 - [Skill discovery at `4c43465`](https://github.com/openai/codex/blob/4c43465133428898aa84f0bfc02c306ed65fb66a/codex-rs/core-skills/src/loader/discovery.rs)
 - [Codex app server at `4c43465`](https://github.com/openai/codex/blob/4c43465133428898aa84f0bfc02c306ed65fb66a/codex-rs/app-server/README.md)
+- [Turn input queue at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/core/src/session/input_queue.rs)
+- [Exact-ID Turn steering at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/app-server/src/request_processors/turn_processor.rs)
+- [Bounded client recovery slots at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/exec-server/src/client_recovery.rs)
 - [Official Codex documentation](https://developers.openai.com/codex/)
 
 ### Hermes Agent
@@ -250,6 +286,8 @@ engine-owned invariants:
 - [Approval flow at `689b51b`](https://github.com/NousResearch/hermes-agent/blob/689b51bef68f9ec95b638121bb9c7fefa3703fb2/tools/approval.py)
 - [Observer contract at `689b51b`](https://github.com/NousResearch/hermes-agent/blob/689b51bef68f9ec95b638121bb9c7fefa3703fb2/docs/observability/README.md)
 - [Architecture at `689b51b`](https://github.com/NousResearch/hermes-agent/blob/689b51bef68f9ec95b638121bb9c7fefa3703fb2/website/docs/developer-guide/architecture.md)
+- [Crossed-response steering at `6ab5d2d`](https://github.com/NousResearch/hermes-agent/blob/6ab5d2df2a5748f23ba7557ec527fac628720a22/agent/conversation_loop.py)
+- [Backup-first session recovery at `6ab5d2d`](https://github.com/NousResearch/hermes-agent/blob/6ab5d2df2a5748f23ba7557ec527fac628720a22/hermes_cli/session_recovery.py)
 
 ### OpenCode
 
@@ -261,3 +299,4 @@ engine-owned invariants:
 - [Session projection at `7534d23`](https://github.com/anomalyco/opencode/blob/7534d23551f665e65080809975b4ca5c7d63807b/packages/core/src/session/projector.ts)
 - [Plugin runtime at `7534d23`](https://github.com/anomalyco/opencode/blob/7534d23551f665e65080809975b4ca5c7d63807b/packages/opencode/src/plugin/index.ts)
 - [Typed server at `7534d23`](https://github.com/anomalyco/opencode/blob/7534d23551f665e65080809975b4ca5c7d63807b/packages/opencode/src/server/server.ts)
+- [Serialized client prompt queue at `7534d23`](https://github.com/anomalyco/opencode/blob/7534d23551f665e65080809975b4ca5c7d63807b/packages/opencode/src/cli/cmd/run/runtime.queue.ts)

@@ -74,6 +74,7 @@ id_type!(TaskLeaseId, "lease");
 id_type!(TaskMessageId, "message");
 id_type!(ArtifactId, "artifact");
 id_type!(OperationId, "operation");
+id_type!(SteeringId, "steering");
 
 fn next_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
@@ -194,6 +195,24 @@ pub enum ItemKind {
     /// User input supplied to the turn.
     UserMessage {
         /// Message text.
+        content: String,
+    },
+    /// Durable external input accepted for a running Turn but not yet exposed
+    /// to the Model.
+    SteeringQueued {
+        /// Runtime-generated correlation identity.
+        steering_id: SteeringId,
+        /// Authenticated actor established by the embedding host or transport.
+        submitted_by: ActorIdentity,
+        /// Bounded correction or additional instruction.
+        content: String,
+    },
+    /// Steering input exposed to the Model at a protocol-safe Agent Loop
+    /// boundary.
+    SteeringApplied {
+        /// Identity of the earlier durable queue record.
+        steering_id: SteeringId,
+        /// Exact text copied from the matching queue record.
         content: String,
     },
     /// Final or intermediate assistant text.
@@ -396,11 +415,11 @@ pub enum RiskLevel {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// Provider-neutral identity participating in an approval workflow.
+/// Provider-neutral identity attributed to an authority-bearing Runtime action.
 ///
 /// This value is attribution supplied by a trusted transport or embedding
 /// host; constructing `Authenticated` does not authenticate its strings.
-pub enum ApprovalActor {
+pub enum ActorIdentity {
     /// Caller trusted only through the embedding process boundary.
     LocalProcess,
     /// Subject established by one named authentication authority.
@@ -417,8 +436,13 @@ pub enum ApprovalActor {
     UnattributedLegacy,
 }
 
-impl ApprovalActor {
+impl ActorIdentity {
     pub(crate) fn validate_shape(&self, kind: &str) -> Result<(), HarnessError> {
+        self.validate_shape_message(kind)
+            .map_err(HarnessError::Approval)
+    }
+
+    fn validate_shape_message(&self, kind: &str) -> Result<(), String> {
         match self {
             Self::LocalProcess | Self::UnattributedLegacy => Ok(()),
             Self::Authenticated { authority, subject } => {
@@ -429,21 +453,36 @@ impl ApprovalActor {
     }
 
     pub(crate) fn validate_current(&self, kind: &str) -> Result<(), HarnessError> {
-        self.validate_shape(kind)?;
+        self.validate_current_message(kind)
+            .map_err(HarnessError::Approval)
+    }
+
+    pub(crate) fn validate_current_state(&self, kind: &str) -> Result<(), HarnessError> {
+        self.validate_current_message(kind)
+            .map_err(HarnessError::State)
+    }
+
+    fn validate_current_message(&self, kind: &str) -> Result<(), String> {
+        self.validate_shape_message(kind)?;
         if matches!(self, Self::UnattributedLegacy) {
-            return Err(HarnessError::Approval(format!(
+            return Err(format!(
                 "{kind} cannot use the legacy unattributed identity"
-            )));
+            ));
         }
         Ok(())
     }
 }
 
-fn validate_actor_identity(kind: &str, field: &str, value: &str) -> Result<(), HarnessError> {
+/// Backwards-compatible name for the actor participating in an approval flow.
+///
+/// Approval is one use of the shared authenticated actor identity; Turn input
+/// uses the same authority/subject coordinate without inventing another
+/// principal type.
+pub type ApprovalActor = ActorIdentity;
+
+fn validate_actor_identity(kind: &str, field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        return Err(HarnessError::Approval(format!(
-            "{kind} {field} must be 1-256 non-control bytes"
-        )));
+        return Err(format!("{kind} {field} must be 1-256 non-control bytes"));
     }
     Ok(())
 }
@@ -684,6 +723,11 @@ pub enum ModelStreamEvent {
         model_step: u32,
         /// Provisional text fragment.
         delta: String,
+    },
+    /// Invalidates provisional output from a superseded model step.
+    StepInvalidated {
+        /// One-based Agent Loop model-step number.
+        model_step: u32,
     },
 }
 

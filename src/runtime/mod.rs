@@ -4,7 +4,7 @@ mod control;
 mod policy;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
@@ -22,13 +22,13 @@ pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngin
 pub use crate::kernel::{LanguageModel, Tool};
 
 use crate::{
-    ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine, ContextSource,
-    ExecutionPhase, HarnessError, Item, ItemKind, MemoryContextRecordStatus, MemoryContextStatus,
-    MemoryScope, ModelContinuation, ModelOutput, ModelRegistry, ModelRequest, ModelResponse,
-    ModelStream, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
-    StateCapacity, StateEngine, Thread, ThreadId, ToolAuthorization, ToolContext, ToolRegistry,
-    Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
-    VerificationRegistry, VerificationRequest,
+    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine,
+    ContextSource, ExecutionPhase, HarnessError, Item, ItemKind, MemoryContextRecordStatus,
+    MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput, ModelRegistry, ModelRequest,
+    ModelResponse, ModelStream, Observability, ObservationOutcome, PhaseObservation,
+    PolicyDecision, StateCapacity, StateEngine, SteeringId, Thread, ThreadId, ToolAuthorization,
+    ToolContext, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
+    VerificationOutcome, VerificationRegistry, VerificationRequest,
     context::model_visible_items,
     kernel::{validate_capability_origin, validate_model_id},
 };
@@ -49,6 +49,30 @@ const MAX_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(86_400);
 const DEFAULT_MAX_CONCURRENT_TURNS: usize = 32;
 const MAX_CONCURRENT_TURNS: usize = 4_096;
 const MIN_RUNTIME_GENERAL_EVENTS: u64 = 4;
+const MAX_PENDING_STEERING: usize = 64;
+const MAX_PENDING_STEERING_BYTES: usize = 1_048_576;
+
+/// Durable acknowledgement for one Turn steering submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SteeringReceipt {
+    /// Runtime-generated steering identity.
+    pub steering_id: SteeringId,
+    /// Exact active Turn that accepted the input.
+    pub turn_id: TurnId,
+}
+
+#[derive(Clone)]
+struct PendingSteering {
+    steering_id: SteeringId,
+    content: String,
+}
+
+struct ActiveTurnControl {
+    turn_id: TurnId,
+    accepting_steering: bool,
+    pending_steering: VecDeque<PendingSteering>,
+    pending_steering_bytes: usize,
+}
 
 /// Headless Agent Loop coordinating model, context, policy, tools, and state.
 pub struct HarnessRuntime {
@@ -61,6 +85,7 @@ pub struct HarnessRuntime {
     verification: VerificationRegistry,
     observability: Observability,
     active_threads: Mutex<BTreeSet<ThreadId>>,
+    turn_controls: Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
     max_concurrent_turns: usize,
     max_steps: usize,
 }
@@ -87,6 +112,7 @@ impl HarnessRuntime {
             verification: VerificationRegistry::new(),
             observability: Observability::new(),
             active_threads: Mutex::new(BTreeSet::new()),
+            turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_steps: 32,
         }
@@ -127,6 +153,7 @@ impl HarnessRuntime {
             verification: VerificationRegistry::new(),
             observability: Observability::new(),
             active_threads: Mutex::new(BTreeSet::new()),
+            turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_steps: 32,
         })
@@ -213,6 +240,68 @@ impl HarnessRuntime {
         thread_id: &ThreadId,
     ) -> Result<Option<StateCapacity>, HarnessError> {
         self.state.thread_capacity(thread_id).await
+    }
+
+    /// Durably queues additional user input for one exact active Turn.
+    ///
+    /// The input is not exposed to the Model until the Runtime reaches a safe
+    /// boundary. A mismatched or already sealed Turn fails without writing.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
+        content: impl Into<String>,
+        submitted_by: ActorIdentity,
+    ) -> Result<SteeringReceipt, HarnessError> {
+        let content = content.into();
+        validate_steering(&content)?;
+        submitted_by.validate_current_state("steering actor")?;
+        let control = self.turn_control(thread_id)?;
+        let mut control = control.lock().await;
+        if control.turn_id != *expected_turn_id {
+            return Err(HarnessError::State(format!(
+                "steering expected turn {expected_turn_id}, active turn is {}",
+                control.turn_id
+            )));
+        }
+        if !control.accepting_steering {
+            return Err(HarnessError::State(format!(
+                "turn {expected_turn_id} no longer accepts steering"
+            )));
+        }
+        if control.pending_steering.len() >= MAX_PENDING_STEERING
+            || control
+                .pending_steering_bytes
+                .checked_add(content.len())
+                .is_none_or(|bytes| bytes > MAX_PENDING_STEERING_BYTES)
+        {
+            return Err(HarnessError::State(format!(
+                "turn steering capacity reached ({MAX_PENDING_STEERING} messages or {MAX_PENDING_STEERING_BYTES} bytes)"
+            )));
+        }
+
+        let steering_id = SteeringId::generate();
+        let queued = Item::new(ItemKind::SteeringQueued {
+            steering_id: steering_id.clone(),
+            submitted_by,
+            content: content.clone(),
+        });
+        let turn = Turn {
+            id: expected_turn_id.clone(),
+            thread_id: thread_id.clone(),
+            status: TurnStatus::Running,
+            items: Vec::new(),
+        };
+        self.state.append_item(&turn, queued).await?;
+        control.pending_steering_bytes += content.len();
+        control.pending_steering.push_back(PendingSteering {
+            steering_id: steering_id.clone(),
+            content,
+        });
+        Ok(SteeringReceipt {
+            steering_id,
+            turn_id: expected_turn_id.clone(),
+        })
     }
 
     /// Recovers unfinished execution and orphans approvals it can no longer consume.
@@ -343,147 +432,170 @@ impl HarnessRuntime {
             .validate_current("approval requester")?;
         let deadline = deadline(options.timeout)?;
         let _active = self.claim_thread(thread_id)?;
-        let (mut turn, conversation_items, context_blocks, starting_step, mut tool_call_ids) =
-            match entry {
-                TurnEntry::Start(prompt) => {
-                    validate_prompt(&prompt)?;
-                    let existing = self.load_thread(thread_id).await?.ok_or_else(|| {
+        let (
+            mut turn,
+            conversation_items,
+            context_blocks,
+            starting_step,
+            mut tool_call_ids,
+            _turn_control,
+        ) = match entry {
+            TurnEntry::Start(prompt) => {
+                validate_prompt(&prompt)?;
+                let existing = self.load_thread(thread_id).await?.ok_or_else(|| {
+                    HarnessError::State(format!("thread {thread_id} does not exist"))
+                })?;
+                let capacity = self
+                    .state
+                    .thread_capacity(thread_id)
+                    .await?
+                    .ok_or_else(|| {
                         HarnessError::State(format!("thread {thread_id} does not exist"))
                     })?;
-                    let capacity =
-                        self.state
-                            .thread_capacity(thread_id)
-                            .await?
-                            .ok_or_else(|| {
-                                HarnessError::State(format!("thread {thread_id} does not exist"))
-                            })?;
-                    require_runtime_capacity(&capacity)?;
-                    let conversation = self.context.compile_conversation(&existing)?;
+                require_runtime_capacity(&capacity)?;
+                let conversation = self.context.compile_conversation(&existing)?;
 
-                    let mut turn = self.state.start_turn(thread_id).await?;
-                    self.record(
-                        &mut turn,
-                        ItemKind::UserMessage {
-                            content: prompt.clone(),
-                        },
-                    )
-                    .await?;
-                    self.record(
-                        &mut turn,
-                        ItemKind::ConversationContext {
-                            included_turns: conversation.included_turns.clone(),
-                            dropped_turns: conversation.dropped_turns,
-                            estimated_tokens: conversation.serialized_bytes,
-                        },
-                    )
-                    .await?;
+                let mut turn = self.state.start_turn(thread_id).await?;
+                let turn_control = self.register_turn_control(&turn)?;
+                self.record(
+                    &mut turn,
+                    ItemKind::UserMessage {
+                        content: prompt.clone(),
+                    },
+                )
+                .await?;
+                self.record(
+                    &mut turn,
+                    ItemKind::ConversationContext {
+                        included_turns: conversation.included_turns.clone(),
+                        dropped_turns: conversation.dropped_turns,
+                        estimated_tokens: conversation.serialized_bytes,
+                    },
+                )
+                .await?;
 
-                    let conversation_summary = if let Some(compactor) =
-                        self.context.conversation_compactor_name(&conversation)
-                    {
-                        match self
-                            .controlled_observed(
-                                ObservationTarget::new(
-                                    thread_id,
-                                    &turn.id,
-                                    compactor,
-                                    ExecutionPhase::Context,
-                                ),
-                                &options.cancellation,
-                                deadline,
-                                || {
-                                    self.context.compile_conversation_summary(
-                                        &conversation,
-                                        &prompt,
-                                        options.cancellation.clone(),
-                                    )
-                                },
-                            )
-                            .await
-                        {
-                            Ok(summary) => summary,
-                            Err(error) => {
-                                self.settle_error(&mut turn, &error).await?;
-                                return Err(error);
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let conversation_summary_record = match conversation_summary
-                        .as_ref()
-                        .map(conversation_summary_record)
-                        .transpose()
-                    {
-                        Ok(record) => record,
-                        Err(error) => {
-                            self.settle_error(&mut turn, &error).await?;
-                            return Err(error);
-                        }
-                    };
-                    let compilation = match self
+                let conversation_summary = if let Some(compactor) =
+                    self.context.conversation_compactor_name(&conversation)
+                {
+                    match self
                         .controlled_observed(
                             ObservationTarget::new(
                                 thread_id,
                                 &turn.id,
-                                "context-engine",
+                                compactor,
                                 ExecutionPhase::Context,
                             ),
                             &options.cancellation,
                             deadline,
-                            || self.context.compile(&prompt, options.memory_scope.clone()),
+                            || {
+                                self.context.compile_conversation_summary(
+                                    &conversation,
+                                    &prompt,
+                                    options.cancellation.clone(),
+                                )
+                            },
                         )
                         .await
                     {
-                        Ok(compilation) => compilation,
+                        Ok(summary) => summary,
                         Err(error) => {
                             self.settle_error(&mut turn, &error).await?;
                             return Err(error);
                         }
-                    };
-                    let compilation = match self
-                        .context
-                        .merge_conversation_summary(compilation, conversation_summary)
-                    {
-                        Ok(compilation) => compilation,
-                        Err(error) => {
-                            self.settle_error(&mut turn, &error).await?;
-                            return Err(error);
-                        }
-                    };
-                    if let Some(record) = conversation_summary_record {
-                        self.record(&mut turn, record).await?;
                     }
-                    if let Some(observation) = compilation.memory {
-                        let status = match observation.status {
-                            MemoryContextStatus::Loaded => MemoryContextRecordStatus::Loaded,
-                            MemoryContextStatus::Degraded => MemoryContextRecordStatus::Degraded,
-                        };
-                        self.record(
-                            &mut turn,
-                            ItemKind::MemoryContext {
-                                provider: observation.provider,
-                                status,
-                                references: observation.references,
-                                packed_tokens: observation.packed_tokens,
-                                warnings: observation.warnings,
-                            },
-                        )
-                        .await?;
+                } else {
+                    None
+                };
+                let conversation_summary_record = match conversation_summary
+                    .as_ref()
+                    .map(conversation_summary_record)
+                    .transpose()
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
                     }
-                    (
-                        turn,
-                        conversation.items,
-                        compilation.blocks,
-                        0,
-                        BTreeSet::new(),
+                };
+                let compilation = match self
+                    .controlled_observed(
+                        ObservationTarget::new(
+                            thread_id,
+                            &turn.id,
+                            "context-engine",
+                            ExecutionPhase::Context,
+                        ),
+                        &options.cancellation,
+                        deadline,
+                        || self.context.compile(&prompt, options.memory_scope.clone()),
                     )
+                    .await
+                {
+                    Ok(compilation) => compilation,
+                    Err(error) => {
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                };
+                let compilation = match self
+                    .context
+                    .merge_conversation_summary(compilation, conversation_summary)
+                {
+                    Ok(compilation) => compilation,
+                    Err(error) => {
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                };
+                if let Some(record) = conversation_summary_record {
+                    self.record(&mut turn, record).await?;
                 }
-                TurnEntry::ResumeApproval(turn_id) => {
-                    self.prepare_approval_resume(thread_id, &turn_id, &options, deadline)
-                        .await?
+                if let Some(observation) = compilation.memory {
+                    let status = match observation.status {
+                        MemoryContextStatus::Loaded => MemoryContextRecordStatus::Loaded,
+                        MemoryContextStatus::Degraded => MemoryContextRecordStatus::Degraded,
+                    };
+                    self.record(
+                        &mut turn,
+                        ItemKind::MemoryContext {
+                            provider: observation.provider,
+                            status,
+                            references: observation.references,
+                            packed_tokens: observation.packed_tokens,
+                            warnings: observation.warnings,
+                        },
+                    )
+                    .await?;
                 }
-            };
+                (
+                    turn,
+                    conversation.items,
+                    compilation.blocks,
+                    0,
+                    BTreeSet::new(),
+                    turn_control,
+                )
+            }
+            TurnEntry::ResumeApproval(turn_id) => {
+                let thread = self.load_thread(thread_id).await?.ok_or_else(|| {
+                    HarnessError::State(format!("thread {thread_id} does not exist"))
+                })?;
+                let turn = thread
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == turn_id && turn.status == TurnStatus::Running)
+                    .ok_or_else(|| {
+                        HarnessError::State(format!(
+                            "turn {turn_id} is not the running turn in thread {thread_id}"
+                        ))
+                    })?;
+                let turn_control = self.register_turn_control(turn)?;
+                let (turn, conversation, context, step, call_ids) = self
+                    .prepare_approval_resume(thread_id, &turn_id, &options, deadline)
+                    .await?;
+                (turn, conversation, context, step, call_ids, turn_control)
+            }
+        };
 
         let model_stream = options
             .model_event_sink
@@ -491,6 +603,9 @@ impl HarnessRuntime {
             .map_or_else(ModelStream::disabled, ModelStream::new)
             .with_cancellation(options.cancellation.clone());
         for step in starting_step..self.max_steps {
+            let _ = self
+                .apply_pending_steering(&mut turn, false, &model_stream, None)
+                .await?;
             let mut items = conversation_items.clone();
             items.extend(model_visible_items(&turn.items));
             let request = ModelRequest {
@@ -530,26 +645,28 @@ impl HarnessRuntime {
                     continuation,
                     output: ModelOutput::Message { content },
                 }) => {
-                    if let Some(continuation) = continuation {
-                        self.record(
+                    let continuation =
+                        continuation.map(|continuation| ItemKind::ProviderContinuation {
+                            model_id: model_id.clone(),
+                            model_origin: model_origin.clone(),
+                            continuation,
+                        });
+                    if self
+                        .record_model_decision_if_current(
                             &mut turn,
-                            ItemKind::ProviderContinuation {
-                                model_id: model_id.clone(),
-                                model_origin: model_origin.clone(),
-                                continuation,
+                            &model_stream,
+                            u32::try_from(step + 1).unwrap_or(u32::MAX),
+                            continuation,
+                            ItemKind::AssistantMessage {
+                                model_id: Some(model_id),
+                                model_origin: Some(model_origin),
+                                content: content.clone(),
                             },
                         )
-                        .await?;
+                        .await?
+                    {
+                        continue;
                     }
-                    self.record(
-                        &mut turn,
-                        ItemKind::AssistantMessage {
-                            model_id: Some(model_id),
-                            model_origin: Some(model_origin),
-                            content: content.clone(),
-                        },
-                    )
-                    .await?;
                     let verification_request = VerificationRequest {
                         thread_id: thread_id.clone(),
                         turn_id: turn.id.clone(),
@@ -612,6 +729,17 @@ impl HarnessRuntime {
                             }
                         }
                     }
+                    if self
+                        .apply_pending_steering(
+                            &mut turn,
+                            !retry_candidate,
+                            &model_stream,
+                            Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
                     if retry_candidate {
                         continue;
                     }
@@ -633,35 +761,38 @@ impl HarnessRuntime {
                             input,
                         },
                 }) => {
-                    if !tool_call_ids.insert(call_id.clone()) {
+                    if tool_call_ids.contains(&call_id) {
                         let error = HarnessError::Model(format!(
                             "model reused Tool call id {call_id:?} within one Turn"
                         ));
                         self.settle_error(&mut turn, &error).await?;
                         return Err(error);
                     }
-                    if let Some(continuation) = continuation {
-                        self.record(
+                    let continuation =
+                        continuation.map(|continuation| ItemKind::ProviderContinuation {
+                            model_id: model_id.clone(),
+                            model_origin: model_origin.clone(),
+                            continuation,
+                        });
+                    if self
+                        .record_model_decision_if_current(
                             &mut turn,
-                            ItemKind::ProviderContinuation {
-                                model_id: model_id.clone(),
-                                model_origin: model_origin.clone(),
-                                continuation,
+                            &model_stream,
+                            u32::try_from(step + 1).unwrap_or(u32::MAX),
+                            continuation,
+                            ItemKind::ToolCall {
+                                model_id: Some(model_id),
+                                model_origin: Some(model_origin),
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
                             },
                         )
-                        .await?;
+                        .await?
+                    {
+                        continue;
                     }
-                    self.record(
-                        &mut turn,
-                        ItemKind::ToolCall {
-                            model_id: Some(model_id),
-                            model_origin: Some(model_origin),
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        },
-                    )
-                    .await?;
+                    tool_call_ids.insert(call_id.clone());
 
                     let Some(registered) = self.tools.get(&name) else {
                         let error = HarnessError::UnknownTool(name);
@@ -790,6 +921,12 @@ impl HarnessRuntime {
                         }
                     }
 
+                    if self
+                        .supersede_tool_before_effect(&mut turn, &call_id)
+                        .await?
+                    {
+                        continue;
+                    }
                     self.execute_tool_call(&mut turn, &name, call_id, input, &options, deadline)
                         .await?;
                 }
@@ -965,6 +1102,18 @@ impl HarnessRuntime {
             };
             self.settle_error(&mut turn, &error).await?;
             return Err(error);
+        }
+        if self
+            .supersede_tool_before_effect(&mut turn, &evidence.call_id)
+            .await?
+        {
+            return Ok((
+                turn,
+                conversation.items,
+                compilation.blocks,
+                evidence.consumed_steps,
+                evidence.tool_call_ids,
+            ));
         }
         self.execute_tool_call(
             &mut turn,
@@ -1277,7 +1426,202 @@ impl HarnessRuntime {
         })
     }
 
+    fn register_turn_control(&self, turn: &Turn) -> Result<TurnControlGuard<'_>, HarnessError> {
+        let pending_steering = pending_steering_from_items(&turn.items)?;
+        let pending_steering_bytes =
+            pending_steering
+                .iter()
+                .try_fold(0_usize, |total, steering| {
+                    total.checked_add(steering.content.len()).ok_or_else(|| {
+                        HarnessError::State("pending steering byte count overflow".to_owned())
+                    })
+                })?;
+        if pending_steering.len() > MAX_PENDING_STEERING
+            || pending_steering_bytes > MAX_PENDING_STEERING_BYTES
+        {
+            return Err(HarnessError::State(
+                "recovered Turn exceeds pending steering capacity".to_owned(),
+            ));
+        }
+        let control = Arc::new(tokio::sync::Mutex::new(ActiveTurnControl {
+            turn_id: turn.id.clone(),
+            accepting_steering: true,
+            pending_steering,
+            pending_steering_bytes,
+        }));
+        let mut controls = self
+            .turn_controls
+            .lock()
+            .map_err(|_| HarnessError::State("Turn control lock poisoned".to_owned()))?;
+        if controls.contains_key(&turn.thread_id) {
+            return Err(HarnessError::State(format!(
+                "thread {} already has an active Turn control",
+                turn.thread_id
+            )));
+        }
+        controls.insert(turn.thread_id.clone(), control);
+        Ok(TurnControlGuard {
+            controls: &self.turn_controls,
+            thread_id: turn.thread_id.clone(),
+        })
+    }
+
+    fn turn_control(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<Arc<tokio::sync::Mutex<ActiveTurnControl>>, HarnessError> {
+        self.turn_controls
+            .lock()
+            .map_err(|_| HarnessError::State("Turn control lock poisoned".to_owned()))?
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                HarnessError::State(format!("thread {thread_id} has no active steerable Turn"))
+            })
+    }
+
+    async fn apply_pending_steering(
+        &self,
+        turn: &mut Turn,
+        seal_if_empty: bool,
+        model_stream: &ModelStream,
+        invalidated_model_step: Option<u32>,
+    ) -> Result<bool, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if control.pending_steering.is_empty() {
+            if seal_if_empty {
+                control.accepting_steering = false;
+            }
+            return Ok(false);
+        }
+        if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        if let Some(model_step) = invalidated_model_step {
+            model_stream.invalidate_step(model_step);
+        }
+        Ok(true)
+    }
+
+    async fn supersede_tool_before_effect(
+        &self,
+        turn: &mut Turn,
+        call_id: &str,
+    ) -> Result<bool, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if control.pending_steering.is_empty() {
+            return Ok(false);
+        }
+        if let Err(error) = self
+            .record_unlocked(
+                turn,
+                ItemKind::ToolResult {
+                    call_id: call_id.to_owned(),
+                    output: serde_json::json!({
+                        "error": "tool call superseded by user steering before execution"
+                    }),
+                    is_error: true,
+                },
+            )
+            .await
+        {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    async fn record_model_decision_if_current(
+        &self,
+        turn: &mut Turn,
+        model_stream: &ModelStream,
+        model_step: u32,
+        continuation: Option<ItemKind>,
+        decision: ItemKind,
+    ) -> Result<bool, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty() {
+            if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+                control.accepting_steering = false;
+                return Err(error);
+            }
+            model_stream.invalidate_step(model_step);
+            return Ok(true);
+        }
+        if let Some(continuation) = continuation
+            && let Err(error) = self.record_unlocked(turn, continuation).await
+        {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        if let Err(error) = self.record_unlocked(turn, decision).await {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        Ok(false)
+    }
+
+    async fn apply_pending_steering_locked(
+        &self,
+        turn: &mut Turn,
+        control: &mut ActiveTurnControl,
+    ) -> Result<(), HarnessError> {
+        while let Some(steering) = control.pending_steering.front().cloned() {
+            let remaining_bytes = control
+                .pending_steering_bytes
+                .checked_sub(steering.content.len())
+                .ok_or_else(|| {
+                    HarnessError::State(
+                        "pending steering byte count is internally inconsistent".to_owned(),
+                    )
+                })?;
+            self.record_unlocked(
+                turn,
+                ItemKind::SteeringApplied {
+                    steering_id: steering.steering_id,
+                    content: steering.content,
+                },
+            )
+            .await?;
+            let _ = control.pending_steering.pop_front();
+            control.pending_steering_bytes = remaining_bytes;
+        }
+        let thread = self
+            .state
+            .load_thread(&turn.thread_id)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {} disappeared", turn.thread_id)))?;
+        *turn = thread
+            .turns
+            .into_iter()
+            .find(|candidate| candidate.id == turn.id)
+            .ok_or_else(|| HarnessError::State(format!("turn {} disappeared", turn.id)))?;
+        Ok(())
+    }
+
     async fn record(&self, turn: &mut Turn, kind: ItemKind) -> Result<(), HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        let result = self.record_unlocked(turn, kind).await;
+        if result.is_err() {
+            control.accepting_steering = false;
+        }
+        result
+    }
+
+    async fn record_unlocked(&self, turn: &mut Turn, kind: ItemKind) -> Result<(), HarnessError> {
         let item = Item::new(kind);
         match self.state.append_item(turn, item.clone()).await {
             Ok(_) => {
@@ -1301,6 +1645,10 @@ impl HarnessRuntime {
         turn: &mut Turn,
         error: &HarnessError,
     ) -> Result<(), HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        control.accepting_steering = false;
         let (item, status) = match error {
             HarnessError::Cancelled { phase } => (
                 ItemKind::TurnStopped {
@@ -1372,7 +1720,12 @@ fn approval_resume_evidence(
     turn: &Turn,
     expected_requester: &crate::ApprovalActor,
 ) -> Result<ApprovalResumeEvidence, HarnessError> {
-    let pending_tool_item_index = turn.items.len().checked_sub(3).ok_or_else(|| {
+    let boundary_end = turn
+        .items
+        .iter()
+        .rposition(|item| !matches!(item.kind, ItemKind::SteeringQueued { .. }))
+        .map_or(0, |index| index + 1);
+    let pending_tool_item_index = boundary_end.checked_sub(3).ok_or_else(|| {
         HarnessError::State(
             "running Turn has no complete pre-Tool approval continuation boundary".to_owned(),
         )
@@ -1864,6 +2217,66 @@ fn validate_prompt(prompt: &str) -> Result<(), HarnessError> {
     Ok(())
 }
 
+fn validate_steering(content: &str) -> Result<(), HarnessError> {
+    if content.trim().is_empty() || content.len() > MAX_PROMPT_BYTES {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "steering content must be 1-{MAX_PROMPT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn pending_steering_from_items(items: &[Item]) -> Result<VecDeque<PendingSteering>, HarnessError> {
+    let mut pending = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    for item in items {
+        match &item.kind {
+            ItemKind::SteeringQueued {
+                steering_id,
+                content,
+                ..
+            } => {
+                if !seen.insert(steering_id.clone()) {
+                    return Err(HarnessError::State(format!(
+                        "duplicate steering identity {steering_id}"
+                    )));
+                }
+                pending.push_back(PendingSteering {
+                    steering_id: steering_id.clone(),
+                    content: content.clone(),
+                });
+            }
+            ItemKind::SteeringApplied {
+                steering_id,
+                content,
+            } => {
+                let Some(queued) = pending.pop_front() else {
+                    return Err(HarnessError::State(format!(
+                        "applied steering {steering_id} has no pending queue record"
+                    )));
+                };
+                if queued.steering_id != *steering_id || queued.content != *content {
+                    return Err(HarnessError::State(format!(
+                        "applied steering {steering_id} does not match queue order and content"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(pending)
+}
+
+fn require_control_turn(control: &ActiveTurnControl, turn: &Turn) -> Result<(), HarnessError> {
+    if control.turn_id != turn.id {
+        return Err(HarnessError::State(format!(
+            "Turn control {} does not match active turn {}",
+            control.turn_id, turn.id
+        )));
+    }
+    Ok(())
+}
+
 fn require_runtime_capacity(capacity: &StateCapacity) -> Result<(), HarnessError> {
     if capacity.general_events_remaining < MIN_RUNTIME_GENERAL_EVENTS {
         return Err(HarnessError::State(format!(
@@ -2060,6 +2473,19 @@ impl Drop for ActiveThreadGuard<'_> {
     }
 }
 
+struct TurnControlGuard<'a> {
+    controls: &'a Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
+    thread_id: ThreadId,
+}
+
+impl Drop for TurnControlGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.remove(&self.thread_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2077,10 +2503,10 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, PolicyEngine, Tool,
-        TurnExecutionOptions, require_runtime_capacity, validate_approval_decision,
-        validate_model_request, validate_model_tool_call, validate_policy_decision,
-        validate_tool_output,
+        AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, MAX_PENDING_STEERING,
+        MAX_PENDING_STEERING_BYTES, PolicyEngine, Tool, TurnExecutionOptions,
+        require_runtime_capacity, validate_approval_decision, validate_model_request,
+        validate_model_tool_call, validate_policy_decision, validate_tool_output,
     };
     use crate::{
         ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus, ApprovalRequest,
@@ -2142,6 +2568,18 @@ mod tests {
         inner: MemoryEventStore,
     }
 
+    struct RejectSteeringApplicationStore {
+        inner: MemoryEventStore,
+    }
+
+    impl RejectSteeringApplicationStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryEventStore::new(),
+            }
+        }
+    }
+
     impl RejectStopEvidenceStore {
         fn new() -> Self {
             Self {
@@ -2188,6 +2626,36 @@ mod tests {
                 return Box::pin(async {
                     Err(HarnessError::State(
                         "simulated Item persistence failure".to_owned(),
+                    ))
+                });
+            }
+            self.inner.append(pending)
+        }
+
+        fn events_page<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            after_sequence: u64,
+            limit: usize,
+            max_recovery_bytes: u64,
+        ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+            self.inner
+                .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
+        }
+    }
+
+    impl EventStore for RejectSteeringApplicationStore {
+        fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent> {
+            if matches!(
+                &pending.event,
+                StateEvent::ItemAppended {
+                    item,
+                    ..
+                } if matches!(&item.kind, ItemKind::SteeringApplied { .. })
+            ) {
+                return Box::pin(async {
+                    Err(HarnessError::State(
+                        "simulated steering application persistence failure".to_owned(),
                     ))
                 });
             }
@@ -2563,6 +3031,37 @@ mod tests {
         events: Mutex<Vec<ModelStreamEvent>>,
     }
 
+    struct SteeringModel {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct SteeringToolModel {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    struct BlockingAllowPolicy {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl PolicyEngine for BlockingAllowPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _request: &'a ToolAuthorization,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(PolicyDecision::Allow)
+            })
+        }
+    }
+
     impl ModelEventSink for RecordingModelSink {
         fn emit(&self, event: &ModelStreamEvent) -> Result<(), String> {
             self.events
@@ -2570,6 +3069,85 @@ mod tests {
                 .map_err(|_| "model event recorder poisoned".to_owned())?
                 .push(event.clone());
             Ok(())
+        }
+    }
+
+    impl LanguageModel for SteeringModel {
+        fn id(&self) -> &str {
+            "test/steering-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Err(HarnessError::Model(
+                    "steering test requires streaming entrypoint".to_owned(),
+                ))
+            })
+        }
+
+        fn complete_streaming<'a>(
+            &'a self,
+            request: ModelRequest,
+            stream: ModelStream,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("steering requests")
+                    .push(request.clone());
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = stream.emit_text_delta("stale provisional response");
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    return Ok(ModelResponse::from(ModelOutput::Message {
+                        content: "stale final response".to_owned(),
+                    }));
+                }
+                let correction = request
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        ItemKind::UserMessage { content } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Ok(ModelResponse::from(ModelOutput::Message {
+                    content: format!("accepted: {correction}"),
+                }))
+            })
+        }
+    }
+
+    impl LanguageModel for SteeringToolModel {
+        fn id(&self) -> &str {
+            "test/steering-tool-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    return Ok(ModelOutput::ToolCall {
+                        call_id: "stale-tool-call".to_owned(),
+                        name: "echo".to_owned(),
+                        input: json!({"text": "must not execute"}),
+                    });
+                }
+                let correction = request
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.kind {
+                        ItemKind::UserMessage { content } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Ok(ModelOutput::Message {
+                    content: format!("accepted: {correction}"),
+                })
+            })
         }
     }
 
@@ -2828,6 +3406,12 @@ mod tests {
         retryable: bool,
     }
 
+    struct BlockingRetryVerifier {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
     impl Verifier for CandidateVerifier {
         fn descriptor(&self) -> VerifierDescriptor {
             VerifierDescriptor {
@@ -2849,6 +3433,37 @@ mod tests {
                     Ok(VerificationOutcome::Failed {
                         reason: "candidate must equal good".to_owned(),
                         retryable: self.retryable,
+                    })
+                }
+            })
+        }
+    }
+
+    impl Verifier for BlockingRetryVerifier {
+        fn descriptor(&self) -> VerifierDescriptor {
+            VerifierDescriptor {
+                name: "blocking-candidate-quality".to_owned(),
+                description: "Exercises steering across a retryable completion gate".to_owned(),
+            }
+        }
+
+        fn verify<'a>(
+            &'a self,
+            request: VerificationRequest,
+        ) -> HarnessFuture<'a, VerificationOutcome> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                if request.candidate == "good" {
+                    Ok(VerificationOutcome::Passed {
+                        summary: Some("candidate accepted".to_owned()),
+                    })
+                } else {
+                    Ok(VerificationOutcome::Failed {
+                        reason: "candidate must equal good".to_owned(),
+                        retryable: true,
                     })
                 }
             })
@@ -3498,6 +4113,73 @@ mod tests {
             }
         ));
         assert_eq!(state.events(&thread.id).await.expect("events").len(), 9);
+    }
+
+    #[tokio::test]
+    async fn steering_remains_open_across_a_retryable_verification_gate() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut verification = VerificationRegistry::new();
+        verification
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(BlockingRetryVerifier {
+                    calls: AtomicUsize::new(0),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .expect("register verifier");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(RevisionModel),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_verification(verification),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "produce a candidate").await })
+        };
+        entered.notified().await;
+        let turn_id = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread")
+            .turns[0]
+            .id
+            .clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "apply this before retrying",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("steering remains open during retryable verification");
+        release.notify_one();
+
+        let outcome = worker.await.expect("worker").expect("revised candidate");
+        assert_eq!(outcome.final_text, "good");
+        let queued = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringQueued { .. }))
+            .expect("queue evidence");
+        let applied = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+            .expect("application evidence");
+        assert!(queued < applied);
     }
 
     #[tokio::test]
@@ -5467,6 +6149,441 @@ mod tests {
             })
             .expect("bounded Tool error");
         assert!(result.to_string().len() < 1_024);
+    }
+
+    #[tokio::test]
+    async fn steering_is_durable_fenced_and_invalidates_a_crossed_model_response() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingModelSink::default());
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(SteeringModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+                release: release.clone(),
+                requests: requests.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        ));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "original",
+                        TurnExecutionOptions {
+                            model_event_sink: Some(sink),
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        let active = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active thread")
+            .expect("thread");
+        let turn_id = active
+            .turns
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Running)
+            .expect("running turn")
+            .id
+            .clone();
+        let mismatch = runtime
+            .steer_turn(
+                &thread.id,
+                &crate::TurnId::generate(),
+                "wrong target",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect_err("mismatched Turn must fail");
+        assert!(matches!(mismatch, HarnessError::State(_)));
+        let receipt = runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "corrected",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue steering");
+        assert_eq!(receipt.turn_id, turn_id);
+        release.notify_one();
+
+        let outcome = worker.await.expect("worker").expect("steered turn");
+        assert_eq!(outcome.final_text, "accepted: corrected");
+        assert!(!outcome.turn.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::AssistantMessage { content, .. } if content.contains("stale")
+            )
+        }));
+        let queued = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringQueued { .. }))
+            .expect("durable queue record");
+        let applied = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+            .expect("durable application record");
+        assert!(queued < applied);
+        assert!(matches!(
+            sink.events.lock().expect("stream events").as_slice(),
+            [
+                ModelStreamEvent::TextDelta { delta, .. },
+                ModelStreamEvent::StepInvalidated { model_step: 1 }
+            ] if delta == "stale provisional response"
+        ));
+        {
+            let requests = requests.lock().expect("requests");
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].items.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::UserMessage { content } if content == "corrected"
+                )
+            }));
+        }
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "too late",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect_err("terminal Turn must reject steering");
+    }
+
+    #[tokio::test]
+    async fn failed_steering_application_preserves_the_pending_runtime_projection() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(RejectSteeringApplicationStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let mut turn = runtime
+            .state
+            .start_turn(&thread.id)
+            .await
+            .expect("start turn");
+        let _turn_control = runtime
+            .register_turn_control(&turn)
+            .expect("register Turn control");
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn.id,
+                "keep me pending",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue steering");
+
+        let error = runtime
+            .apply_pending_steering(&mut turn, false, &ModelStream::disabled(), None)
+            .await
+            .expect_err("SteeringApplied append must fail");
+        assert!(matches!(error, HarnessError::State(_)));
+
+        let control = runtime
+            .turn_control(&thread.id)
+            .expect("Turn control remains registered");
+        let control = control.lock().await;
+        assert!(!control.accepting_steering);
+        assert_eq!(control.pending_steering.len(), 1);
+        assert_eq!(
+            control.pending_steering_bytes,
+            "keep me pending".len(),
+            "in-memory projection must not advance before durable State"
+        );
+        drop(control);
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(
+            projected.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::SteeringQueued { .. }))
+        );
+        assert!(
+            !projected.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_crossing_model_inference_discards_a_stale_tool_call() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: tool_calls.clone(),
+                }),
+            )
+            .expect("register echo");
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(SteeringToolModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        ));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "original").await })
+        };
+        entered.notified().await;
+        let active = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread");
+        let turn_id = active.turns[0].id.clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "do not execute that tool",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue steering");
+        release.notify_one();
+
+        let outcome = worker.await.expect("worker").expect("steered turn");
+        assert_eq!(outcome.final_text, "accepted: do not execute that tool");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !outcome
+                .turn
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::ToolCall { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_before_the_tool_effect_preserves_call_result_structure_without_execution() {
+        let policy_entered = Arc::new(Notify::new());
+        let policy_release = Arc::new(Notify::new());
+        let model_release = Arc::new(Notify::new());
+        model_release.notify_one();
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: tool_calls.clone(),
+                }),
+            )
+            .expect("register echo");
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(SteeringToolModel {
+                calls: AtomicUsize::new(0),
+                entered: Arc::new(Notify::new()),
+                release: model_release,
+            }),
+            tools,
+            Arc::new(BlockingAllowPolicy {
+                entered: policy_entered.clone(),
+                release: policy_release.clone(),
+            }),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        ));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "original").await })
+        };
+        policy_entered.notified().await;
+        let active = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread");
+        let turn_id = active.turns[0].id.clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "skip the pending tool",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue steering");
+        policy_release.notify_one();
+
+        let outcome = worker.await.expect("worker").expect("steered turn");
+        assert_eq!(outcome.final_text, "accepted: skip the pending tool");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        let tool_call = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::ToolCall { .. }))
+            .expect("recorded Tool call");
+        let tool_result = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::ToolResult {
+                        call_id,
+                        is_error: true,
+                        ..
+                    } if call_id == "stale-tool-call"
+                )
+            })
+            .expect("synthetic Tool result");
+        let applied = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+            .expect("steering application");
+        assert!(tool_call < tool_result && tool_result < applied);
+    }
+
+    #[tokio::test]
+    async fn steering_pending_count_and_bytes_are_bounded_before_durable_acceptance() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(SteeringModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+                release: release.clone(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        ));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "original").await })
+        };
+        entered.notified().await;
+        let turn_id = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread")
+            .turns[0]
+            .id
+            .clone();
+        for _ in 0..MAX_PENDING_STEERING {
+            runtime
+                .steer_turn(&thread.id, &turn_id, "x", ApprovalActor::LocalProcess)
+                .await
+                .expect("queue within count bound");
+        }
+        let error = runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "overflow",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect_err("reject count overflow");
+        assert!(error.to_string().contains("steering capacity reached"));
+        release.notify_one();
+        worker.await.expect("worker").expect("count-bounded turn");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(SteeringModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+                release: release.clone(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        ));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "original").await })
+        };
+        entered.notified().await;
+        let turn_id = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread")
+            .turns[0]
+            .id
+            .clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "a".repeat(600_000),
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue first byte range");
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "b".repeat(MAX_PENDING_STEERING_BYTES - 600_000),
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue through exact byte bound");
+        let error = runtime
+            .steer_turn(&thread.id, &turn_id, "x", ApprovalActor::LocalProcess)
+            .await
+            .expect_err("reject byte overflow");
+        assert!(error.to_string().contains("steering capacity reached"));
+        release.notify_one();
+        worker.await.expect("worker").expect("byte-bounded turn");
     }
 
     #[tokio::test]

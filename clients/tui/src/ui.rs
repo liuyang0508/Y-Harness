@@ -292,6 +292,19 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
             ));
             append_multiline(lines, content, Color::White);
         }
+        ItemKind::SteeringQueued { steering_id, .. } => {
+            lines.push(Line::styled(
+                format!("◇ STEERING QUEUED · {}", short_id(steering_id.as_str())),
+                Style::default().fg(MUTED),
+            ));
+        }
+        ItemKind::SteeringApplied { content, .. } => {
+            lines.push(Line::styled(
+                "YOU · STEERING",
+                Style::default().fg(USER).add_modifier(Modifier::BOLD),
+            ));
+            append_multiline(lines, content, Color::White);
+        }
         ItemKind::AssistantMessage {
             model_id, content, ..
         } => {
@@ -724,7 +737,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v11.",
+            "Approvals and Tasks are accessed exclusively through Protocol v12.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -968,7 +981,9 @@ mod tests {
         assert!(screen.contains("PROVIDER STATE"));
         assert!(screen.contains("fixture.reasoning.v1"));
         assert!(!screen.contains("never-render-this-ciphertext"));
-        assert!(screen.contains("Keep clients behind Protocol v11"));
+        assert!(screen.contains("STEERING QUEUED"));
+        assert!(screen.contains("Prefer the durable boundary"));
+        assert!(screen.contains("Keep clients behind Protocol v12"));
         assert!(screen.contains("Activity"));
         Ok(())
     }

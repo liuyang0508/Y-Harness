@@ -11,9 +11,9 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"11"` | exact `Initialize` request/response |
-| State events | `5` | per-event durable envelope; reads schemas 1 through 5 |
-| State snapshots | `5` | cache body; incompatible caches are discarded |
+| Client protocol | `"12"` | exact `Initialize` request/response |
+| State events | `6` | per-event durable envelope; reads schemas 1 through 6 |
+| State snapshots | `6` | cache body; incompatible caches are discarded |
 | Approval Inbox | `2` | per-record durable body after explicit migration |
 | Task Coordinator | `1` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
@@ -64,6 +64,14 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `12` preserves all protocol-v11 framing, paging, Task,
+Approval, and Operation authority semantics. It adds exact-ID `steer_turn`,
+the `turn.steer` permission, durable `turn_steered` acknowledgement, and
+provisional `step_invalidated` events. It advances the advertised State
+event/snapshot coordinates and permits Thread/Event results to carry schema-6
+Steering Items. Protocol-v11 clients must fail exact initialization rather than
+silently ignore the new command, stream event, or durable shapes.
 
 Client protocol `11` preserves all protocol-v10 commands, framing, paging, and
 authority semantics. It advances the advertised State event/snapshot and Model
@@ -121,6 +129,12 @@ Client protocol `3` added exact recovery-byte fields to the protocol-v2
 Thread-capacity result. Protocol versions remain exact rather than rolling
 field negotiation.
 
+State event schema `6` adds actor-attributed `steering_queued` and exactly
+correlated `steering_applied` Items. Queue records are durable acceptance
+evidence but are not Model-visible; application records project as user input
+only at Runtime safe boundaries. Schema-6 readers accept immutable
+schema-1/2/3/4/5 history, and the schema-6 writer emits only schema 6.
+
 State event schema `5` adds the bounded `provider_continuation` Item. The
 Runtime binds it to the exact registered Model identity and origin that
 settled the response; provider adapters own format-specific replay. Schema-5
@@ -143,7 +157,9 @@ State event schema `2` added content-free `conversation_summary` evidence. Its
 body remains ephemeral Context; original conversation Items remain immutable
 schema-1 or schema-2 events.
 
-State snapshot schema `5` admits Provider Continuation evidence. Older
+State snapshot schema `6` admits Steering evidence. Older snapshots are
+disposable and are ignored. State snapshot schema `5` admits Provider
+Continuation evidence. Older
 snapshots are disposable and are ignored. State snapshot schema `4` admits
 Policy-to-Tool-origin evidence. Older
 snapshots are disposable and are ignored. State snapshot schema `3` admitted
@@ -204,28 +220,28 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1, 2, 3, and 4 are supported migration sources. Populated SQLite
-stores at any of those coordinates require the explicit backup-first command
-below before a schema-5 Runtime can open them:
+State schemas 1, 2, 3, 4, and 5 are supported migration sources. Populated
+SQLite stores at any of those coordinates require the explicit backup-first
+command below before a schema-6 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v5.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v6.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
 disk space, creates and validates a no-clobber SQLite backup, then adds or
 advances event and disposable-snapshot writer metadata in one immediate
 transaction. Historical event JSON and schema labels are never rewritten. An
-interrupted schema-1, schema-2, schema-3, or schema-4 run can reuse its
-validated backup.
+interrupted schema-1, schema-2, schema-3, schema-4, or schema-5 run can reuse
+its validated backup.
 
-The schema-5 reader/new writer decision is asymmetric:
+The schema-6 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1, schema-2, schema-3, and schema-4 events remain readable;
-- old reader + new writer: unsupported and fails on schema-5 metadata or Items;
+  schema-1, schema-2, schema-3, schema-4, and schema-5 events remain readable;
+- old reader + new writer: unsupported and fails on schema-6 metadata or Items;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-5 event
+- downgrade: supported only by restoring the backup before any schema-6 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -236,7 +252,9 @@ schema-3 continuation boundary and
 [ADR 0068](adr/0068-durable-policy-tool-origin-provenance.md) for schema-4
 authorization provenance, plus
 [ADR 0077](adr/0077-origin-bound-provider-continuation.md) for schema-5
-Provider Continuation.
+Provider Continuation, plus
+[ADR 0078](adr/0078-durable-safe-boundary-turn-steering.md) for schema-6
+safe-boundary steering.
 
 Approval Inbox schema 1 is independently migrated with:
 
@@ -281,9 +299,9 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 5 reads
-immutable schema-1, schema-2, schema-3, and schema-4 history after explicit
-store migration.
+durable schema support windows are declared per release. State schema 6 reads
+immutable schema-1, schema-2, schema-3, schema-4, and schema-5 history after
+explicit store migration.
 Approval reads only schema 2 in normal operation; its migration tool alone
 reads schema 1.
 

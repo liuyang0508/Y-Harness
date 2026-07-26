@@ -1,10 +1,10 @@
-# Client protocol v11
+# Client protocol v12
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"11"` is exact. Every request carries that value, and a peer
+Protocol version `"12"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "11",
+  "protocol_version": "12",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "11",
+  "protocol_version": "12",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "11",
+  "protocol_version": "12",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "11",
+  "protocol_version": "12",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "11",
+  "protocol_version": "12",
   "body": {
     "status": "success",
     "result": {
@@ -125,12 +125,13 @@ The result type is `initialized`:
         "thread.create",
         "thread.events",
         "thread.get",
-        "turn.start"
+        "turn.start",
+        "turn.steer"
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 4,
-        "state_snapshot_schema": 4,
+        "state_event_schema": 6,
+        "state_snapshot_schema": 6,
         "approval_inbox_schema": 2,
         "task_graph_schema": 1,
         "memory_api": 1,
@@ -138,7 +139,7 @@ The result type is `initialized`:
         "conversation_compactor_api": 1,
         "secret_api": 1,
         "skill_api": "1",
-        "model_gateway_api": "2",
+        "model_gateway_api": "3",
         "workspace_provider_api": "1"
       }
     }
@@ -165,6 +166,7 @@ exclusive: a returned item must have a sequence strictly greater than
 | `get_thread` | `thread_id` | `thread.get` | `thread` |
 | `get_thread_capacity` | `thread_id` | `thread.capacity` | `thread_capacity` |
 | `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `timeout_ms` | `turn.start` | `turn_started` |
+| `steer_turn` | `thread_id`, `expected_turn_id`, `content` | `turn.steer` | `turn_steered` |
 | `get_operation` | `operation_id` | `operation.get` | `operation` |
 | `get_operation_events` | `operation_id`, optional `after_sequence`, optional `limit` | `operation.events` | `operation_events` |
 | `cancel_operation` | `operation_id` | `operation.cancel` | `cancellation` |
@@ -199,6 +201,24 @@ input. `timeout_ms`, when present, must be greater than zero and fit the host
 Runtime clock. A timeout is a total external-work deadline, not a guarantee
 that non-cooperative persistence can be forcibly aborted.
 
+`steer_turn` supplies additional input to one exact running Turn. The caller
+must first observe its `TurnId` through `get_thread`; a stale or already sealed
+identity fails without writing. A successful result acknowledges the durable
+queue record:
+
+```json
+{
+  "type": "turn_steered",
+  "steering_id": "steering-...",
+  "turn_id": "turn-..."
+}
+```
+
+Acceptance does not mean immediate Model visibility. Runtime applies queued
+input FIFO only at a safe Agent Loop boundary. It invalidates and resamples a
+Model response crossed by newer steering, never executes a stale Tool call,
+and will not complete a Turn while accepted input remains unapplied.
+
 An approval decision is immutable:
 
 ```json
@@ -227,6 +247,7 @@ The normal client sequence is:
 initialize
   → create_thread
   → start_turn
+  → optional steer_turn while running
   → get_operation_events / get_operation
   → get_events
   → forget_operation
@@ -260,6 +281,11 @@ service restart. Thread events are authoritative: after reconnect or restart,
 a client reconciles with `get_thread` and `get_events`. Recovery marks
 unfinished work interrupted and never generically replays an uncertain Tool
 effect.
+
+If `get_operation_events` returns
+`{"type":"step_invalidated","model_step":N}`, clients must discard provisional
+text previously emitted for model step `N`. Authoritative State and the
+terminal operation result remain the reconciliation source.
 
 ## Task Graph and worker lifecycle
 
@@ -467,6 +493,34 @@ Clients must treat `continuation.items` as opaque provider state. Product UIs
 should not render its body. Runtime routing and provider adapters, rather than
 clients, validate and replay it.
 
+State event schema 6 adds two correlated steering Items:
+
+```json
+{
+  "type": "steering_queued",
+  "steering_id": "steering-...",
+  "submitted_by": {
+    "kind": "authenticated",
+    "authority": "mtls-certificate-sha256",
+    "subject": "<client-leaf-fingerprint>"
+  },
+  "content": "correct course"
+}
+```
+
+```json
+{
+  "type": "steering_applied",
+  "steering_id": "steering-...",
+  "content": "correct course"
+}
+```
+
+`steering_queued` is evidence of acceptance and is not Model-visible.
+`steering_applied` must match the oldest pending identity and exact content; it
+projects as user input for the following Model step. A completed Turn cannot
+contain unapplied steering.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -481,7 +535,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v11 value |
+| Boundary | Protocol v12 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -512,7 +566,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"11"` |
+| `unsupported_version` | Request protocol is not exactly `"12"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -531,9 +585,10 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-5 Provider Continuation evidence, schema-4 Tool-origin evidence, all 23
-method tags, and their permission
-mapping. Task integration tests prove conditional discovery, bounded cursor
+schema-6 Steering evidence, schema-5 Provider Continuation evidence, schema-4
+Tool-origin evidence, all method tags, and their permission mapping. Turn
+integration tests prove exact-ID durable steering acceptance. Task integration
+tests prove conditional discovery, bounded cursor
 paging, principal-derived ownership, cross-principal fencing, server-clock
 heartbeat, messaging, terminal recovery, and explicit-revision cancellation.
 Process tests additionally prove stdout purity, one response per request,
