@@ -248,6 +248,9 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
             inherited_environment_names: spec.inherit_environment,
             timeout_ms: spec.timeout_ms,
             requested_max_budget_usd: None,
+            requested_reasoning_effort: None,
+            requested_max_turns: None,
+            product_sandbox: None,
             unsupported_controls,
         },
         execution,
@@ -262,13 +265,7 @@ fn validate_home(spec: &RunSpec, environment: &BTreeMap<String, String>) -> AppR
         .codex_home
         .as_ref()
         .ok_or_else(|| "bare Codex profile has no codex_home".to_owned())
-        .and_then(|path| {
-            fs::canonicalize(path)
-                .map_err(|error| format!("cannot canonicalize codex_home: {error}"))
-        })?;
-    if !expected.is_dir() {
-        return Err("codex_home must resolve to a directory".to_owned());
-    }
+        .and_then(|path| canonical_empty_directory(path, "codex_home"))?;
     let configured = environment
         .get("CODEX_HOME")
         .ok_or_else(|| "bare Codex profile has no CODEX_HOME environment".to_owned())
@@ -278,16 +275,6 @@ fn validate_home(spec: &RunSpec, environment: &BTreeMap<String, String>) -> AppR
         })?;
     if configured != expected {
         return Err("codex_home and inherited CODEX_HOME resolve differently".to_owned());
-    }
-    let mut entries =
-        fs::read_dir(&expected).map_err(|error| format!("cannot inspect codex_home: {error}"))?;
-    if entries
-        .next()
-        .transpose()
-        .map_err(|error| format!("cannot inspect codex_home: {error}"))?
-        .is_some()
-    {
-        return Err("bare Codex codex_home must be empty before execution".to_owned());
     }
     Ok(())
 }

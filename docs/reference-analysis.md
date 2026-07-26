@@ -89,10 +89,11 @@ Four useful design inputs follow without copying product semantics:
    authority and evidence. They must never be mislabeled as Harness-executed
    Tools merely because the provider protocol uses similar nouns.
 
-Y-Harness may add xAI as a direct Model provider, Grok 4.5 as a controlled
-Model cell, and released Grok Build as an external benchmark adapter. Source
-comparison is now possible; superiority is still unproven until both systems
-run the same versioned workloads under declared controls.
+Y-Harness may add xAI as a direct Model provider and Grok 4.5 as a controlled
+Model cell. Released Grok Build now has a bounded external adapter contract,
+but no live result. Source comparison is possible; superiority is still
+unproven until both systems run the same versioned workloads under declared
+controls.
 
 ## 2026-07-26 Turn-steering delta
 

@@ -9,7 +9,10 @@ All notable changes to Y-Harness are documented in this file.
   product metrics as unavailable rather than inferred;
 - added Grok Build's official Rust Agent/Harness source as an audited baseline,
   while keeping the Grok 4.5 Model coordinate distinct from supporting xAI
-  weights, prompt, SDK, and protocol evidence.
+  weights, prompt, SDK, and protocol evidence;
+- added a bounded Grok Build headless JSON adapter with isolated bare homes,
+  private prompt-file cleanup, exact Model/effort/Turn controls, and truthful
+  observed-Model and complete-cost evidence.
 
 ## 0.1.0 - 2026-07-25
 

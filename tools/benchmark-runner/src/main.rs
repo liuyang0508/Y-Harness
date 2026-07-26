@@ -1,6 +1,7 @@
 //! Released-product benchmark adapters kept outside the Harness semantic core.
 
 mod codex;
+mod grok_build;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -106,6 +107,12 @@ struct RunControls {
     inherited_environment_names: Vec<String>,
     timeout_ms: u64,
     requested_max_budget_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_max_turns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    product_sandbox: Option<&'static str>,
     unsupported_controls: Vec<&'static str>,
 }
 
@@ -199,12 +206,13 @@ async fn run() -> AppResult<ExternalRunReport> {
     match adapter.as_str() {
         "claude-code" => execute_claude(read_claude_spec(&spec_path)?).await,
         "codex" => codex::execute(codex::read_spec(&spec_path)?).await,
+        "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?).await,
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex> <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex|grok-build> <run-spec.json>".to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {
@@ -532,6 +540,9 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
             inherited_environment_names: spec.inherit_environment,
             timeout_ms: spec.timeout_ms,
             requested_max_budget_usd: Some(spec.max_budget_usd),
+            requested_reasoning_effort: None,
+            requested_max_turns: None,
+            product_sandbox: None,
             unsupported_controls,
         },
         execution,
@@ -563,6 +574,25 @@ fn inherited_environment(names: &[String]) -> AppResult<BTreeMap<String, String>
                 .map_err(|_| format!("required inherited environment variable {name} is absent"))
         })
         .collect()
+}
+
+fn canonical_empty_directory(path: &Path, kind: &str) -> AppResult<PathBuf> {
+    let directory =
+        fs::canonicalize(path).map_err(|error| format!("cannot canonicalize {kind}: {error}"))?;
+    if !directory.is_dir() {
+        return Err(format!("{kind} must resolve to a directory"));
+    }
+    let mut entries =
+        fs::read_dir(&directory).map_err(|error| format!("cannot inspect {kind}: {error}"))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| format!("cannot inspect {kind}: {error}"))?
+        .is_some()
+    {
+        return Err(format!("{kind} must be empty before execution"));
+    }
+    Ok(directory)
 }
 
 async fn read_cli_version(

@@ -95,5 +95,57 @@ search, and bounded JSONL parsing. The output is external-run format 2. Codex
 does not expose observed Model identity, cost, or product/API duration in this
 stream, so those fields remain empty or `null`; they are never guessed.
 
+The Grok Build adapter consumes the official headless JSON surface:
+
+```json
+{
+  "format_version": 3,
+  "run_id": "grok-build-probe-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/absolute/path/to/grok",
+  "expected_cli_version": "grok <exact-version>",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/isolated/workspace",
+  "workspace_snapshot": "empty-workspace-v1",
+  "profile": "bare",
+  "model": "grok-4.5",
+  "reasoning_effort": "low",
+  "system_prompt": "Return only the requested fixed text.",
+  "prompt": "Reply exactly YH-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "XAI_API_KEY"
+  ],
+  "home": "/absolute/empty/home",
+  "grok_home": "/absolute/empty/grok-home",
+  "prompt_directory": "/absolute/empty/prompt-directory"
+}
+```
+
+```bash
+cargo run --locked -p y-harness-benchmark-runner -- \
+  grok-build /absolute/path/to/spec.json > external-run.json
+```
+
+`bare` injects exact empty `HOME`, `USERPROFILE`, and `GROK_HOME` directories
+instead of inheriting ambient product state. `product` must omit `home` and
+`grok_home` and may inherit its normal environment explicitly.
+`prompt_directory` must be empty and outside the benchmark workspace. Both
+profiles use a create-exclusive prompt file that is owner-only on Unix and
+removed after execution; Windows callers must protect the supplied directory
+ACL.
+They also use an exact Model and reasoning effort; one maximum Turn;
+`dontAsk`; the product's `read-only` sandbox; disabled Memory, planning,
+Subagents, questions, web Tools, and automatic updates; and a `read_file` Tool
+allowlist. Grok Build's always-on MCP meta-tools and session persistence remain
+declared unsupported controls.
+
+External-run format 3 preserves Grok Build's observed `modelUsage`, Turn count,
+and cost only when the product reports complete cost. Missing or partial cost
+remains `null`; the requested Model is never copied into observed Models.
+There is no checked-in live Grok Build result yet, so this adapter provides
+contract evidence only.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

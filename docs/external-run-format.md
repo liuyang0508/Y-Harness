@@ -6,13 +6,15 @@ turning it into a comparative score. They are produced by the independent
 
 - format 1 is the original Claude Code single-result envelope;
 - format 2 adds explicit unavailable product metrics for the Codex JSONL
-  envelope without weakening strict format-1 readers.
+  envelope without weakening strict format-1 readers;
+- format 3 adds Grok Build's headless JSON controls, optional complete cost,
+  and observed Model usage.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1` or `2`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1`, `2`, or `3`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
@@ -22,7 +24,8 @@ turning it into a comparative score. They are produced by the independent
 
 - process exit code and adapter-observed wall time;
 - product-reported total/API duration and actual cost; format 1 requires
-  numbers, while format 2 uses exact `null` when Codex does not expose them;
+  numbers, format 2 uses exact `null` when Codex does not expose them, and
+  format 3 preserves Grok Build cost only when the product marks it complete;
   an adapter must never infer them;
 - the validated Turn count represented by the retained product envelope;
 - result subtype;
@@ -75,6 +78,23 @@ fields. Codex built-in Tools also remain available within its read-only
 sandbox. These differences make the adapter suitable for conformance evidence,
 not a controlled Harness comparison.
 
+The Grok Build adapter emits format 3 and also fixes
+`claim_eligible: false`. `bare` runs inject empty exact `HOME`, `USERPROFILE`,
+and `GROK_HOME` roots while inheriting only declared secrets such as
+`XAI_API_KEY`; `product` runs retain explicitly inherited ambient
+configuration. The adapter supplies the prompt through a private
+create-exclusive file, makes it owner-only on Unix, removes it after execution,
+requests one exact Turn and reasoning effort, disables Memory, planning,
+Subagents, questions, web Tools, and updates, and requests the product's
+`read-only` sandbox with `dontAsk`. Windows reports inherited prompt-directory
+ACLs as an unsupported control.
+
+Grok Build's `read_file` and always-on MCP meta-tools remain visible, and the
+product persists its session beneath the isolated Grok home. Format 3 records
+those limitations, the requested reasoning effort and Turn ceiling, and the
+product sandbox. It derives observed Models only from `modelUsage`; absent or
+partial cost remains `null`, never zero.
+
 ## Evidence
 
 The first real format-1 record and its exact input are preserved under
@@ -87,3 +107,8 @@ The Codex adapter is source- and contract-tested against official snapshot
 [`61a4488`](https://github.com/openai/codex/tree/61a44880a85d2fd0d8770908dea5733495e571c8).
 No real Codex result is checked in yet, so it contributes no live product
 evidence.
+
+The Grok Build adapter is source- and contract-tested against official snapshot
+[`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2).
+No real Grok Build result is checked in yet, so it also contributes no live
+product evidence.

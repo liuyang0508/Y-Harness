@@ -22,20 +22,20 @@ Until released products have executed the same versioned workloads under
 declared controls, the only permitted statement is: **Y-Harness has implemented
 a governed local baseline; comparative effectiveness is unverified.**
 
-External-run formats 1/2 and released Claude Code and Codex CLI adapter
-contracts now
-exist, with one checked-in real Claude Code `adapter_conformance` result. That
-result has
-`claim_eligible: false`: it proves the bounded adapter can execute and preserve
-the product envelope, not that either Harness is better. See
+External-run formats 1/2/3 and released Claude Code, Codex, and Grok Build CLI
+adapter contracts now exist, with one checked-in real Claude Code
+`adapter_conformance` result. That result has `claim_eligible: false`: it proves
+the bounded adapter can execute and preserve the product envelope, not that
+either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
 
 Grok Build is an official open-source coding Agent, TUI, and Harness, so it is
 a source-level baseline. Grok 4.5 remains a separate Model coordinate and is
 the audited Grok Build snapshot's checked-in default. A released Grok Build
 run may enter the product-default track; it enters the Harness-control track
-only when the same Model and authority controls can actually be fixed. No Grok
-Build adapter or comparative result is claimed yet. See
+only when the same Model and authority controls can actually be fixed. The
+Grok Build adapter currently has bounded contract evidence but no live or
+comparative result. See
 [`reference-analysis.md`](reference-analysis.md).
 
 ## Two tracks
@@ -247,14 +247,15 @@ The shortest path to credible comparison is:
    released-product restart drivers and the remaining fault matrix are open;
 3. continue adding Pi, OpenCode, and Hermes adapters without importing their
    code; the Claude Code adapter has one real conformance record, while the
-   Codex adapter has bounded contract tests but no live record;
+   Codex and Grok Build adapters have bounded contract tests but no live
+   records;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
 Provider continuation and durable safe-boundary steering are implemented and
 locally fault-tested in Y-Harness. The first real released-product adapter
-record, a second source-pinned adapter contract, and the first
+record, two additional source-pinned adapter contracts, and the first
 controller-owned fault fixture are preserved, but no cross-product fault case
 has run. Execution of CF-001/CF-002/CF-003 across products, Linux and Windows
 containment, and live external integration evidence remain prerequisites for
