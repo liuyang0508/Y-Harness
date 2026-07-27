@@ -3,12 +3,24 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::{
+    io::{BufRead, BufReader},
+    time::Duration,
+};
+
+use ed25519_dalek::{Signer, SigningKey};
+#[cfg(unix)]
+use y_harness::{CapabilityOrigin, OperationStatus};
 use y_harness::{
-    PROTOCOL_VERSION, ProtocolCommand, ProtocolRequest, ProtocolResponse, ProtocolResponseBody,
-    ProtocolResult, TaskDefinition, TaskId, WorkspaceMode,
+    Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand, ProtocolRequest, ProtocolResponse,
+    ProtocolResponseBody, ProtocolResult, SignedSkillPackage, SkillPackage, SkillSignature,
+    SkillTransparencyReceipt, SqliteEventStore, StateEngine, TaskDefinition, TaskId, ThreadId,
+    TurnStatus, WorkspaceMode, decode_thread_archive,
 };
 
 #[test]
@@ -55,10 +67,150 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
-    assert!(report.contains("protocol: 12"));
+    assert!(report.contains("protocol: 18"));
     assert!(report.contains("model: local/demo"));
+    assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
+    assert!(report.contains("mcp servers: 0 enabled / 0 configured"));
+    assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
     assert!(report.contains("skills: 0"));
     assert!(report.contains("status: ok"));
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn thread_archive_cli_round_trips_without_clobber_or_partial_import() {
+    let project = isolated_project("thread-archive");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let config = project.join("y-harness.json");
+    let database = project.join(".y-harness/state.db");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test Runtime");
+    let source_id = runtime.block_on(async {
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&database)
+                .await
+                .expect("open State database"),
+        ));
+        let source = state.create_thread().await.expect("create source");
+        state
+            .set_thread_name(&source.id, Some("CLI portable".to_owned()))
+            .await
+            .expect("name source");
+        let turn = state.start_turn(&source.id).await.expect("start Turn");
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::UserMessage {
+                    content: "portable".to_owned(),
+                }),
+            )
+            .await
+            .expect("append Item");
+        state
+            .finish_turn(&turn, TurnStatus::Completed)
+            .await
+            .expect("finish Turn");
+        source.id
+    });
+
+    let archive_path = project.join("source.yh-thread.json");
+    let exported = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["thread", "export"])
+        .arg(source_id.as_str())
+        .arg(&archive_path)
+        .arg(&config)
+        .output()
+        .expect("export archive");
+    assert!(
+        exported.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let original = fs::read(&archive_path).expect("read archive");
+    let archive = decode_thread_archive(&original).expect("decode archive");
+    assert_eq!(archive.source_thread_id, source_id);
+
+    let repeated_export = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["thread", "export"])
+        .arg(source_id.as_str())
+        .arg(&archive_path)
+        .arg(&config)
+        .output()
+        .expect("repeat export");
+    assert!(!repeated_export.status.success());
+    assert_eq!(fs::read(&archive_path).expect("reread archive"), original);
+
+    let target_id = ThreadId::from_static("cli-import-target");
+    for _ in 0..2 {
+        let imported = Command::new(env!("CARGO_BIN_EXE_yh"))
+            .args(["thread", "import"])
+            .arg(&archive_path)
+            .arg(target_id.as_str())
+            .arg(&config)
+            .output()
+            .expect("import archive");
+        assert!(
+            imported.status.success(),
+            "import failed: {}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+    }
+
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&original).expect("decode archive JSON");
+    tampered["source_events_sha256"] = serde_json::Value::String("0".repeat(64));
+    let tampered_path = project.join("tampered.yh-thread.json");
+    fs::write(
+        &tampered_path,
+        serde_json::to_vec(&tampered).expect("encode tampered archive"),
+    )
+    .expect("write tampered archive");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["thread", "import"])
+        .arg(&tampered_path)
+        .arg("cli-tampered-target")
+        .arg(&config)
+        .output()
+        .expect("reject tampered archive");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("digest mismatch"));
+
+    runtime.block_on(async {
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&database)
+                .await
+                .expect("reopen State database"),
+        ));
+        let imported = state
+            .load_thread(&target_id)
+            .await
+            .expect("load target")
+            .expect("target Thread");
+        assert_eq!(imported.name.as_deref(), Some("CLI portable"));
+        assert_eq!(imported.turns.len(), 1);
+        assert_eq!(
+            imported
+                .import_origin
+                .as_ref()
+                .expect("import provenance")
+                .source_thread_id,
+            source_id
+        );
+        assert!(
+            state
+                .load_thread(&ThreadId::from_static("cli-tampered-target"))
+                .await
+                .expect("load rejected target")
+                .is_none()
+        );
+    });
     fs::remove_dir_all(project).expect("remove isolated project");
 }
 
@@ -91,6 +243,7 @@ fn doctor_loads_exact_project_skills_and_rejects_content_tampering() {
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains("skills: 1"));
+    assert!(report.contains("skill lock: concise-assistant@1.0.0 0ddd1d0a"));
     assert!(report.contains("status: ok"));
 
     let tampered = fs::read_to_string(&package_path)
@@ -106,6 +259,499 @@ fn doctor_loads_exact_project_skills_and_rejects_content_tampering() {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("digest"));
 
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn skill_cli_installs_verifies_and_recoverably_removes_exact_packages() {
+    let project = isolated_project("skill-lifecycle");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let config_path = project.join("y-harness.json");
+    let default_config = fs::read(&config_path).expect("read default config");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/skills/concise-assistant.skill.json");
+    let digest = "0ddd1d0af09a2ea5bc0166943f62b579eb3335a9c3919824ecf43864881fa460";
+    let installed_path = project.join(format!("skills/{digest}.skill.json"));
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("skill")
+        .arg("install")
+        .arg(&source)
+        .arg(&config_path)
+        .output()
+        .expect("install Skill");
+    assert!(
+        installed.status.success(),
+        "Skill install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let report = String::from_utf8(installed.stdout).expect("UTF-8 install report");
+    assert!(report.contains("skill lock: concise-assistant@1.0.0 0ddd1d0a"));
+    assert!(report.contains("activation required:"));
+    assert!(installed_path.is_file());
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "install"])
+        .arg(&source)
+        .arg(&config_path)
+        .output()
+        .expect("repeat Skill install");
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("already installed:"));
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "list"])
+        .arg(&config_path)
+        .output()
+        .expect("list Skills");
+    assert!(listed.status.success());
+    let report = String::from_utf8(listed.stdout).expect("UTF-8 Skill list");
+    assert!(report.contains("installed skills: 1"));
+    assert!(report.contains("skill: concise-assistant@1.0.0 0ddd1d0a"));
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "verify"])
+        .arg(&config_path)
+        .output()
+        .expect("verify Skills");
+    assert!(verified.status.success());
+    let report = String::from_utf8(verified.stdout).expect("UTF-8 Skill verification");
+    assert!(report.contains("verified skills: 1"));
+    assert!(report.contains("status: ok"));
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {{"type": "demo"}},
+              "skills": {{
+                "package_files": ["skills/{digest}.skill.json"],
+                "activate": [{{"name": "concise-assistant", "version": "1.0.0"}}],
+                "budget_tokens": 256
+              }}
+            }}"#
+        ),
+    )
+    .expect("configure installed Skill");
+    let active_removal = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "remove", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("reject active Skill removal");
+    assert!(!active_removal.status.success());
+    assert!(String::from_utf8_lossy(&active_removal.stderr).contains("active Skill"));
+    assert!(installed_path.is_file());
+
+    fs::write(&config_path, default_config).expect("restore default config");
+    let removed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "remove", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("remove Skill");
+    assert!(
+        removed.status.success(),
+        "Skill removal failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let report = String::from_utf8(removed.stdout).expect("UTF-8 removal report");
+    assert!(report.contains("recoverable:"));
+    assert!(!installed_path.exists());
+    assert_eq!(
+        fs::read_dir(project.join(".y-harness/skill-trash"))
+            .expect("read Skill trash")
+            .count(),
+        1
+    );
+
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn signed_skill_cli_preserves_external_trust_and_live_revocation() {
+    let project = isolated_project("external-skill-lifecycle");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let config_path = project.join("y-harness.json");
+    let source_path = project.join("downloaded.signed-skill.json");
+    let package: SkillPackage = serde_json::from_slice(include_bytes!(
+        "../examples/skills/concise-assistant.skill.json"
+    ))
+    .expect("Skill fixture");
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let signature = signing_key.sign(
+        &package
+            .publisher_signing_bytes()
+            .expect("publisher signing bytes"),
+    );
+    let mut signed = SignedSkillPackage {
+        package: package.clone(),
+        signature: SkillSignature {
+            key_id: "test-publisher".to_owned(),
+            ed25519: signature.to_bytes().to_vec(),
+        },
+        transparency: None,
+    };
+    fs::write(
+        &source_path,
+        serde_json::to_vec_pretty(&signed).expect("encode signed Skill"),
+    )
+    .expect("write signed Skill");
+    let public_key = lower_hex(&signing_key.verifying_key().to_bytes());
+    let log_key = SigningKey::from_bytes(&[8_u8; 32]);
+    let log_public_key = lower_hex(&log_key.verifying_key().to_bytes());
+    let trust_config = format!(
+        r#"{{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {{"type": "demo"}},
+          "skills": {{
+            "package_files": [],
+            "external_package_files": [],
+            "activate": [],
+            "trust": {{
+              "publishers": [{{
+                "key_id": "test-publisher",
+                "public_key_hex": "{public_key}",
+                "transparency": "required"
+              }}],
+              "transparency_logs": [{{
+                "log_id": "test-log",
+                "public_key_hex": "{log_public_key}"
+              }}]
+            }}
+          }}
+        }}"#
+    );
+    fs::write(&config_path, &trust_config).expect("configure publisher trust");
+    let installed_path = project.join(format!(
+        "skills/{}.signed-skill.json",
+        package.content_sha256
+    ));
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "install-external"])
+        .arg(&source_path)
+        .arg(&config_path)
+        .output()
+        .expect("reject unsigned transparency");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires a transparency receipt"));
+    assert!(!installed_path.exists());
+
+    let integrated_at_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .expect("millisecond timestamp");
+    signed.transparency = Some(SkillTransparencyReceipt {
+        log_id: "test-log".to_owned(),
+        entry_id: "entry-1".to_owned(),
+        integrated_at_ms,
+        ed25519: Vec::new(),
+    });
+    let log_signature = log_key.sign(
+        &signed
+            .transparency_signing_bytes()
+            .expect("transparency signing bytes"),
+    );
+    signed
+        .transparency
+        .as_mut()
+        .expect("transparency receipt")
+        .ed25519 = log_signature.to_bytes().to_vec();
+    fs::write(
+        &source_path,
+        serde_json::to_vec_pretty(&signed).expect("encode transparent Skill"),
+    )
+    .expect("write transparent Skill");
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "install-external"])
+        .arg(&source_path)
+        .arg(&config_path)
+        .output()
+        .expect("install signed Skill");
+    assert!(
+        installed.status.success(),
+        "signed Skill install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(installed_path.is_file());
+    let report = String::from_utf8(installed.stdout).expect("UTF-8 install report");
+    assert!(report.contains("external"));
+    assert!(report.contains("skills.external_package_files"));
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "install-external"])
+        .arg(&source_path)
+        .arg(&config_path)
+        .output()
+        .expect("repeat signed Skill install");
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("already installed:"));
+
+    for command in ["list", "verify"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+            .args(["skill", command])
+            .arg(&config_path)
+            .output()
+            .expect("inspect signed Skills");
+        assert!(
+            output.status.success(),
+            "signed Skill {command} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("external"));
+    }
+
+    let active = format!(
+        r#"{{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {{"type": "demo"}},
+          "skills": {{
+            "package_files": [],
+            "external_package_files": ["skills/{}.signed-skill.json"],
+            "activate": [{{"name": "concise-assistant", "version": "1.0.0"}}],
+            "budget_tokens": 256,
+            "trust": {{
+              "publishers": [{{
+                "key_id": "test-publisher",
+                "public_key_hex": "{public_key}",
+                "transparency": "required"
+              }}],
+              "transparency_logs": [{{
+                "log_id": "test-log",
+                "public_key_hex": "{log_public_key}"
+              }}]
+            }}
+          }}
+        }}"#,
+        package.content_sha256
+    );
+    fs::write(&config_path, &active).expect("activate external Skill");
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("doctor external Skill");
+    assert!(
+        doctor.status.success(),
+        "external Skill doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("skills: 1"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("publisher=test-publisher"));
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("transparency=test-log@entry-1"));
+
+    let active_removal = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "remove", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("reject active external Skill removal");
+    assert!(!active_removal.status.success());
+    assert!(String::from_utf8_lossy(&active_removal.stderr).contains("active Skill"));
+
+    let revoked = trust_config.replace(
+        r#""public_key_hex": ""#,
+        r#""revocation": {"revoked_at_ms": 1, "reason_code": "compromised"},
+                "public_key_hex": ""#,
+    );
+    fs::write(&config_path, &revoked).expect("revoke publisher");
+    let listed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "list"])
+        .arg(&config_path)
+        .output()
+        .expect("reject revoked signed Skill");
+    assert!(!listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stderr).contains("revoked"));
+
+    let removed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "remove", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("remove revoked signed Skill");
+    assert!(
+        removed.status.success(),
+        "revoked signed Skill removal failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!installed_path.exists());
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[cfg(not(feature = "https-skill"))]
+#[test]
+fn https_skill_install_reports_the_missing_optional_feature() {
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args([
+            "skill",
+            "install-https",
+            "https://example.test/skill.json",
+            "example@1.0.0",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .output()
+        .expect("run unavailable HTTPS Skill install");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("`https-skill` Cargo feature"));
+}
+
+#[cfg(not(feature = "https-mcp"))]
+#[test]
+fn enabled_https_mcp_reports_the_missing_optional_feature_before_secret_access() {
+    let project = isolated_project("https-mcp-feature");
+    fs::create_dir_all(&project).expect("create HTTPS MCP project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {"type": "demo"},
+          "https_mcp_servers": [{
+            "id": "remote",
+            "endpoint": "https://example.test/mcp",
+            "bearer_secret_reference": "mcp/remote",
+            "bearer_environment": "MISSING_MCP_SECRET"
+          }]
+        }"#,
+    )
+    .expect("write HTTPS MCP config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("run unavailable HTTPS MCP");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("`--features https-mcp`"));
+    assert!(!project.join(".y-harness").exists());
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn disabled_https_mcp_acquires_no_feature_secret_or_network_authority() {
+    let project = isolated_project("disabled-https-mcp");
+    fs::create_dir_all(&project).expect("create disabled HTTPS MCP project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {"type": "demo"},
+          "https_mcp_servers": [{
+            "id": "remote",
+            "enabled": false,
+            "endpoint": "https://unreachable.invalid/mcp",
+            "bearer_secret_reference": "mcp/remote",
+            "bearer_environment": "MISSING_MCP_SECRET"
+          }]
+        }"#,
+    )
+    .expect("write disabled HTTPS MCP config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose disabled HTTPS MCP");
+    assert!(
+        output.status.success(),
+        "disabled HTTPS MCP acquired authority: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).expect("UTF-8 doctor report");
+    assert!(report.contains("mcp servers: 0 enabled / 1 configured"));
+    assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
+    assert!(report.contains("status: ok"));
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[cfg(feature = "https-mcp")]
+#[test]
+fn invalid_https_mcp_endpoint_is_rejected_before_secret_access() {
+    let project = isolated_project("invalid-https-mcp");
+    fs::create_dir_all(&project).expect("create invalid HTTPS MCP project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {"type": "demo"},
+          "https_mcp_servers": [{
+            "id": "remote",
+            "endpoint": "http://example.test/mcp",
+            "bearer_secret_reference": "mcp/remote",
+            "bearer_environment": "MISSING_MCP_SECRET"
+          }]
+        }"#,
+    )
+    .expect("write invalid HTTPS MCP config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose invalid HTTPS MCP");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 doctor error");
+    assert!(error.contains("MCP endpoint must use HTTPS"));
+    assert!(!error.contains("MISSING_MCP_SECRET"));
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn invalid_json_command_model_is_rejected_before_environment_access() {
+    let project = isolated_project("invalid-json-command-model");
+    fs::create_dir_all(&project).expect("create invalid JSON command Model project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {
+                "type": "json_command",
+                "id": "external/invalid",
+                "process": {
+                    "command": env!("CARGO_BIN_EXE_yh"),
+                    "current_directory": ".",
+                    "environment_from_host": {
+                        "PROVIDER_API_KEY": "MISSING_JSON_MODEL_SECRET"
+                    },
+                    "timeout_ms": 0,
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }
+        }))
+        .expect("encode invalid JSON command Model config"),
+    )
+    .expect("write invalid JSON command Model config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose invalid JSON command Model");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 doctor error");
+    assert!(error.contains("process timeout must be"));
+    assert!(!error.contains("MISSING_JSON_MODEL_SECRET"));
+    fs::remove_dir_all(project).expect("remove invalid JSON command Model project");
 }
 
 #[cfg(feature = "https-model")]
@@ -136,6 +782,244 @@ fn doctor_accepts_the_checked_in_https_gateway_template() {
     assert!(report.contains("status: ok"));
     assert!(!report.contains("doctor-placeholder"));
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[cfg(feature = "https-model")]
+#[test]
+fn doctor_validates_an_explicit_ordered_model_catalog() {
+    let project = isolated_project("model-route");
+    fs::create_dir_all(&project).expect("create Model route project");
+    let config_path = project.join("y-harness.json");
+    fs::write(
+        &config_path,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "models": [
+            {
+              "type": "https_json_gateway",
+              "id": "gateway/primary",
+              "endpoint": "https://primary.example.com/v1/complete",
+              "bearer_secret_reference": "gateway/primary",
+              "bearer_environment": "YH_MODEL_TOKEN"
+            },
+            {
+              "type": "https_json_gateway",
+              "id": "gateway/fallback",
+              "endpoint": "https://fallback.example.com/v1/complete",
+              "bearer_secret_reference": "gateway/fallback",
+              "bearer_environment": "YH_MODEL_TOKEN"
+            }
+          ],
+          "model_route": {
+            "models": ["gateway/primary", "gateway/fallback"],
+            "attempt_timeout_ms": 25000,
+            "timeout_cooldown_ms": 45000,
+            "retry": {
+              "max_retries": 3,
+              "initial_delay_ms": 125,
+              "max_delay_ms": 4000
+            }
+          }
+        }"#,
+    )
+    .expect("write Model route config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .env("YH_MODEL_TOKEN", "doctor-placeholder")
+        .output()
+        .expect("run Model route doctor");
+    assert!(
+        doctor.status.success(),
+        "Model route doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
+    assert!(report.contains("models: 2"));
+    assert!(report.contains("model route: gateway/primary -> gateway/fallback"));
+    assert!(report.contains("model timeout cooldown: 45000 ms"));
+    assert!(report.contains("model retries: 3 (125-4000 ms)"));
+    assert!(report.contains("status: ok"));
+    assert!(!report.contains("doctor-placeholder"));
+    fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_json_command_model_runs_a_real_service_turn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = isolated_project("json-command-model");
+    fs::create_dir_all(&project).expect("create JSON command Model project");
+    let adapter = project.join("model-adapter");
+    fs::write(
+        &adapter,
+        br#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"type":"message","content":"configured command model"}'
+"#,
+    )
+    .expect("write model adapter");
+    let mut permissions = fs::metadata(&adapter)
+        .expect("model adapter metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&adapter, permissions).expect("make model adapter executable");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {
+                "type": "json_command",
+                "id": "external/fixture",
+                "process": {
+                    "command": adapter,
+                    "current_directory": ".",
+                    "timeout_ms": 5_000,
+                    "max_output_bytes": 1_048_576,
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }
+        }))
+        .expect("encode JSON command Model config"),
+    )
+    .expect("write JSON command Model config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn JSON command Model service");
+    let mut input = child.stdin.take().expect("service stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("service stdout"));
+
+    let initialized = exchange(
+        &mut input,
+        &mut output,
+        request("initialize", ProtocolCommand::Initialize {}),
+    );
+    assert!(matches!(
+        initialized.body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    let created = exchange(
+        &mut input,
+        &mut output,
+        request("create-thread", ProtocolCommand::CreateThread {}),
+    );
+    let thread_id = match created.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ThreadCreated { thread },
+        } => thread.id,
+        other => panic!("unexpected create Thread response: {other:?}"),
+    };
+    let started = exchange(
+        &mut input,
+        &mut output,
+        request(
+            "start-turn",
+            ProtocolCommand::StartTurn {
+                thread_id: thread_id.to_string(),
+                prompt: "use configured adapter".to_owned(),
+                memory_scope: Default::default(),
+                context: Vec::new(),
+                timeout_ms: Some(5_000),
+            },
+        ),
+    );
+    let operation_id = match started.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::TurnStarted { operation_id },
+        } => operation_id,
+        other => panic!("unexpected start Turn response: {other:?}"),
+    };
+    let mut attempts = 0;
+    let final_text = loop {
+        attempts += 1;
+        assert!(attempts <= 200, "JSON command Model Turn did not settle");
+        let polled = exchange(
+            &mut input,
+            &mut output,
+            request(
+                "get-operation",
+                ProtocolCommand::GetOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+        );
+        match polled.body {
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Operation {
+                        operation: OperationStatus::Running { .. },
+                    },
+            } => std::thread::sleep(Duration::from_millis(5)),
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Operation {
+                        operation: OperationStatus::Completed { final_text, .. },
+                    },
+            } => break final_text,
+            other => panic!("unexpected operation response: {other:?}"),
+        }
+    };
+    assert_eq!(final_text, "configured command model");
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle service");
+    assert!(
+        settled.status.success(),
+        "JSON command Model service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build provenance test Runtime");
+    let thread = runtime.block_on(async {
+        StateEngine::new(Arc::new(
+            SqliteEventStore::open(project.join(".y-harness/state.db"))
+                .await
+                .expect("open JSON command Model State"),
+        ))
+        .load_thread(&thread_id)
+        .await
+        .expect("load JSON command Model Thread")
+        .expect("persisted JSON command Model Thread")
+    });
+    assert!(
+        thread
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::AssistantMessage {
+                        model_id: Some(model_id),
+                        model_origin:
+                            Some(CapabilityOrigin::External {
+                                id: origin_id
+                            }),
+                        content,
+                    } if model_id == "external/fixture"
+                        && origin_id == "json-command-model/external/fixture"
+                        && content == "configured command model"
+                )
+            })
+    );
+    fs::remove_dir_all(project).expect("remove JSON command Model project");
 }
 
 #[test]
@@ -185,6 +1069,13 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
         &project,
         vec![
             request(
+                "list-threads",
+                ProtocolCommand::ListThreads {
+                    before_sequence: None,
+                    limit: Some(16),
+                },
+            ),
+            request(
                 "get-thread",
                 ProtocolCommand::GetThread {
                     thread_id: thread_id.clone(),
@@ -201,13 +1092,23 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
     assert!(matches!(
         &second[0].body,
         ProtocolResponseBody::Success {
+            result: ProtocolResult::Threads {
+                threads,
+                has_more: false,
+                ..
+            }
+        } if threads.len() == 1 && threads[0].thread_id.to_string() == thread_id
+    ));
+    assert!(matches!(
+        &second[1].body,
+        ProtocolResponseBody::Success {
             result: ProtocolResult::Thread {
                 thread: Some(thread)
             }
         } if thread.id.to_string() == thread_id
     ));
     assert!(matches!(
-        second[1].body,
+        second[2].body,
         ProtocolResponseBody::Success {
             result: ProtocolResult::TaskGraph {
                 graph: Some(ref graph)
@@ -226,6 +1127,21 @@ fn request(id: &str, command: ProtocolCommand) -> ProtocolRequest {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         command,
     }
+}
+
+#[cfg(unix)]
+fn exchange(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    request: ProtocolRequest,
+) -> ProtocolResponse {
+    serde_json::to_writer(&mut *input, &request).expect("encode protocol request");
+    input.write_all(b"\n").expect("write request delimiter");
+    input.flush().expect("flush protocol request");
+    let mut line = String::new();
+    let read = output.read_line(&mut line).expect("read protocol response");
+    assert!(read > 0, "service ended before responding");
+    serde_json::from_str(&line).expect("decode protocol response")
 }
 
 fn serve(project: &Path, requests: Vec<ProtocolRequest>) -> Vec<ProtocolResponse> {
@@ -269,4 +1185,14 @@ fn isolated_project(label: &str) -> PathBuf {
         "y-harness-service-{label}-{}-{nonce}",
         std::process::id()
     ))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }

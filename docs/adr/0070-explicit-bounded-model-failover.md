@@ -55,8 +55,12 @@ the Runtime owns the route-attempt deadline and total Turn deadline. The
 closure gate relies on the existing `ModelEventSink` contract that sink
 callbacks are synchronous and non-blocking; it does not make blocking host
 callbacks safe.
-This baseline does not add load balancing, circuit breaking, health scoring,
-or hedged requests.
+This baseline did not add load balancing, circuit breaking, health scoring, or
+hedged requests. ADR 0099 later adds only an opt-in process-local cooldown for
+Runtime-proven attempt timeouts; it does not infer health from ordinary
+Provider errors. ADR 0101 separately adds default-disabled bounded retries for
+four typed transient Provider failure classes; retries share this decision's
+candidate deadline and provisional-output fence.
 
 The existing State fields already carry the actual Model identity and origin,
 and the wire event shape is unchanged. State schema 4 and Protocol 9 therefore
@@ -72,3 +76,9 @@ remain current.
   retract the failed Model's fragment.
 - Run providers concurrently: hedging multiplies cost and needs an explicit
   winner, cancellation, and streaming arbitration contract.
+
+## Related decisions
+
+- [ADR 0099: observable Model attempt-timeout cooldown](0099-observable-model-attempt-timeout-cooldown.md)
+- [ADR 0100: typed Model Provider failure evidence](0100-typed-model-provider-failure-evidence.md)
+- [ADR 0101: bounded typed Model retry policy](0101-bounded-typed-model-retry-policy.md)

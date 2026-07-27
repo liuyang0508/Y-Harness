@@ -5,10 +5,11 @@ from Pi Agent Harness, Claude Code, Codex, Hermes Agent, OpenCode, and Grok
 Build. It is a design-input audit, not a feature-parity checklist and not an
 endorsement of every implementation choice in those projects.
 
-The baseline source snapshot was reviewed on 2026-07-25 and the Turn-steering
-and Grok Build deltas on 2026-07-26. Every source observation below links to an
-immutable commit. The repositories were inspected locally from shallow
-checkouts; their full test suites were not executed as part of this audit.
+The baseline source snapshot was reviewed on 2026-07-25, the Turn-steering and
+Grok Build deltas on 2026-07-26, and the current Pi capability delta on
+2026-07-27. Every source observation below links to an immutable commit. The
+repositories were inspected locally from shallow checkouts; their full test
+suites were not executed as part of this audit.
 
 Evidence has three levels:
 
@@ -33,7 +34,7 @@ it or treat it as proof of Anthropic's private implementation.
 |---|---|---|
 | Claude Code 2.1.88 source reconstruction | [`3da94d5`](https://github.com/liuyang0508/claude-code-source-code/tree/3da94d5e5f2b99c9d82b0d8f09448b04775cd41f) | corroborating, incomplete, non-commercial notice, no executable upstream test evidence |
 | Codex | [`4c43465`](https://github.com/openai/codex/tree/4c43465133428898aa84f0bfc02c306ed65fb66a) | official public source, Apache-2.0 |
-| Pi Agent Harness | [`5bc1c2c`](https://github.com/earendil-works/pi/tree/5bc1c2c0a6f07e00e8c240304182f213ab8d311f) | official public source supplied for this audit, MIT |
+| Pi Agent Harness | [`cee5ff7`](https://github.com/earendil-works/pi/tree/cee5ff7520d8828bed9955ef00419e995d1f91e0) | official public source, MIT |
 | Hermes Agent | [`689b51b`](https://github.com/NousResearch/hermes-agent/tree/689b51bef68f9ec95b638121bb9c7fefa3703fb2) | official public source, MIT |
 | OpenCode | [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b) | official public source, MIT |
 | Grok Build | [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2) | official public source periodically synced from the SpaceXAI monorepo, Apache-2.0 |
@@ -44,6 +45,35 @@ and Hermes at
 [`6ab5d2d`](https://github.com/NousResearch/hermes-agent/tree/6ab5d2df2a5748f23ba7557ec527fac628720a22).
 These newer coordinates are used only for the delta findings below; they do not
 silently relabel observations made against the earlier baseline.
+
+The Pi snapshot supersedes the earlier `5bc1c2c` audit coordinate after a
+source-level revalidation. The old coordinate remains in historical ADR links
+where it is evidence for the decision made at that time.
+
+## 2026-07-27 Pi capability-alignment delta
+
+Pi changed materially after the earlier audit. Current source contains a
+larger `AgentHarness`, same-message multi-Tool execution, a broad generated
+Provider catalog, custom model configuration, package management, tree-shaped
+sessions, and mature interactive/RPC surfaces. Capability names alone do not
+establish alignment, so this table binds each claim to a Y-Harness evidence
+gate.
+
+| Capability | Current Pi mechanism | Y-Harness evidence | Alignment and next gate |
+|---|---|---|---|
+| Agent Loop | One assistant message may contain several Tool calls; execution is parallel unless the loop or any selected Tool requires sequential execution. Preflight is ordered, execution may overlap, and final Tool-result messages retain assistant source order. | `ModelOutput::ToolCalls` accepts 2–64 calls, records one atomic ordered State decision, authorizes the complete batch before effects, and supports exact approval recovery. Frozen `ParallelSafe` declarations permit maximal contiguous safe runs under a 1–64 Runtime ceiling; sequential Tools fence runs, results settle in source order, and cancellation/deadline tests preserve completed sibling evidence. | **Aligned on the general Harness behavior with stricter effect authority.** Provider intent never grants concurrency and undeclared/MCP Tools remain sequential. Comparative latency and production fault diversity remain evidence gaps, not missing scheduler semantics. |
+| Model and Provider | `packages/ai` registers a broad built-in catalog. `models.json` can add OpenAI Chat/Responses, Anthropic Messages, Google Generative, and compatible local or remote endpoints without changing Pi source. | The service accepts a strict configured Model catalog plus an explicit 1–16 identity route, per-Model environment Secret mapping, per-attempt timeouts, and opt-in observable timeout cooldown over direct OpenAI Responses, the provider-neutral HTTPS gateway, or an arbitrary-language brokered JSON-command Model. Command Models retain External provenance and the existing cancellation/process boundary. Cooling Models remain last-resort candidates; ordinary string errors never become inferred health. | **Partially aligned with stronger routing evidence.** Operators can add routed gateway- or command-backed vendors without Rust changes and avoid repeated proven timeout waits. Broad native vendor protocols, command-level provider metadata/streaming, hot reload, load/price policy, and management UX remain open. |
+| Tool, MCP, and isolation | Pi ships useful file/shell/image Tools and rich hooks, but intentionally has no built-in MCP, permission popups, or sandbox. Extensions run with the launching user's authority. | `src/execution`, `src/transport`, `src/runtime/policy.rs`, and `src/approval` provide governed Tool registration, stdio plus authenticated HTTPS JSON-response MCP, durable approval, and bounded process/network authority. | **Different strengths.** Preserve Y-Harness authority boundaries while adding multi-Tool ergonomics; bounded SSE/OAuth and broader Tool catalogs remain open, and ambient in-process extension authority stays rejected. |
+| Packages, Skills, and extensions | `pi install/remove/list/update/config` manages npm, git, URL, local, user, project, and temporary sources. Packages may provide executable TypeScript extensions, Skills, prompts, and themes; `/reload` hot-loads resources. | `src/skill` verifies exact identity, dependencies, budgets, digests, publisher signatures, revocation, and transparency evidence. `yh skill install`, `install-external`, and `install-https` manage bounded declarative stores while preserving local versus signed-External trust and keeping activation separate. | **Partially aligned with stronger supply-chain authority.** Local and exact public-HTTPS installation are implemented without ambient execution. Dependency download, update/catalog/private-registry UX, hot reload, executable-extension isolation, and ecosystem breadth remain open. |
+| Session and product surface | JSONL session trees support resume, tree navigation, fork, clone, compaction, import/export, and RPC. `getTree()` defensively assembles the entry DAG; `createBranchedSession` extracts the root-to-leaf path, preserves entry identities, re-chains retained entries, records `parentSession`, and writes the new file incrementally. `navigateTree()` may summarize the abandoned old-leaf suffix and append that derived text on the selected branch. | Authoritative SQLite Thread/Turn/Item State, recovery, checkpoints, bounded lineage-aware recent-Thread Protocol paging, explicit durable names, Protocol-backed TUI resume, schema-10 portable archives, and schema-11 attributed per-Turn Context are implemented. Fork preserves historical evidence identity and exact lineage; archive import is atomic. Format-1 Thread handoff preparation computes a bounded source-only Turn delta, binds it to source/target identities and a canonical digest, and converts any host-generated candidate into attributed content-free Context evidence. | **Partially aligned by a different State model.** Durable fork/clone-at-head, bounded recent-page forests, integrity-bound import/export, and read-only Thread-handoff preparation are Engine-owned. Pi's entry-level mutable leaf and automatic in-session navigation are deliberately rejected as a second branch authority. Candidate synthesis remains provider/host-selected and its factual quality requires evaluation. JSON is a bounded interchange format, not authoritative State. |
+| Evaluation | `packages/evals` contains an executable Pi harness adapter. | External-run format 4 now drives the released Pi JSONL CLI under exact binary/version, bounded process, isolated bare configuration, disabled capability, lifecycle, Model, and cost controls. | **Partially aligned.** Contract tests pass, but no live Pi record or deterministic same-model comparison exists. Superiority remains unverified. |
+
+The adoption rule is therefore selective rather than superficial: take Pi's
+small loop, provider normalization, ordered multi-Tool semantics, package UX,
+branch-handoff intent, session navigation, and RPC lessons; retain
+Y-Harness's stronger State, Policy, isolation, provenance, and
+extension-supply-chain contracts. Session navigation composes Engine Threads
+and per-Turn Context instead of importing Pi's mutable entry leaf.
 
 ## Grok Build: open Harness source; Grok 4.5: Model coordinate
 
@@ -104,7 +134,7 @@ level. Similar names do not establish equivalent semantics.
 |---|---|---|---|
 | Pi drains a small steering queue between assistant/tool steps and a follow-up queue when the loop would stop. | New input belongs at explicit loop boundaries rather than in arbitrary provider callbacks. | Pending steering is drained at Model and Tool safe boundaries. | Pi's process-local callback queue is not durable authority; Y-Harness does not inherit its session model or coding-product surface. |
 | The Claude reconstruction has scoped/priority queues and preserves Tool-call/result adjacency before inserting ordinary input. | Provider history must never be malformed merely to make an interactive queue feel immediate. | A superseded Tool call receives a synthetic error result before steering becomes model-visible. | Reconstructed code is not copied. Priority tiers are deferred until a real engine-level requirement justifies their semantics and bounds. |
-| Current Codex requires an exact active Turn ID and separates current-step input from later mail. | A stale client must not redirect whichever Turn happens to be running. | Protocol 12 requires `thread_id` plus exact `expected_turn_id`; a mismatch writes nothing. | Codex's process-local queue is not treated as recoverable State, and its coding-agent product behavior is not a Core contract. |
+| Current Codex requires an exact active Turn ID and separates current-step input from later mail. | A stale client must not redirect whichever Turn happens to be running. | Protocol 15 preserves `thread_id` plus exact `expected_turn_id`; a mismatch writes nothing. | Codex's process-local queue is not treated as recoverable State, and its coding-agent product behavior is not a Core contract. |
 | Current Hermes restarts after steering crosses an in-flight response, and its recovery code copies SQLite/WAL/SHM before canonical rebuild and integrity checks. | A response sampled from old context is stale; recovery must preserve evidence before repair. | Crossed Model messages and Tool calls are discarded, their provisional stream step is invalidated, and steering is applied before resampling. | This delta does not copy Hermes's large parent-object loop, mutable learned-skill behavior, or claim that Y-Harness already matches its recovery breadth. |
 | OpenCode's CLI runtime serializes queued ordinary prompts and allows client editing/removal. | Product-side queue UX can remain independent from Runtime semantics. | The TUI maps input during an active Turn to the engine's typed steering command. | An editable client queue is not Runtime steering authority and cannot replace durable acceptance evidence. |
 
@@ -124,9 +154,9 @@ recovery are still unmeasured.
 
 | Reference | Observed architecture | Adopted by Y-Harness | Deliberately not inherited |
 |---|---|---|---|
-| Pi Agent Harness | `agent-loop.ts` keeps the model/tool loop small, normalizes messages at the provider boundary, emits typed events, and supports steering/follow-up queues. `AgentHarness` composes sessions, resources, hooks, compaction, tools, and model selection. Pi also has a real same-process evaluation adapter. | Embeddable runtime, explicit loop events, provider-neutral model contract, resource discovery, and one registration path for built-ins and extensions. | Package or extension installation is not authority to execute arbitrary code in the kernel. Session files are not the authoritative HA state model. Model/tool parallelism is an explicit scheduler concern, not an implicit registry behavior. |
+| Pi Agent Harness | `agent-loop.ts` keeps the model/tool loop small, normalizes messages at the provider boundary, emits typed events, drains steering/follow-up queues, and executes ordered batches of Tool calls sequentially or concurrently. `AgentHarness` composes sessions, resources, hooks, compaction, tools, and model selection. The coding product adds Provider catalogs, packages, session trees, RPC, root-to-leaf fork extraction, and a real same-process evaluation adapter. | Embeddable runtime, explicit loop events, provider-neutral model contract, resource discovery, ordered multi-Tool semantics, one registration path for built-ins and extensions, and terminal-boundary Thread fork. | Package or extension installation is not authority to execute arbitrary code in the kernel. Session files and incremental copy loops are not the authoritative HA state model. Concurrency requires bounded scheduling plus per-effect Policy, State, cancellation, and recovery evidence. |
 | Claude Code | The reconstructed 2.1.88 source shows an async-generator query loop, streaming tool execution with concurrent/exclusive scheduling, several compaction and recovery paths, layered permissions, MCP management, plugins, persistent tasks, and agent teams. Official docs independently describe instructions, skills, MCP, hooks, permissions, subagents, and worktrees. | Layered Context, discoverable Skills, MCP as a Tool adapter, typed lifecycle observations, capability-scoped sub-tasks, and declarative workspace requirements. Recovery regressions become clean-room fault-injection cases. | Reconstructed code is not copied or treated as authoritative. Product-specific instruction filenames, feature flags, shell-hook semantics, coding workflows, and UI behavior are not kernel contracts. Hooks cannot bypass Policy, bounds, provenance, or failure isolation. |
-| Codex | `run_turn` owns the sampling/tool/follow-up loop and captures one step view for context and advertised tools. A Rust core supports TUI, exec, and a typed app-server protocol. Tool routing records lifecycle outcomes, and the sandbox manager selects macOS Seatbelt, Linux seccomp/bubblewrap, or Windows restricted-token execution independently from approval policy. SQLite state, recovery, skills, plugins, memories, multi-agent paths, and OpenTelemetry are distinct crates or modules. | Rust semantic core, client/runtime separation, versioned asynchronous protocol, Thread/Turn/Item state, explicit approval, process-broker isolation, skills/MCP, and worktree-aware orchestration. | Coding-agent behavior stays outside Core. Process-local operation state is not durable truth. Remote recovery cannot take over a Turn without an external lease and fencing authority. |
+| Codex | `run_turn` owns the sampling/tool/follow-up loop and captures one step view for context and advertised tools. A Rust core supports TUI, exec, and a typed app-server protocol. The pinned app-server exposes `thread/fork`, optional inclusive `lastTurnId`, active-boundary rejection, interrupted latest-state handling, a new Thread ID, and `forkedFromId`. Tool routing records lifecycle outcomes, and the sandbox manager selects macOS Seatbelt, Linux seccomp/bubblewrap, or Windows restricted-token execution independently from approval policy. SQLite state, recovery, skills, plugins, memories, multi-agent paths, and OpenTelemetry are distinct crates or modules. | Rust semantic core, client/runtime separation, versioned asynchronous protocol, Thread/Turn/Item state, explicit approval, process-broker isolation, skills/MCP, worktree-aware orchestration, and typed terminal-boundary fork semantics. | Coding-agent behavior stays outside Core. Y-Harness does not mutate an active source to manufacture an interruption marker; clients select an earlier terminal boundary or settle the active Turn. Process-local operation state is not durable truth. Remote recovery cannot take over a Turn without an external lease and fencing authority. |
 | Hermes Agent | One `AIAgent` serves CLI, gateway, ACP, batch, cron, and API entry points. The source has extensive provider normalization, retry/error classification, context compression, SQLite/FTS session storage, checkpoints, approvals, many execution environments, memory/context plugins, trajectories, and observer hooks. The extracted `conversation_loop.py` still drives a large parent-object state surface, showing useful production handling and a coupling cost at the same time. | General-purpose rather than coding-only scope, shared core across entry points, Memory and Context provider ports, profiles/scopes, provider neutrality, and trajectories as Evaluation evidence. Error taxonomies and provider quirks become adapter conformance cases. | Messaging adapters, provider configuration, mutable skill learning, and application commands do not belong in the microkernel. Import-time self-registration and ambient plugin authority are not accepted extension contracts. |
 | OpenCode | The current tree separates Effect-based services, normalized `LLMEvent` streams, session processing, permissions, tools, providers, plugins, MCP, SQLite schemas/migrations, event-backed session projection, control-plane/worktree code, SDKs, TUI, web, and desktop clients. The permission service keeps pending approvals process-local, while the newer core state uses SQLite and explicit projection code. | Headless core plus typed service boundary, streaming events, provider/tool registries, permission checks, durable projection, and multiple clients over one semantic runtime. | Coding modes, local-server assumptions, and desktop/web product policy do not define Harness semantics. In-process plugins do not receive ambient engine authority by installation alone. Pending approvals and transient stream state cannot become authoritative recovery state. |
 | Grok Build | A Rust composition root separates the full-screen TUI, agent runtime, Tools, workspace/checkpoints, model sampling, chat state, SQLite journal, MCP, Skills, Plugins, Hooks, Subagents, ACP, sandboxing, telemetry, and headless entry points. The public tree is a periodic monorepo sync rather than the complete monorepo. | Rust client/runtime separation, explicit product composition root, local-first provider configuration, ACP embedding, extension breadth, and concrete recovery/UX mechanisms become source-audited design inputs and benchmark cases. | Grok 4.5 defaults, coding workflows, TUI policy, hosted-service assumptions, and product extension semantics do not become Core contracts. A large generated crate closure is not copied as Y-Harness's module topology. |
@@ -136,15 +166,15 @@ recovery are still unmeasured.
 | Layer | Strongest observed lessons | Y-Harness position after this audit |
 |---|---|---|
 | Context Engine | Claude Code and Codex have multiple compaction/recovery paths shaped by real provider failures. OpenCode now models context epochs; Pi keeps compaction understandable; Hermes handles wide provider variance and prompt caching; Grok Build exposes concrete prompt, compaction, and recap paths. | Deterministic whole-Turn selection, independent byte/token bounds, and provenance are credible local strengths. Semantic faithfulness, provider cache behavior, media overflow recovery, and long-session quality are not competitively proven. |
-| Agent Loop | Pi has the clearest small generic loop. Codex captures a consistent per-step view. Claude Code has mature streaming fallback and orphan-result cleanup. Hermes has broad retry/failover classification. OpenCode converges runtimes on one event stream. Grok Build adds a substantial Rust product loop with interjection and long-running task behavior. | Durable settlement, deadlines, cancellation, and explicit recovery are implemented, but the direct-provider path and production fault matrix are much narrower. |
+| Agent Loop | Pi has the clearest small generic loop and explicit sequential/parallel multi-Tool execution. Codex captures a consistent per-step view. Claude Code has mature streaming fallback and orphan-result cleanup. Hermes has broad retry/failover classification. OpenCode converges runtimes on one event stream. Grok Build adds a substantial Rust product loop with interjection and long-running task behavior. | Durable settlement, deadlines, cancellation, exact failover, observable attempt-timeout cooldown, bounded typed Provider failure evidence, bounded same-Model transient retry, atomic ordered same-response decisions, and bounded explicitly safe Tool runs with sequential fences are implemented. Broader recovery, vendor-specific failure breadth, production fault diversity, and comparative latency remain unproven. |
 | Tool Runtime | Codex has the strongest public cross-platform sandbox implementation. Claude Code shows mature concurrent/exclusive tool scheduling. Hermes has the broadest execution-environment catalog. OpenCode and Pi have low-friction extension paths. Grok Build combines local and hosted Tools with a broad Rust extension surface. | Policy-governed registration and fail-closed process authority are strong design choices. Linux/Windows containment, tool breadth, provider-hosted tools, and hostile-process tests remain material gaps. |
-| State Engine | Codex, OpenCode, and Hermes all have substantial SQLite schemas, migrations, and recovery behavior; OpenCode now has event-backed session projection. Pi deliberately supports lighter JSONL/in-memory session stores. | Typed append-only authority, CAS, bounded recovery, snapshots, and backup-first migrations are implemented. Archival, blob offload, remote ownership, and long-running production evidence are open. |
+| State Engine | Codex, OpenCode, and Hermes all have substantial SQLite schemas, migrations, and recovery behavior; OpenCode now has event-backed session projection. Codex has typed Thread fork boundaries; Pi deliberately supports lighter JSONL/in-memory session stores, an entry tree, and root-to-leaf file extraction. | Typed append-only authority, CAS, bounded recovery, snapshots, backup-first migrations, atomic terminal-boundary fork with exact lineage, lineage-bearing bounded Thread summaries, portable integrity-bound terminal Thread archives, and content-free attributed invocation Context are implemented. Destructive archival/offload, blob separation, remote ownership, and long-running production evidence are open. Thread-handoff preparation is deliberately a read-only Context concern; entry-level in-place trees are intentionally outside the State model. |
 | Memory Engine | Hermes exposes several provider plugins. Codex and Claude Code integrate product memory. | The Agent Memory Hub boundary is a genuine differentiator, but retrieval quality and end-to-end outcome gain require shared benchmarks, not architecture claims. |
-| Skill Engine | Codex and Claude Code have marketplace/plugin product flows; OpenCode pulls remote skills; Pi packages skills/extensions; Hermes ships a large catalog; Grok Build exposes Skills, Plugins, Hooks, and marketplace code in one product runtime. | Signature, revocation, receipts, exact pins, and bounded resolution are strong governance primitives. Discovery UX, private registry, cache/mirror, dependency acquisition, and ecosystem size lag. |
+| Skill Engine | Codex and Claude Code have marketplace/plugin product flows; OpenCode pulls remote skills; Pi packages skills/extensions; Hermes ships a large catalog; Grok Build exposes Skills, Plugins, Hooks, and marketplace code in one product runtime. | Signature, revocation, receipts, exact HTTPS pins, bounded resolution, and trusted/signed-External install/list/verify/recoverable-remove lifecycles are strong governance primitives. Network discovery, private registry, cache/mirror, dependency acquisition, update UX, executable-extension isolation, and ecosystem size lag. |
 | Policy Engine | Codex separates approval from OS sandboxing and supports managed requirements. Claude Code has rich permission matching/classification. OpenCode has concise rule evaluation. Hermes covers approvals across CLI/gateway surfaces. | Durable attributed approvals and fingerprint-bound continuation are stronger than an in-memory prompt. Human/tenant identity, signed receipts, role policy, remote continuation, and cross-platform containment are open. |
 | Orchestration | Codex and Claude Code expose mature multi-agent/product workflows. OpenCode has subagents and worktree/control-plane code. Hermes has delegation across many surfaces. Pi has simple steering/follow-up semantics. Grok Build exposes Subagents, workflows, goals, worktrees, and long-running task paths. | Task DAGs, leases, fencing, mailbox, and workspace lifecycle are architecturally substantial. Multi-node consensus, durable orphan reaping, remote executors, and comparative task success are not proven. |
 | Verification | Claude Code has stop hooks and verification-oriented skills; Codex has review/hook paths; Hermes records verification evidence. | Verification is a first-class engine layer rather than only a prompt convention. Its real-world graders and false-completion rate still need competitive measurement. |
-| Observability | Codex has OpenTelemetry modules and rich runtime events. Hermes has a versioned observer contract. OpenCode uses Effect/OTel. Claude Code and Pi expose extensive events. | Failure-isolated, content-free evidence is privacy-conscious and bounded. Exporter breadth, distributed traces, operator UX, and overhead comparisons are open. |
+| Observability | Codex has OpenTelemetry modules and rich runtime events. Hermes has a versioned observer contract. OpenCode uses Effect/OTel. Claude Code and Pi expose extensive events. | Failure-isolated, content-free evidence now includes typed Provider failure class/status/retry facts without diagnostics. Exporter breadth, distributed traces, operator UX, and overhead comparisons are open. |
 | Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner, not a competitive result. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
 
 The architectural boundary is competitive; the product effect is not yet
@@ -183,6 +213,26 @@ approval continuation, and unknown Tool effects are constrained by
 [ADR 0035](adr/0035-explicit-exclusive-turn-recovery.md) and
 [ADR 0065](adr/0065-fingerprinted-pre-tool-approval-resumption.md).
 
+### Provider evidence and recovery policy remain separate
+
+Codex's `codex-api/src/error.rs` and protocol error mapping preserve semantic
+variants and retry delays. OpenCode's provider normalization retains status and
+retryability, while Pi retains HTTP status/headers before its outer
+compatibility layer falls back to text matching. Hermes demonstrates both the
+operational value and the coupling cost of a much broader, pattern-driven
+recovery taxonomy.
+
+Y-Harness adopts the common structured-evidence lesson without importing a
+product-specific recovery table. `ModelProviderFailure` is bounded typed
+evidence; legacy and Harness-owned failures remain `Model(String)`;
+Observability receives no diagnostic content. A separate default-disabled
+policy retries only typed rate-limit, overload, server, and transport failures
+on the same Model, under the existing candidate deadline and provisional-output
+fence. It does not parse strings, replay a Turn, infer cooldown, or install a
+general Provider-specific recovery table. See
+[ADR 0100](adr/0100-typed-model-provider-failure-evidence.md) and
+[ADR 0101](adr/0101-bounded-typed-model-retry-policy.md).
+
 ### Context is compiled, not concatenated ad hoc
 
 All six references expose some combination of instructions, session history,
@@ -196,6 +246,9 @@ The implementation is in `src/context` and `src/memory`. See
 [ADR 0059](adr/0059-registered-token-counters-with-independent-byte-bounds.md),
 and
 [ADR 0060](adr/0060-bounded-non-authoritative-semantic-conversation-compaction.md).
+Cross-Thread handoff reuses the same authority boundary through
+[ADR 0096](adr/0096-attributed-per-turn-context.md) and
+[ADR 0097](adr/0097-bounded-digest-bound-thread-handoff.md).
 
 ### MCP, CLI, and Skills are extension mechanisms, not trust shortcuts
 
@@ -296,10 +349,19 @@ engine-owned invariants:
 
 ### Pi Agent Harness
 
-- [Agent loop at `5bc1c2c`](https://github.com/earendil-works/pi/blob/5bc1c2c0a6f07e00e8c240304182f213ab8d311f/packages/agent/src/agent-loop.ts)
-- [Composable Harness at `5bc1c2c`](https://github.com/earendil-works/pi/blob/5bc1c2c0a6f07e00e8c240304182f213ab8d311f/packages/agent/src/harness/agent-harness.ts)
-- [Session contract at `5bc1c2c`](https://github.com/earendil-works/pi/blob/5bc1c2c0a6f07e00e8c240304182f213ab8d311f/packages/agent/src/harness/session/session.ts)
-- [Evaluation adapter at `5bc1c2c`](https://github.com/earendil-works/pi/blob/5bc1c2c0a6f07e00e8c240304182f213ab8d311f/packages/evals/src/pi-harness.ts)
+- [Agent loop and ordered multi-Tool execution at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/agent/src/agent-loop.ts)
+- [Composable Harness at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/agent/src/harness/agent-harness.ts)
+- [Built-in Provider registry at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/ai/src/providers/all.ts)
+- [Custom model configuration at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/docs/models.md)
+- [Package manager at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/src/core/package-manager.ts)
+- [Package authority warning at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/docs/packages.md)
+- [Session product contract at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/docs/sessions.md)
+- [Explicit security boundary at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/docs/security.md)
+- [Evaluation adapter at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/evals/src/pi-harness.ts)
+- [Released CLI flags at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/src/cli/args.ts)
+- [JSON print mode at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/src/modes/print-mode.ts)
+- [Session event settlement at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/src/core/agent-session.ts)
+- [Root-to-leaf fork materialization and lineage at `cee5ff7`](https://github.com/earendil-works/pi/blob/cee5ff7520d8828bed9955ef00419e995d1f91e0/packages/coding-agent/src/core/session-manager.ts)
 
 ### Claude Code
 
@@ -327,6 +389,7 @@ engine-owned invariants:
 - [Turn input queue at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/core/src/session/input_queue.rs)
 - [Exact-ID Turn steering at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/app-server/src/request_processors/turn_processor.rs)
 - [Bounded client recovery slots at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/exec-server/src/client_recovery.rs)
+- [Typed Thread fork boundaries at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/app-server/README.md)
 - [Official Codex documentation](https://developers.openai.com/codex/)
 
 ### Hermes Agent

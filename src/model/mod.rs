@@ -13,8 +13,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     HarnessError, HarnessFuture, LanguageModel, MODEL_GATEWAY_API_VERSION, ModelOutput,
-    ModelRequest, ModelResponse, ModelStream, SecretProvider, SecretReference, SecretRequest,
-    SecretValue, kernel::validate_model_id,
+    ModelProviderFailure, ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream,
+    SecretProvider, SecretReference, SecretRequest, SecretValue, kernel::validate_model_id,
 };
 
 const MAX_HTTP_MODEL_REQUEST_BYTES: usize = 16_777_216;
@@ -302,12 +302,24 @@ impl HttpModelTransport for ReqwestHttpModelTransport {
         Box::pin(async move {
             tokio::time::timeout(request.timeout, async {
                 let _permit = self.concurrency.acquire().await.map_err(|_| {
-                    HarnessError::Model("HTTPS model transport is closed".to_owned())
+                    provider_failure(
+                        ModelProviderFailureKind::Transport,
+                        "HTTPS model transport is closed",
+                        None,
+                        None,
+                    )
                 })?;
                 execute_http_request(&self.client, request).await
             })
             .await
-            .map_err(|_| HarnessError::Model("HTTPS model request timed out".to_owned()))?
+            .map_err(|_| {
+                provider_failure(
+                    ModelProviderFailureKind::Transport,
+                    "HTTPS model request timed out",
+                    None,
+                    None,
+                )
+            })?
         })
     }
 
@@ -319,12 +331,24 @@ impl HttpModelTransport for ReqwestHttpModelTransport {
         Box::pin(async move {
             tokio::time::timeout(request.timeout, async {
                 let _permit = self.concurrency.acquire().await.map_err(|_| {
-                    HarnessError::Model("HTTPS model transport is closed".to_owned())
+                    provider_failure(
+                        ModelProviderFailureKind::Transport,
+                        "HTTPS model transport is closed",
+                        None,
+                        None,
+                    )
                 })?;
                 execute_http_streaming_request(&self.client, request, stream).await
             })
             .await
-            .map_err(|_| HarnessError::Model("HTTPS model request timed out".to_owned()))?
+            .map_err(|_| {
+                provider_failure(
+                    ModelProviderFailureKind::Transport,
+                    "HTTPS model request timed out",
+                    None,
+                    None,
+                )
+            })?
         })
     }
 }
@@ -467,12 +491,20 @@ impl HttpsJsonModel {
 
     fn decode_response(&self, response: HttpModelResponse) -> Result<ModelResponse, HarnessError> {
         validate_http_response(&response, self.config.max_response_bytes)?;
-        let mut response_body: ModelResponse = serde_json::from_slice(&response.body)
-            .map_err(|_| HarnessError::Model("HTTPS model returned invalid JSON".to_owned()))?;
+        let mut response_body: ModelResponse =
+            serde_json::from_slice(&response.body).map_err(|_| {
+                provider_failure(
+                    ModelProviderFailureKind::Protocol,
+                    "HTTPS model returned invalid JSON",
+                    None,
+                    None,
+                )
+            })?;
         if response_body.provider_request_id.is_none() {
             response_body.provider_request_id = response.provider_request_id;
         }
-        crate::runtime::validate_model_response(&response_body)?;
+        crate::runtime::validate_model_response(&response_body)
+            .map_err(|error| protocol_failure(error.to_string()))?;
         Ok(response_body)
     }
 }
@@ -528,8 +560,8 @@ async fn execute_http_request(
         .and_then(|value| value.parse::<u64>().ok())
         && length > request.max_response_bytes as u64
     {
-        return Err(HarnessError::Model(
-            "HTTPS model response declared an oversized body".to_owned(),
+        return Err(protocol_failure(
+            "HTTPS model response declared an oversized body",
         ));
     }
     let status = response.status().as_u16();
@@ -562,10 +594,10 @@ async fn execute_http_request(
         let next = body
             .len()
             .checked_add(chunk.len())
-            .ok_or_else(|| HarnessError::Model("HTTPS model response size overflow".to_owned()))?;
+            .ok_or_else(|| protocol_failure("HTTPS model response size overflow"))?;
         if next > request.max_response_bytes {
-            return Err(HarnessError::Model(
-                "HTTPS model response exceeded its configured limit".to_owned(),
+            return Err(protocol_failure(
+                "HTTPS model response exceeded its configured limit",
             ));
         }
         body.extend_from_slice(&chunk);
@@ -624,10 +656,10 @@ impl ModelGatewayStreamDecoder {
         self.total_bytes = self
             .total_bytes
             .checked_add(chunk.len())
-            .ok_or_else(|| HarnessError::Model("HTTPS model stream size overflow".to_owned()))?;
+            .ok_or_else(|| protocol_failure("HTTPS model stream size overflow"))?;
         if self.total_bytes > self.max_bytes {
-            return Err(HarnessError::Model(
-                "HTTPS model stream exceeded its configured limit".to_owned(),
+            return Err(protocol_failure(
+                "HTTPS model stream exceeded its configured limit",
             ));
         }
         self.pending.extend_from_slice(chunk);
@@ -659,9 +691,8 @@ impl ModelGatewayStreamDecoder {
                 &mut self.final_response,
             )?;
         }
-        self.final_response.ok_or_else(|| {
-            HarnessError::Model("HTTPS model stream ended without a final response".to_owned())
-        })
+        self.final_response
+            .ok_or_else(|| protocol_failure("HTTPS model stream ended without a final response"))
     }
 }
 
@@ -689,8 +720,8 @@ async fn execute_http_streaming_request(
         .and_then(|value| value.parse::<u64>().ok())
         && length > request.max_response_bytes as u64
     {
-        return Err(HarnessError::Model(
-            "HTTPS model stream declared an oversized body".to_owned(),
+        return Err(protocol_failure(
+            "HTTPS model stream declared an oversized body",
         ));
     }
     let status = response.status().as_u16();
@@ -719,7 +750,7 @@ async fn execute_http_streaming_request(
         });
     }
     if api_version.as_deref() != Some(MODEL_GATEWAY_API_VERSION) {
-        return Err(HarnessError::Model(format!(
+        return Err(protocol_failure(format!(
             "HTTPS model gateway API mismatch; expected {MODEL_GATEWAY_API_VERSION}"
         )));
     }
@@ -727,7 +758,7 @@ async fn execute_http_streaming_request(
         .as_deref()
         .is_some_and(|value| is_media_type(value, MODEL_STREAM_MEDIA_TYPE))
     {
-        return Err(HarnessError::Model(format!(
+        return Err(protocol_failure(format!(
             "HTTPS model stream must use {MODEL_STREAM_MEDIA_TYPE}"
         )));
     }
@@ -739,9 +770,9 @@ async fn execute_http_streaming_request(
     let final_response = decoder.finish()?;
     let body = crate::json::to_bounded_json_vec(&final_response, request.max_response_bytes)
         .map_err(|error| match error {
-            crate::json::BoundedJsonError::LimitExceeded => HarnessError::Model(
-                "streamed final model response exceeds its configured limit".to_owned(),
-            ),
+            crate::json::BoundedJsonError::LimitExceeded => {
+                protocol_failure("streamed final model response exceeds its configured limit")
+            }
             crate::json::BoundedJsonError::CannotEncode => {
                 HarnessError::Model("cannot normalize streamed model response".to_owned())
             }
@@ -763,36 +794,37 @@ fn parse_stream_frame(
 ) -> Result<(), HarnessError> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.is_empty() {
-        return Err(HarnessError::Model(
-            "HTTPS model stream contains an empty frame".to_owned(),
+        return Err(protocol_failure(
+            "HTTPS model stream contains an empty frame",
         ));
     }
     *frame_count = frame_count
         .checked_add(1)
-        .ok_or_else(|| HarnessError::Model("HTTPS model stream frame overflow".to_owned()))?;
+        .ok_or_else(|| protocol_failure("HTTPS model stream frame overflow"))?;
     if *frame_count > MAX_MODEL_STREAM_FRAMES {
-        return Err(HarnessError::Model(format!(
+        return Err(protocol_failure(format!(
             "HTTPS model stream exceeds {MAX_MODEL_STREAM_FRAMES} frames"
         )));
     }
     if final_response.is_some() {
-        return Err(HarnessError::Model(
-            "HTTPS model stream contains frames after its final response".to_owned(),
+        return Err(protocol_failure(
+            "HTTPS model stream contains frames after its final response",
         ));
     }
     let frame: ModelGatewayStreamFrame = serde_json::from_slice(line)
-        .map_err(|_| HarnessError::Model("HTTPS model stream contains invalid JSON".to_owned()))?;
+        .map_err(|_| protocol_failure("HTTPS model stream contains invalid JSON"))?;
     match frame {
         ModelGatewayStreamFrame::TextDelta { delta } => {
             if delta.is_empty() || delta.len() > MAX_MODEL_STREAM_DELTA_BYTES {
-                return Err(HarnessError::Model(format!(
+                return Err(protocol_failure(format!(
                     "HTTPS model stream delta must be 1-{MAX_MODEL_STREAM_DELTA_BYTES} bytes"
                 )));
             }
             let _ = stream.emit_text_delta(delta);
         }
         ModelGatewayStreamFrame::Response { response } => {
-            crate::runtime::validate_model_response(&response)?;
+            crate::runtime::validate_model_response(&response)
+                .map_err(|error| protocol_failure(error.to_string()))?;
             *final_response = Some(response);
         }
     }
@@ -817,29 +849,35 @@ fn validate_http_response(
     max_response_bytes: usize,
 ) -> Result<(), HarnessError> {
     if !(200..300).contains(&response.status) {
-        return Err(HarnessError::Model(format!(
-            "HTTPS model returned HTTP status {}",
-            response.status
-        )));
+        return Err(provider_http_failure("HTTPS model", response.status, None));
     }
     if response.api_version.as_deref() != Some(MODEL_GATEWAY_API_VERSION) {
-        return Err(HarnessError::Model(format!(
-            "HTTPS model gateway API mismatch; expected {MODEL_GATEWAY_API_VERSION}"
-        )));
+        return Err(provider_failure(
+            ModelProviderFailureKind::Protocol,
+            format!("HTTPS model gateway API mismatch; expected {MODEL_GATEWAY_API_VERSION}"),
+            None,
+            None,
+        ));
     }
     let is_json = response
         .content_type
         .as_deref()
         .is_some_and(|content_type| is_media_type(content_type, "application/json"));
     if !is_json {
-        return Err(HarnessError::Model(
-            "HTTPS model response must use application/json".to_owned(),
+        return Err(provider_failure(
+            ModelProviderFailureKind::Protocol,
+            "HTTPS model response must use application/json",
+            None,
+            None,
         ));
     }
     if response.body.is_empty() || response.body.len() > max_response_bytes {
-        return Err(HarnessError::Model(format!(
-            "HTTPS model response must be 1-{max_response_bytes} bytes"
-        )));
+        return Err(provider_failure(
+            ModelProviderFailureKind::Protocol,
+            format!("HTTPS model response must be 1-{max_response_bytes} bytes"),
+            None,
+            None,
+        ));
     }
     validate_provider_request_id(response.provider_request_id.as_deref())
 }
@@ -857,7 +895,7 @@ fn validate_provider_request_id(value: Option<&str>) -> Result<(), HarnessError>
             || value.len() > MAX_PROVIDER_REQUEST_ID_BYTES
             || value.chars().any(char::is_control))
     {
-        return Err(HarnessError::Model(format!(
+        return Err(protocol_failure(format!(
             "provider request id must be 1-{MAX_PROVIDER_REQUEST_ID_BYTES} non-control bytes"
         )));
     }
@@ -866,8 +904,15 @@ fn validate_provider_request_id(value: Option<&str>) -> Result<(), HarnessError>
 
 fn sanitize_transport_error(error: HarnessError) -> HarnessError {
     match error {
-        HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
-        _ => HarnessError::Model("HTTPS model transport failed".to_owned()),
+        HarnessError::Cancelled { .. }
+        | HarnessError::TimedOut { .. }
+        | HarnessError::ModelProvider(_) => error,
+        _ => provider_failure(
+            ModelProviderFailureKind::Transport,
+            "HTTPS model transport failed",
+            None,
+            None,
+        ),
     }
 }
 
@@ -881,7 +926,47 @@ fn map_reqwest_error(error: reqwest::Error) -> HarnessError {
     } else {
         "HTTPS model transport request failed"
     };
-    HarnessError::Model(message.to_owned())
+    provider_failure(ModelProviderFailureKind::Transport, message, None, None)
+}
+
+fn protocol_failure(message: impl Into<String>) -> HarnessError {
+    provider_failure(ModelProviderFailureKind::Protocol, message, None, None)
+}
+
+pub(super) fn provider_http_failure(
+    provider: &str,
+    status: u16,
+    retry_after_ms: Option<u64>,
+) -> HarnessError {
+    let kind = match status {
+        401 => ModelProviderFailureKind::Authentication,
+        403 => ModelProviderFailureKind::Authorization,
+        429 => ModelProviderFailureKind::RateLimited,
+        529 => ModelProviderFailureKind::Overloaded,
+        400..=499 => ModelProviderFailureKind::RequestRejected,
+        500..=599 => ModelProviderFailureKind::Server,
+        _ => ModelProviderFailureKind::Protocol,
+    };
+    provider_failure(
+        kind,
+        format!("{provider} returned HTTP status {status}"),
+        Some(status),
+        retry_after_ms,
+    )
+}
+
+pub(super) fn provider_failure(
+    kind: ModelProviderFailureKind,
+    message: impl Into<String>,
+    http_status: Option<u16>,
+    retry_after_ms: Option<u64>,
+) -> HarnessError {
+    match ModelProviderFailure::new(kind, message, http_status, retry_after_ms) {
+        Ok(failure) => HarnessError::ModelProvider(failure),
+        Err(_) => {
+            HarnessError::InvalidCapability("model Provider failure evidence is invalid".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -894,12 +979,37 @@ mod tests {
         HttpModelRequest, HttpModelResponse, HttpModelTransport, HttpsJsonModel,
         HttpsJsonModelConfig, MAX_ROOT_CA_PEM_BYTES, MODEL_GATEWAY_API_VERSION,
         ModelGatewayStreamDecoder, ReqwestHttpModelTransport, parse_stream_frame,
+        provider_http_failure,
     };
     use crate::{
-        HarnessError, HarnessFuture, LanguageModel, ModelEventSink, ModelOutput, ModelRequest,
-        ModelResponse, ModelStream, ModelStreamEvent, SECRET_API_VERSION, SecretProvider,
-        SecretProviderDescriptor, SecretReference, SecretRequest, SecretValue, ThreadId, TurnId,
+        HarnessError, HarnessFuture, LanguageModel, ModelEventSink, ModelOutput,
+        ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent,
+        SECRET_API_VERSION, SecretProvider, SecretProviderDescriptor, SecretReference,
+        SecretRequest, SecretValue, ThreadId, TurnId,
     };
+
+    #[test]
+    fn http_status_mapping_preserves_facts_without_inventing_policy() {
+        let cases = [
+            (401, ModelProviderFailureKind::Authentication),
+            (403, ModelProviderFailureKind::Authorization),
+            (429, ModelProviderFailureKind::RateLimited),
+            (503, ModelProviderFailureKind::Server),
+            (529, ModelProviderFailureKind::Overloaded),
+            (500, ModelProviderFailureKind::Server),
+            (400, ModelProviderFailureKind::RequestRejected),
+            (302, ModelProviderFailureKind::Protocol),
+        ];
+        for (status, expected) in cases {
+            let error = provider_http_failure("fixture", status, Some(1_000));
+            let HarnessError::ModelProvider(failure) = error else {
+                panic!("expected typed Provider failure");
+            };
+            assert_eq!(failure.kind(), expected);
+            assert_eq!(failure.http_status(), Some(status));
+            assert_eq!(failure.retry_after_ms(), Some(1_000));
+        }
+    }
 
     struct FixedSecret;
 
@@ -947,6 +1057,22 @@ mod tests {
     }
 
     struct StreamingTransport;
+
+    struct FailureTransport;
+
+    impl HttpModelTransport for FailureTransport {
+        fn send<'a>(&'a self, _request: HttpModelRequest) -> HarnessFuture<'a, HttpModelResponse> {
+            Box::pin(async {
+                Ok(HttpModelResponse {
+                    status: 429,
+                    api_version: Some(MODEL_GATEWAY_API_VERSION.to_owned()),
+                    content_type: Some("application/json".to_owned()),
+                    provider_request_id: Some("failed-request".to_owned()),
+                    body: br#"{"secret":"must-not-appear"}"#.to_vec(),
+                })
+            })
+        }
+    }
 
     impl HttpModelTransport for StreamingTransport {
         fn send<'a>(&'a self, _request: HttpModelRequest) -> HarnessFuture<'a, HttpModelResponse> {
@@ -1063,6 +1189,34 @@ mod tests {
             "https://models.example.test/v1/complete"
         );
         assert_eq!(recorded[0].body, request());
+    }
+
+    #[tokio::test]
+    async fn gateway_status_becomes_typed_evidence_without_response_body() {
+        let config = HttpsJsonModelConfig::new(
+            "https://models.example.test/v1/complete",
+            SecretReference::new("model/gateway").expect("reference"),
+        )
+        .expect("config");
+        let model = HttpsJsonModel::with_transport(
+            "gateway/model",
+            config,
+            Arc::new(FixedSecret),
+            Arc::new(FailureTransport),
+        )
+        .expect("model");
+
+        let error = model
+            .complete(request())
+            .await
+            .expect_err("provider status");
+
+        let HarnessError::ModelProvider(failure) = error else {
+            panic!("expected typed Provider failure");
+        };
+        assert_eq!(failure.kind(), ModelProviderFailureKind::RateLimited);
+        assert_eq!(failure.http_status(), Some(429));
+        assert!(!failure.message().contains("must-not-appear"));
     }
 
     #[tokio::test]
@@ -1349,9 +1503,15 @@ mod tests {
             .complete(request())
             .await
             .expect_err("invalid response");
-        assert_eq!(
-            error.to_string(),
-            "model error: HTTPS model returned invalid JSON"
+        assert!(matches!(
+            error,
+            HarnessError::ModelProvider(ref failure)
+                if failure.kind() == ModelProviderFailureKind::Protocol
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("HTTPS model returned invalid JSON")
         );
         assert!(!error.to_string().contains("must-not-appear"));
     }
@@ -1380,11 +1540,13 @@ mod tests {
         .expect("model");
 
         let error = model.complete(request()).await.expect_err("mismatch");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "model error: HTTPS model gateway API mismatch; expected {MODEL_GATEWAY_API_VERSION}"
-            )
-        );
+        assert!(matches!(
+            error,
+            HarnessError::ModelProvider(ref failure)
+                if failure.kind() == ModelProviderFailureKind::Protocol
+        ));
+        assert!(error.to_string().contains(&format!(
+            "HTTPS model gateway API mismatch; expected {MODEL_GATEWAY_API_VERSION}"
+        )));
     }
 }

@@ -4,7 +4,7 @@ Optional full-screen terminal client for the headless Y-Harness Engine.
 
 The TUI is not an execution host and owns no authoritative Agent state. At
 runtime it starts `yh serve` (or `yh serve-demo`) and communicates exclusively
-through Protocol v12 JSONL over the child process pipes.
+through Protocol v18 JSONL over the child process pipes.
 
 ```bash
 cargo install --locked --path clients/tui
@@ -35,8 +35,12 @@ Esc             cancel the active Turn
 F1 or ?         help
 ```
 
-Commands include `/thread <id>`, `/graph <id>`, `/events`, `/approvals`,
-`/tasks`, `/cancel`, and `/quit`.
+The Sessions Inspector lists the latest 64 authoritative Threads and shows
+direct parent lineage for forks; select one and press Enter to resume it.
+`/name <title>` sets the current Engine-owned name and `/name` clears it.
+`/fork [terminal-turn-id]` atomically creates and switches to an independent
+child. Other commands include `/sessions`, `/thread <id>`, `/graph <id>`,
+`/events`, `/approvals`, `/tasks`, `/cancel`, and `/quit`.
 
 The client never opens Engine SQLite files or constructs Runtime, Model, Tool,
 or Policy implementations. Approval settlement requires a separately

@@ -669,7 +669,7 @@ impl McpClient for StdioMcpClient {
     }
 }
 
-async fn list_tools_bounded(
+pub(super) async fn list_tools_bounded(
     service: &RunningService<RoleClient, ()>,
 ) -> Result<Vec<McpToolDescriptor>, HarnessError> {
     let mut tools = Vec::new();
@@ -758,7 +758,7 @@ fn mcp_tool_descriptor(tool: RmcpTool) -> Result<McpToolDescriptor, HarnessError
     Ok(descriptor)
 }
 
-fn tool_result_value(name: &str, result: CallToolResult) -> Result<Value, HarnessError> {
+pub(super) fn tool_result_value(name: &str, result: CallToolResult) -> Result<Value, HarnessError> {
     let is_error = result.is_error.unwrap_or(false);
     if is_error {
         return Err(HarnessError::Mcp(format!(
@@ -868,7 +868,7 @@ fn valid_environment_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn validate_mcp_tool_name(name: &str) -> Result<(), HarnessError> {
+pub(super) fn validate_mcp_tool_name(name: &str) -> Result<(), HarnessError> {
     if name.is_empty() || name.len() > MAX_MCP_TOOL_NAME_BYTES || name.chars().any(char::is_control)
     {
         return Err(HarnessError::Mcp(format!(

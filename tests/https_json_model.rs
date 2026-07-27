@@ -27,14 +27,14 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use y_harness::{
     AllowListPolicy, EnvironmentSecretProvider, HarnessRuntime, HttpsJsonModel,
-    HttpsJsonModelConfig, LanguageModel, MODEL_GATEWAY_API_VERSION, MemoryEventStore,
-    ModelEventSink, ModelOutput, ModelRequest, ModelStreamEvent, SecretReference, StateEngine,
-    ThreadId, ToolRegistry, TurnExecutionOptions, TurnId,
+    HttpsJsonModelConfig, LanguageModel, MemoryEventStore, ModelEventSink, ModelOutput,
+    ModelRequest, ModelStreamEvent, SecretReference, StateEngine, ThreadId, ToolRegistry,
+    TurnExecutionOptions, TurnId,
 };
 #[cfg(feature = "tls-host")]
 use y_harness::{
-    HarnessFuture, ModelResponse, SECRET_API_VERSION, SecretProvider, SecretProviderDescriptor,
-    SecretRequest, SecretValue,
+    HarnessFuture, MODEL_GATEWAY_API_VERSION, ModelResponse, SECRET_API_VERSION, SecretProvider,
+    SecretProviderDescriptor, SecretRequest, SecretValue,
 };
 
 #[derive(Default)]
@@ -243,6 +243,14 @@ async fn authenticated_https_gateway_round_trip() {
         ModelOutput::ToolCall { call_id, name, .. } => {
             assert!(!call_id.trim().is_empty());
             assert!(!name.trim().is_empty());
+        }
+        ModelOutput::ToolCalls { calls } => {
+            assert!(calls.len() >= 2);
+            assert!(
+                calls.iter().all(|call| {
+                    !call.call_id.trim().is_empty() && !call.name.trim().is_empty()
+                })
+            );
         }
     }
 }

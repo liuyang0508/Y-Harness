@@ -59,6 +59,7 @@ jobs:
       - name: Isolated optional-feature checks
         run: |
           cargo check --locked --no-default-features --features https-model
+          cargo check --locked --no-default-features --features https-mcp
           cargo check --locked --no-default-features --features https-skill
           cargo check --locked --no-default-features --features tls-host
       - name: All-feature tests
@@ -137,5 +138,9 @@ jobs:
           YH_BENCH_SAMPLES: "5"
           YH_BENCH_MAX_APPEND_MS: "350"
           YH_BENCH_MAX_PROJECT_MS: "15"
+          YH_BENCH_MAX_FORK_MS: "50"
+          YH_BENCH_MAX_ARCHIVE_EXPORT_MS: "50"
+          YH_BENCH_MAX_ARCHIVE_IMPORT_MS: "50"
+          YH_BENCH_MAX_THREAD_LIST_MS: "50"
           YH_BENCH_MAX_SNAPSHOT_LOAD_MS: "15"
         run: cargo run --locked --release --bin yh-state-bench

@@ -150,5 +150,54 @@ Models.
 There is no checked-in live Grok Build result yet, so this adapter provides
 contract evidence only.
 
+The Pi adapter consumes the released coding agent's JSONL lifecycle:
+
+```json
+{
+  "format_version": 4,
+  "run_id": "pi-probe-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/absolute/path/to/pi",
+  "expected_cli_version": "0.82.1",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/isolated/workspace",
+  "workspace_snapshot": "empty-workspace-v1",
+  "profile": "bare",
+  "provider": "openai",
+  "model": "<exact-model>",
+  "thinking": "low",
+  "system_prompt": "Return only the requested fixed text.",
+  "prompt": "Reply exactly YH-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "OPENAI_API_KEY"
+  ],
+  "pi_agent_dir": "/absolute/empty/pi-agent"
+}
+```
+
+```bash
+cargo run --locked -p y-harness-benchmark-runner -- \
+  pi /absolute/path/to/spec.json > external-run.json
+```
+
+`bare` injects the exact empty `PI_CODING_AGENT_DIR` rather than inheriting
+ambient Pi configuration. `product` must omit `pi_agent_dir` and may retain
+explicitly inherited product configuration. Both profiles run without session
+persistence, Tools, extensions, Skills, prompt templates, themes, project
+context files, or project trust; startup network refresh is disabled. The
+prompt is sent on stdin and must not contain leading or trailing whitespace
+because Pi trims piped input.
+
+External-run format 4 accepts the optional session header followed by Pi's
+bounded `AgentSessionEvent` stream. `agent_settled`, rather than an
+intermediate `agent_end`, is the required terminal event because automatic
+retries may execute more than one Agent run. Turn count, reported assistant
+cost, stop reason, and observed provider/model identities come only from
+validated Pi events. Pi has no built-in sandbox or documented hard monetary
+ceiling, and Tools are disabled, so this remains adapter-conformance evidence.
+There is no checked-in live Pi result or comparative run.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

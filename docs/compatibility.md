@@ -11,19 +11,20 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"12"` | exact `Initialize` request/response |
-| State events | `6` | per-event durable envelope; reads schemas 1 through 6 |
-| State snapshots | `6` | cache body; incompatible caches are discarded |
+| Client protocol | `"18"` | exact `Initialize` request/response |
+| State events | `11` | per-event durable envelope; reads schemas 1 through 11 |
+| State snapshots | `11` | cache body; incompatible caches are discarded |
 | Approval Inbox | `2` | per-record durable body after explicit migration |
 | Task Coordinator | `1` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
+| Thread handoff request format | `1` | canonical bounded summarizer-input envelope |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `1` | exact descriptor registration |
 | Skill package API | `"1"` | exact manifest validation |
-| HTTPS model gateway API | `"5"` | exact request/response header |
+| HTTPS model gateway API | `"7"` | exact request/response header |
 
 `Initialize` advertises the engine version and Runtime-facing durable/API
 coordinates above, including the Workspace Provider API implemented by
@@ -33,10 +34,47 @@ capability is not implied by its schema coordinate.
 
 Service configuration schema 1 is bounded to 65,536 bytes, rejects unknown
 fields, and keeps credentials as environment-backed secret references. Its
-optional service-assembly fields add direct OpenAI Responses, shell-free JSON
-Tools, exact-selected stdio MCP Tools, Agent Memory Hub Context, and explicitly
-activated project-local declarative Skills without changing the meaning of an
-existing field. External process launch is explicit, child environments are
+optional service-assembly fields add direct OpenAI Responses, brokered
+shell-free JSON Models and Tools, exact-selected stdio or authenticated HTTPS
+JSON-response MCP Tools, Agent Memory Hub Context, and explicitly activated
+project-local declarative Skills. The `json_command` Model variant is additive,
+uses the existing process shape, and participates in the existing single
+Model or catalog/route forms without changing their meaning. The additive
+`https_mcp_servers` list preserves the existing
+`mcp_servers` stdio shape; identities collide across both lists and disabled
+entries acquire no process, network, Secret, Tool, or Memory authority. Skills
+may add separate signed
+`external_package_files` plus publisher/log public keys, validity,
+transparency, and immutable revocation policy; the existing unsigned
+`package_files` keep their operator-trusted meaning. A trust-only staged object
+may leave package and activation lists empty. The configuration also supports
+a mutually exclusive `models` catalog plus explicit `model_route` alternative
+to the existing single `model`; no existing field changes meaning. MCP entries
+may be explicitly disabled and may pin the configured command file by SHA-256.
+Multi-Model routes may add a default-disabled `timeout_cooldown_ms` from
+1–86,400,000 milliseconds; Runtime-proven attempt timeouts are tried after
+ready candidates while cooling Models remain last-resort fallbacks.
+They may independently add a default-disabled `retry` object with 1–8
+additional calls and 1–60,000 millisecond initial/maximum delays. Only typed
+rate-limit, overload, server, and transport failures are eligible, and retries
+share the existing candidate deadline.
+The Rust API additively exposes `HarnessError::ModelProvider` and bounded
+`ModelProviderFailure` evidence, plus `ModelRetryPolicy`. Existing providers
+may continue returning `HarnessError::Model(String)`; only exhaustive matches
+on the public pre-1.0 error enum require a source update. Existing Observer
+implementations only read the expanded `PhaseObservation`; external code that
+directly constructs that public pre-1.0 struct must initialize its four new
+optional Provider/retry fields. Those fields use Serde defaults and do not
+advance State, Protocol, Model Gateway, snapshot, or service-configuration
+coordinates. See
+[ADR 0100](adr/0100-typed-model-provider-failure-evidence.md) and
+[ADR 0101](adr/0101-bounded-typed-model-retry-policy.md), plus
+[ADR 0103](adr/0103-bounded-authenticated-https-mcp-json-transport.md) and
+[ADR 0104](adr/0104-configured-brokered-json-command-models.md).
+The defaulted `max_parallel_tool_calls` field is bounded to 1–64, and JSON
+Tools may explicitly opt into `parallel_safe`; absent declarations remain
+sequential.
+External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
 optional exclusive CA file must remain inside the configuration project root.
@@ -47,7 +85,21 @@ Skill API `1` keeps the original package digest and publisher-signature bytes.
 Signed packages may add an optional signed transparency receipt; publisher
 policy decides whether absence is accepted. This does not change how an
 existing receipt-free package is decoded or how its publisher signature is
-verified.
+verified. External project storage preserves that existing signed envelope
+verbatim in canonical JSON; no Skill API coordinate changes. See
+[ADR 0102](adr/0102-governed-signed-external-skill-lifecycle.md).
+
+HTTPS model gateway API `7` preserves API 6's transport rules and adds the
+`invocation` Context-source shape with source/reference and exact source/body
+digests. Gateways must keep this shape, Memory, and conversation summaries at
+ordinary caller/evidence authority; only digest-pinned Skill blocks are
+Harness instructions. API-6 peers must fail exact negotiation rather than
+silently elevate caller context.
+
+HTTPS model gateway API `6` preserves API 5's transport rules and adds the
+ordered `tool_calls` Model output plus optional Tool-call batch metadata on
+replayed request Items. API-5 peers must fail exact header negotiation rather
+than flatten or reject a decision after partial interpretation.
 
 HTTPS model gateway API `5` preserves API 4's transport rules and adds optional
 bounded `provider_model` evidence to `ModelResponse`. Gateways must preserve a
@@ -74,6 +126,59 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `18` preserves protocol-v17 commands, framing, authority,
+lineage, and Thread archive projections. It adds optional bounded
+`TurnContextInput` records to `start_turn`, advances advertised State
+coordinates to schema 11, and carries the new model-gateway API 7 coordinate.
+Runtime derives attribution from the authenticated principal and journals only
+content-free context provenance. Protocol-v17 clients must fail exact
+initialization rather than omit recovery-critical context.
+
+Client protocol `17` preserves protocol-v16 commands, framing, authority, and
+lineage-aware bounded summaries. It advances the advertised State coordinates
+to schema 10 and admits optional immutable import provenance on full Thread and
+State-event projections. Portable archive files are an embedded/CLI adapter
+surface, not a protocol file-transfer command. Protocol-v16 clients must fail
+exact initialization rather than silently discard the new durable shape.
+
+Client protocol `16` preserves protocol-v15 commands, framing, authority,
+State schema-9 coordinates, and atomic fork semantics. It adds the already
+durable direct `lineage` object to bounded Thread summaries so clients can
+construct a recent-page branch forest without loading message histories.
+Root summaries omit the field. This is a wire-shape change, not a new State
+event or SQLite schema. Protocol-v15 clients must fail exact initialization
+rather than silently discard ancestry from navigation results.
+
+Client protocol `15` preserves protocol-v14 framing, paging, authority,
+Thread-name semantics, and every prior command. It adds `fork_thread`, the
+conditional `thread.fork` permission, `thread_forked` settlement, and direct
+immutable lineage on Thread projections. The caller-chosen child Thread ID is
+the durable retry identity. It advances the advertised State event/snapshot
+coordinates to schema 9. Protocol-v14 clients must fail exact initialization
+rather than ignore the new command or durable shape.
+
+Client protocol `14` preserves protocol-v13 framing, paging, authority,
+provisional-stream semantics, and schema-7 Tool-call batches. It adds
+`set_thread_name`, the `thread.name` permission, `thread_named` settlement,
+and optional names on Thread navigation projections. It advances the
+advertised State event/snapshot coordinates to schema 8. Protocol-v13 clients
+must fail exact initialization rather than silently ignore the new command or
+durable shape.
+
+Client protocol `13` preserves all protocol-v12 commands, framing, paging,
+authority, and provisional-stream semantics. It advances the advertised State
+event/snapshot coordinates and permits Thread/Event results to carry one
+schema-7 atomic ordered Tool-call batch from a single Model response.
+Protocol-v12 clients must fail exact initialization rather than silently
+flatten or partially decode the new durable event and Item metadata.
+ADR 0098 later adds host-owned bounded execution of explicitly `ParallelSafe`
+Tools without changing this wire or State shape: Model decisions and
+`ToolResult` Items remain source ordered, while scheduling declarations stay
+in Tool registration and project configuration.
+Within protocol 13, `thread.list` is an optional additive capability: new
+clients must inspect `Initialize`, and older servers remain compatible by not
+advertising or accepting the command.
 
 Client protocol `12` preserves all protocol-v11 framing, paging, Task,
 Approval, and Operation authority semantics. It adds exact-ID `steer_turn`,
@@ -139,6 +244,41 @@ Client protocol `3` added exact recovery-byte fields to the protocol-v2
 Thread-capacity result. Protocol versions remain exact rather than rolling
 field negotiation.
 
+State event schema `11` adds `invocation_context`, a content-free Item carrying
+the authenticated Turn actor plus 1–64 ordered source/reference pairs, exact
+source/model-visible SHA-256 values, and bounded byte/token charges. The body
+is ephemeral and never becomes conversation history. Schema-11 readers accept
+immutable schema-1 through schema-10 history, and the schema-11 writer emits
+only schema 11.
+
+State event schema `10` adds `thread_imported` with the exact source Thread
+identity, source stream version/last sequence, source-event SHA-256, and
+optional source fork lineage. A caller-named target stream is created
+atomically with fresh Event identities, preserved historical correlations,
+copied name transitions, and no recovery-only Checkpoints or replayed effects.
+Schema-10 readers accept immutable schema-1 through schema-9 history, and the
+schema-10 writer emits only schema 10.
+
+State event schema `9` adds `thread_forked` with direct parent identity, exact
+parent sequence/version boundary, and parent-prefix SHA-256. A fork stream is
+created atomically under a caller-chosen child identity; it preserves
+historical Turn/Item/correlation identities without replaying effects and does
+not copy names or Checkpoints. Schema-9 readers accept immutable schema-1
+through schema-8 history, and the schema-9 writer emits only schema 9.
+
+State event schema `8` adds the explicit `thread_named` event. The optional
+name is 1–256 trimmed non-control UTF-8 bytes or null to clear it. Schema-8
+readers accept immutable schema-1 through schema-7 history, and the schema-8
+writer emits only schema 8. SQLite stores a same-transaction nullable
+projection for recent listing and validates it against authoritative events
+when opening.
+
+State event schema `7` adds the atomic `tool_calls_appended` event and batch
+identity/index/size metadata on its ordered Tool-call Items. A singular
+`item_appended` event cannot carry batch metadata. Schema-7 readers accept
+immutable schema-1/2/3/4/5/6 history, and the schema-7 writer emits only
+schema 7.
+
 State event schema `6` adds actor-attributed `steering_queued` and exactly
 correlated `steering_applied` Items. Queue records are durable acceptance
 evidence but are not Model-visible; application records project as user input
@@ -167,7 +307,12 @@ State event schema `2` added content-free `conversation_summary` evidence. Its
 body remains ephemeral Context; original conversation Items remain immutable
 schema-1 or schema-2 events.
 
-State snapshot schema `6` admits Steering evidence. Older snapshots are
+State snapshot schema `10` admits immutable Thread import provenance. Older
+snapshots are disposable and are ignored. State snapshot schema `9` admits
+fork provenance, while schema `8` admits Thread names. State snapshot schema
+`7` admits atomic ordered Tool-call batches. Older
+snapshots are disposable and are ignored. State snapshot schema `6` admits
+Steering evidence. Older snapshots are
 disposable and are ignored. State snapshot schema `5` admits Provider
 Continuation evidence. Older
 snapshots are disposable and are ignored. State snapshot schema `4` admits
@@ -230,28 +375,30 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1, 2, 3, 4, and 5 are supported migration sources. Populated
-SQLite stores at any of those coordinates require the explicit backup-first
-command below before a schema-6 Runtime can open them:
+State schemas 1 through 10 are supported migration sources. Populated SQLite
+stores at any of those coordinates require the explicit backup-first command
+below before a schema-11 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v6.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v11.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
-disk space, creates and validates a no-clobber SQLite backup, then adds or
-advances event and disposable-snapshot writer metadata in one immediate
-transaction. Historical event JSON and schema labels are never rewritten. An
-interrupted schema-1, schema-2, schema-3, schema-4, or schema-5 run can reuse
-its validated backup.
+disk space, creates and validates a no-clobber SQLite backup, conditionally
+adds the nullable Thread-name projection for pre-v8 sources, drops disposable
+old snapshots, and advances
+event/snapshot writer metadata in one immediate transaction. Historical event
+JSON and schema labels are never rewritten. An interrupted schema-1 through
+schema-10 run can reuse its validated backup.
 
-The schema-6 reader/new writer decision is asymmetric:
+The schema-11 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1, schema-2, schema-3, schema-4, and schema-5 events remain readable;
-- old reader + new writer: unsupported and fails on schema-6 metadata or Items;
+  schema-1 through schema-10 events remain readable;
+- old reader + new writer: unsupported and fails on schema-11 metadata or
+  events;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-6 event
+- downgrade: supported only by restoring the backup before any schema-11 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -264,7 +411,28 @@ authorization provenance, plus
 [ADR 0077](adr/0077-origin-bound-provider-continuation.md) for schema-5
 Provider Continuation, plus
 [ADR 0078](adr/0078-durable-safe-boundary-turn-steering.md) for schema-6
-safe-boundary steering.
+safe-boundary steering, plus
+[ADR 0086](adr/0086-atomic-ordered-multi-tool-decisions.md) for schema-7
+atomic ordered Tool-call decisions and
+[ADR 0098](adr/0098-explicit-bounded-parallel-tool-execution.md) for its
+host-owned execution policy, plus
+[ADR 0099](adr/0099-observable-model-attempt-timeout-cooldown.md) for
+process-local observable Model timeout cooldown, plus
+[ADR 0100](adr/0100-typed-model-provider-failure-evidence.md) for the additive
+typed Provider failure evidence boundary, plus
+[ADR 0101](adr/0101-bounded-typed-model-retry-policy.md) for explicit bounded
+same-Model retries, plus
+[ADR 0102](adr/0102-governed-signed-external-skill-lifecycle.md) for governed
+signed External Skill storage and activation, plus
+[ADR 0092](adr/0092-engine-owned-thread-names.md) for schema-8 Thread names,
+plus [ADR 0093](adr/0093-atomic-thread-fork-and-lineage.md) for schema-9
+atomic fork lineage, and
+[ADR 0094](adr/0094-lineage-aware-bounded-thread-navigation.md) for the
+Protocol-16 lineage-aware summary projection, plus
+[ADR 0095](adr/0095-portable-integrity-bound-thread-archives.md) for schema-10
+portable Thread archives and import provenance, plus
+[ADR 0096](adr/0096-attributed-per-turn-context.md) for schema-11 attributed
+per-Turn context.
 
 Approval Inbox schema 1 is independently migrated with:
 
@@ -309,9 +477,8 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 6 reads
-immutable schema-1, schema-2, schema-3, schema-4, and schema-5 history after
-explicit store migration.
+durable schema support windows are declared per release. State schema 11 reads
+immutable schema-1 through schema-10 history after explicit store migration.
 Approval reads only schema 2 in normal operation; its migration tool alone
 reads schema 1.
 

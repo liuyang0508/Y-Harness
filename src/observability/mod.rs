@@ -17,8 +17,8 @@ use tokio::{
 };
 
 use crate::{
-    CapabilityOrigin, ExecutionPhase, HarnessError, ItemKind, ModelUsage, StateEvent, StoredEvent,
-    ThreadId, TurnId,
+    CapabilityOrigin, ExecutionPhase, HarnessError, ItemKind, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
+    ModelProviderFailureKind, ModelUsage, StateEvent, StoredEvent, ThreadId, TurnId,
     json::{BoundedJsonError, to_bounded_json_vec, validate_value_shape},
     kernel::{validate_capability_name, validate_capability_origin, validate_registry_growth},
 };
@@ -33,6 +33,8 @@ const MAX_TRACE_EXPORT_EVENT_BYTES: usize = 8_392_704;
 pub enum ObservationOutcome {
     /// Capability returned successfully.
     Success,
+    /// Runtime routing intentionally did not invoke the capability.
+    Skipped,
     /// Capability returned a non-control error.
     Error,
     /// Caller cancellation won the wait.
@@ -63,6 +65,18 @@ pub struct PhaseObservation {
     pub provider_model: Option<String>,
     /// Opaque bounded provider request ID when available.
     pub provider_request_id: Option<String>,
+    /// Typed provider failure class without diagnostic content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failure_kind: Option<ModelProviderFailureKind>,
+    /// Provider HTTP status attached to a typed failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_status_code: Option<u16>,
+    /// Provider-requested retry delay attached to a typed failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_after_ms: Option<u64>,
+    /// Zero-based retry index for an invoked Model candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_retry_index: Option<u8>,
     /// Provisional provider events rejected during this phase.
     pub stream_events_dropped: u64,
 }
@@ -232,7 +246,21 @@ fn observation_metadata_is_bounded(observation: &PhaseObservation) -> bool {
         !value.is_empty()
             && value.len() <= MAX_OBSERVATION_ID_BYTES
             && !value.chars().any(char::is_control)
-    })
+    }) && observation
+        .provider_status_code
+        .is_none_or(|status| (100..=599).contains(&status))
+        && observation
+            .provider_retry_after_ms
+            .is_none_or(|delay| (1..=MAX_MODEL_PROVIDER_RETRY_AFTER_MS).contains(&delay))
+        && (observation.provider_failure_kind.is_some()
+            || (observation.provider_status_code.is_none()
+                && observation.provider_retry_after_ms.is_none()))
+        && (observation.provider_failure_kind.is_none()
+            || (observation.phase == ExecutionPhase::Model
+                && observation.outcome == ObservationOutcome::Error))
+        && (observation.model_retry_index.is_none()
+            || (observation.phase == ExecutionPhase::Model
+                && observation.outcome != ObservationOutcome::Skipped))
 }
 
 /// Writes stored events as newline-delimited JSON without changing State.
@@ -279,15 +307,25 @@ pub async fn export_jsonl(
 }
 
 fn validate_export_event_json_shape(event: &StoredEvent) -> Result<(), HarnessError> {
-    let value = match &event.event {
+    let values = match &event.event {
         StateEvent::ItemAppended { item, .. } => match &item.kind {
-            ItemKind::ToolCall { input, .. } => Some(input),
-            ItemKind::ToolResult { output, .. } => Some(output),
-            _ => None,
+            ItemKind::ToolCall { input, .. } => vec![input],
+            ItemKind::ToolResult { output, .. } => vec![output],
+            _ => Vec::new(),
         },
-        _ => None,
+        StateEvent::ToolCallsAppended { calls, .. } => calls
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolCall { input, .. } => Some(input),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
-    if value.is_some_and(|value| validate_value_shape(value).is_err()) {
+    if values
+        .into_iter()
+        .any(|value| validate_value_shape(value).is_err())
+    {
         return Err(HarnessError::Trace(
             "trace event JSON exceeds the supported depth or node count".to_owned(),
         ));
@@ -303,8 +341,8 @@ mod tests {
         Observability, ObservationOutcome, Observer, PhaseObservation, TraceCollector, export_jsonl,
     };
     use crate::{
-        CapabilityOrigin, EventId, ExecutionPhase, Item, ItemKind, ModelUsage,
-        STATE_EVENT_SCHEMA_VERSION, StateEvent, StoredEvent, ThreadId, TurnId,
+        CapabilityOrigin, EventId, ExecutionPhase, Item, ItemKind, ModelProviderFailureKind,
+        ModelUsage, STATE_EVENT_SCHEMA_VERSION, StateEvent, StoredEvent, ThreadId, TurnId,
     };
 
     struct FailingObserver;
@@ -332,6 +370,10 @@ mod tests {
             }),
             provider_model: Some("provider/model-v2".to_owned()),
             provider_request_id: Some("request-test".to_owned()),
+            provider_failure_kind: None,
+            provider_status_code: None,
+            provider_retry_after_ms: None,
+            model_retry_index: Some(0),
             stream_events_dropped: 0,
         }
     }
@@ -381,6 +423,36 @@ mod tests {
 
         assert!(collector.snapshot().is_empty());
         assert_eq!(observability.dropped_observations(), 2);
+
+        oversized.provider_model = None;
+        oversized.provider_status_code = Some(429);
+        observability.emit(&oversized);
+
+        assert!(collector.snapshot().is_empty());
+        assert_eq!(observability.dropped_observations(), 3);
+
+        oversized.provider_failure_kind = Some(ModelProviderFailureKind::RateLimited);
+        observability.emit(&oversized);
+
+        assert!(collector.snapshot().is_empty());
+        assert_eq!(observability.dropped_observations(), 4);
+
+        oversized.provider_failure_kind = None;
+        oversized.provider_status_code = None;
+        oversized.phase = ExecutionPhase::Tool;
+        observability.emit(&oversized);
+
+        assert!(collector.snapshot().is_empty());
+        assert_eq!(observability.dropped_observations(), 5);
+
+        oversized.phase = ExecutionPhase::Model;
+        oversized.provider_failure_kind = Some(ModelProviderFailureKind::RateLimited);
+        oversized.provider_status_code = Some(429);
+        oversized.outcome = ObservationOutcome::Error;
+        observability.emit(&oversized);
+
+        assert_eq!(collector.snapshot().len(), 1);
+        assert_eq!(observability.dropped_observations(), 5);
     }
 
     #[tokio::test]

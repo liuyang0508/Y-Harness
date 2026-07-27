@@ -37,7 +37,8 @@ use nix::{
 
 use crate::{
     CancellationToken, ExecutionPhase, HarnessError, HarnessFuture, LanguageModel, ModelOutput,
-    ModelRequest, ModelResponse, ModelStream, ThreadId, Tool, ToolContext, ToolDescriptor, TurnId,
+    ModelRequest, ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext,
+    ToolDescriptor, TurnId,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
 };
 
@@ -567,6 +568,11 @@ pub struct JsonProcessConfig {
 }
 
 impl JsonProcessConfig {
+    /// Validates static process bounds without starting or authorizing a child.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_request(&self.request(Vec::new(), ExecutionPhase::Tool))
+    }
+
     fn request(&self, stdin: Vec<u8>, cancellation_phase: ExecutionPhase) -> ProcessRequest {
         ProcessRequest {
             program: self.program.clone(),
@@ -597,6 +603,7 @@ pub struct JsonToolRequest {
 /// External JSON command exposed through the normal Tool registry and Policy.
 pub struct JsonCommandTool {
     descriptor: ToolDescriptor,
+    batch_execution: ToolBatchExecution,
     config: JsonProcessConfig,
     broker: Arc<dyn ProcessBroker>,
     broker_descriptor: ProcessBrokerDescriptor,
@@ -609,12 +616,13 @@ impl JsonCommandTool {
         config: JsonProcessConfig,
         broker: Arc<dyn ProcessBroker>,
     ) -> Result<Self, HarnessError> {
-        validate_config(&config)?;
+        config.validate()?;
         let broker_descriptor =
             capture_capability_metadata("process broker descriptor", || broker.descriptor())?;
         validate_broker_descriptor(&broker_descriptor)?;
         Ok(Self {
             descriptor,
+            batch_execution: ToolBatchExecution::Sequential,
             config,
             broker,
             broker_descriptor,
@@ -626,11 +634,22 @@ impl JsonCommandTool {
     pub fn broker_descriptor(&self) -> ProcessBrokerDescriptor {
         self.broker_descriptor.clone()
     }
+
+    /// Installs an explicit same-response scheduling guarantee.
+    #[must_use]
+    pub fn with_batch_execution(mut self, execution: ToolBatchExecution) -> Self {
+        self.batch_execution = execution;
+        self
+    }
 }
 
 impl Tool for JsonCommandTool {
     fn descriptor(&self) -> ToolDescriptor {
         self.descriptor.clone()
+    }
+
+    fn batch_execution(&self) -> ToolBatchExecution {
+        self.batch_execution
     }
 
     fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value> {
@@ -698,7 +717,7 @@ impl JsonCommandModel {
     ) -> Result<Self, HarnessError> {
         let id = id.into();
         validate_model_id(&id)?;
-        validate_config(&config)?;
+        config.validate()?;
         let broker_descriptor =
             capture_capability_metadata("process broker descriptor", || broker.descriptor())?;
         validate_broker_descriptor(&broker_descriptor)?;
@@ -777,10 +796,6 @@ fn validate_broker_descriptor(descriptor: &ProcessBrokerDescriptor) -> Result<()
         validate_capability_name("process sandbox mechanism", mechanism)?;
     }
     Ok(())
-}
-
-fn validate_config(config: &JsonProcessConfig) -> Result<(), HarnessError> {
-    validate_request(&config.request(Vec::new(), ExecutionPhase::Tool))
 }
 
 fn validate_request(request: &ProcessRequest) -> Result<(), HarnessError> {
@@ -1066,8 +1081,8 @@ mod tests {
     use super::{MacOsSeatbeltBroker, NetworkAccess};
     use crate::{
         CancellationToken, CapabilityOrigin, ExecutionPhase, HarnessError, HarnessFuture, Item,
-        ItemKind, LanguageModel, ModelRequest, ModelStream, ThreadId, Tool, ToolContext,
-        ToolDescriptor, TurnId,
+        ItemKind, LanguageModel, ModelRequest, ModelStream, ThreadId, Tool, ToolBatchExecution,
+        ToolContext, ToolDescriptor, TurnId,
     };
 
     struct RecordingBroker {
@@ -1228,6 +1243,9 @@ mod tests {
             tool_broker.clone(),
         )
         .expect("tool adapter");
+        assert_eq!(tool.batch_execution(), ToolBatchExecution::Sequential);
+        let tool = tool.with_batch_execution(ToolBatchExecution::ParallelSafe);
+        assert_eq!(tool.batch_execution(), ToolBatchExecution::ParallelSafe);
         assert_eq!(
             tool.execute(
                 json!({"value": 1}),
@@ -1299,6 +1317,7 @@ mod tests {
                     call_id: "call-test".to_owned(),
                     name: "fixture".to_owned(),
                     input: nested,
+                    batch: None,
                 })],
                 context: Vec::new(),
                 tools: Vec::new(),

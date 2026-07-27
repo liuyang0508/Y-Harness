@@ -17,6 +17,12 @@ use crate::{CancellationToken, ContextBlock};
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_MODEL_CONTINUATION_ITEMS: usize = 64;
 const MAX_MODEL_CONTINUATION_BYTES: usize = 1_048_576;
+/// Maximum diagnostic text retained in one typed model-provider failure.
+pub const MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES: usize = 4_096;
+/// Maximum provider-requested retry delay retained as evidence.
+pub const MAX_MODEL_PROVIDER_RETRY_AFTER_MS: u64 = 86_400_000;
+/// Maximum Tool calls accepted from one Model response.
+pub const MAX_TOOL_CALLS_PER_BATCH: usize = 64;
 
 /// Boxed asynchronous result used by object-safe capability contracts.
 pub type HarnessFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HarnessError>> + Send + 'a>>;
@@ -75,6 +81,7 @@ id_type!(TaskMessageId, "message");
 id_type!(ArtifactId, "artifact");
 id_type!(OperationId, "operation");
 id_type!(SteeringId, "steering");
+id_type!(ToolCallBatchId, "tool-batch");
 
 fn next_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
@@ -93,6 +100,15 @@ fn next_id(prefix: &str) -> String {
 pub struct Thread {
     /// Stable thread identity.
     pub id: ThreadId,
+    /// Optional operator-authored display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Direct immutable ancestry when this Thread was forked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<ThreadLineage>,
+    /// Immutable provenance when materialized from a portable archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_origin: Option<ThreadImportOrigin>,
     /// Creation time in Unix milliseconds.
     pub created_at_ms: u64,
     /// Ordered Turn projections.
@@ -107,6 +123,9 @@ impl Thread {
     pub fn new() -> Self {
         Self {
             id: ThreadId::generate(),
+            name: None,
+            lineage: None,
+            import_origin: None,
             created_at_ms: now_ms(),
             turns: Vec::new(),
             checkpoints: Vec::new(),
@@ -188,6 +207,23 @@ impl Item {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Content-free provenance for one caller-supplied Turn context block.
+pub struct InvocationContextEvidence {
+    /// Stable caller-assigned source class.
+    pub source: String,
+    /// Opaque source-specific locator.
+    pub reference: String,
+    /// SHA-256 of the exact caller-supplied text.
+    pub source_sha256: String,
+    /// SHA-256 of the exact model-visible, provenance-prefixed block.
+    pub content_sha256: String,
+    /// Provider-specific token charge for the final block.
+    pub estimated_tokens: usize,
+    /// Exact UTF-8 bytes in the final model-visible block.
+    pub serialized_bytes: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Runtime item payloads recorded in ordered state.
@@ -249,6 +285,9 @@ pub enum ItemKind {
         name: String,
         /// Validated JSON input.
         input: Value,
+        /// Same-response batch position for schema-7 multi-Tool decisions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<ToolCallBatch>,
     },
     /// Policy settlement associated with a tool call.
     PolicyDecision {
@@ -339,6 +378,13 @@ pub enum ItemKind {
         estimated_tokens: usize,
         /// Exact UTF-8 bytes in the final summary block.
         serialized_bytes: usize,
+    },
+    /// Content-free evidence for caller-supplied non-authoritative context.
+    InvocationContext {
+        /// Authenticated actor that supplied the context with this Turn.
+        submitted_by: ActorIdentity,
+        /// Ordered provenance matching the model-visible context blocks.
+        blocks: Vec<InvocationContextEvidence>,
     },
     /// Runtime-level failure evidence.
     RuntimeError {
@@ -547,6 +593,40 @@ pub struct ToolDescriptor {
     pub description: String,
     /// JSON Schema describing accepted input.
     pub input_schema: Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Same-response batch scheduling guarantee declared by a Tool implementation.
+pub enum ToolBatchExecution {
+    /// Never overlap this call with another call from the same Model decision.
+    #[default]
+    Sequential,
+    /// The Tool guarantees semantic safety when overlapping any other
+    /// `ParallelSafe` call in the same batch, including another call to itself.
+    ParallelSafe,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Durable source position of one Tool call in a same-response batch.
+pub struct ToolCallBatch {
+    /// Runtime-generated identity shared by every call in the batch.
+    pub id: ToolCallBatchId,
+    /// Zero-based source position.
+    pub index: usize,
+    /// Total calls emitted by the Model decision.
+    pub size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// One provider-proposed Tool invocation within a Model decision.
+pub struct ModelToolCall {
+    /// Provider-generated correlation ID.
+    pub call_id: String,
+    /// Requested registered Tool name.
+    pub name: String,
+    /// Proposed JSON input.
+    pub input: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -770,6 +850,11 @@ pub enum ModelOutput {
         /// Proposed JSON input.
         input: Value,
     },
+    /// Request several registered Tools from one Model response.
+    ToolCalls {
+        /// Calls in provider source order.
+        calls: Vec<ModelToolCall>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -789,6 +874,35 @@ pub struct Checkpoint {
     pub label: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Immutable evidence identifying the exact parent journal prefix of a fork.
+pub struct ThreadLineage {
+    /// Direct parent Thread.
+    pub parent_thread_id: ThreadId,
+    /// Last global parent-journal sequence included in the child history.
+    pub parent_through_sequence: u64,
+    /// Number of parent-stream events included by the fork boundary.
+    pub parent_stream_version: u64,
+    /// SHA-256 of the exact ordered parent events through the boundary.
+    pub parent_events_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Immutable evidence identifying one imported source Thread archive.
+pub struct ThreadImportOrigin {
+    /// Thread identity recorded by the source archive.
+    pub source_thread_id: ThreadId,
+    /// Number of source-stream events bound by the archive.
+    pub source_stream_version: u64,
+    /// Last global sequence observed in the source store.
+    pub source_last_sequence: u64,
+    /// SHA-256 of the exact ordered source Stored Events.
+    pub source_events_sha256: String,
+    /// Source fork ancestry retained as evidence, not local lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lineage: Option<ThreadLineage>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Append-only events accepted by the State Engine projector.
@@ -797,6 +911,21 @@ pub enum StateEvent {
     ThreadCreated {
         /// Thread creation time in Unix milliseconds.
         created_at_ms: u64,
+    },
+    /// Changes or clears the operator-authored Thread name.
+    ThreadNamed {
+        /// Canonical display name, or `None` to clear it.
+        name: Option<String>,
+    },
+    /// Records the immutable source prefix used to create this Thread.
+    ThreadForked {
+        /// Direct parent and exact source-journal boundary.
+        lineage: ThreadLineage,
+    },
+    /// Records the source archive used to materialize this Thread.
+    ThreadImported {
+        /// Exact source identity, boundary, digest, and optional ancestry.
+        origin: ThreadImportOrigin,
     },
     /// Starts a new turn.
     TurnStarted {
@@ -809,6 +938,13 @@ pub enum StateEvent {
         turn_id: TurnId,
         /// Appended item.
         item: Item,
+    },
+    /// Atomically appends every Tool call from one Model response.
+    ToolCallsAppended {
+        /// Target turn.
+        turn_id: TurnId,
+        /// Ordered Tool-call items sharing one batch identity.
+        calls: Vec<Item>,
     },
     /// Settles a running turn.
     TurnFinished {
@@ -835,6 +971,22 @@ pub struct PendingEvent {
     pub expected_stream_version: u64,
     /// Required current bounded recovery charge for optimistic concurrency control.
     pub expected_stream_recovery_bytes: u64,
+    /// Recording time in Unix milliseconds.
+    pub recorded_at_ms: u64,
+    /// Typed state transition.
+    pub event: StateEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+/// One event in a new stream that must be created atomically as a whole.
+pub struct NewStreamEvent {
+    /// Globally idempotent event identity.
+    pub event_id: EventId,
+    /// Schema coordinate carried by this event.
+    ///
+    /// New control events use the current writer schema. Copied immutable
+    /// history retains its original supported schema coordinate.
+    pub schema_version: u32,
     /// Recording time in Unix milliseconds.
     pub recorded_at_ms: u64,
     /// Typed state transition.
@@ -868,6 +1020,138 @@ pub struct TurnOutcome {
     pub final_text: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Provider-reported failure fact, independent from Runtime recovery policy.
+pub enum ModelProviderFailureKind {
+    /// Credentials were absent, invalid, or expired.
+    Authentication,
+    /// Valid credentials lacked permission for the request.
+    Authorization,
+    /// A request-rate limit was reached.
+    RateLimited,
+    /// The account or project exhausted an allocated usage quota.
+    QuotaExhausted,
+    /// The provider rejected the request as unsupported or invalid.
+    RequestRejected,
+    /// The requested provider model is unavailable.
+    ModelUnavailable,
+    /// Provider safety or content policy rejected the request.
+    ContentPolicy,
+    /// Provider capacity is temporarily overloaded.
+    Overloaded,
+    /// The provider returned an internal server failure.
+    Server,
+    /// Network transport failed before a valid response was received.
+    Transport,
+    /// A response violated the selected provider protocol.
+    Protocol,
+}
+
+impl Display for ModelProviderFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Authentication => "authentication",
+            Self::Authorization => "authorization",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::RequestRejected => "request_rejected",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::ContentPolicy => "content_policy",
+            Self::Overloaded => "overloaded",
+            Self::Server => "server",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Bounded typed evidence returned by a model-provider adapter.
+///
+/// The adapter must remove response bodies, secrets, and untrusted control
+/// characters before construction. Runtime enforces structural bounds but
+/// cannot recognize secret material.
+pub struct ModelProviderFailure {
+    kind: ModelProviderFailureKind,
+    message: String,
+    http_status: Option<u16>,
+    retry_after_ms: Option<u64>,
+}
+
+impl ModelProviderFailure {
+    /// Creates and validates one provider failure from an adapter-sanitized diagnostic.
+    pub fn new(
+        kind: ModelProviderFailureKind,
+        message: impl Into<String>,
+        http_status: Option<u16>,
+        retry_after_ms: Option<u64>,
+    ) -> Result<Self, HarnessError> {
+        let failure = Self {
+            kind,
+            message: message.into(),
+            http_status,
+            retry_after_ms,
+        };
+        failure.validate()?;
+        Ok(failure)
+    }
+
+    /// Returns the stable failure class.
+    #[must_use]
+    pub const fn kind(&self) -> ModelProviderFailureKind {
+        self.kind
+    }
+
+    /// Returns the bounded human-readable diagnostic.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the provider HTTP status when one was received.
+    #[must_use]
+    pub const fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// Returns the provider-requested retry delay when explicitly reported.
+    #[must_use]
+    pub const fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
+    }
+
+    /// Revalidates evidence at an executable capability boundary.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        if self.message.trim().is_empty()
+            || self.message.len() > MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES
+            || self.message.chars().any(char::is_control)
+        {
+            return Err(HarnessError::InvalidCapability(format!(
+                "model Provider failure message must be 1-{MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES} non-control bytes"
+            )));
+        }
+        if self
+            .http_status
+            .is_some_and(|status| !(100..=599).contains(&status))
+        {
+            return Err(HarnessError::InvalidCapability(
+                "model Provider HTTP status must be 100-599".to_owned(),
+            ));
+        }
+        if self
+            .retry_after_ms
+            .is_some_and(|delay| delay == 0 || delay > MAX_MODEL_PROVIDER_RETRY_AFTER_MS)
+        {
+            return Err(HarnessError::InvalidCapability(format!(
+                "model Provider retry-after must be 1-{MAX_MODEL_PROVIDER_RETRY_AFTER_MS} milliseconds"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Typed subsystem errors surfaced by the public runtime.
 pub enum HarnessError {
@@ -895,8 +1179,10 @@ pub enum HarnessError {
         /// Approval rationale.
         reason: String,
     },
-    /// Model-provider failure.
+    /// Legacy model contract or unclassified provider failure.
     Model(String),
+    /// Typed bounded model-provider failure evidence.
+    ModelProvider(ModelProviderFailure),
     /// Policy-provider evaluation failure.
     Policy(String),
     /// Approval-provider settlement failure.
@@ -998,6 +1284,20 @@ impl Display for HarnessError {
                 write!(formatter, "approval denied tool {tool}: {reason}")
             }
             Self::Model(message) => write!(formatter, "model error: {message}"),
+            Self::ModelProvider(failure) => {
+                write!(
+                    formatter,
+                    "model Provider error ({}): {}",
+                    failure.kind, failure.message
+                )?;
+                if let Some(status) = failure.http_status {
+                    write!(formatter, " [HTTP {status}]")?;
+                }
+                if let Some(delay) = failure.retry_after_ms {
+                    write!(formatter, " [retry after {delay} ms]")?;
+                }
+                Ok(())
+            }
             Self::Policy(message) => write!(formatter, "policy error: {message}"),
             Self::Approval(message) => write!(formatter, "approval error: {message}"),
             Self::ApprovalConflict {
@@ -1073,8 +1373,56 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS, ModelContinuation, ModelUsage,
+        HarnessError, MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS,
+        MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
+        ModelContinuation, ModelProviderFailure, ModelProviderFailureKind, ModelUsage,
     };
+
+    #[test]
+    fn model_provider_failure_is_typed_bounded_evidence() {
+        let failure = ModelProviderFailure::new(
+            ModelProviderFailureKind::RateLimited,
+            "provider rate limit reached",
+            Some(429),
+            Some(2_000),
+        )
+        .expect("typed failure");
+        assert_eq!(failure.kind(), ModelProviderFailureKind::RateLimited);
+        assert_eq!(failure.http_status(), Some(429));
+        assert_eq!(failure.retry_after_ms(), Some(2_000));
+        assert_eq!(
+            HarnessError::ModelProvider(failure).to_string(),
+            "model Provider error (rate_limited): provider rate limit reached [HTTP 429] [retry after 2000 ms]"
+        );
+
+        assert!(
+            ModelProviderFailure::new(
+                ModelProviderFailureKind::Protocol,
+                "x".repeat(MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES + 1),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ModelProviderFailure::new(
+                ModelProviderFailureKind::Server,
+                "server failure",
+                Some(99),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ModelProviderFailure::new(
+                ModelProviderFailureKind::Overloaded,
+                "provider overloaded",
+                Some(503),
+                Some(MAX_MODEL_PROVIDER_RETRY_AFTER_MS + 1),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn model_continuation_enforces_format_count_and_size_bounds() {

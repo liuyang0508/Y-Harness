@@ -6,7 +6,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::{
     ApprovalActor, CancellationToken, ExecutionPhase, HarnessError, MemoryScope, ModelEventSink,
-    isolation::isolate_future,
+    TurnContextInput, isolation::isolate_future,
 };
 
 /// Caller-controlled isolation, cancellation, and deadline for one Turn.
@@ -19,6 +19,8 @@ pub struct TurnExecutionOptions {
     pub approval_requester: ApprovalActor,
     /// Scope applied to long-term memory operations.
     pub memory_scope: MemoryScope,
+    /// Bounded non-authoritative reference context supplied for this Turn.
+    pub context: Vec<TurnContextInput>,
     /// Optional total deadline for external Context, Model, Policy, and Tool work.
     ///
     /// State settlement may continue after this duration so the journal always
@@ -35,6 +37,7 @@ impl Default for TurnExecutionOptions {
         Self {
             approval_requester: ApprovalActor::LocalProcess,
             memory_scope: MemoryScope::default(),
+            context: Vec::new(),
             timeout: None,
             cancellation: CancellationToken::new(),
             model_event_sink: None,

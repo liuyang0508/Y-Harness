@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v12 projections.
+//! Product TUI state derived exclusively from Protocol v18 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use y_harness::{
     ApprovalRecord, ItemKind, MemoryScope, ModelStreamEvent, OperationId, OperationStatus,
     ProtocolCommand, ProtocolResult, StateCapacity, StateEvent, StoredEvent, TaskGraphSummary,
-    TaskRecord, Thread, TurnStatus,
+    TaskRecord, Thread, ThreadId, ThreadSummary, TurnStatus,
 };
 
 use crate::{
@@ -36,16 +36,19 @@ pub(crate) enum Focus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SidebarTab {
     Activity,
+    Sessions,
     Approvals,
     Tasks,
 }
 
 impl SidebarTab {
-    pub(crate) const ALL: [Self; 3] = [Self::Activity, Self::Approvals, Self::Tasks];
+    pub(crate) const ALL: [Self; 4] =
+        [Self::Activity, Self::Sessions, Self::Approvals, Self::Tasks];
 
     fn next(self) -> Self {
         match self {
-            Self::Activity => Self::Approvals,
+            Self::Activity => Self::Sessions,
+            Self::Sessions => Self::Approvals,
             Self::Approvals => Self::Tasks,
             Self::Tasks => Self::Activity,
         }
@@ -54,7 +57,8 @@ impl SidebarTab {
     fn previous(self) -> Self {
         match self {
             Self::Activity => Self::Tasks,
-            Self::Approvals => Self::Activity,
+            Self::Sessions => Self::Activity,
+            Self::Approvals => Self::Sessions,
             Self::Tasks => Self::Approvals,
         }
     }
@@ -86,6 +90,9 @@ pub(crate) struct App {
     pub(crate) thread: Thread,
     pub(crate) capacity: Option<StateCapacity>,
     pub(crate) activity: VecDeque<ActivityEntry>,
+    pub(crate) sessions: Vec<ThreadSummary>,
+    pub(crate) sessions_have_more: bool,
+    pub(crate) selected_session: usize,
     pub(crate) approvals: Vec<ApprovalRecord>,
     pub(crate) selected_approval: usize,
     pub(crate) graph_id: Option<String>,
@@ -135,6 +142,7 @@ impl App {
             "thread.create",
             "thread.events",
             "thread.get",
+            "thread.name",
             "turn.start",
             "turn.steer",
         ] {
@@ -157,6 +165,9 @@ impl App {
             thread,
             capacity: None,
             activity: VecDeque::new(),
+            sessions: Vec::new(),
+            sessions_have_more: false,
+            selected_session: 0,
             approvals: Vec::new(),
             selected_approval: 0,
             graph_id: None,
@@ -312,10 +323,7 @@ impl App {
 
         match self.focus {
             Focus::Composer => self.handle_composer_key(client, key).await,
-            Focus::Sidebar => {
-                self.handle_sidebar_key(client, key).await;
-                Ok(())
-            }
+            Focus::Sidebar => self.handle_sidebar_key(client, key).await,
         }
     }
 
@@ -356,11 +364,18 @@ impl App {
         Ok(())
     }
 
-    async fn handle_sidebar_key(&mut self, client: &mut ProtocolClient, key: KeyEvent) {
+    async fn handle_sidebar_key(
+        &mut self,
+        client: &mut ProtocolClient,
+        key: KeyEvent,
+    ) -> ClientResult<()> {
         match key.code {
             KeyCode::Left => self.sidebar_tab = self.sidebar_tab.previous(),
             KeyCode::Right => self.sidebar_tab = self.sidebar_tab.next(),
             KeyCode::Up => match self.sidebar_tab {
+                SidebarTab::Sessions => {
+                    self.selected_session = self.selected_session.saturating_sub(1);
+                }
                 SidebarTab::Approvals => {
                     self.selected_approval = self.selected_approval.saturating_sub(1);
                 }
@@ -370,6 +385,12 @@ impl App {
                 SidebarTab::Activity => {}
             },
             KeyCode::Down => match self.sidebar_tab {
+                SidebarTab::Sessions => {
+                    self.selected_session = self
+                        .selected_session
+                        .saturating_add(1)
+                        .min(self.sessions.len().saturating_sub(1));
+                }
                 SidebarTab::Approvals => {
                     self.selected_approval = self
                         .selected_approval
@@ -384,12 +405,21 @@ impl App {
                 }
                 SidebarTab::Activity => {}
             },
+            KeyCode::Enter if self.sidebar_tab == SidebarTab::Sessions => {
+                let thread_id = self
+                    .sessions
+                    .get(self.selected_session)
+                    .map(|summary| summary.thread_id.to_string())
+                    .ok_or_else(|| io::Error::other("No Thread selected"))?;
+                self.switch_thread(client, thread_id).await?;
+            }
             KeyCode::Char('r') => {
                 self.refresh_all(client).await;
                 self.set_notice("Protocol projections refreshed");
             }
             _ => {}
         }
+        Ok(())
     }
 
     async fn submit(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
@@ -438,6 +468,7 @@ impl App {
                 thread_id: self.thread.id.to_string(),
                 prompt: submitted,
                 memory_scope: MemoryScope::default(),
+                context: Vec::new(),
                 timeout_ms: Some(120_000),
             })
             .await?;
@@ -469,6 +500,36 @@ impl App {
         let mut parts = command.split_whitespace();
         match parts.next().unwrap_or_default() {
             "/new" => self.create_and_switch_thread(client).await,
+            "/fork" => {
+                let through_turn_id = parts.next().map(str::to_owned);
+                if parts.next().is_some() {
+                    return Err(io::Error::other("usage: /fork [terminal-turn-id]").into());
+                }
+                self.fork_and_switch_thread(client, through_turn_id).await
+            }
+            "/name" => {
+                let name = command.strip_prefix("/name").unwrap_or_default().trim();
+                let name = (!name.is_empty()).then(|| name.to_owned());
+                match client
+                    .call(ProtocolCommand::SetThreadName {
+                        thread_id: self.thread.id.to_string(),
+                        name: name.clone(),
+                    })
+                    .await?
+                {
+                    ProtocolResult::ThreadNamed { name } => {
+                        self.thread.name = name;
+                        self.refresh_sessions(client).await?;
+                        self.set_notice(if self.thread.name.is_some() {
+                            "Thread name changed"
+                        } else {
+                            "Thread name cleared"
+                        });
+                        Ok(())
+                    }
+                    result => Err(unexpected("name Thread", result)),
+                }
+            }
             "/thread" => {
                 let thread_id = parts
                     .next()
@@ -496,6 +557,12 @@ impl App {
                 self.sidebar_tab = SidebarTab::Activity;
                 self.focus = Focus::Sidebar;
                 self.refresh_events(client).await?;
+                Ok(())
+            }
+            "/sessions" => {
+                self.sidebar_tab = SidebarTab::Sessions;
+                self.focus = Focus::Sidebar;
+                self.refresh_sessions(client).await?;
                 Ok(())
             }
             "/approvals" => {
@@ -544,6 +611,40 @@ impl App {
         self.install_thread(thread);
         self.refresh_all(client).await;
         self.set_notice("Created a new authoritative Thread");
+        Ok(())
+    }
+
+    async fn fork_and_switch_thread(
+        &mut self,
+        client: &mut ProtocolClient,
+        through_turn_id: Option<String>,
+    ) -> ClientResult<()> {
+        if self.active.is_some() {
+            return Err(io::Error::other("cancel the running Turn before forking").into());
+        }
+        if !self.capabilities.contains("thread.fork") {
+            return Err(io::Error::other("Engine does not advertise atomic Thread fork").into());
+        }
+        let child_thread_id = ThreadId::generate();
+        let parent_thread_id = self.thread.id.clone();
+        let thread = match client
+            .call(ProtocolCommand::ForkThread {
+                parent_thread_id: parent_thread_id.to_string(),
+                child_thread_id: child_thread_id.to_string(),
+                through_turn_id,
+            })
+            .await?
+        {
+            ProtocolResult::ThreadForked { thread } => thread,
+            result => return Err(unexpected("fork Thread", result)),
+        };
+        self.install_thread(thread);
+        self.refresh_all(client).await;
+        self.set_notice(format!(
+            "Forked {} into independent Thread {}",
+            short_id(parent_thread_id.as_str()),
+            short_id(child_thread_id.as_str())
+        ));
         Ok(())
     }
 
@@ -707,6 +808,9 @@ impl App {
         if let Err(error) = self.refresh_events(client).await {
             errors.push(error.to_string());
         }
+        if let Err(error) = self.refresh_sessions(client).await {
+            errors.push(error.to_string());
+        }
         if let Err(error) = self.refresh_capacity(client).await {
             errors.push(error.to_string());
         }
@@ -790,6 +894,39 @@ impl App {
                 Ok(())
             }
             result => Err(unexpected("refresh Thread capacity", result)),
+        }
+    }
+
+    async fn refresh_sessions(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("thread.list") {
+            self.sessions.clear();
+            self.sessions_have_more = false;
+            self.selected_session = 0;
+            return Ok(());
+        }
+        match client
+            .call(ProtocolCommand::ListThreads {
+                before_sequence: None,
+                limit: Some(64),
+            })
+            .await?
+        {
+            ProtocolResult::Threads {
+                threads, has_more, ..
+            } => {
+                self.sessions = threads;
+                self.sessions_have_more = has_more;
+                self.selected_session = self
+                    .sessions
+                    .iter()
+                    .position(|summary| summary.thread_id == self.thread.id)
+                    .unwrap_or_else(|| {
+                        self.selected_session
+                            .min(self.sessions.len().saturating_sub(1))
+                    });
+                Ok(())
+            }
+            result => Err(unexpected("refresh Threads", result)),
         }
     }
 
@@ -941,9 +1078,25 @@ impl App {
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v12.".to_owned(),
+                content: "Keep clients behind Protocol v18.".to_owned(),
             }));
+        thread.name = Some("Harness design".to_owned());
+        let lineage = y_harness::ThreadLineage {
+            parent_thread_id: ThreadId::from_static("fixture-parent"),
+            parent_through_sequence: 1,
+            parent_stream_version: 1,
+            parent_events_sha256: "0".repeat(64),
+        };
+        thread.lineage = Some(lineage.clone());
         thread.turns.push(turn);
+        let session = ThreadSummary {
+            thread_id: thread.id.clone(),
+            name: Some("Harness design".to_owned()),
+            lineage: Some(lineage),
+            last_sequence: 8,
+            updated_at_ms: thread.created_at_ms,
+            stream_version: 7,
+        };
         let now = Instant::now();
         Ok(Self {
             server: "Y-Harness Engineering".to_owned(),
@@ -951,6 +1104,8 @@ impl App {
             capabilities: BTreeSet::from([
                 "approval.pending".to_owned(),
                 "task.graph.get".to_owned(),
+                "thread.fork".to_owned(),
+                "thread.list".to_owned(),
             ]),
             thread,
             capacity: None,
@@ -958,6 +1113,9 @@ impl App {
                 sequence: 1,
                 text: "Thread created".to_owned(),
             }]),
+            sessions: vec![session],
+            sessions_have_more: false,
+            selected_session: 0,
             approvals: Vec::new(),
             selected_approval: 0,
             graph_id: None,
@@ -1010,6 +1168,21 @@ async fn load_thread(client: &mut ProtocolClient, thread_id: String) -> ClientRe
 fn describe_event(event: &StoredEvent) -> String {
     match &event.event {
         StateEvent::ThreadCreated { .. } => "Thread created".to_owned(),
+        StateEvent::ThreadNamed { name } => {
+            if name.is_some() {
+                "Thread named".to_owned()
+            } else {
+                "Thread name cleared".to_owned()
+            }
+        }
+        StateEvent::ThreadForked { lineage } => format!(
+            "Forked from {}",
+            short_id(lineage.parent_thread_id.as_str())
+        ),
+        StateEvent::ThreadImported { origin } => format!(
+            "Imported from {}",
+            short_id(origin.source_thread_id.as_str())
+        ),
         StateEvent::TurnStarted { turn_id } => {
             format!("Turn {} started", short_id(turn_id.as_str()))
         }
@@ -1026,6 +1199,9 @@ fn describe_event(event: &StoredEvent) -> String {
                 .as_deref()
                 .map_or_else(String::new, |label| format!(" · {label}"))
         ),
+        StateEvent::ToolCallsAppended { calls, .. } => {
+            format!("Tool calls · {} ordered", calls.len())
+        }
         StateEvent::ItemAppended { item, .. } => match &item.kind {
             ItemKind::UserMessage { .. } => "User message".to_owned(),
             ItemKind::SteeringQueued { .. } => "Steering queued".to_owned(),
@@ -1056,6 +1232,9 @@ fn describe_event(event: &StoredEvent) -> String {
             ItemKind::ConversationContext { .. } => "Conversation context compiled".to_owned(),
             ItemKind::ConversationSummary { compactor, .. } => {
                 format!("Conversation summary · {compactor}")
+            }
+            ItemKind::InvocationContext { blocks, .. } => {
+                format!("Turn context · {} blocks", blocks.len())
             }
             ItemKind::RuntimeError { .. } => "Runtime error".to_owned(),
             ItemKind::TurnStopped { phase, .. } => format!("Turn stopped · {phase:?}"),

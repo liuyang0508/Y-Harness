@@ -23,12 +23,20 @@ yh doctor "$project/y-harness.json"
 - [ ] `y-harness.json`、`.gitignore` 和 `.y-harness/` 已创建。
 - [ ] 对同一路径再次执行 `yh init` 失败，原配置字节不变。
 - [ ] `doctor` 输出 Protocol、schema、模型、数据目录和 `status: ok`。
+- [ ] 重启服务后，TUI Sessions 面板仍能列出并恢复此前 Thread，分叉项显示权威直接父级。
+- [ ] TUI `/name <标题>` 设置的名称在重启后仍显示，`/name` 可清除。
+- [ ] TUI `/fork [已终结-turn-id]` 创建独立子 Thread；父子后续 Turn
+      互不影响，重启后 `lineage` 仍可读取。
+- [ ] `yh thread export <thread-id> <archive> <config>` 导出终态 Thread，
+      重复导出不覆盖文件；`yh thread import <archive> <target-id> <config>`
+      原子导入且相同来源/目标可安全重试。
+- [ ] 修改归档事件或摘要后导入失败，目标 Thread 不存在。
 
 ## C. 持久化服务
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"12","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"18","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
@@ -65,7 +73,57 @@ cargo run --locked --example orchestrated
 - [ ] 嵌入式 Agent Loop 保留 Model、Tool 与 Policy 来源证据。
 - [ ] Orchestrator 完成依赖 DAG、Workspace cleanup 和精确租约结算。
 
-## F. 回归、安全与兼容性
+## F. Model 扩展边界
+
+- [ ] `model.type = "json_command"` 可用于兼容单 Model 配置，也可作为
+      `models + model_route` 中的一个精确身份，无需修改 Rust。
+- [ ] 命令必须是现存绝对路径，并显式选择 Process Broker；工作目录
+      规范化、环境清空后逐项映射，输入/输出/时间/并发均有上限。
+- [ ] 真实服务 Turn 能从 stdin 发送 `ModelRequest`，从 stdout 接收一个
+      `message`、`tool_call` 或 `tool_calls`，并在 State 中保持 External
+      Model 来源。
+- [ ] Turn 取消传播给 Model 进程；超时、future drop 和 Unix 子进程组
+      按现有有界 settlement 规则清理。
+- [ ] command Model 不会伪造 usage、cost、Provider request/model、
+      continuation、typed HTTP failure 或 provisional stream。
+
+## G. MCP 扩展边界
+
+- [ ] `mcp_servers` 的 stdio 条目必须显式启用和选择 Tool；停用条目不
+      启动进程、不发现目录，也不授予 Policy 或 Memory 权限。
+- [ ] `https_mcp_servers` 可仅通过配置加入远程 Tool；Endpoint 必须是
+      无 userinfo/query/fragment 的 HTTPS，Bearer 只从命名环境变量解析。
+- [ ] 远程 Tool 仍按 `namespace + allow` 精确注册，并经过普通
+      Policy/Approval/State；缺失任一 Tool 时整批失败。
+- [ ] 私有 CA 的真实 TLS `tools/list`、`tools/call` 和 `doctor` 装配测试
+      通过；响应、Session ID、请求和超时均有上限。
+- [ ] 当前 JSON-response 适配器明确拒绝 SSE，且不会重放失败 Tool；
+      OAuth、跳转、环境代理和任意 Header 不会被误报为支持。
+
+## H. Skill 供应链与项目生命周期
+
+```bash
+yh skill install \
+  examples/skills/concise-assistant.skill.json \
+  "$project/y-harness.json"
+yh skill list "$project/y-harness.json"
+yh skill verify "$project/y-harness.json"
+```
+
+- [ ] 本地包按内容摘要写入项目 `skills/`，但不会自动激活或修改配置。
+- [ ] 离线第三方签名包只能通过 `install-external` 进入
+      `.signed-skill.json` 存储，并保持 `External` 来源。
+- [ ] `install-https` 要求精确公共 HTTPS URL、`name@version`、内容
+      SHA-256 和预先验证通过的发布者信任配置。
+- [ ] 发布者签名、有效期、撤销以及必需/已提供的透明度收据在首次写盘前
+      通过验证；`doctor` 输出发布者和日志锁。
+- [ ] 安装不等于激活；只有显式列入 `external_package_files` 和
+      `activate` 的精确包进入 Context。
+- [ ] 发布者或日志被实时撤销后，后续 `list`、`verify` 和 Context 编译
+      失败；取消配置引用后，包仍能被移入可恢复垃圾目录。
+- [ ] 不会自动更新、递归下载依赖、执行包内代码或把网络包降级为本地信任。
+
+## I. 回归、安全与兼容性
 
 ```bash
 cargo fmt --all -- --check
@@ -94,7 +152,7 @@ cargo audit --deny warnings
 - [ ] `docs/protocol.md`、`docs/compatibility.md` 与代码坐标一致。
 - [ ] 没有已知 Critical 或 High 缺陷。
 
-## G. 发布
+## J. 发布
 
 - [ ] `LICENSE-MIT` 与 `LICENSE-APACHE` 存在。
 - [ ] `cargo package --locked -p y-harness` 成功。

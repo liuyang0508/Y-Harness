@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "data_directory": ".y-harness",
+  "max_parallel_tool_calls": 4,
   "model": {
     "type": "open_ai_responses",
     "id": "openai/default",
@@ -17,6 +18,7 @@
       "type": "json_command",
       "name": "uppercase",
       "description": "Convert one text value to uppercase",
+      "batch_execution": "parallel_safe",
       "input_schema": {
         "type": "object",
         "properties": {

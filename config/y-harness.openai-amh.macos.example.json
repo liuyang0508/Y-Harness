@@ -15,7 +15,9 @@
   "mcp_servers": [
     {
       "id": "agent-memory-hub",
+      "enabled": true,
       "command": "/absolute/path/to/agent-memory-hub/agent_runtime_kit/mcp/server.sh",
+      "command_sha256": null,
       "args": [],
       "current_directory": "/absolute/path/to/agent-memory-hub/agent_runtime_kit/mcp",
       "environment_from_host": {

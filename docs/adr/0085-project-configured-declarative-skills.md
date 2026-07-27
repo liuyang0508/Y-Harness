@@ -46,9 +46,9 @@ tampering fail before the service accepts Turns.
 
 Local project approval proves operator intent, not third-party publisher
 authenticity. A package copied from an untrusted source must be reviewed before
-being named in the trusted project configuration. A future `yh skill install`
-or remote registry must preserve the existing signed external boundary rather
-than relabel downloaded content as a trusted project file.
+being named in the trusted project configuration. ADR 0102 adds a separate
+signed `external_package_files` path and preserves that external boundary
+rather than relabeling downloaded content as a trusted project file.
 
 This is the first product-facing extension-management slice, not a claim that
 all registered capability types now have zero-code installation or hot reload.
@@ -64,7 +64,8 @@ all registered capability types now have zero-code installation or hot reload.
 
 ## Related decisions
 
-- [ADR 0009](0009-digest-pinned-skill-resolution.md)
+- [ADR 0009](0009-declarative-skill-packages.md)
 - [ADR 0014](0014-signed-external-skills.md)
 - [ADR 0033](0033-pinned-https-skill-acquisition.md)
 - [ADR 0076](0076-governed-service-capability-assembly.md)
+- [ADR 0102](0102-governed-signed-external-skill-lifecycle.md)

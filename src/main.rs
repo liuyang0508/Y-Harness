@@ -42,6 +42,69 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reject_extra_argument(args.next())?;
             reference_cli::run_approval_migrate(database, backup).await
         }
+        Some("skill") => match args.next().as_deref() {
+            Some("install") => {
+                let package = required_argument(args.next(), "Skill package")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_install(package, config)
+            }
+            Some("install-external") => {
+                let package = required_argument(args.next(), "signed Skill package")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_install_external(package, config)
+            }
+            Some("install-https") => {
+                let endpoint = required_argument(args.next(), "HTTPS Skill URL")?;
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let expected_sha256 = required_argument(args.next(), "Skill content SHA-256")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_install_https(endpoint, identity, expected_sha256, config)
+                    .await
+            }
+            Some("list") => {
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_list(config)
+            }
+            Some("verify") => {
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_verify(config)
+            }
+            Some("remove") => {
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_remove(identity, config)
+            }
+            Some(command) => {
+                Err(format!("unknown skill command {command:?}; run `yh --help`").into())
+            }
+            None => Err("missing skill command; run `yh --help`".into()),
+        },
+        Some("thread") => match args.next().as_deref() {
+            Some("export") => {
+                let thread_id = required_argument(args.next(), "Thread identity")?;
+                let archive = required_argument(args.next(), "archive path")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_thread_export(thread_id, archive, config).await
+            }
+            Some("import") => {
+                let archive = required_argument(args.next(), "archive path")?;
+                let target_thread_id = required_argument(args.next(), "target Thread identity")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_thread_import(archive, target_thread_id, config).await
+            }
+            Some(command) => {
+                Err(format!("unknown thread command {command:?}; run `yh --help`").into())
+            }
+            None => Err("missing thread command; run `yh --help`".into()),
+        },
         Some("-V" | "--version") => {
             reject_extra_argument(args.next())?;
             println!("yh {}", env!("CARGO_PKG_VERSION"));

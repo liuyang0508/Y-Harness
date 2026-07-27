@@ -161,6 +161,7 @@ impl EvaluationTarget for HarnessRuntime {
                 TurnExecutionOptions {
                     approval_requester: crate::ApprovalActor::LocalProcess,
                     memory_scope: case.memory_scope,
+                    context: Vec::new(),
                     timeout: None,
                     cancellation,
                     model_event_sink: None,

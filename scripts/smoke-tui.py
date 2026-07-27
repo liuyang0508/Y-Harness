@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise yh-tui against yh serve-demo through a real POSIX pseudo-terminal."""
+"""Exercise Turn and Thread-fork paths through a real POSIX pseudo-terminal."""
 
 import argparse
 import errno
@@ -19,7 +19,9 @@ def read_until(master: int, process: subprocess.Popen[bytes], output: bytearray,
                needle: bytes, deadline: float) -> None:
     while needle not in output:
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"timed out waiting for {needle!r}")
+            raise TimeoutError(
+                f"timed out waiting for {needle!r}; terminal tail={bytes(output[-4096:])!r}"
+            )
         readable, _, _ = select.select([master], [], [], 0.1)
         if readable:
             try:
@@ -91,6 +93,8 @@ def main() -> None:
             read_until(master, process, output, b"READY", deadline)
             os.write(master, b"TUI PTY smoke\r")
             read_until(master, process, output, b"observed tool output", deadline)
+            os.write(master, b"/fork\r")
+            read_until(master, process, output, b"fork of ", deadline)
             os.write(master, b"/quit\r")
             read_until(master, process, output, b"\x1b[?1049l", deadline)
             process.wait(timeout=max(0.1, deadline - time.monotonic()))
@@ -108,12 +112,24 @@ def main() -> None:
 
         with sqlite3.connect(database) as connection:
             row = connection.execute(
-                "SELECT COUNT(*) FROM events "
+                "SELECT COUNT(*), COUNT(DISTINCT thread_id) FROM events "
                 "WHERE event_json LIKE '%\"type\":\"user_message\"%' "
                 "AND event_json LIKE '%TUI PTY smoke%'"
             ).fetchone()
-        if row is None or row[0] != 1:
-            raise RuntimeError("authoritative State did not contain the submitted prompt")
+        if row is None or row != (2, 2):
+            raise RuntimeError(
+                "forked parent and child did not each retain the submitted prompt"
+            )
+        with sqlite3.connect(database) as connection:
+            fork_count = connection.execute(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_json LIKE '%\"type\":\"thread_forked\"%'"
+            ).fetchone()
+            thread_count = connection.execute("SELECT COUNT(*) FROM streams").fetchone()
+        if fork_count is None or fork_count[0] != 1:
+            raise RuntimeError("authoritative State did not contain one Thread fork")
+        if thread_count is None or thread_count[0] != 2:
+            raise RuntimeError("Thread fork did not create exactly one independent child")
 
     mode = "configured" if options.configured else "demo"
     print(f"yh-tui PTY smoke ({mode}): ok")

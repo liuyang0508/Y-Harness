@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde_json::Value;
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 use crate::verification::validate_outcome;
 pub use control::TurnExecutionOptions;
@@ -23,19 +23,22 @@ pub use crate::kernel::{LanguageModel, Tool};
 
 use crate::{
     ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine,
-    ContextSource, ExecutionPhase, HarnessError, Item, ItemKind, MemoryContextRecordStatus,
-    MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput, ModelRegistry, ModelRequest,
-    ModelResponse, ModelStream, Observability, ObservationOutcome, PhaseObservation,
-    PolicyDecision, StateCapacity, StateEngine, SteeringId, Thread, ThreadId, ToolAuthorization,
-    ToolContext, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome, VerificationRegistry, VerificationRequest,
-    context::model_visible_items,
+    ContextSource, ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemKind,
+    MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput,
+    ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+    ModelToolCall, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
+    StateCapacity, StateEngine, SteeringId, StoredEvent, Thread, ThreadArchive, ThreadId,
+    ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
+    ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
+    VerificationRegistry, VerificationRequest,
+    context::{model_visible_items, validate_turn_context_inputs},
     kernel::{validate_capability_origin, validate_model_id},
 };
 
 const MAX_PROMPT_BYTES: usize = 1_048_576;
 const MAX_MODEL_TEXT_BYTES: usize = 1_048_576;
 const MAX_MODEL_TOOL_INPUT_BYTES: usize = 1_048_576;
+const MAX_MODEL_TOOL_BATCH_BYTES: usize = 4_194_304;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1_048_576;
 const MAX_MODEL_REQUEST_BYTES: usize = 16_777_216;
 const MAX_RUNTIME_ERROR_CHARS: usize = 4_096;
@@ -46,8 +49,17 @@ const MAX_AGENT_STEPS: usize = 256;
 const MAX_MODEL_ROUTE_ENTRIES: usize = 16;
 const DEFAULT_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(86_400);
+const MAX_MODEL_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(86_400);
+/// Maximum additional calls permitted for one configured Model candidate.
+pub const MAX_MODEL_RETRIES: u8 = 8;
+/// Maximum configured fallback delay between calls to the same Model.
+pub const MAX_MODEL_RETRY_DELAY_MS: u64 = 60_000;
 const DEFAULT_MAX_CONCURRENT_TURNS: usize = 32;
 const MAX_CONCURRENT_TURNS: usize = 4_096;
+/// Default same-batch concurrency ceiling for explicitly `ParallelSafe` Tools.
+pub const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
+/// Hard same-batch concurrency ceiling.
+pub const MAX_PARALLEL_TOOL_CALLS: usize = 64;
 const MIN_RUNTIME_GENERAL_EVENTS: u64 = 4;
 const MAX_PENDING_STEERING: usize = 64;
 const MAX_PENDING_STEERING_BYTES: usize = 1_048_576;
@@ -61,10 +73,73 @@ pub struct SteeringReceipt {
     pub turn_id: TurnId,
 }
 
+/// Explicit bounded policy for retrying one Model before Route failover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelRetryPolicy {
+    max_retries: u8,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl ModelRetryPolicy {
+    /// Creates a policy with bounded equal-jitter exponential fallback delays.
+    pub fn new(
+        max_retries: u8,
+        initial_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<Self, HarnessError> {
+        if !(1..=MAX_MODEL_RETRIES).contains(&max_retries) {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model retries must be 1-{MAX_MODEL_RETRIES}"
+            )));
+        }
+        let supported = Duration::from_millis(1)..=Duration::from_millis(MAX_MODEL_RETRY_DELAY_MS);
+        if !supported.contains(&initial_delay) || !supported.contains(&max_delay) {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model retry delays must be 1-{MAX_MODEL_RETRY_DELAY_MS} milliseconds"
+            )));
+        }
+        if initial_delay > max_delay {
+            return Err(HarnessError::InvalidConfiguration(
+                "Model initial retry delay cannot exceed its maximum delay".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_retries,
+            initial_delay,
+            max_delay,
+        })
+    }
+
+    /// Returns the maximum number of calls after the initial attempt.
+    #[must_use]
+    pub const fn max_retries(&self) -> u8 {
+        self.max_retries
+    }
+
+    /// Returns the first fallback backoff ceiling.
+    #[must_use]
+    pub const fn initial_delay(&self) -> Duration {
+        self.initial_delay
+    }
+
+    /// Returns the maximum accepted or computed retry delay.
+    #[must_use]
+    pub const fn max_delay(&self) -> Duration {
+        self.max_delay
+    }
+}
+
 #[derive(Clone)]
 struct PendingSteering {
     steering_id: SteeringId,
     content: String,
+}
+
+struct ToolCallSettlement {
+    call_id: String,
+    output: Value,
+    is_error: bool,
 }
 
 struct ActiveTurnControl {
@@ -87,6 +162,7 @@ pub struct HarnessRuntime {
     active_threads: Mutex<BTreeSet<ThreadId>>,
     turn_controls: Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
     max_concurrent_turns: usize,
+    max_parallel_tool_calls: usize,
     max_steps: usize,
 }
 
@@ -114,6 +190,7 @@ impl HarnessRuntime {
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_steps: 32,
         }
     }
@@ -155,6 +232,7 @@ impl HarnessRuntime {
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_steps: 32,
         })
     }
@@ -210,6 +288,36 @@ impl HarnessRuntime {
         Ok(self)
     }
 
+    /// Temporarily deprioritizes a routed Model after its Runtime attempt timeout.
+    ///
+    /// The cooldown is process-local, applies only when another routed Model
+    /// is available, and never overrides Provider Continuation affinity.
+    pub fn with_model_timeout_cooldown(mut self, cooldown: Duration) -> Result<Self, HarnessError> {
+        if self.models.entries.len() < 2 {
+            return Err(HarnessError::InvalidConfiguration(
+                "Model timeout cooldown requires a multi-Model route".to_owned(),
+            ));
+        }
+        if cooldown < Duration::from_millis(1) || cooldown > MAX_MODEL_TIMEOUT_COOLDOWN {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model timeout cooldown must be 1-{} milliseconds",
+                MAX_MODEL_TIMEOUT_COOLDOWN.as_millis()
+            )));
+        }
+        self.models.timeout_cooldown = Some(cooldown);
+        Ok(self)
+    }
+
+    /// Enables bounded typed-failure retries for each Model candidate.
+    ///
+    /// Retries share the candidate's existing attempt deadline and stop after
+    /// any provisional output. The total Turn deadline remains authoritative.
+    #[must_use]
+    pub fn with_model_retry_policy(mut self, policy: ModelRetryPolicy) -> Self {
+        self.models.retry_policy = Some(policy);
+        self
+    }
+
     /// Sets the maximum number of Turns executing concurrently in this Runtime.
     ///
     /// Admission fails before any Turn state is written when the limit is
@@ -224,6 +332,18 @@ impl HarnessRuntime {
         Ok(self)
     }
 
+    /// Sets the maximum concurrently executing `ParallelSafe` calls from one
+    /// same-response Tool batch.
+    pub fn with_max_parallel_tool_calls(mut self, limit: usize) -> Result<Self, HarnessError> {
+        if !(1..=MAX_PARALLEL_TOOL_CALLS).contains(&limit) {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "parallel Tool limit must be 1-{MAX_PARALLEL_TOOL_CALLS}"
+            )));
+        }
+        self.max_parallel_tool_calls = limit;
+        Ok(self)
+    }
+
     /// Creates and persists a new Thread.
     pub async fn create_thread(&self) -> Result<Thread, HarnessError> {
         self.state.create_thread().await
@@ -234,12 +354,94 @@ impl HarnessRuntime {
         self.state.load_thread(thread_id).await
     }
 
+    /// Whether the configured State store supports atomic Thread forks.
+    #[must_use]
+    pub fn supports_thread_fork(&self) -> bool {
+        self.state.supports_thread_fork()
+    }
+
+    /// Forks one terminal parent boundary into an independent child Thread.
+    pub async fn fork_thread(
+        &self,
+        parent_thread_id: &ThreadId,
+        child_thread_id: ThreadId,
+        through_turn_id: Option<&TurnId>,
+    ) -> Result<Thread, HarnessError> {
+        self.state
+            .fork_thread(parent_thread_id, child_thread_id, through_turn_id)
+            .await
+    }
+
+    /// Exports one terminal Thread as a portable integrity-bound archive.
+    pub async fn export_thread(&self, thread_id: &ThreadId) -> Result<ThreadArchive, HarnessError> {
+        self.state.export_thread(thread_id).await
+    }
+
+    /// Whether the configured State store supports atomic Thread imports.
+    #[must_use]
+    pub fn supports_thread_import(&self) -> bool {
+        self.state.supports_thread_import()
+    }
+
+    /// Atomically imports one portable archive under a caller-chosen identity.
+    pub async fn import_thread(
+        &self,
+        archive: &ThreadArchive,
+        target_thread_id: ThreadId,
+    ) -> Result<Thread, HarnessError> {
+        self.state.import_thread(archive, target_thread_id).await
+    }
+
+    /// Changes or clears the durable operator-authored Thread name.
+    pub async fn set_thread_name(
+        &self,
+        thread_id: &ThreadId,
+        name: Option<String>,
+    ) -> Result<StoredEvent, HarnessError> {
+        self.state.set_thread_name(thread_id, name).await
+    }
+
     /// Returns journal pressure before one Thread reaches its finite boundary.
     pub async fn thread_capacity(
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<StateCapacity>, HarnessError> {
         self.state.thread_capacity(thread_id).await
+    }
+
+    /// Whether the configured State store supports recent-Thread navigation.
+    #[must_use]
+    pub fn supports_thread_listing(&self) -> bool {
+        self.state.supports_thread_listing()
+    }
+
+    /// Returns one bounded recent-Thread page without loading full histories.
+    pub async fn list_threads(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::ThreadSummaryPage, HarnessError> {
+        self.state.list_threads(before_sequence, limit).await
+    }
+
+    /// Prepares a bounded, digest-bound source delta for an optional Thread handoff.
+    ///
+    /// This read-only operation does not synthesize or persist a summary. The
+    /// embedding host may pass the request to any summarizer, then convert its
+    /// response with [`crate::ThreadHandoffRequest::to_context`].
+    pub async fn prepare_thread_handoff(
+        &self,
+        source_thread_id: &ThreadId,
+        target_thread_id: &ThreadId,
+        config: &crate::ThreadHandoffConfig,
+    ) -> Result<Option<crate::ThreadHandoffRequest>, HarnessError> {
+        let source = self.load_thread(source_thread_id).await?.ok_or_else(|| {
+            HarnessError::State(format!("thread {source_thread_id} does not exist"))
+        })?;
+        let target = self.load_thread(target_thread_id).await?.ok_or_else(|| {
+            HarnessError::State(format!("thread {target_thread_id} does not exist"))
+        })?;
+        crate::ThreadHandoffRequest::prepare(&source, &target, config)
     }
 
     /// Durably queues additional user input for one exact active Turn.
@@ -430,6 +632,7 @@ impl HarnessRuntime {
         options
             .approval_requester
             .validate_current("approval requester")?;
+        validate_turn_context_inputs(&options.context)?;
         let deadline = deadline(options.timeout)?;
         let _active = self.claim_thread(thread_id)?;
         let (
@@ -547,7 +750,24 @@ impl HarnessRuntime {
                         return Err(error);
                     }
                 };
+                let compilation = match self
+                    .context
+                    .merge_turn_context(compilation, &options.context)
+                {
+                    Ok(compilation) => compilation,
+                    Err(error) => {
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                };
                 if let Some(record) = conversation_summary_record {
+                    self.record(&mut turn, record).await?;
+                }
+                let invocation_record = invocation_context_record(
+                    &compilation.blocks,
+                    options.approval_requester.clone(),
+                );
+                if let Some(record) = invocation_record {
                     self.record(&mut turn, record).await?;
                 }
                 if let Some(observation) = compilation.memory {
@@ -786,6 +1006,7 @@ impl HarnessRuntime {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                                 input: input.clone(),
+                                batch: None,
                             },
                         )
                         .await?
@@ -794,132 +1015,18 @@ impl HarnessRuntime {
                     }
                     tool_call_ids.insert(call_id.clone());
 
-                    let Some(registered) = self.tools.get(&name) else {
-                        let error = HarnessError::UnknownTool(name);
-                        self.settle_error(&mut turn, &error).await?;
-                        return Err(error);
-                    };
-
-                    let authorization = ToolAuthorization {
-                        thread_id: thread_id.clone(),
-                        turn_id: turn.id.clone(),
-                        call_id: call_id.clone(),
-                        descriptor: registered.descriptor.clone(),
-                        origin: registered.origin.clone(),
-                        input: input.clone(),
-                    };
-                    let decision = match self
-                        .controlled_observed(
-                            ObservationTarget::new(
-                                thread_id,
-                                &turn.id,
-                                "policy-engine",
-                                ExecutionPhase::Policy,
-                            ),
-                            &options.cancellation,
-                            deadline,
-                            || self.policy.authorize(&authorization),
-                        )
-                        .await
-                    {
-                        Ok(decision) => decision,
-                        Err(error) => {
-                            self.settle_error(&mut turn, &error).await?;
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = validate_policy_decision(&decision) {
-                        self.settle_error(&mut turn, &error).await?;
-                        return Err(error);
-                    }
-                    self.record(
+                    self.authorize_tool_call(
                         &mut turn,
-                        ItemKind::PolicyDecision {
+                        &ModelToolCall {
                             call_id: call_id.clone(),
-                            tool_origin: Some(authorization.origin.clone()),
-                            decision: decision.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
                         },
+                        &model_request_sha256,
+                        &options,
+                        deadline,
                     )
                     .await?;
-
-                    match decision {
-                        PolicyDecision::Allow => {}
-                        PolicyDecision::Deny { reason } => {
-                            let error = HarnessError::PolicyDenied { tool: name, reason };
-                            self.settle_error(&mut turn, &error).await?;
-                            return Err(error);
-                        }
-                        PolicyDecision::Ask { reason, risk } => {
-                            let request = ApprovalRequest {
-                                id: ApprovalId::generate(),
-                                requested_by: options.approval_requester.clone(),
-                                authorization,
-                                reason,
-                                risk,
-                            };
-                            self.record(
-                                &mut turn,
-                                ItemKind::ApprovalRequested {
-                                    approval_id: request.id.clone(),
-                                    call_id: call_id.clone(),
-                                    tool: name.clone(),
-                                    reason: request.reason.clone(),
-                                    risk: request.risk,
-                                    requested_by: Some(request.requested_by.clone()),
-                                    tool_origin: Some(request.authorization.origin.clone()),
-                                    model_request_sha256: Some(model_request_sha256),
-                                },
-                            )
-                            .await?;
-                            let approval = match self
-                                .controlled_observed(
-                                    ObservationTarget::new(
-                                        thread_id,
-                                        &turn.id,
-                                        "approval-handler",
-                                        ExecutionPhase::Approval,
-                                    ),
-                                    &options.cancellation,
-                                    deadline,
-                                    || self.approvals.decide(&request),
-                                )
-                                .await
-                            {
-                                Ok(approval) => approval,
-                                Err(error) => {
-                                    let abandonment = self
-                                        .approvals
-                                        .abandon_turn(
-                                            thread_id,
-                                            &turn.id,
-                                            "approval wait ended without a settlement",
-                                        )
-                                        .await;
-                                    self.settle_error(&mut turn, &error).await?;
-                                    abandonment?;
-                                    return Err(error);
-                                }
-                            };
-                            if let Err(error) = validate_approval_decision(&approval) {
-                                self.settle_error(&mut turn, &error).await?;
-                                return Err(error);
-                            }
-                            self.record(
-                                &mut turn,
-                                ItemKind::ApprovalDecision {
-                                    approval_id: request.id,
-                                    call_id: call_id.clone(),
-                                    decision: approval.clone(),
-                                },
-                            )
-                            .await?;
-                            if let ApprovalDecision::Deny { reason } = approval {
-                                let error = HarnessError::ApprovalDenied { tool: name, reason };
-                                self.settle_error(&mut turn, &error).await?;
-                                return Err(error);
-                            }
-                        }
-                    }
 
                     if self
                         .supersede_tool_before_effect(&mut turn, &call_id)
@@ -929,6 +1036,78 @@ impl HarnessRuntime {
                     }
                     self.execute_tool_call(&mut turn, &name, call_id, input, &options, deadline)
                         .await?;
+                }
+                Ok(SettledModelOutput {
+                    model_id,
+                    model_origin,
+                    continuation,
+                    output: ModelOutput::ToolCalls { calls },
+                }) => {
+                    if let Some(call) = calls
+                        .iter()
+                        .find(|call| tool_call_ids.contains(&call.call_id))
+                    {
+                        let error = HarnessError::Model(format!(
+                            "model reused Tool call id {:?} within one Turn",
+                            call.call_id
+                        ));
+                        self.settle_error(&mut turn, &error).await?;
+                        return Err(error);
+                    }
+                    let batch_id = ToolCallBatchId::generate();
+                    let batch_size = calls.len();
+                    let decisions = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, call)| ItemKind::ToolCall {
+                            model_id: Some(model_id.clone()),
+                            model_origin: Some(model_origin.clone()),
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                            batch: Some(ToolCallBatch {
+                                id: batch_id.clone(),
+                                index,
+                                size: batch_size,
+                            }),
+                        })
+                        .collect::<Vec<_>>();
+                    let continuation =
+                        continuation.map(|continuation| ItemKind::ProviderContinuation {
+                            model_id,
+                            model_origin,
+                            continuation,
+                        });
+                    if self
+                        .record_model_tool_batch_if_current(
+                            &mut turn,
+                            &model_stream,
+                            u32::try_from(step + 1).unwrap_or(u32::MAX),
+                            continuation,
+                            decisions,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    for call in &calls {
+                        tool_call_ids.insert(call.call_id.clone());
+                        self.authorize_tool_call(
+                            &mut turn,
+                            call,
+                            &model_request_sha256,
+                            &options,
+                            deadline,
+                        )
+                        .await?;
+                    }
+
+                    if self
+                        .execute_tool_batch(&mut turn, &calls, &options, deadline)
+                        .await?
+                    {
+                        continue;
+                    }
                 }
                 Err(error) => {
                     self.settle_error(&mut turn, &error).await?;
@@ -1039,9 +1218,12 @@ impl HarnessRuntime {
         let compilation = self
             .context
             .merge_conversation_summary(compilation, conversation_summary)?;
+        let compilation = self
+            .context
+            .merge_turn_context(compilation, &options.context)?;
         let mut original_items = conversation.items.clone();
         original_items.extend(model_visible_items(
-            &turn.items[..evidence.pending_tool_item_index],
+            &turn.items[..evidence.model_request_item_index],
         ));
         let original_request = ModelRequest {
             thread_id: thread_id.clone(),
@@ -1103,27 +1285,24 @@ impl HarnessRuntime {
             self.settle_error(&mut turn, &error).await?;
             return Err(error);
         }
-        if self
-            .supersede_tool_before_effect(&mut turn, &evidence.call_id)
-            .await?
-        {
-            return Ok((
-                turn,
-                conversation.items,
-                compilation.blocks,
-                evidence.consumed_steps,
-                evidence.tool_call_ids,
-            ));
+        for call in &evidence.batch_calls[evidence.current_batch_index + 1..] {
+            self.authorize_tool_call(
+                &mut turn,
+                call,
+                &evidence.model_request_sha256,
+                options,
+                deadline,
+            )
+            .await?;
         }
-        self.execute_tool_call(
-            &mut turn,
-            &evidence.tool,
-            evidence.call_id,
-            evidence.input,
-            options,
-            deadline,
-        )
-        .await?;
+        validate_resumed_batch_authority(
+            &turn,
+            &evidence.batch_calls[..=evidence.current_batch_index],
+            &self.tools,
+        )?;
+        let _ = self
+            .execute_tool_batch(&mut turn, &evidence.batch_calls, options, deadline)
+            .await?;
 
         Ok((
             turn,
@@ -1147,60 +1326,360 @@ impl HarnessRuntime {
             .tools
             .get(name)
             .ok_or_else(|| HarnessError::UnknownTool(name.to_owned()))?;
-        let context = ToolContext {
+        let call = ModelToolCall {
+            call_id,
+            name: name.to_owned(),
+            input,
+        };
+        match invoke_tool_capability(
+            registered.tool.clone(),
+            self.observability.clone(),
+            turn.thread_id.clone(),
+            turn.id.clone(),
+            call,
+            options.cancellation.clone(),
+            deadline,
+        )
+        .await
+        {
+            Ok(settlement) => self.record_tool_settlement(turn, settlement).await,
+            Err(error) => {
+                self.settle_error(turn, &error).await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_tool_batch(
+        &self,
+        turn: &mut Turn,
+        calls: &[ModelToolCall],
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+    ) -> Result<bool, HarnessError> {
+        let mut index = 0;
+        while index < calls.len() {
+            let registered = self
+                .tools
+                .get(&calls[index].name)
+                .ok_or_else(|| HarnessError::UnknownTool(calls[index].name.clone()))?;
+            if self.max_parallel_tool_calls == 1
+                || registered.batch_execution == ToolBatchExecution::Sequential
+            {
+                let pending = calls[index..]
+                    .iter()
+                    .map(|call| call.call_id.as_str())
+                    .collect::<Vec<_>>();
+                if self
+                    .supersede_tool_calls_before_effect(turn, &pending)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                let call = &calls[index];
+                self.execute_tool_call(
+                    turn,
+                    &call.name,
+                    call.call_id.clone(),
+                    call.input.clone(),
+                    options,
+                    deadline,
+                )
+                .await?;
+                index += 1;
+                continue;
+            }
+
+            let mut end = index + 1;
+            while end < calls.len()
+                && self
+                    .tools
+                    .get(&calls[end].name)
+                    .is_some_and(|tool| tool.batch_execution == ToolBatchExecution::ParallelSafe)
+            {
+                end += 1;
+            }
+            let pending = calls[index..]
+                .iter()
+                .map(|call| call.call_id.as_str())
+                .collect::<Vec<_>>();
+            if self
+                .supersede_tool_calls_before_effect(turn, &pending)
+                .await?
+            {
+                return Ok(true);
+            }
+            if end == index + 1 {
+                let call = &calls[index];
+                self.execute_tool_call(
+                    turn,
+                    &call.name,
+                    call.call_id.clone(),
+                    call.input.clone(),
+                    options,
+                    deadline,
+                )
+                .await?;
+            } else {
+                self.execute_parallel_tool_calls(turn, &calls[index..end], options, deadline)
+                    .await?;
+            }
+            index = end;
+        }
+        Ok(false)
+    }
+
+    async fn execute_parallel_tool_calls(
+        &self,
+        turn: &mut Turn,
+        calls: &[ModelToolCall],
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+    ) -> Result<(), HarnessError> {
+        let mut jobs = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().cloned().enumerate() {
+            let Some(registered) = self.tools.get(&call.name) else {
+                let error = HarnessError::UnknownTool(call.name);
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            };
+            jobs.push((index, call, registered.tool.clone()));
+        }
+        let semaphore = Arc::new(Semaphore::new(self.max_parallel_tool_calls));
+        let mut tasks = JoinSet::new();
+        for (index, call, tool) in jobs {
+            let semaphore = semaphore.clone();
+            let observability = self.observability.clone();
+            let thread_id = turn.thread_id.clone();
+            let turn_id = turn.id.clone();
+            let cancellation = options.cancellation.clone();
+            tasks.spawn(async move {
+                let result = match semaphore.acquire_owned().await {
+                    Ok(permit) => {
+                        let result = invoke_tool_capability(
+                            tool,
+                            observability,
+                            thread_id,
+                            turn_id,
+                            call,
+                            cancellation,
+                            deadline,
+                        )
+                        .await;
+                        drop(permit);
+                        result
+                    }
+                    Err(_) => Err(HarnessError::Tool(
+                        "parallel Tool scheduler closed unexpectedly".to_owned(),
+                    )),
+                };
+                (index, result)
+            });
+        }
+
+        let mut results = std::iter::repeat_with(|| None)
+            .take(calls.len())
+            .collect::<Vec<Option<Result<ToolCallSettlement, HarnessError>>>>();
+        while let Some(joined) = tasks.join_next().await {
+            let (index, result) = match joined {
+                Ok(result) => result,
+                Err(_) => {
+                    tasks.shutdown().await;
+                    let error = HarnessError::CapabilityPanicked {
+                        phase: ExecutionPhase::Tool,
+                    };
+                    self.settle_error(turn, &error).await?;
+                    return Err(error);
+                }
+            };
+            let Some(slot) = results.get_mut(index) else {
+                tasks.shutdown().await;
+                let error = HarnessError::State("parallel Tool result index is invalid".to_owned());
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            };
+            if slot.replace(result).is_some() {
+                tasks.shutdown().await;
+                let error = HarnessError::State("parallel Tool result index was reused".to_owned());
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
+        }
+
+        let mut stop_error = None;
+        for result in results {
+            let Some(result) = result else {
+                let error = HarnessError::State("parallel Tool result is missing".to_owned());
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            };
+            match result {
+                Ok(settlement) => self.record_tool_settlement(turn, settlement).await?,
+                Err(error) if stop_error.is_none() => stop_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = stop_error {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn record_tool_settlement(
+        &self,
+        turn: &mut Turn,
+        settlement: ToolCallSettlement,
+    ) -> Result<(), HarnessError> {
+        self.record(
+            turn,
+            ItemKind::ToolResult {
+                call_id: settlement.call_id,
+                output: settlement.output,
+                is_error: settlement.is_error,
+            },
+        )
+        .await
+    }
+
+    async fn authorize_tool_call(
+        &self,
+        turn: &mut Turn,
+        call: &ModelToolCall,
+        model_request_sha256: &str,
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+    ) -> Result<(), HarnessError> {
+        let Some(registered) = self.tools.get(&call.name) else {
+            let error = HarnessError::UnknownTool(call.name.clone());
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        };
+        let authorization = ToolAuthorization {
             thread_id: turn.thread_id.clone(),
             turn_id: turn.id.clone(),
-            call_id: call_id.clone(),
-            cancellation: options.cancellation.clone(),
+            call_id: call.call_id.clone(),
+            descriptor: registered.descriptor.clone(),
+            origin: registered.origin.clone(),
+            input: call.input.clone(),
         };
-        match self
+        let decision = match self
             .controlled_observed(
-                ObservationTarget::new(&turn.thread_id, &turn.id, name, ExecutionPhase::Tool),
+                ObservationTarget::new(
+                    &turn.thread_id,
+                    &turn.id,
+                    "policy-engine",
+                    ExecutionPhase::Policy,
+                ),
                 &options.cancellation,
                 deadline,
-                || registered.tool.execute(input, context),
+                || self.policy.authorize(&authorization),
             )
             .await
         {
-            Ok(output) => {
-                let (output, is_error) = match validate_tool_output(&output) {
-                    Ok(()) => (output, false),
-                    Err(error) => (
-                        serde_json::json!({
-                            "error": bounded_runtime_error(&error.to_string())
-                        }),
-                        true,
-                    ),
+            Ok(decision) => decision,
+            Err(error) => {
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_policy_decision(&decision) {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
+        self.record(
+            turn,
+            ItemKind::PolicyDecision {
+                call_id: call.call_id.clone(),
+                tool_origin: Some(authorization.origin.clone()),
+                decision: decision.clone(),
+            },
+        )
+        .await?;
+
+        match decision {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny { reason } => {
+                let error = HarnessError::PolicyDenied {
+                    tool: call.name.clone(),
+                    reason,
+                };
+                self.settle_error(turn, &error).await?;
+                Err(error)
+            }
+            PolicyDecision::Ask { reason, risk } => {
+                let request = ApprovalRequest {
+                    id: ApprovalId::generate(),
+                    requested_by: options.approval_requester.clone(),
+                    authorization,
+                    reason,
+                    risk,
                 };
                 self.record(
                     turn,
-                    ItemKind::ToolResult {
-                        call_id,
-                        output,
-                        is_error,
+                    ItemKind::ApprovalRequested {
+                        approval_id: request.id.clone(),
+                        call_id: call.call_id.clone(),
+                        tool: call.name.clone(),
+                        reason: request.reason.clone(),
+                        risk: request.risk,
+                        requested_by: Some(request.requested_by.clone()),
+                        tool_origin: Some(request.authorization.origin.clone()),
+                        model_request_sha256: Some(model_request_sha256.to_owned()),
                     },
                 )
-                .await
-            }
-            Err(error) => {
-                if matches!(
-                    &error,
-                    HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. }
-                ) {
+                .await?;
+                let approval = match self
+                    .controlled_observed(
+                        ObservationTarget::new(
+                            &turn.thread_id,
+                            &turn.id,
+                            "approval-handler",
+                            ExecutionPhase::Approval,
+                        ),
+                        &options.cancellation,
+                        deadline,
+                        || self.approvals.decide(&request),
+                    )
+                    .await
+                {
+                    Ok(approval) => approval,
+                    Err(error) => {
+                        let abandonment = self
+                            .approvals
+                            .abandon_turn(
+                                &turn.thread_id,
+                                &turn.id,
+                                "approval wait ended without a settlement",
+                            )
+                            .await;
+                        self.settle_error(turn, &error).await?;
+                        abandonment?;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = validate_approval_decision(&approval) {
                     self.settle_error(turn, &error).await?;
                     return Err(error);
                 }
                 self.record(
                     turn,
-                    ItemKind::ToolResult {
-                        call_id,
-                        output: serde_json::json!({
-                            "error": bounded_runtime_error(&error.to_string())
-                        }),
-                        is_error: true,
+                    ItemKind::ApprovalDecision {
+                        approval_id: request.id,
+                        call_id: call.call_id.clone(),
+                        decision: approval.clone(),
                     },
                 )
-                .await
+                .await?;
+                if let ApprovalDecision::Deny { reason } = approval {
+                    let error = HarnessError::ApprovalDenied {
+                        tool: call.name.clone(),
+                        reason,
+                    };
+                    self.settle_error(turn, &error).await?;
+                    return Err(error);
+                }
+                Ok(())
             }
         }
     }
@@ -1228,6 +1707,10 @@ impl HarnessRuntime {
             model_usage: None,
             provider_model: None,
             provider_request_id: None,
+            provider_failure_kind: None,
+            provider_status_code: None,
+            provider_retry_after_ms: None,
+            model_retry_index: None,
             stream_events_dropped: 0,
         });
         result
@@ -1244,7 +1727,7 @@ impl HarnessRuntime {
     ) -> Result<SettledModelOutput, HarnessError> {
         validate_model_request(&request)?;
         let continuation_target = pending_provider_continuation_target(&request.items)?;
-        let candidates = self
+        let mut candidates = self
             .models
             .entries
             .iter()
@@ -1265,6 +1748,17 @@ impl HarnessRuntime {
                 target.model_id
             )));
         }
+        let mut cooling_fallbacks = Vec::new();
+        let mut non_cooling_count = candidates.len();
+        if continuation_target.is_none() {
+            let (mut available, cooling) = self
+                .models
+                .partition_timeout_cooldown(candidates, Instant::now())?;
+            non_cooling_count = available.len();
+            available.extend(cooling.iter().copied());
+            candidates = available;
+            cooling_fallbacks = cooling;
+        }
         let mut request = Some(request);
         let total = candidates.len();
         for (index, registered) in candidates.into_iter().enumerate() {
@@ -1284,62 +1778,131 @@ impl HarnessRuntime {
                     .clone()
             };
             retain_model_continuations(&mut attempt_request, model_id, &registered.origin);
-            let attempt_stream = stream
-                .for_step(model_step)
-                .with_cancellation(crate::CancellationToken::new());
-            let delivered_before = attempt_stream.delivered_events();
-            let settlement = self
-                .complete_model_attempt_observed(
-                    ObservationTarget::new(
-                        target.thread_id,
-                        target.turn_id,
-                        model_id,
-                        ExecutionPhase::Model,
-                    ),
-                    registered,
-                    cancellation,
-                    attempt_deadline,
-                    attempt_request,
-                    attempt_stream.clone(),
-                )
-                .await;
-            let delivered = attempt_stream
-                .delivered_events()
-                .saturating_sub(delivered_before);
-            if settlement.control == ModelAttemptControl::Cancelled
-                || (settlement.control == ModelAttemptControl::DeadlineElapsed
-                    && !attempt_timeout_elapsed)
-            {
-                return settlement.result.map(|response| SettledModelOutput {
-                    model_id: model_id.to_owned(),
-                    model_origin: registered.origin.clone(),
-                    output: response.output,
-                    continuation: response.continuation,
-                });
-            }
-            let result = if settlement.control == ModelAttemptControl::DeadlineElapsed {
-                Err(HarnessError::Model(format!(
-                    "Model {model_id} exceeded the configured failover attempt timeout"
-                )))
-            } else {
-                settlement.result
-            };
-            match result {
-                Ok(response) => {
-                    return Ok(SettledModelOutput {
+            let retry_template = self.models.retry_policy.map(|_| attempt_request.clone());
+            let mut initial_request = Some(attempt_request);
+            let mut retry_index = 0_u8;
+            loop {
+                let request = if retry_index == 0 {
+                    initial_request.take().ok_or_else(|| {
+                        HarnessError::Model(
+                            "Model retry lost its bounded initial request".to_owned(),
+                        )
+                    })?
+                } else {
+                    retry_template
+                        .as_ref()
+                        .ok_or_else(|| {
+                            HarnessError::Model(
+                                "Model retry lost its bounded request template".to_owned(),
+                            )
+                        })?
+                        .clone()
+                };
+                let attempt_stream = stream
+                    .for_step(model_step)
+                    .with_cancellation(crate::CancellationToken::new());
+                let delivered_before = attempt_stream.delivered_events();
+                let settlement = self
+                    .complete_model_attempt_observed(
+                        ObservationTarget::new(
+                            target.thread_id,
+                            target.turn_id,
+                            model_id,
+                            ExecutionPhase::Model,
+                        ),
+                        registered,
+                        cancellation,
+                        attempt_deadline,
+                        ModelAttemptInvocation {
+                            request,
+                            stream: attempt_stream.clone(),
+                            retry_index,
+                        },
+                    )
+                    .await;
+                let delivered = attempt_stream
+                    .delivered_events()
+                    .saturating_sub(delivered_before);
+                if settlement.control == ModelAttemptControl::Cancelled
+                    || (settlement.control == ModelAttemptControl::DeadlineElapsed
+                        && !attempt_timeout_elapsed)
+                {
+                    return settlement.result.map(|response| SettledModelOutput {
                         model_id: model_id.to_owned(),
                         model_origin: registered.origin.clone(),
                         output: response.output,
                         continuation: response.continuation,
                     });
                 }
-                Err(_) if index + 1 < total && delivered > 0 => {
-                    return Err(HarnessError::Model(format!(
-                        "Model {model_id} failed after delivering provisional output; failover was suppressed"
-                    )));
+                if settlement.control == ModelAttemptControl::DeadlineElapsed {
+                    self.models
+                        .record_attempt_timeout(model_id, Instant::now())?;
                 }
-                Err(_) if index + 1 < total => {}
-                Err(error) => return Err(error),
+                let result = if settlement.control == ModelAttemptControl::DeadlineElapsed {
+                    Err(HarnessError::Model(format!(
+                        "Model {model_id} exceeded the configured failover attempt timeout"
+                    )))
+                } else {
+                    settlement.result
+                };
+                match result {
+                    Ok(response) => {
+                        self.models.clear_attempt_timeout(model_id);
+                        if index < non_cooling_count {
+                            for cooling in &cooling_fallbacks {
+                                self.observability.emit(&PhaseObservation {
+                                    thread_id: target.thread_id.clone(),
+                                    turn_id: target.turn_id.clone(),
+                                    phase: ExecutionPhase::Model,
+                                    capability: cooling.identity.get()?.to_owned(),
+                                    duration_micros: 0,
+                                    outcome: ObservationOutcome::Skipped,
+                                    model_usage: None,
+                                    provider_model: None,
+                                    provider_request_id: None,
+                                    provider_failure_kind: None,
+                                    provider_status_code: None,
+                                    provider_retry_after_ms: None,
+                                    model_retry_index: None,
+                                    stream_events_dropped: 0,
+                                });
+                            }
+                        }
+                        return Ok(SettledModelOutput {
+                            model_id: model_id.to_owned(),
+                            model_origin: registered.origin.clone(),
+                            output: response.output,
+                            continuation: response.continuation,
+                        });
+                    }
+                    Err(_) if index + 1 < total && delivered > 0 => {
+                        return Err(HarnessError::Model(format!(
+                            "Model {model_id} failed after delivering provisional output; failover was suppressed"
+                        )));
+                    }
+                    Err(error) => {
+                        let next_retry = retry_index.saturating_add(1);
+                        if delivered == 0
+                            && let Some(delay) = self
+                                .models
+                                .retry_delay(&error, next_retry, &target, model_id)
+                            && wait_for_model_retry(
+                                cancellation,
+                                attempt_deadline,
+                                attempt_timeout_elapsed,
+                                delay,
+                            )
+                            .await?
+                        {
+                            retry_index = next_retry;
+                            continue;
+                        }
+                        if index + 1 == total {
+                            return Err(error);
+                        }
+                        break;
+                    }
+                }
             }
         }
         Err(HarnessError::InvalidConfiguration(
@@ -1353,9 +1916,13 @@ impl HarnessRuntime {
         registered: &RuntimeModel,
         cancellation: &crate::CancellationToken,
         deadline: Option<Instant>,
-        request: ModelRequest,
-        stream: ModelStream,
+        invocation: ModelAttemptInvocation,
     ) -> ModelAttemptSettlement {
+        let ModelAttemptInvocation {
+            request,
+            stream,
+            retry_index,
+        } = invocation;
         let started = Instant::now();
         let dropped_before = stream.dropped_events();
         let provider_stream = stream.clone();
@@ -1384,10 +1951,12 @@ impl HarnessRuntime {
             }
             Err(error) => (Err(error), ModelAttemptControl::None),
         };
-        let result = result.and_then(|response| {
-            validate_model_response(&response)?;
-            Ok(response)
-        });
+        let result = result
+            .map_err(validate_model_attempt_error)
+            .and_then(|response| {
+                validate_model_response(&response)?;
+                Ok(response)
+            });
         let (model_usage, provider_model, provider_request_id) =
             result.as_ref().map_or((None, None, None), |response| {
                 (
@@ -1396,6 +1965,14 @@ impl HarnessRuntime {
                     response.provider_request_id.clone(),
                 )
             });
+        let (provider_failure_kind, provider_status_code, provider_retry_after_ms) = match &result {
+            Err(HarnessError::ModelProvider(failure)) => (
+                Some(failure.kind()),
+                failure.http_status(),
+                failure.retry_after_ms(),
+            ),
+            _ => (None, None, None),
+        };
         self.observability.emit(&PhaseObservation {
             thread_id: target.thread_id.clone(),
             turn_id: target.turn_id.clone(),
@@ -1406,6 +1983,10 @@ impl HarnessRuntime {
             model_usage,
             provider_model,
             provider_request_id,
+            provider_failure_kind,
+            provider_status_code,
+            provider_retry_after_ms,
+            model_retry_index: Some(retry_index),
             stream_events_dropped,
         });
         ModelAttemptSettlement { result, control }
@@ -1518,27 +2099,38 @@ impl HarnessRuntime {
         turn: &mut Turn,
         call_id: &str,
     ) -> Result<bool, HarnessError> {
+        self.supersede_tool_calls_before_effect(turn, &[call_id])
+            .await
+    }
+
+    async fn supersede_tool_calls_before_effect(
+        &self,
+        turn: &mut Turn,
+        call_ids: &[&str],
+    ) -> Result<bool, HarnessError> {
         let control = self.turn_control(&turn.thread_id)?;
         let mut control = control.lock().await;
         require_control_turn(&control, turn)?;
         if control.pending_steering.is_empty() {
             return Ok(false);
         }
-        if let Err(error) = self
-            .record_unlocked(
-                turn,
-                ItemKind::ToolResult {
-                    call_id: call_id.to_owned(),
-                    output: serde_json::json!({
-                        "error": "tool call superseded by user steering before execution"
-                    }),
-                    is_error: true,
-                },
-            )
-            .await
-        {
-            control.accepting_steering = false;
-            return Err(error);
+        for call_id in call_ids {
+            if let Err(error) = self
+                .record_unlocked(
+                    turn,
+                    ItemKind::ToolResult {
+                        call_id: (*call_id).to_owned(),
+                        output: serde_json::json!({
+                            "error": "tool call superseded by user steering before execution"
+                        }),
+                        is_error: true,
+                    },
+                )
+                .await
+            {
+                control.accepting_steering = false;
+                return Err(error);
+            }
         }
         if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
             control.accepting_steering = false;
@@ -1573,6 +2165,39 @@ impl HarnessRuntime {
             return Err(error);
         }
         if let Err(error) = self.record_unlocked(turn, decision).await {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        Ok(false)
+    }
+
+    async fn record_model_tool_batch_if_current(
+        &self,
+        turn: &mut Turn,
+        model_stream: &ModelStream,
+        model_step: u32,
+        continuation: Option<ItemKind>,
+        decisions: Vec<ItemKind>,
+    ) -> Result<bool, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty() {
+            if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+                control.accepting_steering = false;
+                return Err(error);
+            }
+            model_stream.invalidate_step(model_step);
+            return Ok(true);
+        }
+        if let Some(continuation) = continuation
+            && let Err(error) = self.record_unlocked(turn, continuation).await
+        {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        let calls = decisions.into_iter().map(Item::new).collect();
+        if let Err(error) = self.record_tool_calls_unlocked(turn, calls).await {
             control.accepting_steering = false;
             return Err(error);
         }
@@ -1642,6 +2267,28 @@ impl HarnessRuntime {
                 }
                 Err(settlement_error) => Err(HarnessError::State(format!(
                     "State Item append failed ({record_error}); terminal settlement also failed ({settlement_error})"
+                ))),
+            },
+        }
+    }
+
+    async fn record_tool_calls_unlocked(
+        &self,
+        turn: &mut Turn,
+        calls: Vec<Item>,
+    ) -> Result<(), HarnessError> {
+        match self.state.append_tool_calls(turn, calls.clone()).await {
+            Ok(_) => {
+                turn.items.extend(calls);
+                Ok(())
+            }
+            Err(record_error) => match self.state.finish_turn(turn, TurnStatus::Failed).await {
+                Ok(_) => {
+                    turn.status = TurnStatus::Failed;
+                    Err(record_error)
+                }
+                Err(settlement_error) => Err(HarnessError::State(format!(
+                    "State Tool-call batch append failed ({record_error}); terminal settlement also failed ({settlement_error})"
                 ))),
             },
         }
@@ -1718,7 +2365,9 @@ struct ApprovalResumeEvidence {
     model_id: String,
     model_origin: crate::CapabilityOrigin,
     model_request_sha256: String,
-    pending_tool_item_index: usize,
+    model_request_item_index: usize,
+    batch_calls: Vec<ModelToolCall>,
+    current_batch_index: usize,
     consumed_steps: usize,
     tool_call_ids: BTreeSet<String>,
 }
@@ -1732,21 +2381,69 @@ fn approval_resume_evidence(
         .iter()
         .rposition(|item| !matches!(item.kind, ItemKind::SteeringQueued { .. }))
         .map_or(0, |index| index + 1);
-    let pending_tool_item_index = boundary_end.checked_sub(3).ok_or_else(|| {
+    let approval_item_index = boundary_end.checked_sub(1).ok_or_else(|| {
         HarnessError::State(
             "running Turn has no complete pre-Tool approval continuation boundary".to_owned(),
         )
     })?;
+    let policy_item_index = approval_item_index.checked_sub(1).ok_or_else(|| {
+        HarnessError::State(
+            "running Turn has no complete pre-Tool approval continuation boundary".to_owned(),
+        )
+    })?;
+    let ItemKind::ApprovalRequested {
+        approval_id,
+        call_id: approval_call_id,
+        tool,
+        reason: approval_reason,
+        risk: approval_risk,
+        requested_by,
+        tool_origin,
+        model_request_sha256,
+    } = &turn.items[approval_item_index].kind
+    else {
+        return Err(HarnessError::State(
+            "running Turn is not paused at an approval request".to_owned(),
+        ));
+    };
+    let ItemKind::PolicyDecision {
+        call_id: policy_call_id,
+        tool_origin: policy_tool_origin,
+        decision: PolicyDecision::Ask { reason, risk },
+    } = &turn.items[policy_item_index].kind
+    else {
+        return Err(HarnessError::State(
+            "approval continuation has no immediately preceding Ask decision".to_owned(),
+        ));
+    };
+    if policy_call_id != approval_call_id || approval_reason != reason || approval_risk != risk {
+        return Err(HarnessError::State(
+            "approval continuation Policy and request evidence is inconsistent".to_owned(),
+        ));
+    }
+    let pending_tool_item_index = turn.items[..policy_item_index]
+        .iter()
+        .rposition(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::ToolCall { call_id, .. } if call_id == approval_call_id
+            )
+        })
+        .ok_or_else(|| {
+            HarnessError::State("approval continuation has no correlated Tool call".to_owned())
+        })?;
     let ItemKind::ToolCall {
         model_id: recorded_model_id,
         model_origin: recorded_model_origin,
         call_id,
         name,
         input,
+        batch,
+        ..
     } = &turn.items[pending_tool_item_index].kind
     else {
         return Err(HarnessError::State(
-            "approval continuation is not immediately preceded by its Tool call".to_owned(),
+            "approval continuation has no correlated Tool call".to_owned(),
         ));
     };
     let model_id = recorded_model_id.clone().ok_or_else(|| {
@@ -1760,31 +2457,6 @@ fn approval_resume_evidence(
     let model_origin = recorded_model_origin.clone().ok_or_else(|| {
         HarnessError::State("legacy approval continuation has no recorded Model origin".to_owned())
     })?;
-    let ItemKind::PolicyDecision {
-        call_id: policy_call_id,
-        tool_origin: policy_tool_origin,
-        decision: PolicyDecision::Ask { reason, risk },
-    } = &turn.items[pending_tool_item_index + 1].kind
-    else {
-        return Err(HarnessError::State(
-            "approval continuation has no immediately preceding Ask decision".to_owned(),
-        ));
-    };
-    let ItemKind::ApprovalRequested {
-        approval_id,
-        call_id: approval_call_id,
-        tool,
-        reason: approval_reason,
-        risk: approval_risk,
-        requested_by,
-        tool_origin,
-        model_request_sha256,
-    } = &turn.items[pending_tool_item_index + 2].kind
-    else {
-        return Err(HarnessError::State(
-            "running Turn is not paused at an approval request".to_owned(),
-        ));
-    };
     if policy_call_id != call_id
         || approval_call_id != call_id
         || tool != name
@@ -1822,6 +2494,80 @@ fn approval_resume_evidence(
         ));
     }
 
+    let (model_request_item_index, batch_calls, current_batch_index) = if let Some(batch) = batch {
+        let start = pending_tool_item_index
+            .checked_sub(batch.index)
+            .ok_or_else(|| {
+                HarnessError::State(
+                    "approval continuation Tool-call batch starts before the Turn".to_owned(),
+                )
+            })?;
+        let end = start.checked_add(batch.size).ok_or_else(|| {
+            HarnessError::State("approval continuation Tool-call batch size overflow".to_owned())
+        })?;
+        if end > policy_item_index {
+            return Err(HarnessError::State(
+                "approval continuation Tool-call batch overlaps Policy evidence".to_owned(),
+            ));
+        }
+        let mut calls = Vec::with_capacity(batch.size);
+        for (index, item) in turn.items[start..end].iter().enumerate() {
+            let ItemKind::ToolCall {
+                model_id: Some(candidate_model_id),
+                model_origin: Some(candidate_model_origin),
+                call_id,
+                name,
+                input,
+                batch: Some(candidate_batch),
+            } = &item.kind
+            else {
+                return Err(HarnessError::State(
+                    "approval continuation Tool-call batch is incomplete".to_owned(),
+                ));
+            };
+            if candidate_batch.id != batch.id
+                || candidate_batch.index != index
+                || candidate_batch.size != batch.size
+                || candidate_model_id != &model_id
+                || candidate_model_origin != &model_origin
+            {
+                return Err(HarnessError::State(
+                    "approval continuation Tool-call batch evidence is inconsistent".to_owned(),
+                ));
+            }
+            calls.push(ModelToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            });
+        }
+        (
+            model_request_boundary(&turn.items, start, &model_id, &model_origin),
+            calls,
+            batch.index,
+        )
+    } else {
+        if policy_item_index != pending_tool_item_index + 1 {
+            return Err(HarnessError::State(
+                "single approval continuation is not adjacent to its Tool call".to_owned(),
+            ));
+        }
+        (
+            model_request_boundary(
+                &turn.items,
+                pending_tool_item_index,
+                &model_id,
+                &model_origin,
+            ),
+            vec![ModelToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }],
+            0,
+        )
+    };
+
     let mut consumed_steps = 0_usize;
     let mut tool_call_ids = BTreeSet::new();
     for item in &turn.items {
@@ -1831,10 +2577,12 @@ fn approval_resume_evidence(
                     .checked_add(1)
                     .ok_or_else(|| HarnessError::State("model step count overflow".to_owned()))?;
             }
-            ItemKind::ToolCall { call_id, .. } => {
-                consumed_steps = consumed_steps
-                    .checked_add(1)
-                    .ok_or_else(|| HarnessError::State("model step count overflow".to_owned()))?;
+            ItemKind::ToolCall { call_id, batch, .. } => {
+                if batch.as_ref().is_none_or(|batch| batch.index == 0) {
+                    consumed_steps = consumed_steps.checked_add(1).ok_or_else(|| {
+                        HarnessError::State("model step count overflow".to_owned())
+                    })?;
+                }
                 if !tool_call_ids.insert(call_id.clone()) {
                     return Err(HarnessError::State(
                         "approval continuation contains duplicate Tool call identities".to_owned(),
@@ -1857,10 +2605,99 @@ fn approval_resume_evidence(
         model_id,
         model_origin,
         model_request_sha256,
-        pending_tool_item_index,
+        model_request_item_index,
+        batch_calls,
+        current_batch_index,
         consumed_steps,
         tool_call_ids,
     })
+}
+
+fn model_request_boundary(
+    items: &[Item],
+    decision_start: usize,
+    model_id: &str,
+    model_origin: &crate::CapabilityOrigin,
+) -> usize {
+    decision_start
+        .checked_sub(1)
+        .filter(|index| {
+            matches!(
+                &items[*index].kind,
+                ItemKind::ProviderContinuation {
+                    model_id: continuation_model_id,
+                    model_origin: continuation_model_origin,
+                    ..
+                } if continuation_model_id == model_id
+                    && continuation_model_origin == model_origin
+            )
+        })
+        .unwrap_or(decision_start)
+}
+
+fn validate_resumed_batch_authority(
+    turn: &Turn,
+    calls: &[ModelToolCall],
+    tools: &ToolRegistry,
+) -> Result<(), HarnessError> {
+    for call in calls {
+        let registered = tools.get(&call.name).ok_or_else(|| {
+            HarnessError::State(format!(
+                "approval continuation Tool {} is not registered",
+                call.name
+            ))
+        })?;
+        let mut decisions = turn.items.iter().filter_map(|item| {
+            if let ItemKind::PolicyDecision {
+                call_id,
+                tool_origin,
+                decision,
+            } = &item.kind
+                && call_id == &call.call_id
+            {
+                Some((tool_origin, decision))
+            } else {
+                None
+            }
+        });
+        let (origin, decision) = decisions.next().ok_or_else(|| {
+            HarnessError::State(format!(
+                "approval continuation Tool call {} has no Policy decision",
+                call.call_id
+            ))
+        })?;
+        if decisions.next().is_some()
+            || origin.as_ref() != Some(&registered.origin)
+            || matches!(decision, PolicyDecision::Deny { .. })
+        {
+            return Err(HarnessError::State(format!(
+                "approval continuation Tool call {} has inconsistent Policy authority",
+                call.call_id
+            )));
+        }
+        if matches!(decision, PolicyDecision::Ask { .. }) {
+            let mut approvals = turn.items.iter().filter_map(|item| {
+                if let ItemKind::ApprovalDecision {
+                    call_id, decision, ..
+                } = &item.kind
+                    && call_id == &call.call_id
+                {
+                    Some(decision)
+                } else {
+                    None
+                }
+            });
+            if !matches!(approvals.next(), Some(ApprovalDecision::Approve))
+                || approvals.next().is_some()
+            {
+                return Err(HarnessError::State(format!(
+                    "approval continuation Tool call {} is not approved",
+                    call.call_id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn turn_prompt(turn: &Turn) -> Result<String, HarnessError> {
@@ -1999,6 +2836,12 @@ struct ModelAttemptSettlement {
     control: ModelAttemptControl,
 }
 
+struct ModelAttemptInvocation {
+    request: ModelRequest,
+    stream: ModelStream,
+    retry_index: u8,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ModelAttemptControl {
     None,
@@ -2015,6 +2858,9 @@ struct RuntimeModel {
 struct ModelRoute {
     entries: Vec<RuntimeModel>,
     attempt_timeout: Option<Duration>,
+    retry_policy: Option<ModelRetryPolicy>,
+    timeout_cooldown: Option<Duration>,
+    timeout_cooldowns: Mutex<BTreeMap<String, Instant>>,
 }
 
 impl ModelRoute {
@@ -2026,6 +2872,9 @@ impl ModelRoute {
                 origin: crate::CapabilityOrigin::BuiltIn,
             }],
             attempt_timeout: None,
+            retry_policy: None,
+            timeout_cooldown: None,
+            timeout_cooldowns: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -2055,6 +2904,9 @@ impl ModelRoute {
         Ok(Self {
             entries,
             attempt_timeout: (model_ids.len() > 1).then_some(DEFAULT_MODEL_ATTEMPT_TIMEOUT),
+            retry_policy: None,
+            timeout_cooldown: None,
+            timeout_cooldowns: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2095,6 +2947,119 @@ impl ModelRoute {
             Ok((Some(attempt_deadline), true))
         }
     }
+
+    fn retry_delay(
+        &self,
+        error: &HarnessError,
+        next_retry: u8,
+        target: &ObservationTarget<'_>,
+        model_id: &str,
+    ) -> Option<Duration> {
+        let policy = self.retry_policy?;
+        if next_retry == 0 || next_retry > policy.max_retries {
+            return None;
+        }
+        let HarnessError::ModelProvider(failure) = error else {
+            return None;
+        };
+        if !matches!(
+            failure.kind(),
+            ModelProviderFailureKind::RateLimited
+                | ModelProviderFailureKind::Overloaded
+                | ModelProviderFailureKind::Server
+                | ModelProviderFailureKind::Transport
+        ) {
+            return None;
+        }
+        if let Some(delay_ms) = failure.retry_after_ms() {
+            let delay = Duration::from_millis(delay_ms);
+            return (delay <= policy.max_delay).then_some(delay);
+        }
+        let multiplier = 1_u32 << u32::from(next_retry - 1);
+        let ceiling = policy
+            .initial_delay
+            .saturating_mul(multiplier)
+            .min(policy.max_delay);
+        let ceiling_ms = u64::try_from(ceiling.as_millis()).ok()?;
+        let floor_ms = ceiling_ms.div_ceil(2);
+        let width = ceiling_ms.checked_sub(floor_ms)?.checked_add(1)?;
+        let jitter = stable_retry_hash(
+            target.thread_id.as_str(),
+            target.turn_id.as_str(),
+            model_id,
+            next_retry,
+        ) % width;
+        Some(Duration::from_millis(floor_ms + jitter))
+    }
+
+    fn partition_timeout_cooldown<'a>(
+        &self,
+        candidates: Vec<&'a RuntimeModel>,
+        now: Instant,
+    ) -> Result<(Vec<&'a RuntimeModel>, Vec<&'a RuntimeModel>), HarnessError> {
+        if self.timeout_cooldown.is_none() || candidates.len() < 2 {
+            return Ok((candidates, Vec::new()));
+        }
+        let mut cooldowns = self
+            .timeout_cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cooldowns.retain(|_, unavailable_until| *unavailable_until > now);
+        let mut available = Vec::with_capacity(candidates.len());
+        let mut cooling = Vec::new();
+        for candidate in candidates {
+            if cooldowns.contains_key(candidate.identity.get()?) {
+                cooling.push(candidate);
+            } else {
+                available.push(candidate);
+            }
+        }
+        if available.is_empty() {
+            available = cooling;
+            cooling = Vec::new();
+        }
+        Ok((available, cooling))
+    }
+
+    fn record_attempt_timeout(&self, model_id: &str, now: Instant) -> Result<(), HarnessError> {
+        let Some(cooldown) = self.timeout_cooldown else {
+            return Ok(());
+        };
+        let unavailable_until = now.checked_add(cooldown).ok_or_else(|| {
+            HarnessError::InvalidConfiguration(
+                "Model timeout cooldown exceeds the runtime clock range".to_owned(),
+            )
+        })?;
+        self.timeout_cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(model_id.to_owned(), unavailable_until);
+        Ok(())
+    }
+
+    fn clear_attempt_timeout(&self, model_id: &str) {
+        if self.timeout_cooldown.is_none() {
+            return;
+        }
+        self.timeout_cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(model_id);
+    }
+}
+
+fn stable_retry_hash(thread_id: &str, turn_id: &str, model_id: &str, retry: u8) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [thread_id, turn_id, model_id] {
+        for byte in value.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= u64::from(retry);
+    hash.wrapping_mul(0x0000_0100_0000_01b3)
 }
 
 enum FrozenModelIdentity {
@@ -2181,6 +3146,7 @@ pub(crate) fn validate_model_output(output: &ModelOutput) -> Result<(), HarnessE
             name,
             input,
         } => validate_model_tool_call(call_id, name, input),
+        ModelOutput::ToolCalls { calls } => validate_model_tool_calls(calls),
     }
 }
 
@@ -2383,6 +3349,38 @@ fn validate_model_tool_call(call_id: &str, name: &str, input: &Value) -> Result<
     )
 }
 
+fn validate_model_tool_calls(calls: &[ModelToolCall]) -> Result<(), HarnessError> {
+    if !(2..=crate::MAX_TOOL_CALLS_PER_BATCH).contains(&calls.len()) {
+        return Err(HarnessError::Model(format!(
+            "tool-call batch must contain 2-{} calls",
+            crate::MAX_TOOL_CALLS_PER_BATCH
+        )));
+    }
+    let mut call_ids = BTreeSet::new();
+    for call in calls {
+        validate_model_tool_call(&call.call_id, &call.name, &call.input)?;
+        if !call_ids.insert(&call.call_id) {
+            return Err(HarnessError::Model(format!(
+                "tool-call batch reused correlation id {:?}",
+                call.call_id
+            )));
+        }
+    }
+    crate::json::bounded_serialized_size(&calls, MAX_MODEL_TOOL_BATCH_BYTES).map_err(
+        |failure| {
+            HarnessError::Model(match failure {
+                crate::json::BoundedJsonError::LimitExceeded => {
+                    format!("tool-call batch exceeds {MAX_MODEL_TOOL_BATCH_BYTES} bytes")
+                }
+                crate::json::BoundedJsonError::CannotEncode => {
+                    "cannot encode tool-call batch".to_owned()
+                }
+            })
+        },
+    )?;
+    Ok(())
+}
+
 fn validate_tool_output(output: &Value) -> Result<(), HarnessError> {
     validate_runtime_json(
         "tool output",
@@ -2463,6 +3461,109 @@ fn conversation_summary_record(block: &ContextBlock) -> Result<ItemKind, Harness
     })
 }
 
+fn invocation_context_record(
+    blocks: &[ContextBlock],
+    submitted_by: ActorIdentity,
+) -> Option<ItemKind> {
+    let mut evidence = Vec::new();
+    for block in blocks {
+        let ContextSource::Invocation {
+            source,
+            reference,
+            source_sha256,
+            content_sha256,
+        } = &block.source
+        else {
+            continue;
+        };
+        evidence.push(InvocationContextEvidence {
+            source: source.clone(),
+            reference: reference.clone(),
+            source_sha256: source_sha256.clone(),
+            content_sha256: content_sha256.clone(),
+            estimated_tokens: block.estimated_tokens,
+            serialized_bytes: block.text.len(),
+        });
+    }
+    if evidence.is_empty() {
+        None
+    } else {
+        Some(ItemKind::InvocationContext {
+            submitted_by,
+            blocks: evidence,
+        })
+    }
+}
+
+async fn invoke_tool_capability(
+    tool: Arc<dyn Tool>,
+    observability: Observability,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    call: ModelToolCall,
+    cancellation: crate::CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<ToolCallSettlement, HarnessError> {
+    let ModelToolCall {
+        call_id,
+        name,
+        input,
+    } = call;
+    let context = ToolContext {
+        thread_id: thread_id.clone(),
+        turn_id: turn_id.clone(),
+        call_id: call_id.clone(),
+        cancellation: cancellation.clone(),
+    };
+    let started = Instant::now();
+    let result = controlled(&cancellation, deadline, ExecutionPhase::Tool, || {
+        tool.execute(input, context)
+    })
+    .await;
+    observability.emit(&PhaseObservation {
+        thread_id,
+        turn_id,
+        phase: ExecutionPhase::Tool,
+        capability: name,
+        duration_micros: elapsed_micros(started),
+        outcome: observation_outcome(&result),
+        model_usage: None,
+        provider_model: None,
+        provider_request_id: None,
+        provider_failure_kind: None,
+        provider_status_code: None,
+        provider_retry_after_ms: None,
+        model_retry_index: None,
+        stream_events_dropped: 0,
+    });
+    match result {
+        Ok(output) => {
+            let (output, is_error) = match validate_tool_output(&output) {
+                Ok(()) => (output, false),
+                Err(error) => (
+                    serde_json::json!({
+                        "error": bounded_runtime_error(&error.to_string())
+                    }),
+                    true,
+                ),
+            };
+            Ok(ToolCallSettlement {
+                call_id,
+                output,
+                is_error,
+            })
+        }
+        Err(error @ (HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. })) => Err(error),
+        Err(error) => Ok(ToolCallSettlement {
+            call_id,
+            output: serde_json::json!({
+                "error": bounded_runtime_error(&error.to_string())
+            }),
+            is_error: true,
+        }),
+    }
+}
+
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -2473,6 +3574,59 @@ fn observation_outcome<T>(result: &Result<T, HarnessError>) -> ObservationOutcom
         Err(HarnessError::Cancelled { .. }) => ObservationOutcome::Cancelled,
         Err(HarnessError::TimedOut { .. }) => ObservationOutcome::TimedOut,
         Err(_) => ObservationOutcome::Error,
+    }
+}
+
+fn validate_model_attempt_error(error: HarnessError) -> HarnessError {
+    match error {
+        HarnessError::ModelProvider(failure) => match failure.validate() {
+            Ok(()) => HarnessError::ModelProvider(failure),
+            Err(_) => HarnessError::InvalidCapability(
+                "Model returned invalid typed Provider failure metadata".to_owned(),
+            ),
+        },
+        error => error,
+    }
+}
+
+async fn wait_for_model_retry(
+    cancellation: &crate::CancellationToken,
+    deadline: Option<Instant>,
+    deadline_is_attempt: bool,
+    delay: Duration,
+) -> Result<bool, HarnessError> {
+    if let Some(deadline) = deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            return if deadline_is_attempt {
+                Ok(false)
+            } else {
+                Err(HarnessError::TimedOut {
+                    phase: ExecutionPhase::Model,
+                })
+            };
+        }
+        if now
+            .checked_add(delay)
+            .is_none_or(|ready_at| ready_at >= deadline)
+        {
+            return Ok(false);
+        }
+    }
+    match controlled(
+        cancellation,
+        deadline,
+        ExecutionPhase::Model,
+        || async move {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(HarnessError::TimedOut { .. }) if deadline_is_attempt => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -2516,19 +3670,23 @@ mod tests {
     };
 
     use serde_json::{Value, json};
-    use tokio::sync::Notify;
+    use tokio::{
+        sync::{Barrier, Notify},
+        time::Instant,
+    };
 
     use super::{
         AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, MAX_PENDING_STEERING,
-        MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES, PolicyEngine, Tool,
-        TurnExecutionOptions, require_runtime_capacity, validate_approval_decision,
-        validate_model_request, validate_model_response, validate_model_tool_call,
-        validate_policy_decision, validate_tool_output,
+        MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES, ModelRetryPolicy, ModelRoute,
+        PolicyEngine, Tool, TurnExecutionOptions, require_runtime_capacity,
+        validate_approval_decision, validate_model_request, validate_model_response,
+        validate_model_tool_call, validate_model_tool_calls, validate_policy_decision,
+        validate_tool_output,
     };
     use crate::{
-        ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus, ApprovalRequest,
-        CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin, ContextEngine,
-        ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
+        ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus,
+        ApprovalRequest, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
+        ContextEngine, ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
         ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
         ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
         ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler, ItemKind,
@@ -2536,12 +3694,14 @@ mod tests {
         MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
         MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
         MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
-        ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent,
-        ModelUsage, Observability, ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel,
-        SqliteApprovalInbox, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
-        StateEvent, StoredEvent, ThreadId, ToolAuthorization, ToolContext, ToolDescriptor,
-        ToolRegistry, TraceCollector, TurnStatus, TurnStopReason, VerificationOutcome,
-        VerificationRegistry, VerificationRequest, Verifier, VerifierDescriptor,
+        ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
+        ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, Observability,
+        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox,
+        SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
+        ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution, ToolContext,
+        ToolDescriptor, ToolRegistry, TraceCollector, TurnContextInput, TurnStatus, TurnStopReason,
+        VerificationOutcome, VerificationRegistry, VerificationRequest, Verifier,
+        VerifierDescriptor,
     };
 
     struct EchoTool {
@@ -2734,6 +3894,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_rejects_an_unbounded_parallel_tool_limit() {
+        for limit in [0, super::MAX_PARALLEL_TOOL_CALLS + 1] {
+            let runtime = HarnessRuntime::new(
+                Arc::new(EchoModel),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            );
+            assert!(runtime.with_max_parallel_tool_calls(limit).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn state_item_failure_still_durably_settles_the_turn() {
         let runtime = HarnessRuntime::new(
@@ -2770,6 +3943,10 @@ mod tests {
                     "required": ["text"]
                 }),
             }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            ToolBatchExecution::ParallelSafe
         }
 
         fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
@@ -2826,6 +4003,23 @@ mod tests {
         entered: Arc<Notify>,
     }
 
+    struct ParallelEchoTool {
+        rendezvous: Arc<Barrier>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    struct ParallelFastOrPendingTool {
+        fast_done: Arc<Notify>,
+        pending_entered: Arc<Notify>,
+    }
+
+    struct LoggingBatchTool {
+        name: &'static str,
+        execution: ToolBatchExecution,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
     impl Tool for PendingCountingTool {
         fn descriptor(&self) -> ToolDescriptor {
             ToolDescriptor {
@@ -2844,9 +4038,111 @@ mod tests {
         }
     }
 
+    impl Tool for ParallelEchoTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Parallel-safe echo probe".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            ToolBatchExecution::ParallelSafe
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+                self.rendezvous.wait().await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(input)
+            })
+        }
+    }
+
+    impl Tool for ParallelFastOrPendingTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Completes only the first parallel probe".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            ToolBatchExecution::ParallelSafe
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                if input.get("text").and_then(Value::as_str) == Some("first") {
+                    self.fast_done.notify_one();
+                    Ok(input)
+                } else {
+                    self.fast_done.notified().await;
+                    self.pending_entered.notify_one();
+                    pending().await
+                }
+            })
+        }
+    }
+
+    impl Tool for LoggingBatchTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: self.name.to_owned(),
+                description: "Records batch scheduling boundaries".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "label": { "type": "string" } },
+                    "required": ["label"]
+                }),
+            }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            self.execution
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                let label = input
+                    .get("label")
+                    .or_else(|| input.get("text"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| HarnessError::Tool("missing label".to_owned()))?
+                    .to_owned();
+                self.events
+                    .lock()
+                    .map_err(|_| HarnessError::Tool("event recorder poisoned".to_owned()))?
+                    .push(format!("start:{label}"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.events
+                    .lock()
+                    .map_err(|_| HarnessError::Tool("event recorder poisoned".to_owned()))?
+                    .push(format!("end:{label}"));
+                Ok(input)
+            })
+        }
+    }
+
     struct EchoModel;
 
     struct DuplicateCallModel;
+
+    struct BatchToolModel;
+
+    struct MixedBatchToolModel;
 
     struct ContinuationModel {
         requests: Arc<Mutex<Vec<ModelRequest>>>,
@@ -2910,6 +4206,77 @@ mod tests {
                     name: "echo".to_owned(),
                     input: json!({"text": "once"}),
                 })
+            })
+        }
+    }
+
+    impl LanguageModel for BatchToolModel {
+        fn id(&self) -> &str {
+            "test/batch-tool-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let results = request
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item.kind, ItemKind::ToolResult { .. }))
+                    .count();
+                if results == 2 {
+                    return Ok(ModelOutput::Message {
+                        content: "observed ordered batch".to_owned(),
+                    });
+                }
+                Ok(ModelOutput::ToolCalls {
+                    calls: vec![
+                        ModelToolCall {
+                            call_id: "batch-call-1".to_owned(),
+                            name: "echo".to_owned(),
+                            input: json!({"text": "first"}),
+                        },
+                        ModelToolCall {
+                            call_id: "batch-call-2".to_owned(),
+                            name: "echo".to_owned(),
+                            input: json!({"text": "second"}),
+                        },
+                    ],
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for MixedBatchToolModel {
+        fn id(&self) -> &str {
+            "test/mixed-batch-tool-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let results = request
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item.kind, ItemKind::ToolResult { .. }))
+                    .count();
+                if results == 5 {
+                    return Ok(ModelOutput::Message {
+                        content: "observed fenced batch".to_owned(),
+                    });
+                }
+                let calls = [
+                    ("mixed-call-1", "parallel-probe", "p1"),
+                    ("mixed-call-2", "parallel-probe", "p2"),
+                    ("mixed-call-3", "exclusive-probe", "x"),
+                    ("mixed-call-4", "parallel-probe", "p3"),
+                    ("mixed-call-5", "parallel-probe", "p4"),
+                ]
+                .into_iter()
+                .map(|(call_id, name, label)| ModelToolCall {
+                    call_id: call_id.to_owned(),
+                    name: name.to_owned(),
+                    input: json!({"label": label}),
+                })
+                .collect();
+                Ok(ModelOutput::ToolCalls { calls })
             })
         }
     }
@@ -3036,12 +4403,32 @@ mod tests {
 
     struct UsageModel;
 
+    struct TypedProviderFailureModel;
+
     struct RouteFailingModel {
         calls: Arc<AtomicUsize>,
         emit_delta: bool,
     }
 
+    struct TypedRouteFailingModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct TypedRetryModel {
+        id: &'static str,
+        calls: Arc<AtomicUsize>,
+        kind: ModelProviderFailureKind,
+        retry_after_ms: Option<u64>,
+        succeeds_on_call: Option<usize>,
+        emit_before_failure: bool,
+        failure_observed: Option<Arc<Notify>>,
+    }
+
     struct RouteSuccessModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct SuccessThenFailureModel {
         calls: Arc<AtomicUsize>,
     }
 
@@ -3209,6 +4596,85 @@ mod tests {
         }
     }
 
+    impl LanguageModel for TypedRouteFailingModel {
+        fn id(&self) -> &str {
+            "test/typed-route-primary"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(HarnessError::ModelProvider(ModelProviderFailure::new(
+                    ModelProviderFailureKind::RateLimited,
+                    "provider rate limit reached",
+                    Some(429),
+                    Some(2_000),
+                )?))
+            })
+        }
+    }
+
+    impl LanguageModel for TypedRetryModel {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Err(HarnessError::Model(
+                    "typed retry fixture requires streaming entrypoint".to_owned(),
+                ))
+            })
+        }
+
+        fn complete_streaming<'a>(
+            &'a self,
+            _request: ModelRequest,
+            stream: ModelStream,
+        ) -> HarnessFuture<'a, ModelResponse> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.succeeds_on_call == Some(call) {
+                    return Ok(ModelResponse::from(ModelOutput::Message {
+                        content: "retry settled".to_owned(),
+                    }));
+                }
+                if self.emit_before_failure {
+                    let _ = stream.emit_text_delta("provisional");
+                }
+                if let Some(observed) = &self.failure_observed {
+                    observed.notify_one();
+                }
+                Err(HarnessError::ModelProvider(ModelProviderFailure::new(
+                    self.kind,
+                    "typed retry fixture failure",
+                    None,
+                    self.retry_after_ms,
+                )?))
+            })
+        }
+    }
+
+    impl LanguageModel for SuccessThenFailureModel {
+        fn id(&self) -> &str {
+            "test/route-secondary"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(ModelOutput::Message {
+                        content: "secondary result".to_owned(),
+                    })
+                } else {
+                    Err(HarnessError::Model(
+                        "secondary model unavailable".to_owned(),
+                    ))
+                }
+            })
+        }
+    }
+
     impl LanguageModel for UsageModel {
         fn id(&self) -> &str {
             "test/usage-model"
@@ -3242,6 +4708,23 @@ mod tests {
                     provider_request_id: Some("provider-request".to_owned()),
                     continuation: None,
                 })
+            })
+        }
+    }
+
+    impl LanguageModel for TypedProviderFailureModel {
+        fn id(&self) -> &str {
+            "test/typed-provider-failure"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async {
+                Err(HarnessError::ModelProvider(ModelProviderFailure::new(
+                    ModelProviderFailureKind::RateLimited,
+                    "provider rate limit reached",
+                    Some(429),
+                    Some(2_000),
+                )?))
             })
         }
     }
@@ -3386,6 +4869,7 @@ mod tests {
     }
 
     struct CancellablePendingModel {
+        calls: Arc<AtomicUsize>,
         cancellation_observed: Arc<AtomicUsize>,
     }
 
@@ -3536,6 +5020,7 @@ mod tests {
             stream: ModelStream,
         ) -> HarnessFuture<'a, ModelResponse> {
             Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 let cancellation = stream.cancellation_token();
                 let observed = self.cancellation_observed.clone();
                 tokio::spawn(async move {
@@ -3619,6 +5104,28 @@ mod tests {
                     reason: "operator confirmation required".to_owned(),
                     risk: RiskLevel::High,
                 })
+            })
+        }
+    }
+
+    struct BatchAskFirstPolicy;
+
+    impl PolicyEngine for BatchAskFirstPolicy {
+        fn authorize<'a>(
+            &'a self,
+            request: &'a ToolAuthorization,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async move {
+                match request.call_id.as_str() {
+                    "batch-call-1" => Ok(PolicyDecision::Ask {
+                        reason: "approve the ordered batch".to_owned(),
+                        risk: RiskLevel::High,
+                    }),
+                    "batch-call-2" => Ok(PolicyDecision::Allow),
+                    other => Err(HarnessError::Policy(format!(
+                        "unexpected batch call {other}"
+                    ))),
+                }
             })
         }
     }
@@ -3771,6 +5278,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_a_read_only_digest_bound_thread_handoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = runtime(
+            calls,
+            AllowListPolicy::deny_by_default().allow("echo"),
+            state.clone(),
+        );
+        let source = runtime.create_thread().await.expect("create source");
+        let shared = runtime
+            .run_turn(&source.id, "shared")
+            .await
+            .expect("shared turn");
+        let target_id = ThreadId::from_static("runtime-handoff-target");
+        runtime
+            .fork_thread(&source.id, target_id.clone(), Some(&shared.turn.id))
+            .await
+            .expect("fork target");
+        runtime
+            .run_turn(&source.id, "source-only")
+            .await
+            .expect("source-only turn");
+        let target_events_before = state.events(&target_id).await.expect("target events").len();
+
+        let request = runtime
+            .prepare_thread_handoff(&source.id, &target_id, &ThreadHandoffConfig::default())
+            .await
+            .expect("prepare handoff")
+            .expect("source delta");
+
+        assert_eq!(request.shared_prefix_turns, 1);
+        assert_eq!(request.turns.len(), 1);
+        assert_eq!(request.older_source_turns, 0);
+        assert_eq!(
+            state.events(&target_id).await.expect("target events").len(),
+            target_events_before
+        );
+        let context = request
+            .to_context("Source explored a separate path.")
+            .expect("context");
+        assert_eq!(context.source, "thread-handoff");
+        assert!(context.reference.contains(&request.source_sha256));
+    }
+
+    #[tokio::test]
+    async fn runs_same_response_tool_calls_as_one_ordered_durable_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(BatchToolModel),
+            registry(calls.clone()),
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            state.clone(),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "batch")
+            .await
+            .expect("batch turn");
+
+        assert_eq!(outcome.final_text, "observed ordered batch");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let events = state.events(&thread.id).await.expect("events");
+        let batches = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                StateEvent::ToolCallsAppended { calls, .. } => Some(calls),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+
+        let items = &outcome.turn.items;
+        assert_eq!(items.len(), 9);
+        let first_batch = match &items[2].kind {
+            ItemKind::ToolCall { call_id, batch, .. } if call_id == "batch-call-1" => {
+                batch.as_ref().expect("first batch position")
+            }
+            other => panic!("unexpected first batch Item: {other:?}"),
+        };
+        let second_batch = match &items[3].kind {
+            ItemKind::ToolCall { call_id, batch, .. } if call_id == "batch-call-2" => {
+                batch.as_ref().expect("second batch position")
+            }
+            other => panic!("unexpected second batch Item: {other:?}"),
+        };
+        assert_eq!(first_batch.id, second_batch.id);
+        assert_eq!((first_batch.index, first_batch.size), (0, 2));
+        assert_eq!((second_batch.index, second_batch.size), (1, 2));
+        assert!(matches!(
+            &items[4].kind,
+            ItemKind::PolicyDecision { call_id, .. } if call_id == "batch-call-1"
+        ));
+        assert!(matches!(
+            &items[5].kind,
+            ItemKind::PolicyDecision { call_id, .. } if call_id == "batch-call-2"
+        ));
+        assert!(matches!(
+            &items[6].kind,
+            ItemKind::ToolResult {
+                call_id,
+                is_error: false,
+                ..
+            } if call_id == "batch-call-1"
+        ));
+        assert!(matches!(
+            &items[7].kind,
+            ItemKind::ToolResult {
+                call_id,
+                is_error: false,
+                ..
+            } if call_id == "batch-call-2"
+        ));
+        assert!(matches!(items[8].kind, ItemKind::AssistantMessage { .. }));
+    }
+
+    #[tokio::test]
     async fn provider_continuation_is_durable_and_replayed_through_the_tool_loop() {
         let calls = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -3814,6 +5440,320 @@ mod tests {
             } if model_id == "test/continuation-model"
                 && continuation.format() == "test.provider.reasoning.v1"
         ));
+    }
+
+    #[tokio::test]
+    async fn explicitly_safe_tool_calls_overlap_but_settle_in_source_order() {
+        let rendezvous = Arc::new(Barrier::new(3));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(ParallelEchoTool {
+                    rendezvous: rendezvous.clone(),
+                    in_flight: in_flight.clone(),
+                    max_in_flight: max_in_flight.clone(),
+                }),
+            )
+            .expect("parallel-safe Tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(BatchToolModel),
+                tools,
+                Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_max_parallel_tool_calls(2)
+            .expect("parallel limit"),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            async move { runtime.run_turn(&thread_id, "parallel batch").await }
+        });
+
+        if tokio::time::timeout(Duration::from_secs(1), rendezvous.wait())
+            .await
+            .is_err()
+        {
+            worker.abort();
+            let _ = worker.await;
+            panic!("parallel-safe calls did not overlap");
+        }
+        let outcome = worker.await.expect("worker").expect("parallel batch");
+
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        let results = outcome
+            .turn
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, ["batch-call-1", "batch-call-2"]);
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_fences_neighboring_parallel_safe_runs() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register_batch([
+                (
+                    CapabilityOrigin::BuiltIn,
+                    Arc::new(LoggingBatchTool {
+                        name: "parallel-probe",
+                        execution: ToolBatchExecution::ParallelSafe,
+                        events: events.clone(),
+                    }) as Arc<dyn Tool>,
+                ),
+                (
+                    CapabilityOrigin::BuiltIn,
+                    Arc::new(LoggingBatchTool {
+                        name: "exclusive-probe",
+                        execution: ToolBatchExecution::Sequential,
+                        events: events.clone(),
+                    }) as Arc<dyn Tool>,
+                ),
+            ])
+            .expect("logging Tools");
+        let runtime = HarnessRuntime::new(
+            Arc::new(MixedBatchToolModel),
+            tools,
+            Arc::new(
+                AllowListPolicy::deny_by_default()
+                    .allow("parallel-probe")
+                    .allow("exclusive-probe"),
+            ),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_parallel_tool_calls(2)
+        .expect("parallel limit");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "mixed batch")
+            .await
+            .expect("mixed batch");
+        assert_eq!(outcome.final_text, "observed fenced batch");
+        let events = events.lock().expect("events").clone();
+        let position = |event: &str| {
+            events
+                .iter()
+                .position(|candidate| candidate == event)
+                .expect("event position")
+        };
+        assert!(position("end:p1") < position("start:x"));
+        assert!(position("end:p2") < position("start:x"));
+        assert!(position("end:x") < position("start:p3"));
+        assert!(position("end:x") < position("start:p4"));
+        let results = outcome
+            .turn
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            [
+                "mixed-call-1",
+                "mixed-call-2",
+                "mixed-call-3",
+                "mixed-call-4",
+                "mixed-call-5"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_calls_respect_a_runtime_limit_of_one() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(LoggingBatchTool {
+                    name: "echo",
+                    execution: ToolBatchExecution::ParallelSafe,
+                    events: events.clone(),
+                }),
+            )
+            .expect("logging Tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(BatchToolModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_parallel_tool_calls(1)
+        .expect("sequential limit");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        runtime
+            .run_turn(&thread.id, "bounded batch")
+            .await
+            .expect("bounded batch");
+
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["start:first", "end:first", "start:second", "end:second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_timeout_keeps_completed_effect_evidence_and_stops() {
+        let fast_done = Arc::new(Notify::new());
+        let pending_entered = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(ParallelFastOrPendingTool {
+                    fast_done,
+                    pending_entered,
+                }),
+            )
+            .expect("parallel timeout Tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(BatchToolModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_parallel_tool_calls(2)
+        .expect("parallel limit");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "parallel timeout",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(20)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("parallel timeout");
+
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Tool
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        let results = projected.turns[0]
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, ["batch-call-1"]);
+        assert!(projected.turns[0].items.iter().any(|item| matches!(
+            item.kind,
+            ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Tool,
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_cancellation_keeps_completed_effect_evidence_and_stops() {
+        let fast_done = Arc::new(Notify::new());
+        let pending_entered = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(ParallelFastOrPendingTool {
+                    fast_done,
+                    pending_entered: pending_entered.clone(),
+                }),
+            )
+            .expect("parallel cancellation Tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(BatchToolModel),
+                tools,
+                Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_max_parallel_tool_calls(2)
+            .expect("parallel limit"),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let cancellation = CancellationToken::new();
+        let running = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "parallel cancellation",
+                        TurnExecutionOptions {
+                            cancellation,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), pending_entered.notified())
+            .await
+            .expect("pending sibling entered");
+        cancellation.cancel();
+
+        assert_eq!(
+            running
+                .await
+                .expect("parallel task")
+                .expect_err("parallel cancellation"),
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Tool
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Cancelled);
+        let results = projected.turns[0]
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, ["batch-call-1"]);
+        assert!(projected.turns[0].items.iter().any(|item| matches!(
+            item.kind,
+            ItemKind::TurnStopped {
+                reason: TurnStopReason::Cancelled,
+                phase: ExecutionPhase::Tool,
+            }
+        )));
     }
 
     #[tokio::test]
@@ -3890,6 +5830,7 @@ mod tests {
                 call_id: "tampered-call".to_owned(),
                 name: "echo".to_owned(),
                 input: json!({}),
+                batch: None,
             }),
             crate::Item::new(ItemKind::ToolResult {
                 call_id: "tampered-call".to_owned(),
@@ -3924,6 +5865,7 @@ mod tests {
                 call_id: "completed-call".to_owned(),
                 name: "echo".to_owned(),
                 input: json!({}),
+                batch: None,
             }),
             crate::Item::new(ItemKind::ToolResult {
                 call_id: "completed-call".to_owned(),
@@ -4677,10 +6619,27 @@ mod tests {
             .with_approval_handler(handler.clone()),
         );
         let thread = first.create_thread().await.expect("create thread");
+        let turn_context = TurnContextInput {
+            source: "branch-handoff".to_owned(),
+            reference: "thread:source/turn:terminal".to_owned(),
+            text: "exact resumable handoff".to_owned(),
+        };
         let first_worker = {
             let runtime = first.clone();
             let thread_id = thread.id.clone();
-            tokio::spawn(async move { runtime.run_turn(&thread_id, "resume me").await })
+            let turn_context = turn_context.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "resume me",
+                        TurnExecutionOptions {
+                            context: vec![turn_context],
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            })
         };
         let pending = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -4737,12 +6696,26 @@ mod tests {
                     authority: "different-authority".to_owned(),
                     subject: "different-requester".to_owned(),
                 },
+                context: vec![turn_context.clone()],
                 ..TurnExecutionOptions::default()
             },
         )
         .await
         .expect_err("requester drift must fail closed");
         assert!(actor_error.to_string().contains("requester differs"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let context_error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect_err("missing invocation context must fail closed");
+        assert!(context_error.to_string().contains("Model request changed"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let mut drifted_tools = ToolRegistry::new();
@@ -4765,7 +6738,10 @@ mod tests {
             .resume_approval_turn_with_options(
                 &thread.id,
                 &turn_id,
-                TurnExecutionOptions::default(),
+                TurnExecutionOptions {
+                    context: vec![turn_context.clone()],
+                    ..TurnExecutionOptions::default()
+                },
             )
             .await
             .expect_err("Tool descriptor drift must fail closed");
@@ -4789,7 +6765,14 @@ mod tests {
             state.clone(),
         )
         .with_approval_handler(handler)
-        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                context: vec![turn_context],
+                ..TurnExecutionOptions::default()
+            },
+        )
         .await
         .expect("resume approval boundary");
 
@@ -4812,6 +6795,97 @@ mod tests {
                 .items
                 .iter()
                 .filter(|item| matches!(&item.kind, ItemKind::ToolResult { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_batch_approval_resume_executes_every_call_once_in_source_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(BatchToolModel),
+                registry(calls.clone()),
+                Arc::new(BatchAskFirstPolicy),
+                state.clone(),
+            )
+            .with_approval_handler(handler.clone()),
+        );
+        let thread = first.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = first.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "batch resume").await })
+        };
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("pending approvals")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("batch approval submission");
+        let turn_id = pending.request.authorization.turn_id.clone();
+        worker.abort();
+        worker.await.expect_err("simulated worker loss");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle batch approval");
+
+        let resumed = HarnessRuntime::new(
+            Arc::new(BatchToolModel),
+            registry(calls.clone()),
+            Arc::new(BatchAskFirstPolicy),
+            state,
+        )
+        .with_approval_handler(handler)
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect("resume batch approval");
+
+        assert_eq!(resumed.final_text, "observed ordered batch");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let results = resumed
+            .turn
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, ["batch-call-1", "batch-call-2"]);
+        assert_eq!(
+            resumed
+                .turn
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, ItemKind::ApprovalDecision { .. }))
                 .count(),
             1
         );
@@ -5024,7 +7098,11 @@ mod tests {
         .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
         .await
         .expect_err("unknown Tool boundary must not replay");
-        assert!(error.to_string().contains("preceded by its Tool call"));
+        assert!(
+            error
+                .to_string()
+                .contains("not paused at an approval request")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             state
@@ -5419,6 +7497,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn typed_provider_failure_reaches_trace_without_diagnostic_content() {
+        let collector = Arc::new(TraceCollector::new(8).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("register observer");
+        let runtime = HarnessRuntime::new(
+            Arc::new(TypedProviderFailureModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "typed failure")
+            .await
+            .expect_err("provider must fail");
+
+        let HarnessError::ModelProvider(failure) = error else {
+            panic!("expected typed Provider failure");
+        };
+        assert_eq!(failure.kind(), ModelProviderFailureKind::RateLimited);
+        let model = collector
+            .snapshot()
+            .into_iter()
+            .find(|record| record.phase == ExecutionPhase::Model)
+            .expect("model observation");
+        assert_eq!(model.outcome, ObservationOutcome::Error);
+        assert_eq!(
+            model.provider_failure_kind,
+            Some(ModelProviderFailureKind::RateLimited)
+        );
+        assert_eq!(model.provider_status_code, Some(429));
+        assert_eq!(model.provider_retry_after_ms, Some(2_000));
+        assert!(model.provider_model.is_none());
+        assert!(model.provider_request_id.is_none());
+    }
+
     #[test]
     fn provider_model_evidence_is_bounded_before_observation() {
         let mut response = ModelResponse::from(ModelOutput::Message {
@@ -5428,6 +7547,25 @@ mod tests {
 
         let error = validate_model_response(&response).expect_err("oversized provider model");
         assert!(error.to_string().contains("provider model"));
+    }
+
+    #[test]
+    fn model_tool_call_batch_rejects_duplicate_correlations() {
+        let calls = vec![
+            ModelToolCall {
+                call_id: "duplicate".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({"text": "first"}),
+            },
+            ModelToolCall {
+                call_id: "duplicate".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({"text": "second"}),
+            },
+        ];
+
+        let error = validate_model_tool_calls(&calls).expect_err("duplicate correlation");
+        assert!(error.to_string().contains("reused correlation"));
     }
 
     #[tokio::test]
@@ -5514,6 +7652,100 @@ mod tests {
             runtime.with_model_attempt_timeout(Duration::ZERO),
             Err(HarnessError::InvalidConfiguration(_))
         ));
+        let single = HarnessRuntime::from_model_registry(
+            &models,
+            "test/usage-model",
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("single Model route");
+        assert!(matches!(
+            single.with_model_timeout_cooldown(Duration::from_secs(1)),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn model_timeout_cooldown_expires_and_never_removes_the_complete_route() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls,
+                    emit_delta: false,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls,
+                }),
+            )
+            .expect("secondary");
+        for cooldown in [
+            Duration::ZERO,
+            super::MAX_MODEL_TIMEOUT_COOLDOWN + Duration::from_millis(1),
+        ] {
+            let runtime = HarnessRuntime::from_model_registry_failover(
+                &models,
+                &["test/route-primary", "test/route-secondary"],
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .expect("route");
+            assert!(matches!(
+                runtime.with_model_timeout_cooldown(cooldown),
+                Err(HarnessError::InvalidConfiguration(_))
+            ));
+        }
+        let mut route =
+            ModelRoute::from_registry(&models, &["test/route-primary", "test/route-secondary"])
+                .expect("route");
+        route.timeout_cooldown = Some(Duration::from_secs(1));
+        let now = Instant::now();
+        route
+            .record_attempt_timeout("test/route-primary", now)
+            .expect("record timeout");
+
+        let (available, cooling) = route
+            .partition_timeout_cooldown(route.entries.iter().collect(), now)
+            .expect("partition");
+        assert_eq!(
+            available[0].identity.get().expect("identity"),
+            "test/route-secondary"
+        );
+        assert_eq!(
+            cooling[0].identity.get().expect("identity"),
+            "test/route-primary"
+        );
+
+        let (available, cooling) = route
+            .partition_timeout_cooldown(
+                route.entries.iter().collect(),
+                now + Duration::from_secs(1),
+            )
+            .expect("expired partition");
+        assert_eq!(available.len(), 2);
+        assert!(cooling.is_empty());
+
+        route
+            .record_attempt_timeout("test/route-primary", now)
+            .expect("record primary timeout");
+        route
+            .record_attempt_timeout("test/route-secondary", now)
+            .expect("record secondary timeout");
+        let (available, cooling) = route
+            .partition_timeout_cooldown(route.entries.iter().collect(), now)
+            .expect("all cooling partition");
+        assert_eq!(available.len(), 2);
+        assert!(cooling.is_empty());
     }
 
     #[tokio::test]
@@ -5658,6 +7890,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_attempt_timeout_cancels_primary_and_reaches_secondary() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
         let cancellation_observed = Arc::new(AtomicUsize::new(0));
         let secondary_calls = Arc::new(AtomicUsize::new(0));
         let mut models = ModelRegistry::new();
@@ -5667,6 +7900,7 @@ mod tests {
                     id: "pending-provider".to_owned(),
                 },
                 Arc::new(CancellablePendingModel {
+                    calls: primary_calls,
                     cancellation_observed: cancellation_observed.clone(),
                 }),
             )
@@ -5737,6 +7971,619 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn model_timeout_cooldown_skips_repeated_wait_but_keeps_trace_evidence() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "pending-provider".to_owned(),
+                },
+                Arc::new(CancellablePendingModel {
+                    calls: primary_calls.clone(),
+                    cancellation_observed: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::External {
+                    id: "secondary-provider".to_owned(),
+                },
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let collector = Arc::new(TraceCollector::new(16).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("observer");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/cancellable-pending-model", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_attempt_timeout(Duration::from_millis(5))
+        .expect("attempt timeout")
+        .with_model_timeout_cooldown(Duration::from_secs(1))
+        .expect("timeout cooldown")
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime
+            .run_turn(&thread.id, "first")
+            .await
+            .expect("first fallback");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("cooled fallback");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+        let attempts = collector
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.phase == ExecutionPhase::Model)
+            .map(|record| (record.capability, record.outcome))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [
+                (
+                    "test/cancellable-pending-model".to_owned(),
+                    ObservationOutcome::TimedOut
+                ),
+                (
+                    "test/route-secondary".to_owned(),
+                    ObservationOutcome::Success
+                ),
+                (
+                    "test/route-secondary".to_owned(),
+                    ObservationOutcome::Success
+                ),
+                (
+                    "test/cancellable-pending-model".to_owned(),
+                    ObservationOutcome::Skipped
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_timeout_cooldown_fails_open_after_ready_candidates_fail() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(CancellablePendingModel {
+                    calls: primary_calls.clone(),
+                    cancellation_observed: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SuccessThenFailureModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/cancellable-pending-model", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_attempt_timeout(Duration::from_millis(5))
+        .expect("attempt timeout")
+        .with_model_timeout_cooldown(Duration::from_secs(1))
+        .expect("timeout cooldown");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime
+            .run_turn(&thread.id, "first")
+            .await
+            .expect("first fallback");
+        let error = runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect_err("ready and cooling candidates fail");
+
+        assert!(matches!(error, HarnessError::Model(_)));
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            2,
+            "cooling primary remains the last-resort candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_model_failure_does_not_open_timeout_cooldown() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls.clone(),
+                    emit_delta: false,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_timeout_cooldown(Duration::from_secs(1))
+        .expect("timeout cooldown");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime.run_turn(&thread.id, "first").await.expect("first");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn typed_provider_failure_does_not_open_timeout_cooldown() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(TypedRouteFailingModel {
+                    calls: primary_calls.clone(),
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/typed-route-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_timeout_cooldown(Duration::from_secs(1))
+        .expect("timeout cooldown");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime.run_turn(&thread.id, "first").await.expect("first");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn model_retry_policy_rejects_unbounded_or_inverted_delays() {
+        let policy =
+            ModelRetryPolicy::new(2, Duration::from_millis(10), Duration::from_millis(100))
+                .expect("retry policy");
+        assert_eq!(policy.max_retries(), 2);
+        assert_eq!(policy.initial_delay(), Duration::from_millis(10));
+        assert_eq!(policy.max_delay(), Duration::from_millis(100));
+        assert!(
+            ModelRetryPolicy::new(0, Duration::from_millis(1), Duration::from_millis(1)).is_err()
+        );
+        assert!(
+            ModelRetryPolicy::new(
+                super::MAX_MODEL_RETRIES + 1,
+                Duration::from_millis(1),
+                Duration::from_millis(1)
+            )
+            .is_err()
+        );
+        assert!(ModelRetryPolicy::new(1, Duration::ZERO, Duration::from_millis(1)).is_err());
+        assert!(
+            ModelRetryPolicy::new(1, Duration::from_millis(2), Duration::from_millis(1)).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_failure_retries_same_model_with_trace_indices() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let collector = Arc::new(TraceCollector::new(8).expect("collector"));
+        let mut observability = Observability::new();
+        observability
+            .register("collector", CapabilityOrigin::BuiltIn, collector.clone())
+            .expect("observer");
+        let runtime = HarnessRuntime::new(
+            Arc::new(TypedRetryModel {
+                id: "test/retry-success",
+                calls: calls.clone(),
+                kind: ModelProviderFailureKind::Transport,
+                retry_after_ms: None,
+                succeeds_on_call: Some(2),
+                emit_before_failure: false,
+                failure_observed: None,
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(1))
+                .expect("retry policy"),
+        )
+        .with_observability(observability);
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "retry")
+            .await
+            .expect("retry settles");
+
+        assert_eq!(outcome.final_text, "retry settled");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let attempts = collector
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.phase == ExecutionPhase::Model)
+            .map(|record| {
+                (
+                    record.model_retry_index,
+                    record.outcome,
+                    record.provider_failure_kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts,
+            [
+                (
+                    Some(0),
+                    ObservationOutcome::Error,
+                    Some(ModelProviderFailureKind::Transport)
+                ),
+                (Some(1), ObservationOutcome::Success, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_retry_exhaustion_is_exact_and_returns_typed_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HarnessRuntime::new(
+            Arc::new(TypedRetryModel {
+                id: "test/retry-exhausted",
+                calls: calls.clone(),
+                kind: ModelProviderFailureKind::Server,
+                retry_after_ms: None,
+                succeeds_on_call: None,
+                emit_before_failure: false,
+                failure_observed: None,
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(1))
+                .expect("retry policy"),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "exhaust")
+            .await
+            .expect_err("retry exhaustion");
+
+        assert!(matches!(error, HarnessError::ModelProvider(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_provider_failure_falls_through_without_same_model_retry() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(TypedRetryModel {
+                    id: "test/non-retryable-primary",
+                    calls: primary_calls.clone(),
+                    kind: ModelProviderFailureKind::Authentication,
+                    retry_after_ms: Some(1),
+                    succeeds_on_call: None,
+                    emit_before_failure: false,
+                    failure_observed: None,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/non-retryable-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(10))
+                .expect("retry policy"),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime
+            .run_turn(&thread.id, "fallback")
+            .await
+            .expect("secondary settles");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_that_cannot_fit_candidate_budget_yields_without_cooldown() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(TypedRetryModel {
+                    id: "test/retry-budget-primary",
+                    calls: primary_calls.clone(),
+                    kind: ModelProviderFailureKind::RateLimited,
+                    retry_after_ms: Some(20),
+                    succeeds_on_call: None,
+                    emit_before_failure: false,
+                    failure_observed: None,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/retry-budget-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_attempt_timeout(Duration::from_millis(5))
+        .expect("attempt timeout")
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(100))
+                .expect("retry policy"),
+        )
+        .with_model_timeout_cooldown(Duration::from_secs(1))
+        .expect("timeout cooldown");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime.run_turn(&thread.id, "first").await.expect("first");
+        runtime
+            .run_turn(&thread.id, "second")
+            .await
+            .expect("second");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_retry_hint_above_policy_max_is_not_shortened() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(TypedRetryModel {
+                    id: "test/retry-hint-primary",
+                    calls: primary_calls.clone(),
+                    kind: ModelProviderFailureKind::RateLimited,
+                    retry_after_ms: Some(20),
+                    succeeds_on_call: Some(2),
+                    emit_before_failure: false,
+                    failure_observed: None,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/retry-hint-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(10))
+                .expect("retry policy"),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        runtime
+            .run_turn(&thread.id, "do not shorten")
+            .await
+            .expect("secondary settles");
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provisional_output_suppresses_typed_retry_and_route_failover() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(TypedRetryModel {
+                    id: "test/retry-streaming-primary",
+                    calls: primary_calls.clone(),
+                    kind: ModelProviderFailureKind::Transport,
+                    retry_after_ms: None,
+                    succeeds_on_call: Some(2),
+                    emit_before_failure: true,
+                    failure_observed: None,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/retry-streaming-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(1))
+                .expect("retry policy"),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "stream",
+                TurnExecutionOptions {
+                    model_event_sink: Some(Arc::new(RecordingModelSink::default())),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("provisional failure");
+
+        assert!(error.to_string().contains("failover was suppressed"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_backoff_before_another_provider_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+        let runtime = HarnessRuntime::new(
+            Arc::new(TypedRetryModel {
+                id: "test/retry-cancelled",
+                calls: calls.clone(),
+                kind: ModelProviderFailureKind::RateLimited,
+                retry_after_ms: Some(50),
+                succeeds_on_call: Some(2),
+                emit_before_failure: false,
+                failure_observed: Some(observed.clone()),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(2, Duration::from_millis(1), Duration::from_millis(100))
+                .expect("retry policy"),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+        let thread_id = thread.id.clone();
+        let run_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            runtime
+                .run_turn_with_options(
+                    &thread_id,
+                    "cancel retry",
+                    TurnExecutionOptions {
+                        cancellation: run_cancellation,
+                        ..TurnExecutionOptions::default()
+                    },
+                )
+                .await
+        });
+
+        observed.notified().await;
+        cancellation.cancel();
+        let error = task
+            .await
+            .expect("runtime task")
+            .expect_err("cancelled retry");
+
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Model
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5958,6 +8805,110 @@ mod tests {
                 ..
             } if included_turns.len() == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn turn_context_is_model_visible_but_state_keeps_only_attributed_provenance() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(RecordingHistoryModel {
+                requests: requests.clone(),
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let secret_body = "branch-only detail that must not enter State";
+        let outcome = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "continue from the selected branch",
+                TurnExecutionOptions {
+                    context: vec![TurnContextInput {
+                        source: "branch-handoff".to_owned(),
+                        reference: "thread:source/turn:terminal".to_owned(),
+                        text: secret_body.to_owned(),
+                    }],
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect("Turn with invocation context");
+
+        let requests = requests.lock().expect("recorded requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].context.len(), 1);
+        assert!(requests[0].context[0].text.contains(secret_body));
+        assert!(matches!(
+            &requests[0].context[0].source,
+            ContextSource::Invocation {
+                source,
+                reference,
+                ..
+            } if source == "branch-handoff"
+                && reference == "thread:source/turn:terminal"
+        ));
+        let record = outcome
+            .turn
+            .items
+            .iter()
+            .find_map(|item| match &item.kind {
+                ItemKind::InvocationContext {
+                    submitted_by,
+                    blocks,
+                } => Some((submitted_by, blocks)),
+                _ => None,
+            })
+            .expect("State provenance");
+        assert_eq!(record.0, &ActorIdentity::LocalProcess);
+        assert_eq!(record.1.len(), 1);
+        assert_eq!(record.1[0].source_sha256.len(), 64);
+        assert_eq!(record.1[0].content_sha256.len(), 64);
+        assert!(
+            !serde_json::to_string(&outcome.turn)
+                .expect("serialize Turn")
+                .contains(secret_body)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_turn_context_fails_before_turn_state_is_created() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let duplicated = TurnContextInput {
+            source: "rag".to_owned(),
+            reference: "document:1".to_owned(),
+            text: "same provenance".to_owned(),
+        };
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "must not mutate",
+                TurnExecutionOptions {
+                    context: vec![duplicated.clone(), duplicated],
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("invalid context");
+
+        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
+        assert!(
+            runtime
+                .load_thread(&thread.id)
+                .await
+                .expect("load")
+                .expect("thread")
+                .turns
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -6697,6 +9648,7 @@ mod tests {
                 call_id: "call-1".to_owned(),
                 name: "tool".to_owned(),
                 input: nested,
+                batch: None,
             })],
             context: Vec::new(),
             tools: Vec::new(),

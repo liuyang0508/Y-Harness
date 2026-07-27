@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "models": [
+    {
+      "type": "open_ai_responses",
+      "id": "openai/primary",
+      "model": "replace-with-an-available-model-id",
+      "api_key_secret_reference": "openai/primary",
+      "api_key_environment": "OPENAI_API_KEY",
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 16
+    },
+    {
+      "type": "https_json_gateway",
+      "id": "gateway/fallback",
+      "endpoint": "https://model-gateway.example.com/v1/complete",
+      "bearer_secret_reference": "gateway/fallback",
+      "bearer_environment": "YH_MODEL_TOKEN",
+      "request_timeout_ms": 60000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 2097152,
+      "max_concurrency": 16,
+      "exclusive_root_ca_pem_path": null
+    }
+  ],
+  "model_route": {
+    "models": [
+      "openai/primary",
+      "gateway/fallback"
+    ],
+    "attempt_timeout_ms": 30000,
+    "timeout_cooldown_ms": 30000,
+    "retry": {
+      "max_retries": 2,
+      "initial_delay_ms": 250,
+      "max_delay_ms": 5000
+    }
+  }
+}

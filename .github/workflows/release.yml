@@ -55,7 +55,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Build
         run: |
-          cargo +1.88.0 build --locked --release --features https-model --bin yh -p y-harness
+          cargo +1.88.0 build --locked --release --features https-mcp,https-model,https-skill --bin yh -p y-harness
           cargo +1.88.0 build --locked --release --bin yh-tui -p y-harness-tui
       - name: Package and upload
         env:
@@ -89,7 +89,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Build
         run: |
-          cargo +1.88.0 build --locked --release --features https-model --bin yh -p y-harness
+          cargo +1.88.0 build --locked --release --features https-mcp,https-model,https-skill --bin yh -p y-harness
           cargo +1.88.0 build --locked --release --bin yh-tui -p y-harness-tui
       - name: Package and upload
         shell: pwsh

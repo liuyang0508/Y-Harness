@@ -201,14 +201,43 @@ internals or read Engine storage directly.
 - MCP discovery never mutates Tool registration incrementally. The complete
   namespaced catalog is validated for portable names, schemas, collisions, and
   metadata panics before one atomic registry commit.
+- Remote MCP must reuse the same provider-neutral client and Tool/Memory
+  registration path. The shipped HTTPS adapter accepts only exact
+  credential-free HTTPS URLs, resolves a configured Secret for each request,
+  disables redirects, proxies, transport retry, SSE reconnect, and
+  expired-session request replay, and bounds encoded requests, retained
+  responses, session IDs, and lifecycle calls. A JSON-response-only adapter
+  must reject SSE rather than silently materializing an unbounded event.
 - Configuration-file size checks must be enforced while reading, not only
   after a whole file has already been allocated.
+- Configured JSON-command Models must use the same brokered process constructor
+  as JSON Tools: absolute executable, canonical working directory, cleared and
+  explicitly mapped environment, finite time/output/concurrency, and explicit
+  launch authority. Static process bounds and launch policy are validated
+  before reading mapped host environment values. They retain External
+  provenance. Their legacy
+  `ModelOutput` stdout cannot be interpreted as provider usage, continuation,
+  provisional streaming, or typed retry evidence.
 - Durable SQLite `TEXT` from data-bearing tables must select its BLOB byte
   length and reject an over-limit value before converting it to Rust `String`.
   Decoded schema and domain validation remain mandatory.
 - Default phase observations contain no prompt, context, model content, or Tool
-  payload. Provider Model identity, usage, and cost are reported only when
-  supplied by a provider and never replace registered Model authority.
+  payload. Provider Model identity, usage, cost, typed failure class, HTTP
+  status, and retry delay are reported only when supplied by a provider and
+  never replace registered Model authority. Provider failure diagnostics and
+  response bodies never enter Observability.
+- `ModelProviderFailure` is evidence, not an automatic recovery command. Only
+  an explicit `ModelRetryPolicy` may retry typed rate-limit, overload, server,
+  or transport failures on the same Model. It must share the candidate attempt
+  deadline, remain cancellable, stop after delivered provisional output, and
+  never imply cooldown, route removal, or whole-Turn replay. Legacy diagnostics
+  are never parsed into retry authority.
+- Provider retry delays are honored exactly only within the configured maximum
+  and remaining deadline. An excessive hint is not shortened; an absent hint
+  uses bounded equal-jitter exponential backoff. A wait that cannot fit yields
+  to Route fallback and cannot itself open timeout cooldown.
+- Every invoked Model call reports a zero-based retry index in content-free
+  Observability. Cooldown-skipped candidates were not calls and have no index.
 - Observer errors, panics, backpressure, and capacity loss cannot alter Agent
   Loop settlement and must be exposed through explicit drop counters.
 - Provisional model streams are application content, never Observability
@@ -475,6 +504,16 @@ schema must not advance.
   digest pins, keeps network indirection disabled, bounds response and decoded
   package memory independently, and completes all trust checks before Registry
   mutation.
+- Downloaded or offline signed Skills must retain their complete signed
+  envelope and `External` origin in project storage. They cannot be relabeled
+  as operator-trusted files. Publisher validity, immutable revocation, required
+  transparency, and supplied receipts are rechecked before installation,
+  service activation, dependency/resource access, and Context compilation.
+- Skill storage is not activation. CLI installation must use create-new
+  canonical files, remain idempotent only for an identical trust envelope,
+  avoid configuration mutation, and preserve a structural removal path after
+  trust failure. Remote package metadata never authorizes recursive dependency
+  fetching.
 - Performance claims require a reproducible benchmark, workload, baseline, and
   regression threshold. No unmeasured “high performance” claim is accepted.
 
@@ -487,8 +526,11 @@ cargo run --release --bin yh-state-bench
 `YH_BENCH_EVENTS` and `YH_BENCH_SAMPLES` control its bounded workload. It uses
 isolated SQLite databases with production durability settings and reports the
 median append throughput and full projection latency as JSON.
-`YH_BENCH_MAX_APPEND_MS` and `YH_BENCH_MAX_PROJECT_MS` make a calibrated
-environment fail on regression. `YH_BENCH_MAX_SNAPSHOT_LOAD_MS` independently
+`YH_BENCH_MAX_APPEND_MS`, `YH_BENCH_MAX_PROJECT_MS`,
+`YH_BENCH_MAX_FORK_MS`, `YH_BENCH_MAX_ARCHIVE_EXPORT_MS`, and
+`YH_BENCH_MAX_ARCHIVE_IMPORT_MS` make a calibrated environment fail on
+regression.
+`YH_BENCH_MAX_SNAPSHOT_LOAD_MS` independently
 gates journal-anchored snapshot recovery.
 
 ## Defect policy

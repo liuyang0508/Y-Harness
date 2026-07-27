@@ -97,6 +97,8 @@ pub struct RegisteredTool {
     pub descriptor: ToolDescriptor,
     /// Registration trust origin.
     pub origin: CapabilityOrigin,
+    /// Frozen same-response scheduling guarantee.
+    pub batch_execution: crate::ToolBatchExecution,
     /// Executable implementation.
     pub tool: Arc<dyn Tool>,
 }
@@ -136,6 +138,8 @@ impl ToolRegistry {
             validate_registry_growth("tool", self.tools.len(), staged.len().saturating_add(1))?;
             let descriptor = capture_capability_metadata("tool descriptor", || tool.descriptor())?;
             validate_descriptor(&descriptor)?;
+            let batch_execution =
+                capture_capability_metadata("tool batch execution", || tool.batch_execution())?;
             if self.tools.contains_key(&descriptor.name) || staged.contains_key(&descriptor.name) {
                 return Err(HarnessError::DuplicateCapability(descriptor.name));
             }
@@ -169,6 +173,7 @@ impl ToolRegistry {
                 RegisteredTool {
                     descriptor,
                     origin,
+                    batch_execution,
                     tool,
                 },
             );
@@ -317,8 +322,8 @@ mod tests {
 
     use super::{CapabilityOrigin, ModelRegistry, ToolRegistry};
     use crate::{
-        HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest, Tool, ToolContext,
-        ToolDescriptor,
+        HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest, Tool,
+        ToolBatchExecution, ToolContext, ToolDescriptor,
     };
 
     struct TestModel(&'static str);
@@ -331,6 +336,8 @@ mod tests {
     }
 
     struct PanickingTool;
+    struct ParallelTool;
+    struct PanickingBatchExecutionTool;
 
     impl LanguageModel for TestModel {
         fn id(&self) -> &str {
@@ -377,6 +384,42 @@ mod tests {
     impl Tool for PanickingTool {
         fn descriptor(&self) -> ToolDescriptor {
             panic!("sensitive descriptor panic")
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move { Ok(input) })
+        }
+    }
+
+    impl Tool for ParallelTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "parallel".to_owned(),
+                description: "parallel-safe test tool".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            ToolBatchExecution::ParallelSafe
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move { Ok(input) })
+        }
+    }
+
+    impl Tool for PanickingBatchExecutionTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "panic-batch-execution".to_owned(),
+                description: "panics while declaring batch execution".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn batch_execution(&self) -> ToolBatchExecution {
+            panic!("sensitive batch execution panic")
         }
 
         fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
@@ -433,6 +476,35 @@ mod tests {
         assert!(matches!(error, HarnessError::InvalidCapability(_)));
         assert!(!error.to_string().contains("sensitive"));
         assert!(registry.descriptors().is_empty());
+    }
+
+    #[test]
+    fn tool_batch_execution_is_frozen_and_panic_isolated() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(CapabilityOrigin::BuiltIn, Arc::new(TestTool("sequential")))
+            .expect("sequential Tool");
+        registry
+            .register(CapabilityOrigin::BuiltIn, Arc::new(ParallelTool))
+            .expect("parallel Tool");
+        assert_eq!(
+            registry.get("sequential").map(|tool| tool.batch_execution),
+            Some(ToolBatchExecution::Sequential)
+        );
+        assert_eq!(
+            registry.get("parallel").map(|tool| tool.batch_execution),
+            Some(ToolBatchExecution::ParallelSafe)
+        );
+
+        let error = registry
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(PanickingBatchExecutionTool),
+            )
+            .expect_err("batch execution panic");
+        assert!(matches!(error, HarnessError::InvalidCapability(_)));
+        assert!(!error.to_string().contains("sensitive"));
+        assert!(registry.get("panic-batch-execution").is_none());
     }
 
     #[test]

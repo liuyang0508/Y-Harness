@@ -44,6 +44,10 @@ turning Skills into executable installers or letting remote metadata select the
 next URL. Package integrity, publisher authenticity, and transparency remain
 separate checks, all required before registration.
 
+ADR 0102 later exposes this source through the reference CLI, stores the
+complete verified signed envelope under a separate External path, and retains
+live trust checks through activation and Context use.
+
 The built-in source intentionally has no bearer or signed-URL support because
 query credentials are forbidden and no secret should be added casually to an
 artifact fetch path. Authenticated private registries need an explicit
@@ -67,3 +71,7 @@ escaping within the 16 MiB canonical and transport envelopes.
   belong to the caller.
 - Fetch dependencies recursively: dependency resolution must not acquire
   unreviewed transitive packages.
+
+## Related decisions
+
+- [ADR 0102: governed signed External Skill lifecycle](0102-governed-signed-external-skill-lifecycle.md)

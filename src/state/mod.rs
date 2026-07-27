@@ -24,21 +24,24 @@ use tokio::{
 };
 
 use crate::{
-    Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemKind, PendingEvent,
-    StateEvent, StoredEvent, Thread, ThreadId, Turn, TurnId, TurnStatus,
+    Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemId, ItemKind,
+    NewStreamEvent, PendingEvent, StateEvent, StoredEvent, Thread, ThreadId, ThreadImportOrigin,
+    ThreadLineage, Turn, TurnId, TurnStatus,
     json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
     kernel::validate_capability_name,
-    sqlite::bounded_text,
+    sqlite::{bounded_optional_text, bounded_text},
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 6;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 11;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
 const MAX_STATE_EVENT_BYTES: usize = 8_388_608;
 const MAX_STATE_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_EVENT_PAGE_RECOVERY_BYTES: u64 = 16_777_216;
+const MAX_THREAD_SUMMARY_PAGE: usize = 64;
+const MAX_THREAD_NAME_BYTES: usize = 256;
 const MAX_CHECKPOINT_LABEL_BYTES: usize = 4_096;
 const MAX_STATE_SNAPSHOT_BYTES: usize = 67_108_864;
 /// Hard serialized-plus-overhead recovery boundary for one Thread.
@@ -59,8 +62,16 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
+/// Current portable Thread archive format.
+pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 1;
+/// Maximum accepted encoded Thread archive.
+pub const MAX_THREAD_ARCHIVE_BYTES: usize = 75_497_472;
 const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
+const MAX_INVOCATION_CONTEXT_BLOCKS: usize = 64;
+const MAX_INVOCATION_CONTEXT_REFERENCE_BYTES: usize = 4_096;
+const MAX_INVOCATION_CONTEXT_BLOCK_BYTES: usize = 1_048_576;
+const MAX_INVOCATION_CONTEXT_TOTAL_BYTES: usize = 1_061_184;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Validated, disposable projection cache anchored to the event journal.
@@ -70,6 +81,7 @@ const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
 pub struct StateSnapshot {
     schema_version: u32,
     thread: Thread,
+    metadata_events: Vec<StateEvent>,
     through_sequence: u64,
     stream_version: u64,
     recovery_bytes: u64,
@@ -159,6 +171,74 @@ pub struct StateCapacity {
     pub level: StateCapacityLevel,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Bounded recent-Thread projection for product session navigation.
+pub struct ThreadSummary {
+    /// Opaque authoritative Thread identity.
+    pub thread_id: ThreadId,
+    /// Optional operator-authored display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Direct immutable ancestry when this Thread was forked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<ThreadLineage>,
+    /// Global sequence of the latest event currently observed for this Thread.
+    pub last_sequence: u64,
+    /// Timestamp of that latest event in Unix milliseconds.
+    pub updated_at_ms: u64,
+    /// Number of authoritative events currently recorded for this Thread.
+    pub stream_version: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// One bounded page of recent Threads ordered by latest event sequence.
+pub struct ThreadSummaryPage {
+    /// Most recently updated Threads first.
+    pub threads: Vec<ThreadSummary>,
+    /// Exclusive sequence cursor for the next older page.
+    pub next_before_sequence: Option<u64>,
+    /// Whether at least one older Thread was observed.
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Self-contained, bounded export of one authoritative Thread journal.
+pub struct ThreadArchive {
+    /// Exact archive format coordinate.
+    pub format_version: u32,
+    /// Source Thread identity.
+    pub source_thread_id: ThreadId,
+    /// Number of ordered source events.
+    pub source_stream_version: u64,
+    /// Last global sequence observed in the source store.
+    pub source_last_sequence: u64,
+    /// SHA-256 of the exact ordered source Stored Events.
+    pub source_events_sha256: String,
+    /// Complete validated source journal.
+    pub events: Vec<StoredEvent>,
+}
+
+/// Encodes one validated portable Thread archive as bounded UTF-8 JSON.
+pub fn encode_thread_archive(archive: &ThreadArchive) -> Result<Vec<u8>, HarnessError> {
+    validate_thread_archive(archive)?;
+    to_bounded_json_vec(archive, MAX_THREAD_ARCHIVE_BYTES)
+        .map_err(|error| state_json_error("Thread archive", MAX_THREAD_ARCHIVE_BYTES, error))
+}
+
+/// Decodes and validates one bounded portable Thread archive.
+pub fn decode_thread_archive(encoded: &[u8]) -> Result<ThreadArchive, HarnessError> {
+    if encoded.len() > MAX_THREAD_ARCHIVE_BYTES {
+        return Err(HarnessError::State(format!(
+            "Thread archive exceeds {MAX_THREAD_ARCHIVE_BYTES} bytes"
+        )));
+    }
+    let archive = serde_json::from_slice::<ThreadArchive>(encoded)
+        .map_err(|error| HarnessError::State(format!("invalid Thread archive JSON: {error}")))?;
+    validate_thread_archive(&archive)?;
+    Ok(archive)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Validated opt-in policy for automatic disposable snapshot maintenance.
 pub struct SnapshotMaintenanceConfig {
@@ -246,6 +326,29 @@ pub trait EventStore: Send + Sync {
     /// Returned writes must use [`STATE_EVENT_SCHEMA_VERSION`]; prior supported
     /// coordinates are read compatibility, not write authority.
     fn append<'a>(&'a self, pending: PendingEvent) -> HarnessFuture<'a, StoredEvent>;
+
+    /// Whether this store can materialize a complete derived stream atomically.
+    fn supports_atomic_stream_creation(&self) -> bool {
+        false
+    }
+
+    /// Creates one complete derived stream or leaves no target stream behind.
+    ///
+    /// The target identity must not already exist. Implementations must reject
+    /// every partial or duplicate stream and update all stream projections in
+    /// the same transaction as the event rows.
+    fn create_stream_atomic<'a>(
+        &'a self,
+        _thread_id: ThreadId,
+        _events: Vec<NewStreamEvent>,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+        Box::pin(async {
+            Err(HarnessError::State(
+                "Event Store does not support atomic stream creation".to_owned(),
+            ))
+        })
+    }
+
     /// Returns events after one sequence within both caller-supplied bounds.
     ///
     /// Implementations must not materialize more than `max_recovery_bytes`
@@ -257,6 +360,24 @@ pub trait EventStore: Send + Sync {
         limit: usize,
         max_recovery_bytes: u64,
     ) -> HarnessFuture<'a, Vec<StoredEvent>>;
+
+    /// Whether this store implements bounded recent-Thread listing.
+    fn supports_thread_listing(&self) -> bool {
+        false
+    }
+
+    /// Returns latest-per-Thread summaries before one exclusive global cursor.
+    fn thread_summaries_page(
+        &self,
+        _before_sequence: Option<u64>,
+        _limit: usize,
+    ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
+        Box::pin(async {
+            Err(HarnessError::State(
+                "Event Store does not support Thread listing".to_owned(),
+            ))
+        })
+    }
 
     /// Loads an optional disposable projection snapshot.
     fn load_snapshot<'a>(
@@ -287,6 +408,8 @@ struct MemoryStoreData {
     events: Vec<StoredEvent>,
     stream_versions: BTreeMap<ThreadId, u64>,
     stream_recovery_bytes: BTreeMap<ThreadId, u64>,
+    stream_names: BTreeMap<ThreadId, String>,
+    stream_lineages: BTreeMap<ThreadId, ThreadLineage>,
     snapshots: BTreeMap<ThreadId, StateSnapshot>,
 }
 
@@ -332,6 +455,14 @@ impl EventStore for MemoryEventStore {
                 .checked_add(encoded.recovery_bytes)
                 .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
 
+            let name_change = match &pending.event {
+                StateEvent::ThreadNamed { name } => Some(name.clone()),
+                _ => None,
+            };
+            let lineage_change = match &pending.event {
+                StateEvent::ThreadForked { lineage } => Some(lineage.clone()),
+                _ => None,
+            };
             let stored = StoredEvent {
                 schema_version: STATE_EVENT_SCHEMA_VERSION,
                 sequence: u64::try_from(data.events.len() + 1).unwrap_or(u64::MAX),
@@ -343,8 +474,95 @@ impl EventStore for MemoryEventStore {
             data.stream_versions
                 .insert(pending.thread_id.clone(), next_stream_version);
             data.stream_recovery_bytes
-                .insert(pending.thread_id, next_recovery_bytes);
+                .insert(pending.thread_id.clone(), next_recovery_bytes);
+            if let Some(name) = name_change {
+                match name {
+                    Some(name) => {
+                        data.stream_names.insert(pending.thread_id.clone(), name);
+                    }
+                    None => {
+                        data.stream_names.remove(&pending.thread_id);
+                    }
+                }
+            }
+            if let Some(lineage) = lineage_change {
+                data.stream_lineages
+                    .insert(pending.thread_id.clone(), lineage);
+            }
             data.events.push(stored.clone());
+            Ok(stored)
+        })
+    }
+
+    fn supports_atomic_stream_creation(&self) -> bool {
+        true
+    }
+
+    fn create_stream_atomic<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        events: Vec<NewStreamEvent>,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+        Box::pin(async move {
+            let encoded = validate_new_stream(&thread_id, &events)?;
+            let mut data = self.data.lock().await;
+            let actual = data.stream_versions.get(&thread_id).copied().unwrap_or(0);
+            if actual != 0 {
+                return Err(HarnessError::StateConflict {
+                    thread_id,
+                    expected: 0,
+                    actual,
+                });
+            }
+            let requested_ids = events
+                .iter()
+                .map(|event| &event.event_id)
+                .collect::<BTreeSet<_>>();
+            if data
+                .events
+                .iter()
+                .any(|stored| requested_ids.contains(&stored.event_id))
+            {
+                return Err(HarnessError::State(
+                    "atomic stream contains an Event identity already used by another stream"
+                        .to_owned(),
+                ));
+            }
+
+            let mut stored = Vec::with_capacity(events.len());
+            let mut next_sequence = u64::try_from(data.events.len())
+                .map_err(|_| HarnessError::State("global sequence exceeds u64".to_owned()))?;
+            for new in events {
+                next_sequence = next_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| HarnessError::State("global sequence overflow".to_owned()))?;
+                stored.push(StoredEvent {
+                    schema_version: new.schema_version,
+                    sequence: next_sequence,
+                    event_id: new.event_id,
+                    thread_id: thread_id.clone(),
+                    recorded_at_ms: new.recorded_at_ms,
+                    event: new.event,
+                });
+            }
+            let stream_version = u64::try_from(stored.len())
+                .map_err(|_| HarnessError::State("stream version exceeds u64".to_owned()))?;
+            let recovery_bytes = encoded.iter().try_fold(0_u64, |total, event| {
+                total.checked_add(event.recovery_bytes).ok_or_else(|| {
+                    HarnessError::State("stream recovery charge overflow".to_owned())
+                })
+            })?;
+            data.stream_versions
+                .insert(thread_id.clone(), stream_version);
+            data.stream_recovery_bytes
+                .insert(thread_id.clone(), recovery_bytes);
+            if let Some(name) = final_stream_name(&stored) {
+                data.stream_names.insert(thread_id.clone(), name);
+            }
+            if let Some(lineage) = final_stream_lineage(&stored) {
+                data.stream_lineages.insert(thread_id, lineage);
+            }
+            data.events.extend(stored.iter().cloned());
             Ok(stored)
         })
     }
@@ -381,6 +599,49 @@ impl EventStore for MemoryEventStore {
                 }
                 recovery_bytes = next;
                 page.push(event.clone());
+            }
+            Ok(page)
+        })
+    }
+
+    fn supports_thread_listing(&self) -> bool {
+        true
+    }
+
+    fn thread_summaries_page(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
+        Box::pin(async move {
+            validate_thread_summary_page_request(before_sequence, limit)?;
+            let data = self.data.lock().await;
+            let mut seen = BTreeSet::new();
+            let mut page = Vec::new();
+            for event in data.events.iter().rev() {
+                if !seen.insert(event.thread_id.clone())
+                    || before_sequence.is_some_and(|before| event.sequence >= before)
+                {
+                    continue;
+                }
+                let stream_version = data
+                    .stream_versions
+                    .get(&event.thread_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        HarnessError::State("Thread stream metadata is missing".to_owned())
+                    })?;
+                page.push(ThreadSummary {
+                    thread_id: event.thread_id.clone(),
+                    name: data.stream_names.get(&event.thread_id).cloned(),
+                    lineage: data.stream_lineages.get(&event.thread_id).cloned(),
+                    last_sequence: event.sequence,
+                    updated_at_ms: event.recorded_at_ms,
+                    stream_version,
+                });
+                if page.len() == limit {
+                    break;
+                }
             }
             Ok(page)
         })
@@ -445,7 +706,8 @@ impl SqliteEventStore {
                         ON events(thread_id, sequence);
                     CREATE TABLE IF NOT EXISTS streams (
                         thread_id TEXT PRIMARY KEY,
-                        version   INTEGER NOT NULL CHECK(version >= 0)
+                        version   INTEGER NOT NULL CHECK(version >= 0),
+                        name      TEXT
                     );
                     CREATE TABLE IF NOT EXISTS stream_recovery (
                         thread_id      TEXT PRIMARY KEY,
@@ -469,12 +731,14 @@ impl SqliteEventStore {
                                ), 0)
                         FROM events
                         GROUP BY thread_id;
-                    {}
                     ",
-                migration::metadata_schema_sql()
             );
             connection
                 .execute_batch(&schema)
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+            migration::ensure_stream_name_column_for_bootstrap(&connection)?;
+            connection
+                .execute_batch(&migration::metadata_schema_sql())
                 .map_err(|error| HarnessError::State(error.to_string()))?;
             Ok(connection)
         })
@@ -652,6 +916,19 @@ impl EventStore for SqliteEventStore {
                         ],
                     )
                     .map_err(|error| HarnessError::State(error.to_string()))?;
+                if let StateEvent::ThreadNamed { name } = &pending.event {
+                    let changed = transaction
+                        .execute(
+                            "UPDATE streams SET name = ?2 WHERE thread_id = ?1",
+                            params![pending.thread_id.as_str(), name],
+                        )
+                        .map_err(|error| HarnessError::State(error.to_string()))?;
+                    if changed != 1 {
+                        return Err(HarnessError::State(
+                            "Thread name projection row is missing".to_owned(),
+                        ));
+                    }
+                }
                 transaction
                     .execute(
                         "INSERT INTO stream_recovery (thread_id, recovery_bytes)
@@ -680,6 +957,131 @@ impl EventStore for SqliteEventStore {
                     recorded_at_ms: pending.recorded_at_ms,
                     event: pending.event,
                 })
+            })
+            .await
+        })
+    }
+
+    fn supports_atomic_stream_creation(&self) -> bool {
+        true
+    }
+
+    fn create_stream_atomic<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        events: Vec<NewStreamEvent>,
+    ) -> HarnessFuture<'a, Vec<StoredEvent>> {
+        Box::pin(async move {
+            let encoded = validate_new_stream(&thread_id, &events)?;
+            let recovery_bytes = encoded.iter().try_fold(0_u64, |total, event| {
+                total.checked_add(event.recovery_bytes).ok_or_else(|| {
+                    HarnessError::State("stream recovery charge overflow".to_owned())
+                })
+            })?;
+            let prepared = events
+                .into_iter()
+                .zip(encoded)
+                .map(|(event, encoded)| {
+                    let recorded_at_ms = i64::try_from(event.recorded_at_ms).map_err(|_| {
+                        HarnessError::State("timestamp exceeds SQLite INTEGER".to_owned())
+                    })?;
+                    Ok((event, recorded_at_ms, encoded.json))
+                })
+                .collect::<Result<Vec<_>, HarnessError>>()?;
+            self.with_connection(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let actual: Option<i64> = transaction
+                    .query_row(
+                        "SELECT version FROM streams WHERE thread_id = ?1",
+                        [thread_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                if let Some(actual) = actual {
+                    return Err(HarnessError::StateConflict {
+                        thread_id,
+                        expected: 0,
+                        actual: u64::try_from(actual).map_err(|_| {
+                            HarnessError::State("negative stream version".to_owned())
+                        })?,
+                    });
+                }
+
+                let stream_version = u64::try_from(prepared.len())
+                    .map_err(|_| HarnessError::State("stream version exceeds u64".to_owned()))?;
+                let stream_version_sql = i64::try_from(stream_version).map_err(|_| {
+                    HarnessError::State("stream version exceeds SQLite INTEGER".to_owned())
+                })?;
+                let recovery_bytes_sql = i64::try_from(recovery_bytes).map_err(|_| {
+                    HarnessError::State("stream recovery charge exceeds SQLite INTEGER".to_owned())
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO streams (thread_id, version) VALUES (?1, ?2)",
+                        params![thread_id.as_str(), stream_version_sql],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+
+                let mut stored = Vec::with_capacity(prepared.len());
+                {
+                    let mut insert = transaction
+                        .prepare(
+                            "INSERT INTO events
+                                (event_id, thread_id, recorded_at_ms, schema_version, event_json)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                        )
+                        .map_err(|error| HarnessError::State(error.to_string()))?;
+                    for (new, recorded_at_ms, json) in prepared {
+                        insert
+                            .execute(params![
+                                new.event_id.as_str(),
+                                thread_id.as_str(),
+                                recorded_at_ms,
+                                i64::from(new.schema_version),
+                                json
+                            ])
+                            .map_err(|error| HarnessError::State(error.to_string()))?;
+                        let sequence =
+                            u64::try_from(transaction.last_insert_rowid()).map_err(|_| {
+                                HarnessError::State("negative SQLite sequence".to_owned())
+                            })?;
+                        stored.push(StoredEvent {
+                            schema_version: new.schema_version,
+                            sequence,
+                            event_id: new.event_id,
+                            thread_id: thread_id.clone(),
+                            recorded_at_ms: new.recorded_at_ms,
+                            event: new.event,
+                        });
+                    }
+                }
+                if let Some(name) = final_stream_name(&stored) {
+                    let changed = transaction
+                        .execute(
+                            "UPDATE streams SET name = ?2 WHERE thread_id = ?1",
+                            params![thread_id.as_str(), name],
+                        )
+                        .map_err(|error| HarnessError::State(error.to_string()))?;
+                    if changed != 1 {
+                        return Err(HarnessError::State(
+                            "Thread name projection row is missing".to_owned(),
+                        ));
+                    }
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO stream_recovery (thread_id, recovery_bytes)
+                         VALUES (?1, ?2)",
+                        params![thread_id.as_str(), recovery_bytes_sql],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .commit()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(stored)
             })
             .await
         })
@@ -758,6 +1160,177 @@ impl EventStore for SqliteEventStore {
                     events.push(event);
                 }
                 Ok(events)
+            })
+            .await
+        })
+    }
+
+    fn supports_thread_listing(&self) -> bool {
+        true
+    }
+
+    fn thread_summaries_page(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
+        Box::pin(async move {
+            validate_thread_summary_page_request(before_sequence, limit)?;
+            let before_sequence = before_sequence
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    HarnessError::State("Thread cursor exceeds SQLite INTEGER".to_owned())
+                })?
+                .unwrap_or(i64::MAX);
+            let limit = i64::try_from(limit).map_err(|_| {
+                HarnessError::State("Thread page limit exceeds SQLite INTEGER".to_owned())
+            })?;
+            self.with_connection(move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        "WITH recent AS (
+                             SELECT length(CAST(events.thread_id AS BLOB)) AS thread_id_bytes,
+                                    events.thread_id,
+                                    events.sequence AS last_sequence,
+                                    events.recorded_at_ms AS updated_at_ms,
+                                    streams.version,
+                                    length(CAST(streams.name AS BLOB)) AS name_bytes,
+                                    streams.name
+                             FROM events
+                             JOIN streams ON streams.thread_id = events.thread_id
+                             JOIN (
+                                 SELECT thread_id, MAX(sequence) AS last_sequence
+                                 FROM events
+                                 GROUP BY thread_id
+                             ) AS latest
+                               ON latest.thread_id = events.thread_id
+                              AND latest.last_sequence = events.sequence
+                             WHERE events.sequence < ?1
+                             ORDER BY events.sequence DESC
+                             LIMIT ?2
+                         )
+                         SELECT recent.thread_id_bytes,
+                                recent.thread_id,
+                                recent.last_sequence,
+                                recent.updated_at_ms,
+                                recent.version,
+                                recent.name_bytes,
+                                recent.name,
+                                length(CAST(lineage.event_id AS BLOB)),
+                                lineage.event_id,
+                                lineage.sequence,
+                                lineage.recorded_at_ms,
+                                lineage.schema_version,
+                                length(CAST(lineage.event_json AS BLOB)),
+                                lineage.event_json
+                         FROM recent
+                         LEFT JOIN events AS lineage
+                           ON lineage.sequence = (
+                               SELECT candidate.sequence
+                               FROM events AS candidate
+                               WHERE candidate.thread_id = recent.thread_id
+                               ORDER BY candidate.sequence
+                               LIMIT 1 OFFSET 1
+                           )
+                         ORDER BY recent.last_sequence DESC",
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let rows = statement
+                    .query_map(params![before_sequence, limit], |row| {
+                        Ok((
+                            bounded_text(row, 0, 1, 256, "State thread identity")?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            bounded_optional_text(row, 5, 6, MAX_THREAD_NAME_BYTES, "Thread name")?,
+                            bounded_optional_text(row, 7, 8, 256, "Thread lineage event identity")?,
+                            row.get::<_, Option<i64>>(9)?,
+                            row.get::<_, Option<i64>>(10)?,
+                            row.get::<_, Option<i64>>(11)?,
+                            bounded_optional_text(
+                                row,
+                                12,
+                                13,
+                                MAX_STATE_EVENT_BYTES,
+                                "Thread lineage event",
+                            )?,
+                        ))
+                    })
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let mut page = Vec::new();
+                for row in rows {
+                    let (
+                        thread_id,
+                        last_sequence,
+                        updated_at_ms,
+                        stream_version,
+                        name,
+                        lineage_event_id,
+                        lineage_sequence,
+                        lineage_recorded_at_ms,
+                        lineage_schema_version,
+                        lineage_event_json,
+                    ) = row.map_err(|error| HarnessError::State(error.to_string()))?;
+                    validate_thread_name(name.as_deref())?;
+                    let summary_thread_id = ThreadId::from_string(thread_id.clone());
+                    let lineage = match (
+                        lineage_event_id,
+                        lineage_sequence,
+                        lineage_recorded_at_ms,
+                        lineage_schema_version,
+                        lineage_event_json,
+                    ) {
+                        (
+                            Some(event_id),
+                            Some(sequence),
+                            Some(recorded_at_ms),
+                            Some(schema_version),
+                            Some(event_json),
+                        ) => {
+                            let event = decode_row(
+                                EventId::from_string(event_id),
+                                (
+                                    sequence,
+                                    thread_id,
+                                    recorded_at_ms,
+                                    schema_version,
+                                    event_json,
+                                ),
+                            )?;
+                            if event.thread_id != summary_thread_id {
+                                return Err(HarnessError::State(
+                                    "Thread lineage event belongs to another stream".to_owned(),
+                                ));
+                            }
+                            match event.event {
+                                StateEvent::ThreadForked { lineage } => Some(lineage),
+                                _ => None,
+                            }
+                        }
+                        (None, None, None, None, None) => None,
+                        _ => {
+                            return Err(HarnessError::State(
+                                "Thread lineage event row is incomplete".to_owned(),
+                            ));
+                        }
+                    };
+                    page.push(ThreadSummary {
+                        thread_id: summary_thread_id,
+                        name,
+                        lineage,
+                        last_sequence: u64::try_from(last_sequence).map_err(|_| {
+                            HarnessError::State("invalid Thread sequence".to_owned())
+                        })?,
+                        updated_at_ms: u64::try_from(updated_at_ms).map_err(|_| {
+                            HarnessError::State("invalid Thread timestamp".to_owned())
+                        })?,
+                        stream_version: u64::try_from(stream_version).map_err(|_| {
+                            HarnessError::State("invalid Thread stream version".to_owned())
+                        })?,
+                    });
+                }
+                Ok(page)
             })
             .await
         })
@@ -1036,6 +1609,175 @@ impl StateEngine {
         Ok(thread)
     }
 
+    /// Whether the configured Event Store can create derived streams atomically.
+    #[must_use]
+    pub fn supports_thread_fork(&self) -> bool {
+        self.store.supports_atomic_stream_creation()
+    }
+
+    /// Whether the configured Event Store can import Thread archives atomically.
+    #[must_use]
+    pub fn supports_thread_import(&self) -> bool {
+        self.store.supports_atomic_stream_creation()
+    }
+
+    /// Creates an independent Thread from one exact terminal parent boundary.
+    ///
+    /// `child_thread_id` is caller-supplied idempotency identity. Reusing it
+    /// returns the existing matching child. `through_turn_id = None` means the
+    /// complete parent as currently observed and therefore requires no running
+    /// Turn; an explicit terminal Turn may be forked while newer work continues.
+    pub async fn fork_thread(
+        &self,
+        parent_thread_id: &ThreadId,
+        child_thread_id: ThreadId,
+        through_turn_id: Option<&TurnId>,
+    ) -> Result<Thread, HarnessError> {
+        validate_state_id("parent thread", parent_thread_id.as_str())?;
+        validate_state_id("child thread", child_thread_id.as_str())?;
+        if parent_thread_id == &child_thread_id {
+            return Err(HarnessError::State(
+                "fork child identity must differ from its parent".to_owned(),
+            ));
+        }
+        if !self.store.supports_atomic_stream_creation() {
+            return Err(HarnessError::State(
+                "Event Store does not support atomic Thread fork".to_owned(),
+            ));
+        }
+
+        let checked = self.checked_events(parent_thread_id).await?;
+        let parent = project_events(&checked.events)?.ok_or_else(|| {
+            HarnessError::State(format!("thread {parent_thread_id} does not exist"))
+        })?;
+        let existing_child = self.load_thread(&child_thread_id).await?;
+        let boundary = match (&existing_child, through_turn_id) {
+            (Some(existing), None) => {
+                let lineage = existing.lineage.as_ref().ok_or_else(|| {
+                    HarnessError::State(format!(
+                        "thread {child_thread_id} already exists and is not a fork"
+                    ))
+                })?;
+                if &lineage.parent_thread_id != parent_thread_id {
+                    return Err(HarnessError::State(format!(
+                        "thread {child_thread_id} was forked from another parent"
+                    )));
+                }
+                usize::try_from(lineage.parent_stream_version).map_err(|_| {
+                    HarnessError::State("existing fork boundary exceeds usize".to_owned())
+                })?
+            }
+            _ => fork_boundary(&checked.events, &parent, through_turn_id)?,
+        };
+        if boundary == 0 || boundary > checked.events.len() {
+            return Err(HarnessError::State(
+                "fork lineage points outside the available parent journal".to_owned(),
+            ));
+        }
+        let parent_prefix = &checked.events[..boundary];
+        let inherited = project_events(parent_prefix)?.ok_or_else(|| {
+            HarnessError::State("fork boundary has no parent projection".to_owned())
+        })?;
+        if inherited
+            .turns
+            .iter()
+            .any(|turn| turn.status == TurnStatus::Running)
+        {
+            return Err(HarnessError::State(
+                "Thread fork boundary must end at a terminal Turn".to_owned(),
+            ));
+        }
+        let anchor = parent_prefix
+            .last()
+            .ok_or_else(|| HarnessError::State("cannot fork an empty journal".to_owned()))?;
+        let lineage = ThreadLineage {
+            parent_thread_id: parent_thread_id.clone(),
+            parent_through_sequence: anchor.sequence,
+            parent_stream_version: u64::try_from(parent_prefix.len())
+                .map_err(|_| HarnessError::State("parent fork boundary exceeds u64".to_owned()))?,
+            parent_events_sha256: state_events_sha256(parent_prefix)?,
+        };
+
+        if let Some(existing) = existing_child {
+            validate_existing_fork(&existing, &lineage, &inherited.turns)?;
+            return Ok(existing);
+        }
+
+        let recorded_at_ms = crate::kernel::now_ms();
+        let mut new_events = Vec::with_capacity(parent_prefix.len().saturating_add(2));
+        new_events.push(NewStreamEvent {
+            event_id: EventId::generate(),
+            schema_version: STATE_EVENT_SCHEMA_VERSION,
+            recorded_at_ms,
+            event: StateEvent::ThreadCreated {
+                created_at_ms: recorded_at_ms,
+            },
+        });
+        new_events.push(NewStreamEvent {
+            event_id: EventId::generate(),
+            schema_version: STATE_EVENT_SCHEMA_VERSION,
+            recorded_at_ms,
+            event: StateEvent::ThreadForked {
+                lineage: lineage.clone(),
+            },
+        });
+        new_events.extend(
+            parent_prefix
+                .iter()
+                .filter_map(|stored| match &stored.event {
+                    StateEvent::TurnStarted { .. }
+                    | StateEvent::ItemAppended { .. }
+                    | StateEvent::ToolCallsAppended { .. }
+                    | StateEvent::TurnFinished { .. } => Some(NewStreamEvent {
+                        event_id: EventId::generate(),
+                        schema_version: stored.schema_version,
+                        recorded_at_ms: stored.recorded_at_ms,
+                        event: stored.event.clone(),
+                    }),
+                    StateEvent::ThreadCreated { .. }
+                    | StateEvent::ThreadNamed { .. }
+                    | StateEvent::ThreadForked { .. }
+                    | StateEvent::ThreadImported { .. }
+                    | StateEvent::CheckpointCreated { .. } => None,
+                }),
+        );
+        let expected = new_events.clone();
+        let stored = match self
+            .store
+            .create_stream_atomic(child_thread_id.clone(), new_events)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(HarnessError::StateConflict {
+                thread_id,
+                expected: 0,
+                ..
+            }) if thread_id == child_thread_id => {
+                let existing = self.load_thread(&child_thread_id).await?.ok_or_else(|| {
+                    HarnessError::State(
+                        "fork child appeared concurrently but cannot be loaded".to_owned(),
+                    )
+                })?;
+                validate_existing_fork(&existing, &lineage, &inherited.turns)?;
+                return Ok(existing);
+            }
+            Err(error) => return Err(error),
+        };
+        let recovery_bytes = validate_atomic_stream_result(&child_thread_id, &expected, &stored)?;
+        let child = project_events(&stored)?
+            .ok_or_else(|| HarnessError::State("fork created no Thread projection".to_owned()))?;
+        validate_existing_fork(&child, &lineage, &inherited.turns)?;
+        let stream_version = u64::try_from(stored.len())
+            .map_err(|_| HarnessError::State("fork stream version exceeds u64".to_owned()))?;
+        let last_sequence = stored.last().map_or(0, |event| event.sequence);
+        self.cache_head(
+            child_thread_id,
+            stream_head_from_parts(&child, stream_version, recovery_bytes, last_sequence),
+        )
+        .await;
+        Ok(child)
+    }
+
     /// Loads and validates the projected Thread, returning `None` when absent.
     pub async fn load_thread(&self, thread_id: &ThreadId) -> Result<Option<Thread>, HarnessError> {
         let loaded = self.load_projection(thread_id).await?;
@@ -1054,6 +1796,23 @@ impl StateEngine {
             self.heads.lock().await.remove(thread_id);
         }
         Ok(loaded.thread)
+    }
+
+    /// Changes or clears the durable operator-authored Thread name.
+    pub async fn set_thread_name(
+        &self,
+        thread_id: &ThreadId,
+        name: Option<String>,
+    ) -> Result<StoredEvent, HarnessError> {
+        validate_thread_name(name.as_deref())?;
+        let head = self.require_stream_head(thread_id).await?;
+        self.commit(
+            thread_id.clone(),
+            head.stream_version,
+            head.recovery_bytes,
+            StateEvent::ThreadNamed { name },
+        )
+        .await
     }
 
     /// Returns bounded journal pressure for a Thread, or `None` when absent.
@@ -1082,9 +1841,189 @@ impl StateEngine {
         )))
     }
 
+    /// Whether the configured Event Store supports recent-Thread navigation.
+    #[must_use]
+    pub fn supports_thread_listing(&self) -> bool {
+        self.store.supports_thread_listing()
+    }
+
+    /// Returns one bounded recent-Thread page without projecting full histories.
+    pub async fn list_threads(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<ThreadSummaryPage, HarnessError> {
+        if !(1..=MAX_THREAD_SUMMARY_PAGE).contains(&limit) {
+            return Err(HarnessError::State(format!(
+                "Thread page limit must be 1-{MAX_THREAD_SUMMARY_PAGE}"
+            )));
+        }
+        if before_sequence == Some(0) {
+            return Err(HarnessError::State(
+                "Thread page cursor must be greater than zero".to_owned(),
+            ));
+        }
+        let fetch_limit = limit
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("Thread page limit overflow".to_owned()))?;
+        let mut threads = self
+            .store
+            .thread_summaries_page(before_sequence, fetch_limit)
+            .await?;
+        validate_thread_summaries(&threads, before_sequence, fetch_limit)?;
+        let has_more = threads.len() > limit;
+        if has_more {
+            threads.truncate(limit);
+        }
+        let next_before_sequence = has_more
+            .then(|| threads.last().map(|thread| thread.last_sequence))
+            .flatten();
+        Ok(ThreadSummaryPage {
+            threads,
+            next_before_sequence,
+            has_more,
+        })
+    }
+
     /// Returns the authoritative ordered events for a Thread.
     pub async fn events(&self, thread_id: &ThreadId) -> Result<Vec<StoredEvent>, HarnessError> {
         Ok(self.checked_events(thread_id).await?.events)
+    }
+
+    /// Exports one complete terminal Thread journal with an integrity digest.
+    pub async fn export_thread(&self, thread_id: &ThreadId) -> Result<ThreadArchive, HarnessError> {
+        let checked = self.checked_events(thread_id).await?;
+        let thread = project_events(&checked.events)?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        if thread
+            .turns
+            .iter()
+            .any(|turn| turn.status == TurnStatus::Running)
+        {
+            return Err(HarnessError::State(
+                "cannot export a Thread while a Turn is running".to_owned(),
+            ));
+        }
+        let last = checked
+            .events
+            .last()
+            .ok_or_else(|| HarnessError::State("cannot export an empty Thread".to_owned()))?;
+        let archive = ThreadArchive {
+            format_version: THREAD_ARCHIVE_FORMAT_VERSION,
+            source_thread_id: thread.id,
+            source_stream_version: u64::try_from(checked.events.len()).map_err(|_| {
+                HarnessError::State("archive stream version exceeds u64".to_owned())
+            })?,
+            source_last_sequence: last.sequence,
+            source_events_sha256: state_events_sha256(&checked.events)?,
+            events: checked.events,
+        };
+        validate_thread_archive(&archive)?;
+        Ok(archive)
+    }
+
+    /// Atomically materializes a portable archive as a new local Thread.
+    ///
+    /// `target_thread_id` is caller-supplied idempotency identity. A retry
+    /// returns an existing Thread only when its import provenance matches.
+    pub async fn import_thread(
+        &self,
+        archive: &ThreadArchive,
+        target_thread_id: ThreadId,
+    ) -> Result<Thread, HarnessError> {
+        validate_state_id("target thread", target_thread_id.as_str())?;
+        if !self.store.supports_atomic_stream_creation() {
+            return Err(HarnessError::State(
+                "Event Store does not support atomic Thread import".to_owned(),
+            ));
+        }
+        let source = validate_thread_archive(archive)?;
+        let origin = ThreadImportOrigin {
+            source_thread_id: archive.source_thread_id.clone(),
+            source_stream_version: archive.source_stream_version,
+            source_last_sequence: archive.source_last_sequence,
+            source_events_sha256: archive.source_events_sha256.clone(),
+            source_lineage: source.lineage.clone(),
+        };
+        if let Some(existing) = self.load_thread(&target_thread_id).await? {
+            validate_existing_import(&existing, &origin, &source.turns)?;
+            return Ok(existing);
+        }
+
+        let recorded_at_ms = crate::kernel::now_ms();
+        let mut new_events = Vec::with_capacity(archive.events.len().saturating_add(2));
+        new_events.push(NewStreamEvent {
+            event_id: EventId::generate(),
+            schema_version: STATE_EVENT_SCHEMA_VERSION,
+            recorded_at_ms,
+            event: StateEvent::ThreadCreated {
+                created_at_ms: recorded_at_ms,
+            },
+        });
+        new_events.push(NewStreamEvent {
+            event_id: EventId::generate(),
+            schema_version: STATE_EVENT_SCHEMA_VERSION,
+            recorded_at_ms,
+            event: StateEvent::ThreadImported {
+                origin: origin.clone(),
+            },
+        });
+        new_events.extend(
+            archive
+                .events
+                .iter()
+                .filter_map(|stored| match &stored.event {
+                    StateEvent::ThreadNamed { .. }
+                    | StateEvent::TurnStarted { .. }
+                    | StateEvent::ItemAppended { .. }
+                    | StateEvent::ToolCallsAppended { .. }
+                    | StateEvent::TurnFinished { .. } => Some(NewStreamEvent {
+                        event_id: EventId::generate(),
+                        schema_version: stored.schema_version,
+                        recorded_at_ms: stored.recorded_at_ms,
+                        event: stored.event.clone(),
+                    }),
+                    StateEvent::ThreadCreated { .. }
+                    | StateEvent::ThreadForked { .. }
+                    | StateEvent::ThreadImported { .. }
+                    | StateEvent::CheckpointCreated { .. } => None,
+                }),
+        );
+        let expected = new_events.clone();
+        let stored = match self
+            .store
+            .create_stream_atomic(target_thread_id.clone(), new_events)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(HarnessError::StateConflict {
+                thread_id,
+                expected: 0,
+                ..
+            }) if thread_id == target_thread_id => {
+                let existing = self.load_thread(&target_thread_id).await?.ok_or_else(|| {
+                    HarnessError::State(
+                        "import target appeared concurrently but cannot be loaded".to_owned(),
+                    )
+                })?;
+                validate_existing_import(&existing, &origin, &source.turns)?;
+                return Ok(existing);
+            }
+            Err(error) => return Err(error),
+        };
+        let recovery_bytes = validate_atomic_stream_result(&target_thread_id, &expected, &stored)?;
+        let imported = project_events(&stored)?
+            .ok_or_else(|| HarnessError::State("import created no Thread projection".to_owned()))?;
+        validate_existing_import(&imported, &origin, &source.turns)?;
+        let stream_version = u64::try_from(stored.len())
+            .map_err(|_| HarnessError::State("import stream version exceeds u64".to_owned()))?;
+        let last_sequence = stored.last().map_or(0, |event| event.sequence);
+        self.cache_head(
+            target_thread_id,
+            stream_head_from_parts(&imported, stream_version, recovery_bytes, last_sequence),
+        )
+        .await;
+        Ok(imported)
     }
 
     /// Returns a bounded authoritative event page after one durable sequence.
@@ -1127,13 +2066,21 @@ impl StateEngine {
         let events = checked.events;
         let thread = project_events(&events)?
             .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let metadata_events = events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                StateEvent::ThreadNamed { .. } => Some(stored.event.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let anchor = events
             .last()
             .ok_or_else(|| HarnessError::State("cannot snapshot an empty stream".to_owned()))?;
         let snapshot = StateSnapshot {
             schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
-            projection_sha256: projection_sha256(&thread)?,
+            projection_sha256: projection_sha256(&thread, &metadata_events)?,
             thread,
+            metadata_events,
             through_sequence: anchor.sequence,
             stream_version: u64::try_from(events.len())
                 .map_err(|_| HarnessError::State("snapshot stream version overflow".to_owned()))?,
@@ -1194,6 +2141,29 @@ impl StateEngine {
             StateEvent::ItemAppended {
                 turn_id: turn.id.clone(),
                 item,
+            },
+        )
+        .await
+    }
+
+    /// Atomically appends one same-response Tool-call batch.
+    pub(crate) async fn append_tool_calls(
+        &self,
+        turn: &Turn,
+        calls: Vec<Item>,
+    ) -> Result<StoredEvent, HarnessError> {
+        let mut head = self.require_stream_head(&turn.thread_id).await?;
+        if require_running_head(&head, &turn.id).is_err() {
+            head = self.refresh_stream_head(&turn.thread_id).await?;
+            require_running_head(&head, &turn.id)?;
+        }
+        self.commit(
+            turn.thread_id.clone(),
+            head.stream_version,
+            head.recovery_bytes,
+            StateEvent::ToolCallsAppended {
+                turn_id: turn.id.clone(),
+                calls,
             },
         )
         .await
@@ -1718,7 +2688,11 @@ impl StateEngine {
         };
         match &stored.event {
             StateEvent::ThreadCreated { .. }
+            | StateEvent::ThreadNamed { .. }
+            | StateEvent::ThreadForked { .. }
+            | StateEvent::ThreadImported { .. }
             | StateEvent::ItemAppended { .. }
+            | StateEvent::ToolCallsAppended { .. }
             | StateEvent::CheckpointCreated { .. } => {}
             StateEvent::TurnStarted { turn_id } => {
                 let mut turns = (*next.turns).clone();
@@ -1807,6 +2781,193 @@ fn stream_head_from_parts(
         turns: Arc::new(turns),
         running_turn,
     }
+}
+
+fn fork_boundary(
+    events: &[StoredEvent],
+    parent: &Thread,
+    through_turn_id: Option<&TurnId>,
+) -> Result<usize, HarnessError> {
+    let Some(turn_id) = through_turn_id else {
+        if parent
+            .turns
+            .iter()
+            .any(|turn| turn.status == TurnStatus::Running)
+        {
+            return Err(HarnessError::State(
+                "cannot fork the latest parent state while a Turn is running; select an earlier terminal Turn"
+                    .to_owned(),
+            ));
+        }
+        return Ok(events.len());
+    };
+    let turn = parent
+        .turns
+        .iter()
+        .find(|turn| &turn.id == turn_id)
+        .ok_or_else(|| HarnessError::State(format!("turn {turn_id} does not exist")))?;
+    if turn.status == TurnStatus::Running {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} is not terminal"
+        )));
+    }
+    events
+        .iter()
+        .position(|stored| {
+            matches!(
+                &stored.event,
+                StateEvent::TurnFinished {
+                    turn_id: finished,
+                    ..
+                } if finished == turn_id
+            )
+        })
+        .and_then(|index| index.checked_add(1))
+        .ok_or_else(|| HarnessError::State(format!("turn {turn_id} has no terminal event")))
+}
+
+fn validate_existing_fork(
+    child: &Thread,
+    lineage: &ThreadLineage,
+    inherited_turns: &[Turn],
+) -> Result<(), HarnessError> {
+    let history_matches = child.turns.len() >= inherited_turns.len()
+        && child
+            .turns
+            .iter()
+            .zip(inherited_turns)
+            .all(|(child_turn, parent_turn)| {
+                child_turn.thread_id == child.id
+                    && child_turn.id == parent_turn.id
+                    && child_turn.status == parent_turn.status
+                    && child_turn.items == parent_turn.items
+            });
+    if child.lineage.as_ref() != Some(lineage) || !history_matches {
+        return Err(HarnessError::State(format!(
+            "thread {} already exists with different fork provenance",
+            child.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_import(
+    target: &Thread,
+    origin: &ThreadImportOrigin,
+    imported_turns: &[Turn],
+) -> Result<(), HarnessError> {
+    let history_matches = target.turns.len() >= imported_turns.len()
+        && target
+            .turns
+            .iter()
+            .zip(imported_turns)
+            .all(|(target_turn, source_turn)| {
+                target_turn.thread_id == target.id
+                    && target_turn.id == source_turn.id
+                    && target_turn.status == source_turn.status
+                    && target_turn.items == source_turn.items
+            });
+    if target.import_origin.as_ref() != Some(origin) || target.lineage.is_some() || !history_matches
+    {
+        return Err(HarnessError::State(format!(
+            "thread {} already exists with different import provenance",
+            target.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_thread_archive(archive: &ThreadArchive) -> Result<Thread, HarnessError> {
+    if archive.format_version != THREAD_ARCHIVE_FORMAT_VERSION {
+        return Err(HarnessError::State(format!(
+            "unsupported Thread archive format {}",
+            archive.format_version
+        )));
+    }
+    validate_state_id("archive source thread", archive.source_thread_id.as_str())?;
+    if archive.events.is_empty()
+        || archive.source_stream_version
+            != u64::try_from(archive.events.len())
+                .map_err(|_| HarnessError::State("archive event count exceeds u64".to_owned()))?
+        || archive.source_last_sequence != archive.events.last().map_or(0, |event| event.sequence)
+    {
+        return Err(HarnessError::State(
+            "Thread archive boundary does not match its event journal".to_owned(),
+        ));
+    }
+    let _ = validate_stored_events(&archive.source_thread_id, &archive.events, 0, None, None)?;
+    if archive.source_events_sha256 != state_events_sha256(&archive.events)? {
+        return Err(HarnessError::State(
+            "Thread archive event digest mismatch".to_owned(),
+        ));
+    }
+    let thread = project_events(&archive.events)?
+        .ok_or_else(|| HarnessError::State("Thread archive has no projection".to_owned()))?;
+    if thread.id != archive.source_thread_id {
+        return Err(HarnessError::State(
+            "Thread archive projection identity mismatch".to_owned(),
+        ));
+    }
+    if thread
+        .turns
+        .iter()
+        .any(|turn| turn.status == TurnStatus::Running)
+    {
+        return Err(HarnessError::State(
+            "Thread archive cannot end with a running Turn".to_owned(),
+        ));
+    }
+    bounded_serialized_size(archive, MAX_THREAD_ARCHIVE_BYTES)
+        .map_err(|error| state_json_error("Thread archive", MAX_THREAD_ARCHIVE_BYTES, error))?;
+    Ok(thread)
+}
+
+fn state_events_sha256(events: &[StoredEvent]) -> Result<String, HarnessError> {
+    struct DigestWriter<'a>(&'a mut Sha256);
+
+    impl Write for DigestWriter<'_> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.update(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut digest = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut digest), events)
+        .map_err(|error| HarnessError::State(format!("cannot hash State journal: {error}")))?;
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
+}
+
+fn validate_atomic_stream_result(
+    thread_id: &ThreadId,
+    expected: &[NewStreamEvent],
+    stored: &[StoredEvent],
+) -> Result<u64, HarnessError> {
+    let recovery_bytes = validate_stored_events(thread_id, stored, 0, None, None)?;
+    if stored.len() != expected.len()
+        || stored.iter().zip(expected).any(|(stored, expected)| {
+            stored.schema_version != expected.schema_version
+                || stored.event_id != expected.event_id
+                || stored.recorded_at_ms != expected.recorded_at_ms
+                || stored.event != expected.event
+        })
+    {
+        return Err(HarnessError::State(
+            "Event Store returned an atomic stream that differs from the request".to_owned(),
+        ));
+    }
+    Ok(recovery_bytes)
 }
 
 fn nonzero(value: u64) -> Option<u64> {
@@ -1929,10 +3090,52 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
                 }
                 *thread = Some(Thread {
                     id: stored.thread_id.clone(),
+                    name: None,
+                    lineage: None,
+                    import_origin: None,
                     created_at_ms: *created_at_ms,
                     turns: Vec::new(),
                     checkpoints: Vec::new(),
                 });
+            }
+            StateEvent::ThreadNamed { name } => {
+                validate_thread_name(name.as_deref())?;
+                projection_thread(thread)?.name.clone_from(name);
+            }
+            StateEvent::ThreadForked { lineage } => {
+                validate_thread_lineage(lineage)?;
+                if lineage.parent_thread_id == stored.thread_id {
+                    return Err(HarnessError::State(
+                        "Thread cannot be forked from itself".to_owned(),
+                    ));
+                }
+                let thread = projection_thread(thread)?;
+                if thread.lineage.is_some()
+                    || thread.import_origin.is_some()
+                    || thread.name.is_some()
+                    || !thread.turns.is_empty()
+                    || !thread.checkpoints.is_empty()
+                {
+                    return Err(HarnessError::State(
+                        "Thread fork lineage must immediately follow creation".to_owned(),
+                    ));
+                }
+                thread.lineage = Some(lineage.clone());
+            }
+            StateEvent::ThreadImported { origin } => {
+                validate_thread_import_origin(origin)?;
+                let thread = projection_thread(thread)?;
+                if thread.lineage.is_some()
+                    || thread.import_origin.is_some()
+                    || thread.name.is_some()
+                    || !thread.turns.is_empty()
+                    || !thread.checkpoints.is_empty()
+                {
+                    return Err(HarnessError::State(
+                        "Thread import provenance must immediately follow creation".to_owned(),
+                    ));
+                }
+                thread.import_origin = Some(origin.clone());
             }
             StateEvent::TurnStarted { turn_id } => {
                 if !turn_ids.insert(turn_id.clone()) {
@@ -1956,23 +3159,10 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
                 });
             }
             StateEvent::ItemAppended { turn_id, item } => {
-                if !item_ids.insert(item.id.clone()) {
-                    return Err(HarnessError::State(format!("duplicate item {}", item.id)));
-                }
-                let thread = projection_thread(thread)?;
-                let turn = thread
-                    .turns
-                    .iter_mut()
-                    .find(|turn| &turn.id == turn_id)
-                    .ok_or_else(|| {
-                        HarnessError::State(format!("item references unknown turn {turn_id}"))
-                    })?;
-                if turn.status != TurnStatus::Running {
-                    return Err(HarnessError::State(format!(
-                        "item appended after turn {turn_id} finished"
-                    )));
-                }
-                turn.items.push(item.clone());
+                append_projected_items(thread, turn_id, std::slice::from_ref(item), &mut item_ids)?;
+            }
+            StateEvent::ToolCallsAppended { turn_id, calls } => {
+                append_projected_items(thread, turn_id, calls, &mut item_ids)?;
             }
             StateEvent::TurnFinished { turn_id, status } => {
                 if status == &TurnStatus::Running {
@@ -2019,7 +3209,34 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
     }
     if let Some(thread) = thread {
         validate_steering_projection(thread)?;
+        validate_tool_call_batch_projection(thread)?;
     }
+    Ok(())
+}
+
+fn append_projected_items(
+    thread: &mut Option<Thread>,
+    turn_id: &TurnId,
+    items: &[Item],
+    item_ids: &mut BTreeSet<ItemId>,
+) -> Result<(), HarnessError> {
+    if let Some(duplicate) = items.iter().find(|item| !item_ids.insert(item.id.clone())) {
+        return Err(HarnessError::State(format!(
+            "duplicate item {}",
+            duplicate.id
+        )));
+    }
+    let turn = projection_thread(thread)?
+        .turns
+        .iter_mut()
+        .find(|turn| &turn.id == turn_id)
+        .ok_or_else(|| HarnessError::State(format!("item references unknown turn {turn_id}")))?;
+    if turn.status != TurnStatus::Running {
+        return Err(HarnessError::State(format!(
+            "item appended after turn {turn_id} finished"
+        )));
+    }
+    turn.items.extend_from_slice(items);
     Ok(())
 }
 
@@ -2052,7 +3269,10 @@ fn validate_stream_recovery_bytes(actual: u64, pending: &PendingEvent) -> Result
     }
 }
 
-fn projection_sha256(thread: &Thread) -> Result<String, HarnessError> {
+fn projection_sha256(
+    thread: &Thread,
+    metadata_events: &[StateEvent],
+) -> Result<String, HarnessError> {
     struct DigestWriter<'a>(&'a mut Sha256);
 
     impl Write for DigestWriter<'_> {
@@ -2067,7 +3287,7 @@ fn projection_sha256(thread: &Thread) -> Result<String, HarnessError> {
     }
 
     let mut digest = Sha256::new();
-    serde_json::to_writer(DigestWriter(&mut digest), thread)
+    serde_json::to_writer(DigestWriter(&mut digest), &(thread, metadata_events))
         .map_err(|error| HarnessError::State(format!("cannot encode State projection: {error}")))?;
     let digest = digest.finalize();
     let mut encoded = String::with_capacity(64);
@@ -2113,7 +3333,7 @@ fn validate_snapshot(snapshot: &StateSnapshot) -> Result<(), HarnessError> {
             "State snapshot recovery charge does not match its projection".to_owned(),
         ));
     }
-    let digest = projection_sha256(&snapshot.thread)?;
+    let digest = projection_sha256(&snapshot.thread, &snapshot.metadata_events)?;
     if snapshot.projection_sha256 != digest {
         return Err(HarnessError::State(
             "State snapshot projection digest mismatch".to_owned(),
@@ -2137,6 +3357,65 @@ fn validate_projected_thread(
         created_at_ms: thread.created_at_ms,
     })?
     .recovery_bytes;
+    if let Some(lineage) = &thread.lineage {
+        validate_thread_lineage(lineage)?;
+        if lineage.parent_thread_id == thread.id {
+            return Err(HarnessError::State(
+                "State snapshot contains self-referential Thread lineage".to_owned(),
+            ));
+        }
+        represented_events = represented_events
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+        add_recovery_bytes(
+            &mut recovery_bytes,
+            encode_state_event(&StateEvent::ThreadForked {
+                lineage: lineage.clone(),
+            })?
+            .recovery_bytes,
+        )?;
+    }
+    if let Some(origin) = &thread.import_origin {
+        if thread.lineage.is_some() {
+            return Err(HarnessError::State(
+                "State snapshot cannot contain both fork and import provenance".to_owned(),
+            ));
+        }
+        validate_thread_import_origin(origin)?;
+        represented_events = represented_events
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+        add_recovery_bytes(
+            &mut recovery_bytes,
+            encode_state_event(&StateEvent::ThreadImported {
+                origin: origin.clone(),
+            })?
+            .recovery_bytes,
+        )?;
+    }
+    let mut projected_name = None;
+    for event in &snapshot.metadata_events {
+        let StateEvent::ThreadNamed { name } = event else {
+            return Err(HarnessError::State(
+                "State snapshot contains a non-metadata event".to_owned(),
+            ));
+        };
+        validate_state_event(event)?;
+        validate_state_event_schema(event, STATE_EVENT_SCHEMA_VERSION)?;
+        projected_name.clone_from(name);
+        represented_events = represented_events
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
+        add_recovery_bytes(
+            &mut recovery_bytes,
+            encode_state_event(event)?.recovery_bytes,
+        )?;
+    }
+    if projected_name != thread.name {
+        return Err(HarnessError::State(
+            "State snapshot Thread name does not match its metadata events".to_owned(),
+        ));
+    }
     for turn in &thread.turns {
         validate_state_id("snapshot turn", turn.id.as_str())?;
         if turn.thread_id != thread.id || !turn_ids.insert(turn.id.as_str()) {
@@ -2155,25 +3434,60 @@ fn validate_projected_thread(
             .recovery_bytes,
         )?;
 
-        for item in &turn.items {
-            validate_state_id("snapshot item", item.id.as_str())?;
-            validate_state_item(item)?;
-            if !item_ids.insert(item.id.as_str()) {
-                return Err(HarnessError::State(
-                    "State snapshot contains a duplicate Item".to_owned(),
-                ));
+        let mut item_index = 0;
+        while item_index < turn.items.len() {
+            let item = &turn.items[item_index];
+            let batch_size = match &item.kind {
+                ItemKind::ToolCall {
+                    batch: Some(batch), ..
+                } if batch.index == 0 => batch.size,
+                ItemKind::ToolCall { batch: Some(_), .. } => {
+                    return Err(HarnessError::State(
+                        "State snapshot starts inside a Tool-call batch".to_owned(),
+                    ));
+                }
+                _ => 1,
+            };
+            let batch_end = item_index
+                .checked_add(batch_size)
+                .filter(|end| *end <= turn.items.len())
+                .ok_or_else(|| {
+                    HarnessError::State(
+                        "State snapshot contains a truncated Tool-call batch".to_owned(),
+                    )
+                })?;
+            let items = &turn.items[item_index..batch_end];
+            if batch_size > 1 {
+                validate_tool_call_batch_items(items)?;
+            }
+            for item in items {
+                validate_state_id("snapshot item", item.id.as_str())?;
+                validate_state_item(item)?;
+                if !item_ids.insert(item.id.as_str()) {
+                    return Err(HarnessError::State(
+                        "State snapshot contains a duplicate Item".to_owned(),
+                    ));
+                }
             }
             represented_events = represented_events
                 .checked_add(1)
                 .ok_or_else(|| HarnessError::State("snapshot event count overflow".to_owned()))?;
-            add_recovery_bytes(
-                &mut recovery_bytes,
-                encode_state_event(&StateEvent::ItemAppended {
+            let event = if batch_size > 1 {
+                StateEvent::ToolCallsAppended {
+                    turn_id: turn.id.clone(),
+                    calls: items.to_vec(),
+                }
+            } else {
+                StateEvent::ItemAppended {
                     turn_id: turn.id.clone(),
                     item: item.clone(),
-                })?
-                .recovery_bytes,
+                }
+            };
+            add_recovery_bytes(
+                &mut recovery_bytes,
+                encode_state_event(&event)?.recovery_bytes,
             )?;
+            item_index = batch_end;
         }
 
         if turn.status == TurnStatus::Running {
@@ -2200,6 +3514,7 @@ fn validate_projected_thread(
         ));
     }
     validate_steering_projection(thread)?;
+    validate_tool_call_batch_projection(thread)?;
 
     let mut checkpoint_ids = BTreeSet::new();
     for checkpoint in &thread.checkpoints {
@@ -2279,9 +3594,117 @@ fn validate_pending_event(pending: &PendingEvent) -> Result<EncodedStateEvent, H
     Ok(encoded)
 }
 
+fn validate_new_stream(
+    thread_id: &ThreadId,
+    events: &[NewStreamEvent],
+) -> Result<Vec<EncodedStateEvent>, HarnessError> {
+    validate_state_id("thread", thread_id.as_str())?;
+    if events.len() < 2
+        || !matches!(
+            events.first().map(|event| &event.event),
+            Some(StateEvent::ThreadCreated { .. })
+        )
+        || !matches!(
+            events.get(1).map(|event| &event.event),
+            Some(StateEvent::ThreadForked { .. } | StateEvent::ThreadImported { .. })
+        )
+    {
+        return Err(HarnessError::State(
+            "atomic materialized stream must begin with creation then provenance".to_owned(),
+        ));
+    }
+    let stream_version = u64::try_from(events.len())
+        .map_err(|_| HarnessError::State("stream version exceeds u64".to_owned()))?;
+    if stream_version > STATE_THREAD_EVENT_LIMIT.saturating_sub(STATE_TERMINAL_EVENT_RESERVE) {
+        return Err(HarnessError::State(format!(
+            "materialized Thread exceeds its {}-event general boundary",
+            STATE_THREAD_EVENT_LIMIT.saturating_sub(STATE_TERMINAL_EVENT_RESERVE)
+        )));
+    }
+
+    let mut event_ids = BTreeSet::new();
+    let mut encoded = Vec::with_capacity(events.len());
+    let mut recovery_bytes = 0_u64;
+    let mut synthetic = Vec::with_capacity(events.len());
+    for (index, new) in events.iter().enumerate() {
+        validate_state_id("event", new.event_id.as_str())?;
+        if !event_ids.insert(new.event_id.as_str()) {
+            return Err(HarnessError::State(
+                "atomic stream contains duplicate Event identities".to_owned(),
+            ));
+        }
+        if !(1..=STATE_EVENT_SCHEMA_VERSION).contains(&new.schema_version) {
+            return Err(HarnessError::State(format!(
+                "unsupported State event schema {}",
+                new.schema_version
+            )));
+        }
+        if matches!(new.event, StateEvent::CheckpointCreated { .. }) {
+            return Err(HarnessError::State(
+                "materialized history cannot copy recovery Checkpoints".to_owned(),
+            ));
+        }
+        validate_state_event(&new.event)?;
+        validate_state_event_schema(&new.event, new.schema_version)?;
+        let event = encode_state_event(&new.event)?;
+        recovery_bytes = recovery_bytes
+            .checked_add(event.recovery_bytes)
+            .ok_or_else(|| HarnessError::State("stream recovery charge overflow".to_owned()))?;
+        encoded.push(event);
+        synthetic.push(StoredEvent {
+            schema_version: new.schema_version,
+            sequence: u64::try_from(index + 1)
+                .map_err(|_| HarnessError::State("synthetic sequence exceeds u64".to_owned()))?,
+            event_id: new.event_id.clone(),
+            thread_id: thread_id.clone(),
+            recorded_at_ms: new.recorded_at_ms,
+            event: new.event.clone(),
+        });
+    }
+    if recovery_bytes
+        > STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(STATE_TERMINAL_RECOVERY_BYTE_RESERVE)
+    {
+        return Err(HarnessError::State(format!(
+            "materialized Thread exceeds its {}-byte general recovery boundary",
+            STATE_THREAD_RECOVERY_BYTE_LIMIT.saturating_sub(STATE_TERMINAL_RECOVERY_BYTE_RESERVE)
+        )));
+    }
+    let projected = project_events(&synthetic)?
+        .ok_or_else(|| HarnessError::State("atomic stream has no Thread projection".to_owned()))?;
+    if &projected.id != thread_id
+        || projected.lineage.is_some() == projected.import_origin.is_some()
+    {
+        return Err(HarnessError::State(
+            "atomic materialized stream projection is inconsistent".to_owned(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn final_stream_name(events: &[StoredEvent]) -> Option<String> {
+    events
+        .iter()
+        .filter_map(|stored| match &stored.event {
+            StateEvent::ThreadNamed { name } => Some(name.clone()),
+            _ => None,
+        })
+        .next_back()
+        .flatten()
+}
+
+fn final_stream_lineage(events: &[StoredEvent]) -> Option<ThreadLineage> {
+    events.iter().find_map(|stored| match &stored.event {
+        StateEvent::ThreadForked { lineage } => Some(lineage.clone()),
+        _ => None,
+    })
+}
+
 fn validate_state_event(event: &StateEvent) -> Result<(), HarnessError> {
     match event {
         StateEvent::ThreadCreated { .. } => {}
+        StateEvent::ThreadNamed { name } => validate_thread_name(name.as_deref())?,
+        StateEvent::ThreadForked { lineage } => validate_thread_lineage(lineage)?,
+        StateEvent::ThreadImported { origin } => validate_thread_import_origin(origin)?,
         StateEvent::TurnStarted { turn_id } | StateEvent::TurnFinished { turn_id, .. } => {
             validate_state_id("turn", turn_id.as_str())?;
         }
@@ -2289,6 +3712,10 @@ fn validate_state_event(event: &StateEvent) -> Result<(), HarnessError> {
             validate_state_id("turn", turn_id.as_str())?;
             validate_state_id("item", item.id.as_str())?;
             validate_state_item(item)?;
+        }
+        StateEvent::ToolCallsAppended { turn_id, calls } => {
+            validate_state_id("turn", turn_id.as_str())?;
+            validate_tool_call_batch_items(calls)?;
         }
         StateEvent::CheckpointCreated { checkpoint } => {
             validate_state_id("checkpoint", checkpoint.id.as_str())?;
@@ -2302,12 +3729,93 @@ fn validate_state_event(event: &StateEvent) -> Result<(), HarnessError> {
     Ok(())
 }
 
+fn validate_thread_lineage(lineage: &ThreadLineage) -> Result<(), HarnessError> {
+    validate_state_id("parent thread", lineage.parent_thread_id.as_str())?;
+    if lineage.parent_through_sequence == 0
+        || lineage.parent_stream_version == 0
+        || lineage.parent_stream_version > lineage.parent_through_sequence
+        || !is_lower_sha256(&lineage.parent_events_sha256)
+    {
+        return Err(HarnessError::State(
+            "Thread lineage contains an invalid boundary or SHA-256".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_thread_import_origin(origin: &ThreadImportOrigin) -> Result<(), HarnessError> {
+    validate_state_id("source thread", origin.source_thread_id.as_str())?;
+    if origin.source_stream_version == 0
+        || origin.source_last_sequence == 0
+        || origin.source_stream_version > origin.source_last_sequence
+        || !is_lower_sha256(&origin.source_events_sha256)
+    {
+        return Err(HarnessError::State(
+            "Thread import origin contains an invalid boundary or SHA-256".to_owned(),
+        ));
+    }
+    if let Some(lineage) = &origin.source_lineage {
+        validate_thread_lineage(lineage)?;
+    }
+    Ok(())
+}
+
+fn validate_tool_call_batch_items(calls: &[Item]) -> Result<(), HarnessError> {
+    if !(2..=crate::MAX_TOOL_CALLS_PER_BATCH).contains(&calls.len()) {
+        return Err(HarnessError::State(format!(
+            "Tool-call batch must contain 2-{} calls",
+            crate::MAX_TOOL_CALLS_PER_BATCH
+        )));
+    }
+    let mut batch_id = None;
+    let mut call_ids = BTreeSet::new();
+    for (index, item) in calls.iter().enumerate() {
+        validate_state_id("item", item.id.as_str())?;
+        validate_state_item(item)?;
+        let ItemKind::ToolCall {
+            call_id,
+            batch: Some(batch),
+            ..
+        } = &item.kind
+        else {
+            return Err(HarnessError::State(
+                "Tool-call batch contains a non-batched Item".to_owned(),
+            ));
+        };
+        validate_state_id("Tool-call batch", batch.id.as_str())?;
+        if batch.index != index
+            || batch.size != calls.len()
+            || *batch_id.get_or_insert(&batch.id) != &batch.id
+            || !call_ids.insert(call_id)
+        {
+            return Err(HarnessError::State(
+                "Tool-call batch order, size, identity, or correlation is inconsistent".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_label(label: Option<&str>) -> Result<(), HarnessError> {
     if let Some(label) = label
         && (label.trim().is_empty() || label.len() > MAX_CHECKPOINT_LABEL_BYTES)
     {
         return Err(HarnessError::State(format!(
             "checkpoint label must be 1-{MAX_CHECKPOINT_LABEL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_thread_name(name: Option<&str>) -> Result<(), HarnessError> {
+    if let Some(name) = name
+        && (name.is_empty()
+            || name.len() > MAX_THREAD_NAME_BYTES
+            || name.trim() != name
+            || name.chars().any(char::is_control))
+    {
+        return Err(HarnessError::State(format!(
+            "Thread name must be 1-{MAX_THREAD_NAME_BYTES} trimmed non-control bytes"
         )));
     }
     Ok(())
@@ -2380,6 +3888,60 @@ fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
                 ));
             }
         }
+        crate::ItemKind::InvocationContext {
+            submitted_by,
+            blocks,
+        } => {
+            submitted_by.validate_current_state("State Turn context submitter")?;
+            if blocks.is_empty() || blocks.len() > MAX_INVOCATION_CONTEXT_BLOCKS {
+                return Err(HarnessError::State(format!(
+                    "Turn context evidence must contain 1-{MAX_INVOCATION_CONTEXT_BLOCKS} blocks"
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            let mut total_bytes = 0_usize;
+            let mut total_tokens = 0_usize;
+            for block in blocks {
+                validate_capability_name("Turn context source", &block.source)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                if block.reference.trim().is_empty()
+                    || block.reference.len() > MAX_INVOCATION_CONTEXT_REFERENCE_BYTES
+                    || block.reference.chars().any(char::is_control)
+                    || !seen.insert((block.source.as_str(), block.reference.as_str()))
+                {
+                    return Err(HarnessError::State(
+                        "Turn context evidence contains an invalid or duplicate source reference"
+                            .to_owned(),
+                    ));
+                }
+                if !is_lower_sha256(&block.source_sha256)
+                    || !is_lower_sha256(&block.content_sha256)
+                    || !(1..=MAX_INVOCATION_CONTEXT_BLOCK_BYTES).contains(&block.estimated_tokens)
+                    || !(1..=MAX_INVOCATION_CONTEXT_BLOCK_BYTES).contains(&block.serialized_bytes)
+                {
+                    return Err(HarnessError::State(
+                        "Turn context evidence violates bounded provenance".to_owned(),
+                    ));
+                }
+                total_bytes = total_bytes
+                    .checked_add(block.serialized_bytes)
+                    .ok_or_else(|| {
+                        HarnessError::State("Turn context evidence size overflow".to_owned())
+                    })?;
+                total_tokens = total_tokens
+                    .checked_add(block.estimated_tokens)
+                    .ok_or_else(|| {
+                        HarnessError::State("Turn context evidence token overflow".to_owned())
+                    })?;
+            }
+            if total_bytes > MAX_INVOCATION_CONTEXT_TOTAL_BYTES
+                || total_tokens > MAX_INVOCATION_CONTEXT_BLOCK_BYTES
+            {
+                return Err(HarnessError::State(
+                    "Turn context evidence exceeds its aggregate byte or token bound".to_owned(),
+                ));
+            }
+        }
         crate::ItemKind::PolicyDecision {
             tool_origin: Some(tool_origin),
             ..
@@ -2422,13 +3984,46 @@ fn validate_state_event_schema(
     event: &StateEvent,
     schema_version: u32,
 ) -> Result<(), HarnessError> {
-    let StateEvent::ItemAppended {
-        item: Item { kind, .. },
-        ..
-    } = event
-    else {
-        return Ok(());
-    };
+    match event {
+        StateEvent::ThreadNamed { .. } if schema_version < 8 => Err(HarnessError::State(format!(
+            "schema-{schema_version} cannot contain a Thread name"
+        ))),
+        StateEvent::ThreadForked { .. } if schema_version < 9 => Err(HarnessError::State(format!(
+            "schema-{schema_version} cannot contain Thread fork lineage"
+        ))),
+        StateEvent::ThreadImported { .. } if schema_version < 10 => Err(HarnessError::State(
+            format!("schema-{schema_version} cannot contain Thread import provenance"),
+        )),
+        StateEvent::ToolCallsAppended { calls, .. } => {
+            if schema_version < 7 {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} cannot contain an atomic Tool-call batch"
+                )));
+            }
+            for call in calls {
+                validate_state_item_schema(&call.kind, schema_version)?;
+            }
+            Ok(())
+        }
+        StateEvent::ItemAppended {
+            item:
+                Item {
+                    kind: ItemKind::ToolCall { batch: Some(_), .. },
+                    ..
+                },
+            ..
+        } => Err(HarnessError::State(
+            "batched Tool calls require one atomic ToolCallsAppended event".to_owned(),
+        )),
+        StateEvent::ItemAppended {
+            item: Item { kind, .. },
+            ..
+        } => validate_state_item_schema(kind, schema_version),
+        _ => Ok(()),
+    }
+}
+
+fn validate_state_item_schema(kind: &ItemKind, schema_version: u32) -> Result<(), HarnessError> {
     match kind {
         ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
             if schema_version < 6 {
@@ -2441,6 +4036,13 @@ fn validate_state_event_schema(
             if schema_version < 5 {
                 return Err(HarnessError::State(format!(
                     "schema-{schema_version} cannot contain Provider continuation evidence"
+                )));
+            }
+        }
+        ItemKind::InvocationContext { .. } => {
+            if schema_version < 11 {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} cannot contain Turn context evidence"
                 )));
             }
         }
@@ -2535,6 +4137,37 @@ fn validate_steering_projection(thread: &Thread) -> Result<(), HarnessError> {
                 "completed turn {} contains unapplied steering",
                 turn.id
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_call_batch_projection(thread: &Thread) -> Result<(), HarnessError> {
+    let mut batch_ids = BTreeSet::new();
+    for turn in &thread.turns {
+        let mut index = 0;
+        while index < turn.items.len() {
+            let ItemKind::ToolCall {
+                batch: Some(batch), ..
+            } = &turn.items[index].kind
+            else {
+                index += 1;
+                continue;
+            };
+            if batch.index != 0 || !batch_ids.insert(batch.id.clone()) {
+                return Err(HarnessError::State(
+                    "Tool-call batch projection starts out of order or reuses an identity"
+                        .to_owned(),
+                ));
+            }
+            let end = index
+                .checked_add(batch.size)
+                .filter(|end| *end <= turn.items.len())
+                .ok_or_else(|| {
+                    HarnessError::State("Tool-call batch projection is truncated".to_owned())
+                })?;
+            validate_tool_call_batch_items(&turn.items[index..end])?;
+            index = end;
         }
     }
     Ok(())
@@ -2673,6 +4306,64 @@ fn validate_event_page_request(limit: usize, max_recovery_bytes: u64) -> Result<
     Ok(())
 }
 
+fn validate_thread_summary_page_request(
+    before_sequence: Option<u64>,
+    limit: usize,
+) -> Result<(), HarnessError> {
+    if limit == 0 || limit > MAX_THREAD_SUMMARY_PAGE + 1 {
+        return Err(HarnessError::State(format!(
+            "Thread store page limit must be 1-{}",
+            MAX_THREAD_SUMMARY_PAGE + 1
+        )));
+    }
+    if before_sequence == Some(0) {
+        return Err(HarnessError::State(
+            "Thread page cursor must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_thread_summaries(
+    summaries: &[ThreadSummary],
+    before_sequence: Option<u64>,
+    limit: usize,
+) -> Result<(), HarnessError> {
+    if summaries.len() > limit {
+        return Err(HarnessError::State(
+            "Event Store exceeded the requested Thread page limit".to_owned(),
+        ));
+    }
+    let mut previous = before_sequence;
+    let mut identities = BTreeSet::new();
+    for summary in summaries {
+        validate_state_id("Thread summary", summary.thread_id.as_str())?;
+        validate_thread_name(summary.name.as_deref())?;
+        if let Some(lineage) = &summary.lineage {
+            validate_thread_lineage(lineage)?;
+            if lineage.parent_thread_id == summary.thread_id
+                || lineage.parent_through_sequence >= summary.last_sequence
+            {
+                return Err(HarnessError::State(
+                    "Thread summary contains invalid direct lineage".to_owned(),
+                ));
+            }
+        }
+        if summary.last_sequence == 0
+            || summary.stream_version == 0
+            || summary.stream_version > summary.last_sequence
+            || previous.is_some_and(|cursor| summary.last_sequence >= cursor)
+            || !identities.insert(&summary.thread_id)
+        {
+            return Err(HarnessError::State(
+                "Event Store returned invalid or unordered Thread summaries".to_owned(),
+            ));
+        }
+        previous = Some(summary.last_sequence);
+    }
+    Ok(())
+}
+
 fn encode_state_event(event: &StateEvent) -> Result<EncodedStateEvent, HarnessError> {
     validate_state_event_json_shape(event)?;
     let encoded = to_bounded_json_vec(event, MAX_STATE_EVENT_BYTES)
@@ -2690,18 +4381,22 @@ fn encode_state_event(event: &StateEvent) -> Result<EncodedStateEvent, HarnessEr
 }
 
 fn validate_state_event_json_shape(event: &StateEvent) -> Result<(), HarnessError> {
-    let value = match event {
-        StateEvent::ItemAppended { item, .. } => match &item.kind {
+    let items: &[Item] = match event {
+        StateEvent::ItemAppended { item, .. } => std::slice::from_ref(item),
+        StateEvent::ToolCallsAppended { calls, .. } => calls,
+        _ => &[],
+    };
+    for item in items {
+        let value = match &item.kind {
             ItemKind::ToolCall { input, .. } => Some(input),
             ItemKind::ToolResult { output, .. } => Some(output),
             _ => None,
-        },
-        _ => None,
-    };
-    if value.is_some_and(|value| validate_value_shape(value).is_err()) {
-        return Err(HarnessError::State(
-            "state event JSON exceeds the supported depth or node count".to_owned(),
-        ));
+        };
+        if value.is_some_and(|value| validate_value_shape(value).is_err()) {
+            return Err(HarnessError::State(
+                "state event JSON exceeds the supported depth or node count".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2918,7 +4613,7 @@ fn decode_row(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
     use serde_json::json;
 
@@ -2927,9 +4622,10 @@ mod tests {
         SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
     };
     use crate::{
-        ActorIdentity, CapabilityOrigin, EventId, HarnessError, HarnessFuture, Item, ItemKind,
-        ModelContinuation, PendingEvent, StateEvent, SteeringId, StoredEvent, ThreadId, TurnId,
-        TurnStatus, kernel::now_ms,
+        ActorIdentity, CapabilityOrigin, EventId, HarnessError, HarnessFuture,
+        InvocationContextEvidence, Item, ItemKind, ModelContinuation, NewStreamEvent, PendingEvent,
+        StateEvent, SteeringId, StoredEvent, ThreadId, ThreadImportOrigin, ThreadLineage,
+        ToolCallBatch, ToolCallBatchId, TurnId, TurnStatus, kernel::now_ms,
     };
 
     struct LyingAppendStore;
@@ -3309,6 +5005,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_atomically_projects_one_ordered_tool_call_batch() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state.create_thread().await.expect("create thread");
+        let turn = state.start_turn(&thread.id).await.expect("start turn");
+        let batch_id = ToolCallBatchId::from_static("tool-batch-test");
+        let calls = ["call-1", "call-2"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, call_id)| {
+                Item::new(ItemKind::ToolCall {
+                    model_id: Some("test/model".to_owned()),
+                    model_origin: Some(CapabilityOrigin::BuiltIn),
+                    call_id: call_id.to_owned(),
+                    name: "echo".to_owned(),
+                    input: json!({"index": index}),
+                    batch: Some(ToolCallBatch {
+                        id: batch_id.clone(),
+                        index,
+                        size: 2,
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        state
+            .append_tool_calls(&turn, calls.clone())
+            .await
+            .expect("append atomic batch");
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].items, calls);
+        let events = state.events(&thread.id).await.expect("events");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[2].event,
+            StateEvent::ToolCallsAppended {
+                turn_id,
+                calls: persisted,
+            } if turn_id == &turn.id && persisted == &calls
+        ));
+
+        let malformed = vec![
+            Item::new(ItemKind::ToolCall {
+                model_id: Some("test/model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                call_id: "bad-1".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({}),
+                batch: Some(ToolCallBatch {
+                    id: ToolCallBatchId::from_static("bad-batch"),
+                    index: 0,
+                    size: 2,
+                }),
+            }),
+            Item::new(ItemKind::ToolCall {
+                model_id: Some("test/model".to_owned()),
+                model_origin: Some(CapabilityOrigin::BuiltIn),
+                call_id: "bad-2".to_owned(),
+                name: "echo".to_owned(),
+                input: json!({}),
+                batch: Some(ToolCallBatch {
+                    id: ToolCallBatchId::from_static("bad-batch"),
+                    index: 0,
+                    size: 2,
+                }),
+            }),
+        ];
+        let error = state
+            .append_tool_calls(&turn, malformed)
+            .await
+            .expect_err("reject inconsistent positions");
+        assert!(error.to_string().contains("inconsistent"));
+        assert_eq!(state.events(&thread.id).await.expect("events").len(), 3);
+    }
+
+    #[tokio::test]
     async fn state_authority_enforces_steering_correlation_order_and_completion_fence() {
         let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
         let thread = state.create_thread().await.expect("create thread");
@@ -3453,12 +5228,25 @@ mod tests {
             )
             .await
             .expect("append before snapshot");
+        state
+            .set_thread_name(&thread.id, Some("First name".to_owned()))
+            .await
+            .expect("first name");
+        state
+            .set_thread_name(&thread.id, Some("Snapshot name".to_owned()))
+            .await
+            .expect("snapshot name");
         let snapshot = state
             .create_snapshot(&thread.id)
             .await
             .expect("create snapshot");
-        assert_eq!(snapshot.stream_version(), 3);
+        assert_eq!(snapshot.stream_version(), 5);
+        assert_eq!(snapshot.metadata_events.len(), 2);
 
+        state
+            .set_thread_name(&thread.id, Some("Tail name".to_owned()))
+            .await
+            .expect("tail name");
         state
             .append_item(
                 &turn,
@@ -3482,6 +5270,7 @@ mod tests {
             .expect("thread");
         assert_eq!(loaded.turns[0].items.len(), 2);
         assert_eq!(loaded.turns[0].status, TurnStatus::Completed);
+        assert_eq!(loaded.name.as_deref(), Some("Tail name"));
 
         store
             .data
@@ -3775,6 +5564,10 @@ mod tests {
             .await
             .expect("append body");
         state
+            .set_thread_name(&thread.id, Some("Persistent name".to_owned()))
+            .await
+            .expect("name Thread");
+        state
             .create_snapshot(&thread.id)
             .await
             .expect("persist snapshot");
@@ -3797,6 +5590,7 @@ mod tests {
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.turns[0].status, TurnStatus::Completed);
         assert_eq!(loaded.turns[0].items.len(), 1);
+        assert_eq!(loaded.name.as_deref(), Some("Persistent name"));
         remove_database_files(&path);
     }
 
@@ -3819,6 +5613,479 @@ mod tests {
             Arc::new(SqliteEventStore::open(&path).await.expect("open database"));
         assert_event_pages(store).await;
         remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn recent_thread_pages_are_bounded_and_store_consistent() {
+        assert_recent_threads(StateEngine::new(Arc::new(MemoryEventStore::new()))).await;
+
+        let path = temp_database_path();
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open database"),
+        ));
+        assert_recent_threads(state).await;
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn thread_fork_is_terminal_idempotent_and_independent_across_stores() {
+        assert_thread_fork(StateEngine::new(Arc::new(MemoryEventStore::new()))).await;
+
+        let path = temp_database_path();
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open database"),
+        ));
+        let child_id = assert_thread_fork(state.clone()).await;
+        drop(state);
+
+        let reopened = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen fork database"),
+        ));
+        let child = reopened
+            .load_thread(&child_id)
+            .await
+            .expect("load reopened child")
+            .expect("child exists");
+        assert!(child.lineage.is_some());
+        assert_eq!(child.turns.len(), 2);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn thread_archive_is_integrity_bound_idempotent_and_portable_across_stores() {
+        assert_thread_archive(StateEngine::new(Arc::new(MemoryEventStore::new()))).await;
+
+        let path = temp_database_path();
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open database"),
+        ));
+        let target_id = assert_thread_archive(state.clone()).await;
+        drop(state);
+
+        let reopened = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen archive database"),
+        ));
+        let imported = reopened
+            .load_thread(&target_id)
+            .await
+            .expect("load imported Thread")
+            .expect("imported Thread");
+        assert!(imported.import_origin.is_some());
+        assert!(imported.lineage.is_none());
+        assert_eq!(imported.turns.len(), 2);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_atomic_stream_failure_leaves_no_partial_child() {
+        let path = temp_database_path();
+        let store = Arc::new(SqliteEventStore::open(&path).await.expect("open database"));
+        let state = StateEngine::new(store.clone());
+        let parent = state.create_thread().await.expect("create parent");
+        let source = state.events(&parent.id).await.expect("source events");
+        let child_id = ThreadId::from_static("atomic-rollback-child");
+        let turn_id = TurnId::from_static("atomic-rollback-turn");
+        let events = vec![
+            NewStreamEvent {
+                event_id: EventId::from_static("atomic-child-created"),
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: now_ms(),
+                },
+            },
+            NewStreamEvent {
+                event_id: EventId::from_static("atomic-child-lineage"),
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::ThreadForked {
+                    lineage: ThreadLineage {
+                        parent_thread_id: parent.id,
+                        parent_through_sequence: source[0].sequence,
+                        parent_stream_version: 1,
+                        parent_events_sha256: "0".repeat(64),
+                    },
+                },
+            },
+            NewStreamEvent {
+                event_id: source[0].event_id.clone(),
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::TurnStarted {
+                    turn_id: turn_id.clone(),
+                },
+            },
+            NewStreamEvent {
+                event_id: EventId::from_static("atomic-child-finished"),
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                recorded_at_ms: now_ms(),
+                event: StateEvent::TurnFinished {
+                    turn_id,
+                    status: TurnStatus::Completed,
+                },
+            },
+        ];
+        store
+            .create_stream_atomic(child_id.clone(), events)
+            .await
+            .expect_err("global Event identity collision");
+        assert!(
+            state
+                .load_thread(&child_id)
+                .await
+                .expect("load child after rollback")
+                .is_none()
+        );
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_thread_name_projection_drift() {
+        let path = temp_database_path();
+        let store = Arc::new(SqliteEventStore::open(&path).await.expect("open database"));
+        let state = StateEngine::new(store.clone());
+        let thread = state.create_thread().await.expect("create Thread");
+        state
+            .set_thread_name(&thread.id, Some("Authoritative".to_owned()))
+            .await
+            .expect("name Thread");
+        drop(state);
+        drop(store);
+
+        rusqlite::Connection::open(&path)
+            .expect("open raw database")
+            .execute(
+                "UPDATE streams SET name = 'Drifted' WHERE thread_id = ?1",
+                [thread.id.as_str()],
+            )
+            .expect("tamper projection");
+        let error = SqliteEventStore::open(&path)
+            .await
+            .err()
+            .expect("projection drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Thread names do not match authoritative events")
+        );
+        remove_database_files(&path);
+    }
+
+    async fn assert_recent_threads(state: StateEngine) {
+        assert!(state.supports_thread_listing());
+        let first = state.create_thread().await.expect("create first Thread");
+        let second = state.create_thread().await.expect("create second Thread");
+        state
+            .set_thread_name(&first.id, Some("First Thread".to_owned()))
+            .await
+            .expect("name first Thread");
+        state
+            .create_checkpoint(&first.id, None, Some("recent".to_owned()))
+            .await
+            .expect("update first Thread");
+
+        let page = state.list_threads(None, 1).await.expect("recent page");
+        assert_eq!(page.threads[0].thread_id, first.id);
+        assert_eq!(page.threads[0].name.as_deref(), Some("First Thread"));
+        assert!(page.has_more);
+        let cursor = page.next_before_sequence.expect("older cursor");
+
+        let older = state
+            .list_threads(Some(cursor), 1)
+            .await
+            .expect("older page");
+        assert_eq!(older.threads[0].thread_id, second.id);
+        assert_eq!(older.threads[0].name, None);
+        assert!(!older.has_more);
+        assert!(older.next_before_sequence.is_none());
+
+        state
+            .set_thread_name(&first.id, None)
+            .await
+            .expect("clear first Thread name");
+        assert_eq!(
+            state
+                .load_thread(&first.id)
+                .await
+                .expect("load named Thread")
+                .expect("named Thread")
+                .name,
+            None
+        );
+        let event_count = state.events(&first.id).await.expect("events").len();
+        let error = state
+            .set_thread_name(&first.id, Some(" padded ".to_owned()))
+            .await
+            .expect_err("reject non-canonical name");
+        assert!(matches!(error, HarnessError::State(_)));
+        assert_eq!(
+            state.events(&first.id).await.expect("events").len(),
+            event_count
+        );
+    }
+
+    async fn assert_thread_fork(state: StateEngine) -> ThreadId {
+        assert!(state.supports_thread_fork());
+        let parent = state.create_thread().await.expect("create parent");
+        state
+            .set_thread_name(&parent.id, Some("Parent only".to_owned()))
+            .await
+            .expect("name parent");
+        let first = state.start_turn(&parent.id).await.expect("first turn");
+        let first_item = Item::new(ItemKind::UserMessage {
+            content: "shared history".to_owned(),
+        });
+        state
+            .append_item(&first, first_item.clone())
+            .await
+            .expect("first item");
+        state
+            .finish_turn(&first, TurnStatus::Completed)
+            .await
+            .expect("finish first");
+        state
+            .create_checkpoint(
+                &parent.id,
+                Some(first.id.clone()),
+                Some("parent only".to_owned()),
+            )
+            .await
+            .expect("parent checkpoint");
+        let second = state.start_turn(&parent.id).await.expect("second turn");
+        state
+            .append_item(
+                &second,
+                Item::new(ItemKind::AssistantMessage {
+                    model_id: None,
+                    model_origin: None,
+                    content: "later history".to_owned(),
+                }),
+            )
+            .await
+            .expect("second item");
+        state
+            .finish_turn(&second, TurnStatus::Completed)
+            .await
+            .expect("finish second");
+
+        let child_id = ThreadId::from_static("fork-child");
+        let child = state
+            .fork_thread(&parent.id, child_id.clone(), Some(&first.id))
+            .await
+            .expect("fork first terminal turn");
+        assert_eq!(child.id, child_id);
+        assert_eq!(child.name, None);
+        assert!(child.checkpoints.is_empty());
+        assert_eq!(child.turns.len(), 1);
+        assert_eq!(child.turns[0].id, first.id);
+        assert_eq!(child.turns[0].items[0].id, first_item.id);
+        let lineage = child.lineage.as_ref().expect("fork lineage");
+        assert_eq!(lineage.parent_thread_id, parent.id);
+        assert_eq!(lineage.parent_stream_version, 5);
+        assert_eq!(lineage.parent_events_sha256.len(), 64);
+        let summaries = state
+            .list_threads(None, 8)
+            .await
+            .expect("list forked Threads");
+        let child_summary = summaries
+            .threads
+            .iter()
+            .find(|summary| summary.thread_id == child_id)
+            .expect("fork child summary");
+        assert_eq!(child_summary.lineage.as_ref(), Some(lineage));
+        assert!(
+            summaries
+                .threads
+                .iter()
+                .find(|summary| summary.thread_id == parent.id)
+                .is_some_and(|summary| summary.lineage.is_none())
+        );
+
+        let snapshot = state
+            .create_snapshot(&child_id)
+            .await
+            .expect("snapshot fork");
+        assert_eq!(snapshot.stream_version(), 5);
+        let active = state
+            .start_turn(&parent.id)
+            .await
+            .expect("active parent turn");
+        let latest_error = state
+            .fork_thread(
+                &parent.id,
+                ThreadId::from_static("fork-active-latest"),
+                None,
+            )
+            .await
+            .expect_err("latest active parent must be rejected");
+        assert!(latest_error.to_string().contains("Turn is running"));
+
+        let retried = state
+            .fork_thread(&parent.id, child_id.clone(), Some(&first.id))
+            .await
+            .expect("idempotent retry");
+        assert_eq!(retried.lineage, child.lineage);
+        let later_child = state
+            .fork_thread(
+                &parent.id,
+                ThreadId::from_static("fork-later-child"),
+                Some(&second.id),
+            )
+            .await
+            .expect("fork earlier terminal boundary while parent is active");
+        assert_eq!(later_child.turns.len(), 2);
+        state
+            .finish_turn(&active, TurnStatus::Cancelled)
+            .await
+            .expect("settle active parent");
+
+        let child_turn = state.start_turn(&child_id).await.expect("continue child");
+        state
+            .finish_turn(&child_turn, TurnStatus::Completed)
+            .await
+            .expect("settle child");
+        let parent_loaded = state
+            .load_thread(&parent.id)
+            .await
+            .expect("load parent")
+            .expect("parent");
+        assert_eq!(parent_loaded.turns.len(), 3);
+        child_id
+    }
+
+    async fn assert_thread_archive(state: StateEngine) -> ThreadId {
+        assert!(state.supports_thread_import());
+        let source = state.create_thread().await.expect("create source");
+        state
+            .set_thread_name(&source.id, Some("Portable history".to_owned()))
+            .await
+            .expect("name source");
+        let source_turn = state.start_turn(&source.id).await.expect("start source");
+        let source_item = Item::new(ItemKind::UserMessage {
+            content: "portable evidence".to_owned(),
+        });
+        state
+            .append_item(&source_turn, source_item.clone())
+            .await
+            .expect("append source item");
+        state
+            .finish_turn(&source_turn, TurnStatus::Completed)
+            .await
+            .expect("finish source");
+        state
+            .create_checkpoint(
+                &source.id,
+                Some(source_turn.id.clone()),
+                Some("source-only recovery cache".to_owned()),
+            )
+            .await
+            .expect("checkpoint source");
+
+        let archive = state
+            .export_thread(&source.id)
+            .await
+            .expect("export source");
+        assert_eq!(archive.source_stream_version, 6);
+        let encoded = super::encode_thread_archive(&archive).expect("encode archive");
+        let decoded = super::decode_thread_archive(&encoded).expect("decode archive");
+        assert_eq!(decoded, archive);
+
+        let mut unknown = serde_json::to_value(&archive).expect("archive value");
+        unknown
+            .as_object_mut()
+            .expect("archive object")
+            .insert("unexpected".to_owned(), json!(true));
+        assert!(
+            super::decode_thread_archive(
+                &serde_json::to_vec(&unknown).expect("encode unknown archive")
+            )
+            .expect_err("unknown archive field")
+            .to_string()
+            .contains("unknown field")
+        );
+
+        let mut tampered = archive.clone();
+        tampered.events[1].recorded_at_ms = tampered.events[1].recorded_at_ms.saturating_add(1);
+        let error = super::decode_thread_archive(
+            &serde_json::to_vec(&tampered).expect("encode tampered archive"),
+        )
+        .expect_err("tampered digest");
+        assert!(error.to_string().contains("digest mismatch"));
+
+        let target_id = ThreadId::from_string(format!("imported-{}", source.id));
+        let imported = state
+            .import_thread(&archive, target_id.clone())
+            .await
+            .expect("import source");
+        assert_eq!(imported.name.as_deref(), Some("Portable history"));
+        assert_eq!(imported.turns.len(), 1);
+        assert_eq!(imported.turns[0].id, source_turn.id);
+        assert_eq!(imported.turns[0].items[0].id, source_item.id);
+        assert!(imported.checkpoints.is_empty());
+        assert!(imported.lineage.is_none());
+        let origin = imported.import_origin.as_ref().expect("import origin");
+        assert_eq!(origin.source_thread_id, source.id);
+        assert_eq!(origin.source_stream_version, archive.source_stream_version);
+        assert_eq!(origin.source_events_sha256, archive.source_events_sha256);
+        assert!(origin.source_lineage.is_none());
+        let source_ids = archive
+            .events
+            .iter()
+            .map(|event| &event.event_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            state
+                .events(&target_id)
+                .await
+                .expect("target events")
+                .iter()
+                .all(|event| !source_ids.contains(&event.event_id))
+        );
+
+        let continued = state.start_turn(&target_id).await.expect("continue import");
+        state
+            .finish_turn(&continued, TurnStatus::Completed)
+            .await
+            .expect("finish imported Turn");
+        let retried = state
+            .import_thread(&archive, target_id.clone())
+            .await
+            .expect("idempotent import retry");
+        assert_eq!(retried.turns.len(), 2);
+        let snapshot = state
+            .create_snapshot(&target_id)
+            .await
+            .expect("snapshot imported Thread");
+        assert_eq!(
+            snapshot.thread().import_origin.as_ref(),
+            imported.import_origin.as_ref()
+        );
+
+        let conflict = state.create_thread().await.expect("create conflict");
+        let error = state
+            .import_thread(&archive, conflict.id)
+            .await
+            .expect_err("reject unrelated target");
+        assert!(error.to_string().contains("different import provenance"));
+
+        let running = state.create_thread().await.expect("create running source");
+        let _turn = state
+            .start_turn(&running.id)
+            .await
+            .expect("start running Turn");
+        assert!(
+            state
+                .export_thread(&running.id)
+                .await
+                .expect_err("reject running export")
+                .to_string()
+                .contains("Turn is running")
+        );
+        target_id
     }
 
     async fn assert_event_pages(store: Arc<dyn EventStore>) {
@@ -4196,6 +6463,123 @@ mod tests {
         let error = super::validate_stored_event(&stored)
             .expect_err("schema-5 cannot claim steering evidence");
         assert!(error.to_string().contains("schema-5"));
+    }
+
+    #[test]
+    fn atomic_tool_call_batch_requires_schema_seven() {
+        let batch_id = ToolCallBatchId::from_static("schema-seven-batch");
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            event_id: EventId::from_static("event-tool-batch"),
+            thread_id: ThreadId::from_static("thread-tool-batch"),
+            recorded_at_ms: 1,
+            event: StateEvent::ToolCallsAppended {
+                turn_id: TurnId::from_static("turn-tool-batch"),
+                calls: ["call-1", "call-2"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call_id)| {
+                        Item::new(ItemKind::ToolCall {
+                            model_id: Some("test/model".to_owned()),
+                            model_origin: Some(CapabilityOrigin::BuiltIn),
+                            call_id: call_id.to_owned(),
+                            name: "echo".to_owned(),
+                            input: json!({}),
+                            batch: Some(ToolCallBatch {
+                                id: batch_id.clone(),
+                                index,
+                                size: 2,
+                            }),
+                        })
+                    })
+                    .collect(),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-7 Tool-call batch");
+        stored.schema_version = 6;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-6 cannot claim atomic Tool-call batch");
+        assert!(error.to_string().contains("schema-6"));
+    }
+
+    #[test]
+    fn thread_fork_lineage_requires_schema_nine() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            event_id: EventId::from_static("event-thread-fork"),
+            thread_id: ThreadId::from_static("thread-child"),
+            recorded_at_ms: 1,
+            event: StateEvent::ThreadForked {
+                lineage: ThreadLineage {
+                    parent_thread_id: ThreadId::from_static("thread-parent"),
+                    parent_through_sequence: 1,
+                    parent_stream_version: 1,
+                    parent_events_sha256: "0".repeat(64),
+                },
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-9 Thread fork lineage");
+        stored.schema_version = 8;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-8 cannot claim Thread fork lineage");
+        assert!(error.to_string().contains("schema-8"));
+    }
+
+    #[test]
+    fn thread_import_origin_requires_schema_ten() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            event_id: EventId::from_static("event-thread-import"),
+            thread_id: ThreadId::from_static("thread-imported"),
+            recorded_at_ms: 1,
+            event: StateEvent::ThreadImported {
+                origin: ThreadImportOrigin {
+                    source_thread_id: ThreadId::from_static("thread-source"),
+                    source_stream_version: 1,
+                    source_last_sequence: 1,
+                    source_events_sha256: "0".repeat(64),
+                    source_lineage: None,
+                },
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-10 Thread import origin");
+        stored.schema_version = 9;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-9 cannot claim Thread import origin");
+        assert!(error.to_string().contains("schema-9"));
+    }
+
+    #[test]
+    fn invocation_context_evidence_requires_schema_eleven() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 3,
+            event_id: EventId::from_static("event-invocation-context"),
+            thread_id: ThreadId::from_static("thread-invocation-context"),
+            recorded_at_ms: 1,
+            event: StateEvent::ItemAppended {
+                turn_id: TurnId::from_static("turn-invocation-context"),
+                item: Item::new(ItemKind::InvocationContext {
+                    submitted_by: ActorIdentity::LocalProcess,
+                    blocks: vec![InvocationContextEvidence {
+                        source: "rag".to_owned(),
+                        reference: "document:1".to_owned(),
+                        source_sha256: "1".repeat(64),
+                        content_sha256: "2".repeat(64),
+                        estimated_tokens: 4,
+                        serialized_bytes: 16,
+                    }],
+                }),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-11 Turn context evidence");
+        stored.schema_version = 10;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-10 cannot claim Turn context evidence");
+        assert!(error.to_string().contains("schema-10"));
     }
 
     #[test]

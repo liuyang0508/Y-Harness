@@ -45,9 +45,9 @@ yh-tui --config y-harness.local.json
 
 The API key is resolved from the named environment variable and never stored
 in configuration or State. The adapter sends `store: false`, disables
-provider-side parallel function calls, and keeps Tool execution, Policy, and
-State inside Y-Harness. Configured shell-free JSON Tools, selected MCP Tools,
-and Agent Memory Hub remain optional; see the
+provider-side storage, accepts ordered multi-call proposals, and keeps Tool
+execution, Policy, and State inside Y-Harness. Configured shell-free JSON
+Models/Tools, selected MCP Tools, and Agent Memory Hub remain optional; see the
 [Chinese quick start](docs/quickstart.zh-CN.md).
 
 Create and validate a persistent Harness service:
@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v12 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v18 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v12 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v18 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -133,15 +133,36 @@ Multi-model routes apply a 30-second deadline to each attempt by default,
 configurable from 1 millisecond to 24 hours; an earlier total Turn deadline
 always wins. Attempt timeout cancels the provider before its Future is
 released. Cancellation, the Turn deadline, and successfully delivered
-provisional output stop fallback. Model-produced State retains the actual
-successful Model identity and origin for durable provenance, while
-Observability records every attempt.
+provisional output stop fallback. An optional 1-millisecond to 24-hour
+attempt-timeout cooldown tries non-cooling Models first on later steps while
+retaining cooling Models as last-resort fallbacks. Only a Runtime-owned attempt
+timeout opens cooldown; Provider errors never masquerade as that signal.
+Providers may return bounded typed authentication,
+authorization, rate-limit, quota, request, availability, policy, overload,
+server, transport, or protocol evidence. Observability records only its
+content-free class, HTTP status, and explicit retry delay; it never receives
+the diagnostic or response body. An independent default-disabled policy may
+retry only typed rate-limit, overload, server, and transport failures on the
+same Model, at most eight times with bounded cancellable backoff. Retries share
+the candidate attempt deadline, stop after provisional output, and never
+replay a Turn or Tool effect. Model-produced State retains the actual successful
+Model identity and origin for durable provenance, while Observability records
+every invoked retry index and explicit cooldown skips.
 Registry-selected identity is never re-queried from provider code. The
 compatibility constructor captures, panic-isolates, validates, and freezes
 `LanguageModel::id()` exactly once; a bad identity rejects execution before
 `TurnStarted`.
 See [ADR 0018](docs/adr/0018-model-registry-and-provenance.md) and
-[ADR 0070](docs/adr/0070-explicit-bounded-model-failover.md).
+[ADR 0070](docs/adr/0070-explicit-bounded-model-failover.md),
+[ADR 0099](docs/adr/0099-observable-model-attempt-timeout-cooldown.md), plus
+[ADR 0100](docs/adr/0100-typed-model-provider-failure-evidence.md) and
+[ADR 0101](docs/adr/0101-bounded-typed-model-retry-policy.md).
+The reference service exposes the same contract through a mutually exclusive
+`models` catalog plus `model_route`; configured IDs are stable operator aliases,
+each Model keeps its own environment-backed Secret reference, and `yh doctor`
+rejects duplicates, unknown route entries, invalid timeouts, and invalid retry
+bounds before Provider construction. See
+[ADR 0087](docs/adr/0087-explicit-configured-model-catalog-and-route.md).
 
 Executable extension metadata is treated as code, not inert configuration.
 Model, Tool, Memory, Token Counter, Conversation Compactor, Secret, Verifier,
@@ -161,7 +182,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v12 specification](docs/protocol.md).
+[client protocol v18 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -315,16 +336,16 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-6 writer
+introduced bounded content-free evidence, and the current schema-11 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1, schema-2, schema-3, schema-4, and schema-5 SQLite databases
-require an offline, backup-first migration before the current Runtime opens
-them:
+Populated schema-1 through schema-10 SQLite
+databases require an offline, backup-first migration before the current
+Runtime opens them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v6.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v11.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -352,6 +373,79 @@ and actor-attributed before acknowledgement. If steering crosses Model
 inference, Runtime invalidates provisional output, discards the stale response,
 applies the queued input FIFO, and samples again. A stale Tool call never
 executes, and a Turn cannot complete with accepted input still pending.
+
+State schema 7 records every same-response multi-Tool decision as one atomic
+ordered event. Runtime validates the whole 2–64-call batch, resolves and
+authorizes every call before any effect, then executes undeclared Tools
+sequentially. A Tool may explicitly guarantee `parallel_safe`; Runtime overlaps
+only maximal contiguous safe runs under a configurable 1–64 ceiling and still
+journals results in source order. Sequential Tools fence neighboring runs.
+Batch identity and positions survive snapshots and approval restart; a crash
+cannot expose a partially appended decision. Provider `parallel_tool_calls`
+enables multi-call proposals but never grants parallel execution authority.
+See [ADR 0098](docs/adr/0098-explicit-bounded-parallel-tool-execution.md).
+
+State schema 8 records explicit operator-authored Thread names as durable,
+clearable events. Names are bounded canonical metadata, never inferred from
+conversation content. Memory and SQLite recent-Thread indexes are updated in
+the same append transaction; SQLite validates that its name projection matches
+the authoritative journal on open. Schema migration adds the nullable index
+column and discards old disposable snapshots without rewriting history. See
+[ADR 0092](docs/adr/0092-engine-owned-thread-names.md).
+
+State schema 9 makes Thread fork/clone a first-class Engine transition rather
+than a client-side replay. A caller supplies the child Thread ID as a retry
+identity and may select one terminal parent Turn boundary. Memory and SQLite
+create the complete child journal atomically; a failed insert leaves no child.
+The child preserves immutable historical Turn/Item/correlation identities
+without re-executing Tool or approval effects, omits parent names and
+Checkpoints, and records direct parent sequence/version plus an exact event
+prefix SHA-256. Parent and child then continue independently. See
+[ADR 0093](docs/adr/0093-atomic-thread-fork-and-lineage.md).
+Protocol 16 also projects this same direct lineage into content-free bounded
+Thread summaries, so clients can render a recent-page branch forest without
+loading every conversation history. Parents outside the page remain opaque;
+this is not an entry-level mutable session DAG. See
+[ADR 0094](docs/adr/0094-lineage-aware-bounded-thread-navigation.md).
+
+State schema 10 adds portable, integrity-bound Thread archives. Export binds a
+complete terminal source journal to its identity, version, last sequence, and
+SHA-256. Import uses a caller-owned retry identity and atomically materializes
+a new local Thread without replaying effects; historical correlation
+identities and Thread-name transitions survive, recovery-only Checkpoints do
+not, and every Event receives a fresh globally unique identity. Source fork
+lineage is retained as evidence rather than asserted as navigable local
+ancestry. The embedded API exposes the same contract as:
+
+```bash
+yh thread export <thread-id> <archive> [config]
+yh thread import <archive> <target-thread-id> [config]
+```
+
+Export never overwrites its destination, import rejects altered or oversized
+archives before mutation, and a running Turn is not exportable. See
+[ADR 0095](docs/adr/0095-portable-integrity-bound-thread-archives.md).
+
+State schema 11 adds optional per-Turn reference Context without adding another
+conversation or branch authority. An authorized embedding or Protocol caller
+may supply up to 64 unique `TurnContextInput` blocks for RAG, branch handoff,
+or workflow context. Runtime validates them before State mutation, prefixes
+them as non-authoritative data, recounts them, and journals only the
+authenticated actor, source/reference, double SHA-256 provenance, and
+byte/token charges. The body is ephemeral and never becomes a user/assistant
+Item. Direct OpenAI requests reserve provider `instructions` for verified Skill
+blocks; all other Context remains user-level reference data. See
+[ADR 0096](docs/adr/0096-attributed-per-turn-context.md).
+
+For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
+longest identical Turn prefix and selects a bounded newest source-only delta.
+Its format-1 digest binds the exact summarizer input and both Thread identities.
+The Engine does not choose or invoke a summarizer: any host-selected provider
+may return a candidate, and `to_context` converts it into the same attributed,
+non-authoritative `TurnContextInput` path. The read-only
+`HarnessRuntime::prepare_thread_handoff` convenience writes no State and does
+not introduce Pi-style mutable entry navigation. See
+[ADR 0097](docs/adr/0097-bounded-digest-bound-thread-handoff.md).
 
 For asynchronous human workflows, a provider-neutral Approval Inbox supports
 idempotent submission, a deterministic oldest-first 16-record pending window,
@@ -429,18 +523,38 @@ credentials/query/fragment, non-JSON responses, and oversized bodies are
 rejected. Package content is capped at 2 MiB raw and 16 MiB encoded, and the
 registry is capped at 64 MiB of aggregate package content. The safe
 fetch-and-register path performs all live trust checks before mutation.
-Catalog discovery, authenticated private registries, caching, and recursive
-dependency fetching are not implied.
+The reference operator binary includes this feature; headless library users
+may still exclude it. Catalog discovery, authenticated private registries,
+caching, and recursive dependency fetching are not implied.
 
 The reference service also accepts explicitly listed project-local Skill
-package files and exact activation identities. Each path must remain below the
-configuration project root, every package is digest-verified, dependencies and
-required Tools resolve before startup, and the resolved instructions enter the
-ordinary Context Engine. Project files are operator-trusted inputs rather than
-third-party publisher attestations; network packages still require the signed
-external path. See
+package files, signed External package files, and exact activation identities.
+Each path must remain below the configuration project root, every package is
+digest-verified, dependencies and required Tools resolve before startup, and
+the resolved instructions enter the ordinary Context Engine. External files
+are registered with configured publisher/log keys, validity, transparency, and
+immutable revocation policy; they remain `External` and retain live trust
+checks. `yh doctor` emits each resolved exact identity, content digest,
+publisher, and transparency receipt as applicable. Unsigned project files are
+operator-trusted inputs rather than third-party publisher attestations.
+
+`yh skill install <package> [config]` validates and canonically stores a local
+declarative package under the configuration project without activating it.
+`install-external <signed-package> [config]` verifies configured publisher
+trust before storing the complete signed envelope, while
+`install-https <url> <name@version> <sha256> [config]` adds ADR 0033's exact
+network pins. `list` and `verify` revalidate the bounded store and all External
+trust; `remove <name@version>` refuses configured or active packages and moves
+an unreferenced package into project-local recoverable trash even when its key
+has since been revoked. Installation never edits activation authority: the
+operator must still add the printed path to `skills.package_files` or
+`skills.external_package_files`, add the exact identity to `skills.activate`,
+and restart the service. See
 [`y-harness.skill.example.json`](config/y-harness.skill.example.json) and
-[ADR 0085](docs/adr/0085-project-configured-declarative-skills.md).
+[ADRs 0085](docs/adr/0085-project-configured-declarative-skills.md) and
+[0088](docs/adr/0088-explicit-mcp-activation-and-extension-locks.md), and
+[0091](docs/adr/0091-governed-project-skill-lifecycle.md), plus
+[0102](docs/adr/0102-governed-signed-external-skill-lifecycle.md).
 
 Evaluation is a separate comparison layer: validated cases run through an
 `EvaluationTarget` with engine-owned cancellation and deadlines. Cases and
@@ -507,11 +621,17 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v12 preserves the 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v18 preserves the 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
-schema-6 durable safe-boundary Turn steering. Steering requires the exact
+schema-6 durable safe-boundary Turn steering, schema-7 atomic ordered
+Tool-call batches, schema-8 Engine-owned Thread names, and schema-9 atomic
+Thread forks with immutable direct lineage, schema-10 integrity-bound Thread
+import provenance, and schema-11 attributed invocation Context. Protocol 16
+added lineage to bounded content-free Thread summaries without changing State
+schema; Protocol 17 admitted import provenance, and Protocol 18 adds optional
+bounded `start_turn.context`. Steering requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
@@ -599,10 +719,13 @@ yh-tui --demo
 ```
 
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
-streams Turns, polls and forgets Operations, and projects paginated State,
-Approval, and Task views only through Protocol v12. Input submitted during an
-active Turn uses the engine's exact-ID steering command rather than a TUI-owned
-execution queue. It is implemented in
+lists and resumes the latest authoritative Threads, streams Turns, polls and
+forgets Operations, and projects paginated State, Approval, and Task views only
+through Protocol v18. The Sessions panel shows direct fork ancestry from
+content-free Engine summaries. `/name [title]` changes or clears Engine-owned
+Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
+independent child through the same typed protocol. Input submitted during an active Turn uses the engine's
+exact-ID steering command rather than a TUI-owned execution queue. It is implemented in
 [`clients/tui`](clients/tui) and can be omitted without changing the engine.
 
 Agent Memory Hub is the first-party reference integration for governed
@@ -644,6 +767,28 @@ whole catalog. Calls then follow the ordinary model proposal, Policy/approval,
 Tool execution, State evidence, cancellation, and Verification path rather than
 receiving a transport-specific bypass.
 
+The optional `https-mcp` feature adds an authenticated remote transport for
+the bounded stateless JSON-response subset of MCP Streamable HTTP. It requires
+an exact HTTPS URL and environment-backed Secret reference, disables redirects,
+ambient proxies, automatic HTTP/Tool retry, SSE reconnect, and expired-session
+request replay, and independently bounds requests, responses, session IDs, and
+timeouts. A project-contained exclusive CA bundle is supported. SSE, OAuth,
+arbitrary headers, and stateful remote sessions are explicitly not claimed.
+The operator install and release binary include this feature; library hosts may
+exclude it. See
+[ADR 0103](docs/adr/0103-bounded-authenticated-https-mcp-json-transport.md).
+
+Reference-service stdio and `https_mcp_servers` entries are explicitly
+activatable. A disabled entry
+starts no process, discovers no catalog, grants no Tool Policy, and cannot
+satisfy a Memory dependency. Enabled stdio entries may pin the exact command
+file with a lowercase SHA-256 digest; `yh doctor` reports enabled/configured and
+locked/enabled-stdio counts. Remote IDs share the same collision domain and
+exact Tool allow-list, but command locks do not apply to URLs. This is startup
+drift detection for that file, not a sandbox, dependency lock, or atomic
+executable measurement. See
+[ADR 0088](docs/adr/0088-explicit-mcp-activation-and-extension-locks.md).
+
 Executable extensions use a replaceable Process Broker. The default broker
 denies execution. The opt-in local broker clears inherited environment, never
 uses a shell, bounds input/output/time and concurrency (1–4096), keeps
@@ -656,9 +801,25 @@ network, credential, or syscall authority and can be escaped with a new
 session/group. Windows still has direct-child-only cleanup. JSON command
 adapters make the same boundary usable
 for external Tools and Models; Tools still pass through normal Policy and
-evidence ordering. Runtime-driven external Models receive the same Turn
+evidence ordering. JSON Tools default to sequential execution; an operator may
+declare `batch_execution: "parallel_safe"` only when the Tool is semantically
+safe against every other eligible same-response call, while
+`max_parallel_tool_calls` bounds the Runtime to 1–64 concurrent calls.
+Runtime-driven external Models receive the same Turn
 cancellation token through their model-step handle, so a custom broker can
 cooperatively stop work instead of relying only on future-drop cleanup.
+
+The reference service exposes the existing Model adapter as
+`model.type = "json_command"` in either the compatible single-Model form or the
+explicit routed catalog. The executable receives one bounded `ModelRequest` on
+stdin and must return one validated `ModelOutput` on stdout. It is registered
+with External provenance and reuses the same explicit launch, environment,
+timeout, output, cancellation, and cleanup boundaries as JSON Tools. This lets
+an operator bridge a vendor in any language without changing Rust, but it does
+not pretend the command reports provider usage, cost, continuation, typed HTTP
+failure, or provisional streaming. See
+[the example configuration](config/y-harness.command-model.example.json) and
+[ADR 0104](docs/adr/0104-configured-brokered-json-command-models.md).
 
 On macOS, the first concrete sandbox broker uses Seatbelt to deny network by
 default and restrict writes to canonical operator-approved roots. Reads remain

@@ -625,6 +625,7 @@ mod tests {
                     call_id: call_id.to_owned(),
                     name: name.to_owned(),
                     input,
+                    batch: None,
                 }),
             )
             .await

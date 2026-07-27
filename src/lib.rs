@@ -39,7 +39,9 @@ pub use context::{
     ConversationCompactorDescriptor, ConversationCompactorRegistry, ConversationContext,
     ConversationContextConfig, MemoryContextConfig, MemoryContextObservation, MemoryContextStatus,
     MemoryFailureMode, RegisteredConversationCompactor, RegisteredTokenCounter,
-    TOKEN_COUNTER_API_VERSION, TokenCounter, TokenCounterDescriptor, TokenCounterRegistry,
+    THREAD_HANDOFF_FORMAT_VERSION, TOKEN_COUNTER_API_VERSION, ThreadHandoffConfig,
+    ThreadHandoffRequest, TokenCounter, TokenCounterDescriptor, TokenCounterRegistry,
+    TurnContextInput,
 };
 pub use evaluation::{
     BaselineComparison, BaselineFailure, BaselineRequirement, EVALUATION_FORMAT_VERSION,
@@ -56,12 +58,16 @@ pub use execution::{
 pub use kernel::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
     CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId, EventId, ExecutionPhase,
-    HarnessError, HarnessFuture, Item, ItemKind, MemoryContextRecordStatus, ModelContinuation,
-    ModelEventSink, ModelOutput, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
-    ModelStreamEvent, ModelUsage, OperationId, PendingEvent, PolicyDecision, RegisteredModel,
-    RegisteredTool, RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId,
-    TaskLeaseId, TaskMessageId, Thread, ThreadId, ToolAuthorization, ToolContext, ToolDescriptor,
-    ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
+    HarnessError, HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
+    MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
+    MAX_TOOL_CALLS_PER_BATCH, MemoryContextRecordStatus, ModelContinuation, ModelEventSink,
+    ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
+    ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, NewStreamEvent,
+    OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool, RiskLevel,
+    StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread,
+    ThreadId, ThreadImportOrigin, ThreadLineage, ToolAuthorization, ToolBatchExecution,
+    ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor, ToolRegistry, Turn, TurnId,
+    TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -97,8 +103,10 @@ pub use protocol::{
     serve_stdio,
 };
 pub use runtime::{
-    AllowListPolicy, ApprovalHandler, DenyAllApprovals, HarnessRuntime, LanguageModel,
-    PolicyEngine, SteeringReceipt, Tool, TurnExecutionOptions,
+    AllowListPolicy, ApprovalHandler, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DenyAllApprovals,
+    HarnessRuntime, LanguageModel, MAX_MODEL_RETRIES, MAX_MODEL_RETRY_DELAY_MS,
+    MAX_PARALLEL_TOOL_CALLS, ModelRetryPolicy, PolicyEngine, SteeringReceipt, Tool,
+    TurnExecutionOptions,
 };
 pub use secret::{
     EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretProvider,
@@ -116,12 +124,16 @@ pub use skill::{
     SkillTransparencyRequirement, SkillTrustStore, VerifiedSkillTransparency,
 };
 pub use state::{
-    EventStore, MemoryEventStore, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
-    STATE_TERMINAL_EVENT_RESERVE, STATE_TERMINAL_RECOVERY_BYTE_RESERVE, STATE_THREAD_EVENT_LIMIT,
+    EventStore, MAX_THREAD_ARCHIVE_BYTES, MemoryEventStore, STATE_EVENT_SCHEMA_VERSION,
+    STATE_SNAPSHOT_SCHEMA_VERSION, STATE_TERMINAL_EVENT_RESERVE,
+    STATE_TERMINAL_RECOVERY_BYTE_RESERVE, STATE_THREAD_EVENT_LIMIT,
     STATE_THREAD_RECOVERY_BYTE_LIMIT, SnapshotMaintenanceConfig, SnapshotMaintenanceFailure,
     SnapshotMaintenanceStats, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
-    StateMigrationReport, StateMigrationStatus, StateSnapshot,
+    StateMigrationReport, StateMigrationStatus, StateSnapshot, THREAD_ARCHIVE_FORMAT_VERSION,
+    ThreadArchive, ThreadSummary, ThreadSummaryPage, decode_thread_archive, encode_thread_archive,
 };
+#[cfg(feature = "https-mcp")]
+pub use transport::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
 pub use transport::{
     McpClient, McpToolDescriptor, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
     mcp_client, register_mcp_tools, register_selected_mcp_tools,
@@ -133,7 +145,7 @@ pub use verification::{
 };
 
 /// Exact HTTPS JSON model-gateway contract version.
-pub const MODEL_GATEWAY_API_VERSION: &str = "5";
+pub const MODEL_GATEWAY_API_VERSION: &str = "7";
 
 /// Exact model-cost scale used by [`ModelUsage`].
 ///

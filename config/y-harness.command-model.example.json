@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "json_command",
+    "id": "external/model-adapter",
+    "process": {
+      "command": "/absolute/path/to/model-adapter",
+      "args": [],
+      "current_directory": ".",
+      "environment_from_host": {
+        "PROVIDER_API_KEY": "PROVIDER_API_KEY"
+      },
+      "timeout_ms": 120000,
+      "max_output_bytes": 4194304,
+      "launch": {
+        "type": "unrestricted",
+        "max_concurrency": 4
+      }
+    }
+  }
+}

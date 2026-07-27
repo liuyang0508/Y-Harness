@@ -274,6 +274,16 @@ pub trait Tool: Send + Sync {
     /// Returns validated model-visible metadata.
     fn descriptor(&self) -> ToolDescriptor;
 
+    /// Declares whether same-response calls may overlap.
+    ///
+    /// The default is fail-safe and preserves source-order execution. A
+    /// `ParallelSafe` implementation assumes responsibility for semantic
+    /// conflicts across every concurrently eligible call; this is stronger
+    /// than memory safety, idempotency, or provider parallel-call support.
+    fn batch_execution(&self) -> crate::ToolBatchExecution {
+        crate::ToolBatchExecution::Sequential
+    }
+
     /// Executes one authorized call.
     fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value>;
 }

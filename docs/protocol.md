@@ -1,10 +1,10 @@
-# Client protocol v12
+# Client protocol v18
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"12"` is exact. Every request carries that value, and a peer
+Protocol version `"18"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "12",
+  "protocol_version": "18",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "12",
+  "protocol_version": "18",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "12",
+  "protocol_version": "18",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "12",
+  "protocol_version": "18",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "12",
+  "protocol_version": "18",
   "body": {
     "status": "success",
     "result": {
@@ -124,14 +124,17 @@ The result type is `initialized`:
         "thread.capacity",
         "thread.create",
         "thread.events",
+        "thread.fork",
         "thread.get",
+        "thread.list",
+        "thread.name",
         "turn.start",
         "turn.steer"
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 6,
-        "state_snapshot_schema": 6,
+        "state_event_schema": 8,
+        "state_snapshot_schema": 8,
         "approval_inbox_schema": 2,
         "task_graph_schema": 1,
         "memory_api": 1,
@@ -139,7 +142,7 @@ The result type is `initialized`:
         "conversation_compactor_api": 1,
         "secret_api": 1,
         "skill_api": "1",
-        "model_gateway_api": "5",
+        "model_gateway_api": "6",
         "workspace_provider_api": "1"
       }
     }
@@ -156,16 +159,20 @@ coordinate.
 ## Methods
 
 Optional JSON fields may be omitted or sent as `null`. Cursor values are
-exclusive: a returned item must have a sequence strictly greater than
-`after_sequence`.
+exclusive: event items have a sequence strictly greater than
+`after_sequence`; recent Thread summaries have a latest sequence strictly less
+than `before_sequence`.
 
 | `method` | Command fields | Required permission | Success result `type` |
 |---|---|---|---|
 | `initialize` | none | `initialize` | `initialized` |
 | `create_thread` | none | `thread.create` | `thread_created` |
+| `fork_thread` | `parent_thread_id`, `child_thread_id`, optional `through_turn_id` | `thread.fork` | `thread_forked` |
+| `list_threads` | optional `before_sequence`, optional `limit` | `thread.list` | `threads` |
+| `set_thread_name` | `thread_id`, optional `name` | `thread.name` | `thread_named` |
 | `get_thread` | `thread_id` | `thread.get` | `thread` |
 | `get_thread_capacity` | `thread_id` | `thread.capacity` | `thread_capacity` |
-| `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `timeout_ms` | `turn.start` | `turn_started` |
+| `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `context`, optional `timeout_ms` | `turn.start` | `turn_started` |
 | `steer_turn` | `thread_id`, `expected_turn_id`, `content` | `turn.steer` | `turn_steered` |
 | `get_operation` | `operation_id` | `operation.get` | `operation` |
 | `get_operation_events` | `operation_id`, optional `after_sequence`, optional `limit` | `operation.events` | `operation_events` |
@@ -201,6 +208,29 @@ input. `timeout_ms`, when present, must be greater than zero and fit the host
 Runtime clock. A timeout is a total external-work deadline, not a guarantee
 that non-cooperative persistence can be forcibly aborted.
 
+`context` defaults to an empty list. Each entry is non-authoritative reference
+data supplied by the authenticated Turn caller:
+
+```json
+[
+  {
+    "source": "branch-handoff",
+    "reference": "thread:source/turn:terminal",
+    "text": "Bounded derived handoff text."
+  }
+]
+```
+
+`source` is a validated capability-style name; `reference` is an opaque
+1–4,096-byte non-control locator. A request may contain at most 64 unique
+source/reference pairs and 1,048,576 aggregate source-text bytes, within the
+2 MiB request-frame ceiling. Runtime prefixes and recounts every block,
+computes source and model-visible SHA-256 values, and records only hashes,
+charges, source/reference, and the authenticated actor in schema-11 State.
+The text never becomes a user/assistant history Item or durable State body.
+Changing or omitting it during deferred approval recovery changes the complete
+Model request and fails closed before Tool execution.
+
 `steer_turn` supplies additional input to one exact running Turn. The caller
 must first observe its `TurnId` through `get_thread`; a stale or already sealed
 identity fails without writing. A successful result acknowledges the durable
@@ -218,6 +248,38 @@ Acceptance does not mean immediate Model visibility. Runtime applies queued
 input FIFO only at a safe Agent Loop boundary. It invalidates and resamples a
 Model response crossed by newer steering, never executes a stale Tool call,
 and will not complete a Turn while accepted input remains unapplied.
+
+`set_thread_name` records an explicit operator-authored display name in the
+State journal. `name` is either `null` to clear it or 1–256 trimmed,
+non-control UTF-8 bytes. The result echoes only the accepted value:
+
+```json
+{
+  "type": "thread_named",
+  "name": "Harness design"
+}
+```
+
+Names are not generated from conversation content. They appear in `thread`
+and bounded `threads` projections so every client observes the same durable
+metadata.
+
+`fork_thread` creates an independent child from an exact terminal parent
+boundary. `child_thread_id` is caller-chosen durable retry identity. Repeating
+the same request returns the matching child; reusing it for different
+provenance fails. If `through_turn_id` is absent, the fork uses the complete
+settled parent prefix currently observed and rejects a running latest Turn.
+When supplied, it must identify a terminal Turn and the child includes history
+through that Turn only.
+
+The Event Store commits the complete child stream atomically or leaves no
+child. Historical Turn, Item, Tool-call, Approval, and Steering identities are
+preserved because they denote the same already-observed evidence; no Tool or
+approval effect is replayed. Thread names, Checkpoints, and an ancestor's own
+lineage events are not copied. The returned `thread.lineage` records the direct
+parent, parent sequence/version boundary, and SHA-256 of the exact parent event
+prefix. A child can immediately continue with new Turns without mutating its
+parent.
 
 An approval decision is immutable:
 
@@ -246,12 +308,47 @@ The normal client sequence is:
 ```text
 initialize
   → create_thread
+  → optional set_thread_name
   → start_turn
   → optional steer_turn while running
   → get_operation_events / get_operation
   → get_events
   → forget_operation
 ```
+
+When the Event Store advertises `thread.list`, `list_threads` returns at most
+64 bounded summaries ordered by the latest global State sequence,
+newest first:
+
+```json
+{
+  "type": "threads",
+  "threads": [{
+    "thread_id": "thread-...",
+    "name": "Harness design",
+    "lineage": {
+      "parent_thread_id": "thread-parent",
+      "parent_through_sequence": 42,
+      "parent_stream_version": 7,
+      "parent_events_sha256": "lowercase-64-character-sha256"
+    },
+    "last_sequence": 50,
+    "updated_at_ms": 1785142800000,
+    "stream_version": 9
+  }],
+  "next_before_sequence": 50,
+  "has_more": true
+}
+```
+
+Pass the returned `next_before_sequence` as `before_sequence` to request the
+next older page. Paging is a live view, not a snapshot transaction: concurrent
+Thread updates can move entries toward the front. A client should restart at
+the first page when refreshing. Summaries contain no message content. Protocol
+16 adds the optional direct `lineage` already present on forked Thread
+projections, allowing a client to build a forest from the bounded page without
+loading full histories. A root Thread omits it; an ancestor outside the current
+page remains an opaque parent identity. Summaries do not replace `get_thread`.
 
 `start_turn` returns immediately with a process-local `operation_id`. It does
 not return the terminal Turn:
@@ -434,7 +531,9 @@ the domain page is capped at 2,097,152 encoded bytes.
 The protocol serializes the same public domain records used by an embedded
 host:
 
-- a Thread is `{id, created_at_ms, turns, checkpoints}`;
+- a Thread is `{id, name?, lineage?, created_at_ms, turns, checkpoints}`;
+- a Thread summary is
+  `{thread_id, name?, lineage?, last_sequence, updated_at_ms, stream_version}`;
 - a Turn is `{id, thread_id, status, items}`;
 - an Item is tagged by `type`;
 - a Stored Event carries
@@ -521,6 +620,117 @@ State event schema 6 adds two correlated steering Items:
 projects as user input for the following Model step. A completed Turn cannot
 contain unapplied steering.
 
+State event schema 7 adds one atomic event for all Tool calls proposed by the
+same Model response:
+
+```json
+{
+  "type": "tool_calls_appended",
+  "turn_id": "turn-...",
+  "calls": [
+    {
+      "id": "item-...",
+      "created_at_ms": 1785081600000,
+      "type": "tool_call",
+      "model_id": "openai/default",
+      "model_origin": {
+        "kind": "built_in"
+      },
+      "call_id": "call-1",
+      "name": "read",
+      "input": {
+        "path": "README.md"
+      },
+      "batch": {
+        "id": "tool-batch-...",
+        "index": 0,
+        "size": 2
+      }
+    }
+  ]
+}
+```
+
+The actual `calls` array contains exactly `size` Items in source order, with
+indexes zero through `size - 1`, one shared batch identity, and unique call correlations.
+The event contains 2–64 calls. `item_appended` cannot carry batch metadata, so
+a client must not flatten or partially apply this event.
+
+State event schema 8 adds the explicit Thread-name transition:
+
+```json
+{
+  "type": "thread_named",
+  "name": "Harness design"
+}
+```
+
+`name: null` clears the name. The authoritative event is projected into
+`Thread.name`; SQLite maintains `streams.name` only as a transactionally
+consistent recent-list index and fails closed when it drifts from the journal.
+
+State event schema 9 adds direct immutable fork provenance:
+
+```json
+{
+  "type": "thread_forked",
+  "lineage": {
+    "parent_thread_id": "thread-parent",
+    "parent_through_sequence": 42,
+    "parent_stream_version": 7,
+    "parent_events_sha256": "lowercase-64-character-sha256"
+  }
+}
+```
+
+It must immediately follow the child's `thread_created` event. Fork snapshots
+reconstruct this event exactly; copied parent Checkpoints never enter the
+child.
+
+State event schema 10 adds immutable import provenance:
+
+```json
+{
+  "type": "thread_imported",
+  "origin": {
+    "source_thread_id": "thread-source",
+    "source_stream_version": 7,
+    "source_last_sequence": 42,
+    "source_events_sha256": "lowercase-64-character-sha256"
+  }
+}
+```
+
+It must immediately follow the target `thread_created` event. Optional
+`source_lineage` preserves source fork evidence but does not populate the
+target's local `lineage`. Portable archive encoding and file transfer remain
+embedded/CLI concerns; Protocol 18 only transports the resulting Thread and
+State-event projections.
+
+State event schema 11 adds content-free invocation-context evidence:
+
+```json
+{
+  "type": "invocation_context",
+  "submitted_by": { "kind": "local_process" },
+  "blocks": [
+    {
+      "source": "branch-handoff",
+      "reference": "thread:source/turn:terminal",
+      "source_sha256": "lowercase-64-character-sha256",
+      "content_sha256": "lowercase-64-character-sha256",
+      "estimated_tokens": 42,
+      "serialized_bytes": 168
+    }
+  ]
+}
+```
+
+This evidence is excluded from model-visible conversation replay. The typed
+Model Context block carries `source.type = "invocation"` so gateways keep it
+at ordinary caller/evidence authority rather than treating it as Skill
+instructions.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -535,13 +745,15 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v12 value |
+| Boundary | Protocol v18 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
 | Request `id` | 1–128 restricted ASCII bytes |
 | Opaque command identity | 1–256 bytes |
+| Thread name | 1–256 trimmed non-control bytes, or null |
 | Prompt | 1–1,048,576 bytes |
+| Per-Turn context | 64 blocks; 1,048,576 source bytes and tokens; 4,096-byte reference |
 | Retained Operations | 64 default; 4,096 configurable maximum |
 | Operation stream | 4,096 events and 1,048,576 delta bytes |
 | Operation-event page | 16 default; 32 maximum |
@@ -566,7 +778,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"12"` |
+| `unsupported_version` | Request protocol is not exactly `"18"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -585,7 +797,10 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-6 Steering evidence, schema-5 Provider Continuation evidence, schema-4
+schema-11 invocation-context evidence, schema-10 Thread-import evidence,
+schema-9 Thread-fork evidence, schema-8
+Thread-name evidence, schema-7 Tool-call batch evidence, schema-6
+Steering evidence, schema-5 Provider Continuation evidence, schema-4
 Tool-origin evidence, all method tags, and their permission mapping. Turn
 integration tests prove exact-ID durable steering acceptance. Task integration
 tests prove conditional discovery, bounded cursor

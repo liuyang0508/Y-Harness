@@ -18,8 +18,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 use y_harness::{
-    ApprovalDecision, ItemKind, MemoryContextRecordStatus, PolicyDecision, RiskLevel,
-    StateCapacityLevel, TaskStatus, TurnStatus, VerificationOutcome,
+    ApprovalDecision, ItemKind, MemoryContextRecordStatus, PROTOCOL_VERSION, PolicyDecision,
+    RiskLevel, StateCapacityLevel, TaskStatus, TurnStatus, VerificationOutcome,
 };
 
 use crate::app::{App, Focus, SidebarTab};
@@ -150,7 +150,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw("  "),
             running,
             Span::styled(
-                format!("  {} · protocol {PROTOCOL_LABEL}", app.server),
+                format!("  {} · protocol v{PROTOCOL_VERSION}", app.server),
                 Style::default().fg(MUTED),
             ),
         ]),
@@ -160,8 +160,23 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(MUTED),
             ),
             Span::styled(
-                format!("thread {} ", short_id(app.thread.id.as_str())),
+                format!(
+                    "thread {} ",
+                    app.thread
+                        .name
+                        .as_deref()
+                        .unwrap_or_else(|| short_id(app.thread.id.as_str()))
+                ),
                 Style::default().fg(USER),
+            ),
+            Span::styled(
+                app.thread
+                    .lineage
+                    .as_ref()
+                    .map_or_else(String::new, |lineage| {
+                        format!("fork of {} · ", short_id(lineage.parent_thread_id.as_str()))
+                    }),
+                Style::default().fg(MUTED),
             ),
             Span::styled(capacity, Style::default().fg(MUTED)),
         ]),
@@ -173,8 +188,6 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         area,
     );
 }
-
-const PROTOCOL_LABEL: &str = "v10";
 
 fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if area.width >= 100 {
@@ -461,6 +474,10 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
             format!("◇ SUMMARY · {compactor} · {} Turns", covered_turns.len()),
             Style::default().fg(MUTED),
         )),
+        ItemKind::InvocationContext { blocks, .. } => lines.push(Line::styled(
+            format!("◇ TURN CONTEXT · {} attributed blocks", blocks.len()),
+            Style::default().fg(MUTED),
+        )),
     }
 }
 
@@ -481,7 +498,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .position(|tab| *tab == app.sidebar_tab)
         .unwrap_or_default();
     frame.render_widget(
-        Tabs::new(["Activity", "Approvals", "Tasks"])
+        Tabs::new(["Activity", "Sessions", "Approvals", "Tasks"])
             .select(selected)
             .style(Style::default().fg(MUTED))
             .highlight_style(
@@ -494,6 +511,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     match app.sidebar_tab {
         SidebarTab::Activity => render_activity(frame, app, rows[1]),
+        SidebarTab::Sessions => render_sessions(frame, app, rows[1]),
         SidebarTab::Approvals => render_approvals(frame, app, rows[1]),
         SidebarTab::Tasks => render_tasks(frame, app, rows[1]),
     }
@@ -525,6 +543,76 @@ fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
             items
         }),
         area,
+    );
+}
+
+fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if !app.capabilities.contains("thread.list") {
+        frame.render_widget(
+            Paragraph::new("Thread listing is not enabled by this Engine host.")
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    let mut items = app
+        .sessions
+        .iter()
+        .map(|session| {
+            let current = session.thread_id == app.thread.id;
+            let mut lines = vec![Line::styled(
+                format!(
+                    "{}{}",
+                    if current { "● " } else { "  " },
+                    session
+                        .name
+                        .as_deref()
+                        .unwrap_or_else(|| short_id(session.thread_id.as_str()))
+                ),
+                Style::default().fg(if current { USER } else { Color::White }),
+            )];
+            if let Some(lineage) = &session.lineage {
+                lines.push(Line::styled(
+                    format!(
+                        "  ↳ parent {} @ v{}",
+                        short_id(lineage.parent_thread_id.as_str()),
+                        lineage.parent_stream_version
+                    ),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            lines.push(Line::styled(
+                format!(
+                    "{} events · latest sequence {}",
+                    session.stream_version, session.last_sequence
+                ),
+                Style::default().fg(MUTED),
+            ));
+            ListItem::new(lines)
+        })
+        .collect::<Vec<_>>();
+    if app.sessions_have_more {
+        items.push(ListItem::new(Line::styled(
+            "… older Threads omitted; use /thread <id>",
+            Style::default().fg(MUTED),
+        )));
+    }
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No Threads").style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+    let mut state = ListState::default();
+    state.select(Some(app.selected_session));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().bg(SURFACE).fg(Color::White))
+            .highlight_symbol("▸ "),
+        area,
+        &mut state,
     );
 }
 
@@ -726,7 +814,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw(""),
         Line::raw("Commands"),
         Line::raw("  /new                      create and switch Thread"),
+        Line::raw("  /fork [terminal-turn-id]  fork history and switch to child"),
+        Line::raw("  /name [title]             set or clear Thread name"),
         Line::raw("  /thread <id>              attach to an existing Thread"),
+        Line::raw("  /sessions                 list lineage and resume recent Threads"),
         Line::raw("  /graph <id>               watch a durable Task Graph"),
         Line::raw("  /events | /approvals      open Inspector panel"),
         Line::raw("  /refresh | /cancel        refresh or cancel"),
@@ -737,7 +828,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v12.",
+            "Approvals and Tasks are accessed exclusively through Protocol v18.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -941,7 +1032,7 @@ fn short_id(identity: &str) -> &str {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::app::App;
+    use crate::app::{App, SidebarTab};
 
     use super::{input_cursor, render, sanitized};
 
@@ -983,8 +1074,31 @@ mod tests {
         assert!(!screen.contains("never-render-this-ciphertext"));
         assert!(screen.contains("STEERING QUEUED"));
         assert!(screen.contains("Prefer the durable boundary"));
-        assert!(screen.contains("Keep clients behind Protocol v12"));
+        assert!(screen.contains("Keep clients behind Protocol v18"));
+        assert!(screen.contains("Harness design"));
         assert!(screen.contains("Activity"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_panel_renders_authoritative_thread_summaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.sidebar_tab = SidebarTab::Sessions;
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Sessions"));
+        assert!(screen.contains("Harness design"));
+        assert!(screen.contains("↳ parent parent @ v1"));
+        assert!(screen.contains("events · latest sequence"));
         Ok(())
     }
 

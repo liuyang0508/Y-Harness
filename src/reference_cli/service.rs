@@ -1,35 +1,48 @@
 //! Minimal project configuration and persistent stdio service host.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox,
-    CapabilityOrigin, ContextEngine, HarnessRuntime, InboxApprovalHandler, JsonCommandTool,
-    JsonProcessConfig, LanguageModel, LocalProcessBroker, MacOsSeatbeltBroker, McpClient,
-    MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
-    ModelRegistry, NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolHandler,
-    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SkillEngine,
-    SkillId, SkillPackage, SkillRegistry, SqliteApprovalInbox, SqliteEventStore,
-    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
-    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ToolDescriptor, ToolRegistry,
+    CapabilityOrigin, ContextEngine, DEFAULT_MAX_PARALLEL_TOOL_CALLS, HarnessRuntime,
+    InboxApprovalHandler, JsonCommandModel, JsonCommandTool, JsonProcessConfig, LanguageModel,
+    LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker,
+    McpClient, MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
+    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
+    ProcessBroker, ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
+    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
+    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
+    SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine, StdioMcpClient,
+    StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
+    ToolBatchExecution, ToolDescriptor, ToolRegistry, decode_thread_archive, encode_thread_archive,
     register_selected_mcp_tools, serve_stdio,
 };
 
+#[cfg(any(feature = "https-mcp", feature = "https-model"))]
+use y_harness::{
+    EnvironmentSecretProvider, SecretProvider, SecretReference, SecretRequest, TurnId,
+};
+
+#[cfg(feature = "https-mcp")]
+use y_harness::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
 #[cfg(feature = "https-model")]
 use y_harness::{
-    EnvironmentSecretProvider, HttpsJsonModel, HttpsJsonModelConfig, OpenAiResponsesModel,
-    OpenAiResponsesModelConfig, SecretProvider, SecretReference, SecretRequest, ThreadId, TurnId,
+    HttpsJsonModel, HttpsJsonModelConfig, OpenAiResponsesModel, OpenAiResponsesModelConfig,
 };
+#[cfg(feature = "https-skill")]
+use y_harness::{HttpsSkillSource, HttpsSkillSourceConfig};
 
 use super::{CliResult, DemoModel, EchoTool};
 
@@ -37,7 +50,9 @@ const CONFIG_FILE: &str = "y-harness.json";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 65_536;
 const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 16_777_216;
-#[cfg(feature = "https-model")]
+const MAX_PROJECT_SKILL_FILES: usize = 4_096;
+const MAX_PINNED_COMMAND_BYTES: u64 = 268_435_456;
+#[cfg(any(feature = "https-mcp", feature = "https-model"))]
 const MAX_CA_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -45,11 +60,20 @@ const MAX_CA_BYTES: u64 = 1_048_576;
 struct ServiceConfig {
     schema_version: u32,
     data_directory: String,
-    model: ServiceModelConfig,
+    #[serde(default = "default_max_parallel_tool_calls")]
+    max_parallel_tool_calls: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<ServiceModelConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<ServiceModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_route: Option<ServiceModelRouteConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ServiceToolConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<ServiceMcpServerConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    https_mcp_servers: Vec<ServiceHttpsMcpServerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<ServiceMemoryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,9 +85,15 @@ impl Default for ServiceConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             data_directory: ".y-harness".to_owned(),
-            model: ServiceModelConfig::Demo,
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+            model: Some(ServiceModelConfig::Demo {
+                id: default_demo_model_id(),
+            }),
+            models: Vec::new(),
+            model_route: None,
             tools: Vec::new(),
             mcp_servers: Vec::new(),
+            https_mcp_servers: Vec::new(),
             memory: None,
             skills: None,
         }
@@ -73,7 +103,14 @@ impl Default for ServiceConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServiceModelConfig {
-    Demo,
+    Demo {
+        #[serde(default = "default_demo_model_id")]
+        id: String,
+    },
+    JsonCommand {
+        id: String,
+        process: ServiceJsonProcessConfig,
+    },
     OpenAiResponses {
         id: String,
         model: String,
@@ -106,6 +143,39 @@ enum ServiceModelConfig {
     },
 }
 
+impl ServiceModelConfig {
+    fn id(&self) -> &str {
+        match self {
+            Self::Demo { id }
+            | Self::JsonCommand { id, .. }
+            | Self::OpenAiResponses { id, .. }
+            | Self::HttpsJsonGateway { id, .. } => id,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceModelRouteConfig {
+    models: Vec<String>,
+    #[serde(default = "default_model_attempt_timeout_ms")]
+    attempt_timeout_ms: u64,
+    #[serde(default)]
+    timeout_cooldown_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<ServiceModelRetryConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceModelRetryConfig {
+    max_retries: u8,
+    #[serde(default = "default_model_retry_initial_delay_ms")]
+    initial_delay_ms: u64,
+    #[serde(default = "default_model_retry_max_delay_ms")]
+    max_delay_ms: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServiceToolConfig {
@@ -113,6 +183,8 @@ enum ServiceToolConfig {
         name: String,
         description: String,
         input_schema: Value,
+        #[serde(default)]
+        batch_execution: ToolBatchExecution,
         process: ServiceJsonProcessConfig,
     },
 }
@@ -138,7 +210,11 @@ struct ServiceJsonProcessConfig {
 #[serde(deny_unknown_fields)]
 struct ServiceMcpServerConfig {
     id: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_sha256: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default = "default_current_directory")]
@@ -154,6 +230,27 @@ struct ServiceMcpServerConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct ServiceHttpsMcpServerConfig {
+    id: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    endpoint: String,
+    bearer_secret_reference: String,
+    bearer_environment: String,
+    #[serde(default = "default_mcp_request_timeout_ms")]
+    request_timeout_ms: u64,
+    #[serde(default = "default_connect_timeout_ms")]
+    connect_timeout_ms: u64,
+    #[serde(default = "default_mcp_max_response_bytes")]
+    max_response_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusive_root_ca_pem_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<ServiceMcpToolsConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ServiceMcpToolsConfig {
     namespace: String,
     allow: Vec<String>,
@@ -162,10 +259,56 @@ struct ServiceMcpToolsConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceSkillsConfig {
+    #[serde(default)]
     package_files: Vec<String>,
+    #[serde(default)]
+    external_package_files: Vec<String>,
+    #[serde(default)]
     activate: Vec<SkillId>,
     #[serde(default = "default_skill_budget_tokens")]
     budget_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust: Option<ServiceSkillTrustConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillTrustConfig {
+    #[serde(default)]
+    publishers: Vec<ServiceSkillPublisherConfig>,
+    #[serde(default)]
+    transparency_logs: Vec<ServiceSkillTransparencyLogConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillPublisherConfig {
+    key_id: String,
+    public_key_hex: String,
+    #[serde(default)]
+    not_before_ms: Option<u64>,
+    #[serde(default)]
+    not_after_ms: Option<u64>,
+    #[serde(default)]
+    transparency: SkillTransparencyRequirement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation: Option<ServiceSkillRevocationConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillTransparencyLogConfig {
+    log_id: String,
+    public_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation: Option<ServiceSkillRevocationConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillRevocationConfig {
+    revoked_at_ms: u64,
+    reason_code: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -210,10 +353,12 @@ struct LoadedConfig {
     data_directory: PathBuf,
 }
 
-struct ConfiguredModel {
-    id: String,
-    origin: CapabilityOrigin,
-    model: Arc<dyn LanguageModel>,
+struct ConfiguredModels {
+    registry: ModelRegistry,
+    route: Vec<String>,
+    attempt_timeout: Option<Duration>,
+    retry_policy: Option<ModelRetryPolicy>,
+    timeout_cooldown: Option<Duration>,
     demo_tools: bool,
 }
 
@@ -221,9 +366,94 @@ struct ConfiguredCapabilities {
     tools: ToolRegistry,
     policy: AllowListPolicy,
     context: ContextEngine,
-    mcp_clients: BTreeMap<String, Arc<StdioMcpClient>>,
+    mcp_clients: BTreeMap<String, ConfiguredMcpClient>,
+    mcp_configured: usize,
+    mcp_locked: usize,
+    mcp_stdio_enabled: usize,
     memory_health: Option<MemoryHealthStatus>,
-    skill_count: usize,
+    skill_locks: Vec<String>,
+}
+
+enum ConfiguredMcpClient {
+    Stdio(Arc<StdioMcpClient>),
+    #[cfg(feature = "https-mcp")]
+    Https(Arc<HttpsJsonMcpClient>),
+}
+
+impl ConfiguredMcpClient {
+    fn client(&self) -> Arc<dyn McpClient> {
+        match self {
+            Self::Stdio(client) => client.clone(),
+            #[cfg(feature = "https-mcp")]
+            Self::Https(client) => client.clone(),
+        }
+    }
+
+    async fn shutdown(&self) -> Result<(), y_harness::HarnessError> {
+        match self {
+            Self::Stdio(client) => client.shutdown().await,
+            #[cfg(feature = "https-mcp")]
+            Self::Https(client) => client.shutdown().await,
+        }
+    }
+}
+
+struct InstalledProjectSkill {
+    source: InstalledProjectSkillSource,
+    path: PathBuf,
+}
+
+#[derive(Eq, PartialEq)]
+enum InstalledProjectSkillSource {
+    Trusted(SkillPackage),
+    External(SignedSkillPackage),
+}
+
+impl InstalledProjectSkill {
+    fn package(&self) -> &SkillPackage {
+        self.source.package()
+    }
+
+    fn trust_label(&self) -> &'static str {
+        self.source.trust_label()
+    }
+}
+
+impl InstalledProjectSkillSource {
+    fn package(&self) -> &SkillPackage {
+        match self {
+            Self::Trusted(package) => package,
+            Self::External(signed) => &signed.package,
+        }
+    }
+
+    fn trust_label(&self) -> &'static str {
+        match self {
+            InstalledProjectSkillSource::Trusted(_) => "trusted",
+            InstalledProjectSkillSource::External(_) => "external",
+        }
+    }
+
+    fn file_suffix(&self) -> &'static str {
+        match self {
+            Self::Trusted(_) => "skill.json",
+            Self::External(_) => "signed-skill.json",
+        }
+    }
+
+    fn activation_field(&self) -> &'static str {
+        match self {
+            Self::Trusted(_) => "skills.package_files",
+            Self::External(_) => "skills.external_package_files",
+        }
+    }
+
+    fn encode_pretty(&self) -> Result<Vec<u8>, serde_json::Error> {
+        match self {
+            Self::Trusted(package) => serde_json::to_vec_pretty(package),
+            Self::External(signed) => serde_json::to_vec_pretty(signed),
+        }
+    }
 }
 
 /// Creates a no-clobber local project configuration.
@@ -266,10 +496,153 @@ pub fn run_init(directory: String) -> CliResult<()> {
     Ok(())
 }
 
+/// Installs one digest-verified declarative package without activating it.
+pub fn run_skill_install(package_path: String, config_path: String) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let source = canonical_regular_file(&package_path, "Skill package")?;
+    let package = read_skill_package(&source)?;
+    validate_local_skill(&package)?;
+    install_project_skill(&loaded, InstalledProjectSkillSource::Trusted(package))
+}
+
+/// Installs one trust-verified signed declarative package without activating it.
+pub fn run_skill_install_external(package_path: String, config_path: String) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let source = canonical_regular_file(&package_path, "signed Skill package")?;
+    let signed = read_signed_skill_package(&source)?;
+    let trust = configured_skill_trust(&loaded)?;
+    validate_external_skill(&signed, &trust)?;
+    install_project_skill(&loaded, InstalledProjectSkillSource::External(signed))
+}
+
+/// Fetches and installs one exact trust-verified public HTTPS Skill.
+#[cfg(feature = "https-skill")]
+pub async fn run_skill_install_https(
+    endpoint: String,
+    identity: String,
+    expected_sha256: String,
+    config_path: String,
+) -> CliResult<()> {
+    let expected = parse_skill_identity(&identity)?;
+    let loaded = load_config(&config_path)?;
+    let trust = configured_skill_trust(&loaded)?;
+    let source = HttpsSkillSource::new(HttpsSkillSourceConfig::new(endpoint)?)?;
+    let signed = source.fetch(&expected, &expected_sha256).await?;
+    validate_external_skill(&signed, &trust)?;
+    install_project_skill(&loaded, InstalledProjectSkillSource::External(signed))
+}
+
+/// Reports that the optional network acquisition surface is not compiled.
+#[cfg(not(feature = "https-skill"))]
+pub async fn run_skill_install_https(
+    _endpoint: String,
+    _identity: String,
+    _expected_sha256: String,
+    _config_path: String,
+) -> CliResult<()> {
+    Err("HTTPS Skill installation requires the `https-skill` Cargo feature".into())
+}
+
+/// Lists installed packages after revalidating every digest and identity.
+pub fn run_skill_list(config_path: String) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let installed = installed_project_skills(&loaded)?;
+    verify_installed_external_skills(&loaded, &installed)?;
+    println!("installed skills: {}", installed.len());
+    for (id, skill) in installed {
+        println!(
+            "skill: {}@{} {} {} {}",
+            id.name,
+            id.version,
+            skill.package().content_sha256,
+            skill.trust_label(),
+            skill.path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Verifies the complete bounded project Skill store.
+pub fn run_skill_verify(config_path: String) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let installed = installed_project_skills(&loaded)?;
+    verify_installed_external_skills(&loaded, &installed)?;
+    for (id, skill) in &installed {
+        println!(
+            "verified: {}@{} {} {}",
+            id.name,
+            id.version,
+            skill.package().content_sha256,
+            skill.trust_label()
+        );
+    }
+    println!("verified skills: {}", installed.len());
+    println!("status: ok");
+    Ok(())
+}
+
+/// Removes one exact unreferenced package by moving it into project-local trash.
+pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> {
+    let requested = parse_skill_identity(&identity)?;
+    let loaded = load_config(&config_path)?;
+    let installed = installed_project_skills(&loaded)?;
+    let selected = installed.get(&requested).ok_or_else(|| {
+        format!(
+            "Skill {}@{} is not installed",
+            requested.name, requested.version
+        )
+    })?;
+    if let Some(skills) = &loaded.config.skills {
+        if skills.activate.contains(&requested) {
+            return Err(format!(
+                "refusing to remove active Skill {}@{}; remove it from skills.activate first",
+                requested.name, requested.version
+            )
+            .into());
+        }
+        for configured in &skills.package_files {
+            if resolve_project_file(&loaded.root, configured)? == selected.path {
+                return Err(format!(
+                    "refusing to remove configured Skill {identity}; remove {configured:?} from skills.package_files first"
+                )
+                .into());
+            }
+        }
+        for configured in &skills.external_package_files {
+            if resolve_project_file(&loaded.root, configured)? == selected.path {
+                return Err(format!(
+                    "refusing to remove configured external Skill {identity}; remove {configured:?} from skills.external_package_files first"
+                )
+                .into());
+            }
+        }
+    }
+
+    fs::create_dir_all(&loaded.data_directory)?;
+    require_contained_directory(&loaded.root, &loaded.data_directory)?;
+    let trash = loaded.data_directory.join("skill-trash");
+    fs::create_dir_all(&trash)?;
+    require_contained_directory(&loaded.root, &trash)?;
+    let removed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let destination = trash.join(format!(
+        "{}.removed-{removed_at}-{}.{}",
+        selected.package().content_sha256,
+        std::process::id(),
+        selected.source.file_suffix()
+    ));
+    if destination.exists() {
+        return Err(format!("Skill trash destination exists: {}", destination.display()).into());
+    }
+    fs::rename(&selected.path, &destination)?;
+    println!("removed: {}", selected.path.display());
+    println!("recoverable: {}", destination.display());
+    Ok(())
+}
+
 /// Validates configuration, provider construction, credentials, and storage boundaries.
 pub async fn run_doctor(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
-    let model = build_model(&loaded).await?;
+    let models = build_models(&loaded).await?;
     let data_state = if loaded.data_directory.exists() {
         require_contained_directory(&loaded.root, &loaded.data_directory)?;
         if !loaded.data_directory.is_dir() {
@@ -283,17 +656,64 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     } else {
         "will be created"
     };
-    let capabilities = build_capabilities(&loaded, model.demo_tools).await?;
+    let capabilities = build_capabilities(&loaded, models.demo_tools).await?;
 
     println!("Y-Harness doctor");
     println!("engine: {}", env!("CARGO_PKG_VERSION"));
     println!("protocol: {PROTOCOL_VERSION}");
     println!("config schema: {}", loaded.config.schema_version);
     println!("config: {}", loaded.path.display());
-    println!("model: {}", model.id);
+    println!("model: {}", models.route[0]);
+    println!("models: {}", models.registry.ids().len());
+    println!("model route: {}", models.route.join(" -> "));
+    println!(
+        "model timeout cooldown: {}",
+        models.timeout_cooldown.map_or_else(
+            || "disabled".to_owned(),
+            |value| format!("{} ms", value.as_millis())
+        )
+    );
+    println!(
+        "model retries: {}",
+        models.retry_policy.map_or_else(
+            || "disabled".to_owned(),
+            |policy| format!(
+                "{} ({}-{} ms)",
+                policy.max_retries(),
+                policy.initial_delay().as_millis(),
+                policy.max_delay().as_millis()
+            )
+        )
+    );
     println!("tools: {}", capabilities.tools.descriptors().len());
-    println!("mcp servers: {}", capabilities.mcp_clients.len());
-    println!("skills: {}", capabilities.skill_count);
+    let parallel_safe_tools = capabilities
+        .tools
+        .descriptors()
+        .iter()
+        .filter(|descriptor| {
+            capabilities
+                .tools
+                .get(&descriptor.name)
+                .is_some_and(|tool| tool.batch_execution == ToolBatchExecution::ParallelSafe)
+        })
+        .count();
+    println!(
+        "parallel tools: {parallel_safe_tools} safe / {} maximum",
+        loaded.config.max_parallel_tool_calls
+    );
+    println!(
+        "mcp servers: {} enabled / {} configured",
+        capabilities.mcp_clients.len(),
+        capabilities.mcp_configured
+    );
+    println!(
+        "mcp command locks: {} / {} stdio enabled",
+        capabilities.mcp_locked, capabilities.mcp_stdio_enabled
+    );
+    println!("skills: {}", capabilities.skill_locks.len());
+    for skill in &capabilities.skill_locks {
+        println!("skill lock: {skill}");
+    }
     if let Some(status) = &capabilities.memory_health {
         println!("memory: agent-memory-hub ({status:?})");
     } else {
@@ -308,21 +728,79 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     Ok(())
 }
 
+/// Exports one terminal durable Thread without loading service capabilities.
+pub async fn run_thread_export(
+    thread_id: String,
+    archive_path: String,
+    config_path: String,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    fs::create_dir_all(&loaded.data_directory)?;
+    require_contained_directory(&loaded.root, &loaded.data_directory)?;
+    let state = StateEngine::new(Arc::new(
+        SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
+    ));
+    let archive = state
+        .export_thread(&ThreadId::from_string(thread_id))
+        .await?;
+    let encoded = encode_thread_archive(&archive)?;
+    write_new_file(Path::new(&archive_path), &encoded, "Thread archive")?;
+    println!(
+        "exported Thread {}: {} events; archive: {}",
+        archive.source_thread_id,
+        archive.source_stream_version,
+        Path::new(&archive_path).display()
+    );
+    Ok(())
+}
+
+/// Imports one bounded archive as an atomic local Thread stream.
+pub async fn run_thread_import(
+    archive_path: String,
+    target_thread_id: String,
+    config_path: String,
+) -> CliResult<()> {
+    let encoded = read_bounded(
+        Path::new(&archive_path),
+        u64::try_from(MAX_THREAD_ARCHIVE_BYTES)?,
+        "Thread archive",
+    )?;
+    let archive = decode_thread_archive(&encoded)?;
+    let loaded = load_config(&config_path)?;
+    fs::create_dir_all(&loaded.data_directory)?;
+    require_contained_directory(&loaded.root, &loaded.data_directory)?;
+    let state = StateEngine::new(Arc::new(
+        SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
+    ));
+    let target_thread_id = ThreadId::from_string(target_thread_id);
+    let imported = state.import_thread(&archive, target_thread_id).await?;
+    println!(
+        "imported Thread {} from {}: {} turns",
+        imported.id,
+        archive.source_thread_id,
+        imported.turns.len()
+    );
+    Ok(())
+}
+
 /// Runs the durable stdio service described by one validated project configuration.
 pub async fn run_service(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
     fs::create_dir_all(&loaded.data_directory)?;
     require_contained_directory(&loaded.root, &loaded.data_directory)?;
 
-    let configured_model = build_model(&loaded).await?;
-    let capabilities = build_capabilities(&loaded, configured_model.demo_tools).await?;
+    let configured_models = build_models(&loaded).await?;
+    let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
     let ConfiguredCapabilities {
         tools,
         policy,
         context,
         mcp_clients,
+        mcp_configured: _,
+        mcp_locked: _,
+        mcp_stdio_enabled: _,
         memory_health: _,
-        skill_count: _,
+        skill_locks: _,
     } = capabilities;
     let state = StateEngine::new(Arc::new(
         SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
@@ -332,22 +810,36 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let tasks =
         Arc::new(SqliteTaskCoordinator::open(loaded.data_directory.join("tasks.db")).await?);
 
-    let mut models = ModelRegistry::new();
-    models.register(configured_model.origin, configured_model.model)?;
     let approval_handler = Arc::new(InboxApprovalHandler::new(
         approvals.clone(),
         Duration::from_millis(250),
     )?);
+    let route = configured_models
+        .route
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut runtime = HarnessRuntime::from_model_registry_failover(
+        &configured_models.registry,
+        &route,
+        tools,
+        Arc::new(policy),
+        state,
+    )?;
+    if let Some(timeout) = configured_models.attempt_timeout {
+        runtime = runtime.with_model_attempt_timeout(timeout)?;
+    }
+    if let Some(policy) = configured_models.retry_policy {
+        runtime = runtime.with_model_retry_policy(policy);
+    }
+    if let Some(cooldown) = configured_models.timeout_cooldown {
+        runtime = runtime.with_model_timeout_cooldown(cooldown)?;
+    }
+    runtime = runtime.with_max_parallel_tool_calls(loaded.config.max_parallel_tool_calls)?;
     let runtime = Arc::new(
-        HarnessRuntime::from_model_registry(
-            &models,
-            &configured_model.id,
-            tools,
-            Arc::new(policy),
-            state,
-        )?
-        .with_context_engine(context)
-        .with_approval_handler(approval_handler),
+        runtime
+            .with_context_engine(context)
+            .with_approval_handler(approval_handler),
     );
     let approval_port: Arc<dyn ApprovalInbox> = approvals;
     let task_port: Arc<dyn TaskCoordinator> = tasks;
@@ -365,10 +857,37 @@ async fn build_capabilities(
     demo_tools: bool,
 ) -> CliResult<ConfiguredCapabilities> {
     let mut clients = BTreeMap::new();
+    let mut configured_ids = BTreeSet::new();
     for configured in &loaded.config.mcp_servers {
-        if clients.contains_key(&configured.id) {
+        if !configured_ids.insert(&configured.id) {
             return Err(format!("duplicate MCP server id {}", configured.id).into());
         }
+    }
+    for configured in &loaded.config.https_mcp_servers {
+        if !configured_ids.insert(&configured.id) {
+            return Err(format!("duplicate MCP server id {}", configured.id).into());
+        }
+    }
+    let enabled_servers = loaded
+        .config
+        .mcp_servers
+        .iter()
+        .filter(|configured| configured.enabled)
+        .collect::<Vec<_>>();
+    let enabled_https_servers = loaded
+        .config
+        .https_mcp_servers
+        .iter()
+        .filter(|configured| configured.enabled)
+        .collect::<Vec<_>>();
+    #[cfg(not(feature = "https-mcp"))]
+    if !enabled_https_servers.is_empty() {
+        return Err(
+            "HTTPS MCP configuration requires a binary built with `--features https-mcp`".into(),
+        );
+    }
+    let mut mcp_locked = 0;
+    for configured in &enabled_servers {
         let command = PathBuf::from(&configured.command);
         if !command.is_absolute() || !command.is_file() {
             return Err(format!(
@@ -377,6 +896,10 @@ async fn build_capabilities(
                 command.display()
             )
             .into());
+        }
+        if let Some(expected) = &configured.command_sha256 {
+            verify_file_sha256(&command, expected, "MCP command")?;
+            mcp_locked += 1;
         }
         let current_dir = resolve_runtime_directory(
             &loaded.root,
@@ -395,7 +918,14 @@ async fn build_capabilities(
             },
             authority,
         )?);
-        clients.insert(configured.id.clone(), client);
+        clients.insert(configured.id.clone(), ConfiguredMcpClient::Stdio(client));
+    }
+    #[cfg(feature = "https-mcp")]
+    for configured in &enabled_https_servers {
+        clients.insert(
+            configured.id.clone(),
+            build_https_mcp_client(loaded, configured).await?,
+        );
     }
 
     let mut tools = ToolRegistry::new();
@@ -410,39 +940,21 @@ async fn build_capabilities(
                 name,
                 description,
                 input_schema,
+                batch_execution,
                 process,
             } => {
-                let command = PathBuf::from(&process.command);
-                if !command.is_absolute() || !command.is_file() {
-                    return Err(format!(
-                        "JSON Tool {name} command must be an existing absolute file: {}",
-                        command.display()
-                    )
-                    .into());
-                }
-                let current_dir = resolve_runtime_directory(
-                    &loaded.root,
-                    &process.current_directory,
-                    "JSON Tool working directory",
-                )?;
-                let environment = environment_from_host(&process.environment_from_host)?;
-                let broker = build_process_broker(&loaded.root, &process.launch)?;
+                let (process, broker) =
+                    build_json_process(loaded, process, &format!("JSON Tool {name}"))?;
                 let tool = JsonCommandTool::new(
                     ToolDescriptor {
                         name: name.clone(),
                         description: description.clone(),
                         input_schema: input_schema.clone(),
                     },
-                    JsonProcessConfig {
-                        program: command,
-                        args: process.args.clone(),
-                        current_dir,
-                        environment,
-                        timeout: Duration::from_millis(process.timeout_ms),
-                        max_output_bytes: process.max_output_bytes,
-                    },
+                    process,
                     broker,
-                )?;
+                )?
+                .with_batch_execution(*batch_execution);
                 tools.register(
                     CapabilityOrigin::External {
                         id: format!("json-command/{name}"),
@@ -453,27 +965,33 @@ async fn build_capabilities(
             }
         }
     }
-    for configured in &loaded.config.mcp_servers {
-        let Some(exposure) = &configured.tools else {
+    let mcp_exposures = enabled_servers
+        .iter()
+        .map(|configured| (&configured.id, configured.tools.as_ref()))
+        .chain(
+            enabled_https_servers
+                .iter()
+                .map(|configured| (&configured.id, configured.tools.as_ref())),
+        );
+    for (id, exposure) in mcp_exposures {
+        let Some(exposure) = exposure else {
             continue;
         };
         if exposure.allow.is_empty() {
-            return Err(format!(
-                "MCP server {} tools.allow must name at least one remote tool",
-                configured.id
-            )
-            .into());
+            return Err(
+                format!("MCP server {id} tools.allow must name at least one remote tool").into(),
+            );
         }
         let client = clients
-            .get(&configured.id)
-            .ok_or_else(|| format!("MCP server {} was not constructed", configured.id))?;
+            .get(id)
+            .ok_or_else(|| format!("MCP server {id} was not constructed"))?;
         let registered = register_selected_mcp_tools(
             &mut tools,
             CapabilityOrigin::External {
-                id: format!("mcp/{}", configured.id),
+                id: format!("mcp/{id}"),
             },
             &exposure.namespace,
-            client.clone() as Arc<dyn McpClient>,
+            client.client(),
             &exposure.allow,
         )
         .await?;
@@ -504,9 +1022,7 @@ async fn build_capabilities(
             let client = clients
                 .get(mcp_server)
                 .ok_or_else(|| format!("memory references unknown MCP server {mcp_server}"))?;
-            let provider = Arc::new(AgentMemoryHubProvider::new(
-                client.clone() as Arc<dyn McpClient>
-            ));
+            let provider = Arc::new(AgentMemoryHubProvider::new(client.client()));
             let health = provider.health().await?;
             if health.status == MemoryHealthStatus::Unavailable {
                 return Err(format!(
@@ -530,12 +1046,31 @@ async fn build_capabilities(
             (ContextEngine::with_memory(memories, config), health)
         }
     };
-    let skill_count = if let Some(resolved) = load_project_skills(loaded, &tools)? {
-        let count = resolved.skills.len();
+    let skill_locks = if let Some(resolved) = load_project_skills(loaded, &tools)? {
+        let locks = resolved
+            .skills
+            .iter()
+            .map(|skill| {
+                let mut lock = format!(
+                    "{}@{} {}",
+                    skill.id.name, skill.id.version, skill.content_sha256
+                );
+                if let Some(publisher) = &skill.publisher_key_id {
+                    lock.push_str(&format!(" publisher={publisher}"));
+                }
+                if let Some(transparency) = &skill.transparency {
+                    lock.push_str(&format!(
+                        " transparency={}@{}",
+                        transparency.log_id, transparency.entry_id
+                    ));
+                }
+                lock
+            })
+            .collect();
         context = context.with_skills(resolved);
-        count
+        locks
     } else {
-        0
+        Vec::new()
     };
 
     Ok(ConfiguredCapabilities {
@@ -543,8 +1078,15 @@ async fn build_capabilities(
         policy,
         context,
         mcp_clients: clients,
+        mcp_configured: loaded
+            .config
+            .mcp_servers
+            .len()
+            .saturating_add(loaded.config.https_mcp_servers.len()),
+        mcp_locked,
+        mcp_stdio_enabled: enabled_servers.len(),
         memory_health,
-        skill_count,
+        skill_locks,
     })
 }
 
@@ -555,8 +1097,16 @@ fn load_project_skills(
     let Some(config) = &loaded.config.skills else {
         return Ok(None);
     };
-    if config.package_files.is_empty() || config.activate.is_empty() {
-        return Err("skills requires non-empty package_files and activate lists".into());
+    let trust = configured_skill_trust(loaded)?;
+    let packages_empty =
+        config.package_files.is_empty() && config.external_package_files.is_empty();
+    if packages_empty && config.activate.is_empty() {
+        return Ok(None);
+    }
+    if packages_empty || config.activate.is_empty() {
+        return Err(
+            "skills requires at least one package file and a non-empty activate list".into(),
+        );
     }
 
     let mut registry = SkillRegistry::new();
@@ -573,12 +1123,360 @@ fn load_project_skills(
         };
         registry.register(origin, package)?;
     }
+    for configured in &config.external_package_files {
+        let path = resolve_project_file(&loaded.root, configured)?;
+        let signed = read_signed_skill_package(&path)?;
+        let package = &signed.package;
+        let origin = CapabilityOrigin::External {
+            id: format!(
+                "project-external-skill/{}@{}",
+                package.manifest.name, package.manifest.version
+            ),
+        };
+        registry.register_signed(origin, signed, &trust)?;
+    }
 
     Ok(Some(SkillEngine::new(registry).resolve(
         &config.activate,
         tools,
         config.budget_tokens,
     )?))
+}
+
+fn installed_project_skills(
+    loaded: &LoadedConfig,
+) -> CliResult<BTreeMap<SkillId, InstalledProjectSkill>> {
+    let directory = project_skill_directory(loaded, false)?;
+    if !directory.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut registry = SkillRegistry::new();
+    let mut installed = BTreeMap::new();
+    let mut entries = fs::read_dir(&directory)?;
+    for index in 0..=MAX_PROJECT_SKILL_FILES {
+        let Some(entry) = entries.next().transpose()? else {
+            return Ok(installed);
+        };
+        if index == MAX_PROJECT_SKILL_FILES {
+            return Err(format!(
+                "project Skill directory exceeds {MAX_PROJECT_SKILL_FILES} entries"
+            )
+            .into());
+        }
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "project Skill directory contains a non-UTF-8 entry")?;
+        let signed = file_name.ends_with(".signed-skill.json");
+        if !signed && !file_name.ends_with(".skill.json") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(format!(
+                "project Skill entry must be a regular non-symlink file: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        let path = fs::canonicalize(entry.path())?;
+        if !path.starts_with(&directory) {
+            return Err(format!(
+                "project Skill entry escapes {}: {}",
+                directory.display(),
+                path.display()
+            )
+            .into());
+        }
+        let source = if signed {
+            InstalledProjectSkillSource::External(read_signed_skill_package(&path)?)
+        } else {
+            InstalledProjectSkillSource::Trusted(read_skill_package(&path)?)
+        };
+        let package = source.package();
+        let id = SkillId {
+            name: package.manifest.name.clone(),
+            version: package.manifest.version.clone(),
+        };
+        registry.register(
+            CapabilityOrigin::TrustedExtension {
+                id: format!("project-skill/{}@{}", id.name, id.version),
+            },
+            package.clone(),
+        )?;
+        if installed
+            .insert(id, InstalledProjectSkill { source, path })
+            .is_some()
+        {
+            return Err("project Skill store contains a duplicate identity".into());
+        }
+    }
+    Err(format!("project Skill directory exceeds {MAX_PROJECT_SKILL_FILES} entries").into())
+}
+
+fn project_skill_directory(loaded: &LoadedConfig, create: bool) -> CliResult<PathBuf> {
+    let requested = loaded.root.join("skills");
+    if create {
+        fs::create_dir_all(&requested)?;
+    } else if !requested.exists() {
+        return Ok(requested);
+    }
+    let directory = fs::canonicalize(&requested)?;
+    if directory == loaded.root || !directory.starts_with(&loaded.root) {
+        return Err(format!(
+            "project Skill directory must remain below {}",
+            loaded.root.display()
+        )
+        .into());
+    }
+    if !directory.is_dir() {
+        return Err(format!(
+            "project Skill directory is not a directory: {}",
+            directory.display()
+        )
+        .into());
+    }
+    Ok(directory)
+}
+
+fn canonical_regular_file(path: &str, kind: &str) -> CliResult<PathBuf> {
+    let requested = PathBuf::from(path);
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        env::current_dir()?.join(requested)
+    };
+    let canonical = fs::canonicalize(&requested)?;
+    if !canonical.is_file() {
+        return Err(format!("{kind} must resolve to a regular file").into());
+    }
+    Ok(canonical)
+}
+
+fn read_skill_package(path: &Path) -> CliResult<SkillPackage> {
+    let encoded = read_bounded(path, MAX_SKILL_PACKAGE_FILE_BYTES, "Skill package")?;
+    let package: SkillPackage = serde_json::from_slice(&encoded)
+        .map_err(|_| format!("Skill package is malformed: {}", path.display()))?;
+    validate_local_skill(&package)?;
+    Ok(package)
+}
+
+fn read_signed_skill_package(path: &Path) -> CliResult<SignedSkillPackage> {
+    let encoded = read_bounded(path, MAX_SKILL_PACKAGE_FILE_BYTES, "signed Skill package")?;
+    let signed: SignedSkillPackage = serde_json::from_slice(&encoded)
+        .map_err(|_| format!("signed Skill package is malformed: {}", path.display()))?;
+    validate_local_skill(&signed.package)?;
+    Ok(signed)
+}
+
+fn validate_local_skill(package: &SkillPackage) -> CliResult<()> {
+    let mut registry = SkillRegistry::new();
+    registry.register(
+        CapabilityOrigin::TrustedExtension {
+            id: "skill-cli-validation".to_owned(),
+        },
+        package.clone(),
+    )?;
+    Ok(())
+}
+
+fn validate_external_skill(signed: &SignedSkillPackage, trust: &SkillTrustStore) -> CliResult<()> {
+    let package = &signed.package;
+    let mut registry = SkillRegistry::new();
+    registry.register_signed(
+        CapabilityOrigin::External {
+            id: format!(
+                "project-external-skill/{}@{}",
+                package.manifest.name, package.manifest.version
+            ),
+        },
+        signed.clone(),
+        trust,
+    )?;
+    Ok(())
+}
+
+fn verify_installed_external_skills(
+    loaded: &LoadedConfig,
+    installed: &BTreeMap<SkillId, InstalledProjectSkill>,
+) -> CliResult<()> {
+    let trust = configured_skill_trust(loaded)?;
+    let mut registry = SkillRegistry::new();
+    for skill in installed.values() {
+        if let InstalledProjectSkillSource::External(signed) = &skill.source {
+            let package = &signed.package;
+            registry.register_signed(
+                CapabilityOrigin::External {
+                    id: format!(
+                        "project-external-skill/{}@{}",
+                        package.manifest.name, package.manifest.version
+                    ),
+                },
+                signed.clone(),
+                &trust,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn configured_skill_trust(loaded: &LoadedConfig) -> CliResult<SkillTrustStore> {
+    let trust = SkillTrustStore::new();
+    let Some(config) = loaded
+        .config
+        .skills
+        .as_ref()
+        .and_then(|skills| skills.trust.as_ref())
+    else {
+        return Ok(trust);
+    };
+    for publisher in &config.publishers {
+        trust.trust_with_policy(
+            publisher.key_id.clone(),
+            decode_ed25519_public_key(&publisher.public_key_hex, "publisher key")?,
+            SkillPublisherPolicy {
+                not_before_ms: publisher.not_before_ms,
+                not_after_ms: publisher.not_after_ms,
+                transparency: publisher.transparency,
+            },
+        )?;
+        if let Some(revocation) = &publisher.revocation {
+            trust.revoke_publisher(
+                &publisher.key_id,
+                revocation.revoked_at_ms,
+                revocation.reason_code.clone(),
+            )?;
+        }
+    }
+    for log in &config.transparency_logs {
+        trust.trust_transparency_log(
+            log.log_id.clone(),
+            decode_ed25519_public_key(&log.public_key_hex, "transparency-log key")?,
+        )?;
+        if let Some(revocation) = &log.revocation {
+            trust.revoke_transparency_log(
+                &log.log_id,
+                revocation.revoked_at_ms,
+                revocation.reason_code.clone(),
+            )?;
+        }
+    }
+    Ok(trust)
+}
+
+fn decode_ed25519_public_key(value: &str, kind: &str) -> CliResult<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            format!("{kind} must be exactly 32 bytes encoded as lowercase hexadecimal").into(),
+        );
+    }
+    let encoded = value.as_bytes();
+    let mut key = [0_u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let high = decode_lower_hex_nibble(encoded[index * 2]);
+        let low = decode_lower_hex_nibble(encoded[index * 2 + 1]);
+        *byte = (high << 4) | low;
+    }
+    Ok(key)
+}
+
+const fn decode_lower_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
+    }
+}
+
+fn install_project_skill(
+    loaded: &LoadedConfig,
+    source: InstalledProjectSkillSource,
+) -> CliResult<()> {
+    let package = source.package();
+    let id = SkillId {
+        name: package.manifest.name.clone(),
+        version: package.manifest.version.clone(),
+    };
+    let installed = installed_project_skills(loaded)?;
+    if let Some(existing) = installed.get(&id) {
+        if existing.source != source {
+            return Err(format!(
+                "Skill {}@{} is already installed with a different package or trust envelope",
+                id.name, id.version
+            )
+            .into());
+        }
+        println!("already installed: {}", existing.path.display());
+        println!(
+            "skill lock: {}@{} {} {}",
+            id.name,
+            id.version,
+            package.content_sha256,
+            source.trust_label()
+        );
+        return Ok(());
+    }
+
+    let directory = project_skill_directory(loaded, true)?;
+    let destination = directory.join(format!(
+        "{}.{}",
+        package.content_sha256,
+        source.file_suffix()
+    ));
+    if destination.exists() {
+        return Err(format!(
+            "Skill destination already exists without a matching installed identity: {}",
+            destination.display()
+        )
+        .into());
+    }
+    let mut encoded = source.encode_pretty()?;
+    encoded.push(b'\n');
+    write_new_file(&destination, &encoded, "Skill package")?;
+
+    println!("installed: {}", destination.display());
+    println!(
+        "skill lock: {}@{} {} {}",
+        id.name,
+        id.version,
+        package.content_sha256,
+        source.trust_label()
+    );
+    let relative = destination
+        .strip_prefix(&loaded.root)
+        .map_err(|_| "installed Skill escaped the project root")?;
+    println!(
+        "activation required: add {:?} to {} and {}@{} to skills.activate",
+        relative.to_string_lossy(),
+        source.activation_field(),
+        id.name,
+        id.version
+    );
+    Ok(())
+}
+
+fn parse_skill_identity(value: &str) -> CliResult<SkillId> {
+    let (name, version) = value
+        .rsplit_once('@')
+        .ok_or("Skill identity must be name@version")?;
+    let valid_name = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-' | '.')
+        });
+    if !valid_name {
+        return Err("Skill name must use 1-64 lowercase portable identity characters".into());
+    }
+    Ok(SkillId {
+        name: name.to_owned(),
+        version: Version::parse(version)?,
+    })
 }
 
 fn build_mcp_launch_authority(
@@ -633,6 +1531,39 @@ fn build_process_broker(
     }
 }
 
+fn build_json_process(
+    loaded: &LoadedConfig,
+    configured: &ServiceJsonProcessConfig,
+    role: &str,
+) -> CliResult<(JsonProcessConfig, Arc<dyn ProcessBroker>)> {
+    let command = PathBuf::from(&configured.command);
+    if !command.is_absolute() || !command.is_file() {
+        return Err(format!(
+            "{role} command must be an existing absolute file: {}",
+            command.display()
+        )
+        .into());
+    }
+    let current_dir = resolve_runtime_directory(
+        &loaded.root,
+        &configured.current_directory,
+        &format!("{role} working directory"),
+    )?;
+    let mut process = JsonProcessConfig {
+        program: command,
+        args: configured.args.clone(),
+        current_dir,
+        environment: BTreeMap::new(),
+        timeout: Duration::from_millis(configured.timeout_ms),
+        max_output_bytes: configured.max_output_bytes,
+    };
+    process.validate()?;
+    let broker = build_process_broker(&loaded.root, &configured.launch)?;
+    process.environment = environment_from_host(&configured.environment_from_host)?;
+    process.validate()?;
+    Ok((process, broker))
+}
+
 fn environment_from_host(
     configured: &BTreeMap<String, String>,
 ) -> CliResult<BTreeMap<String, String>> {
@@ -669,7 +1600,7 @@ fn resolve_runtime_directory(root: &Path, configured: &str, kind: &str) -> CliRe
     Ok(canonical)
 }
 
-async fn shutdown_mcp_clients(clients: &BTreeMap<String, Arc<StdioMcpClient>>) -> CliResult<()> {
+async fn shutdown_mcp_clients(clients: &BTreeMap<String, ConfiguredMcpClient>) -> CliResult<()> {
     let mut first_error = None;
     for (id, client) in clients {
         if let Err(error) = client.shutdown().await
@@ -684,14 +1615,151 @@ async fn shutdown_mcp_clients(clients: &BTreeMap<String, Arc<StdioMcpClient>>) -
     }
 }
 
-async fn build_model(loaded: &LoadedConfig) -> CliResult<ConfiguredModel> {
-    match &loaded.config.model {
-        ServiceModelConfig::Demo => Ok(ConfiguredModel {
-            id: "local/demo".to_owned(),
-            origin: CapabilityOrigin::BuiltIn,
-            model: Arc::new(DemoModel),
-            demo_tools: true,
-        }),
+#[cfg(feature = "https-mcp")]
+async fn build_https_mcp_client(
+    loaded: &LoadedConfig,
+    configured: &ServiceHttpsMcpServerConfig,
+) -> CliResult<ConfiguredMcpClient> {
+    let reference = SecretReference::new(configured.bearer_secret_reference.clone())?;
+    let secrets = Arc::new(EnvironmentSecretProvider::new(
+        "service-environment",
+        BTreeMap::from([(reference.clone(), configured.bearer_environment.clone())]),
+    )?);
+    let mut config = HttpsJsonMcpConfig::new(&configured.endpoint, reference.clone())?
+        .with_limits(
+            Duration::from_millis(configured.request_timeout_ms),
+            Duration::from_millis(configured.connect_timeout_ms),
+            configured.max_response_bytes,
+        )?;
+    if let Some(path) = &configured.exclusive_root_ca_pem_path {
+        let path = resolve_project_file(&loaded.root, path)?;
+        config = config.with_exclusive_root_certificates_pem(read_bounded(
+            &path,
+            MAX_CA_BYTES,
+            "exclusive MCP root CA",
+        )?)?;
+    }
+    let _credential = secrets
+        .resolve(SecretRequest {
+            reference,
+            consumer: configured.id.clone(),
+            thread_id: ThreadId::from_static("doctor-thread"),
+            turn_id: TurnId::from_static("doctor-turn"),
+        })
+        .await?;
+    Ok(ConfiguredMcpClient::Https(Arc::new(
+        HttpsJsonMcpClient::new(config, secrets)?,
+    )))
+}
+
+async fn build_models(loaded: &LoadedConfig) -> CliResult<ConfiguredModels> {
+    let (configured, route, attempt_timeout, retry_config, timeout_cooldown) = match (
+        loaded.config.model.as_ref(),
+        loaded.config.models.as_slice(),
+        loaded.config.model_route.as_ref(),
+    ) {
+        (Some(model), [], None) => (vec![model], vec![model.id().to_owned()], None, None, None),
+        (None, models, Some(route)) if !models.is_empty() => {
+            if !(1..=16).contains(&route.models.len()) {
+                return Err("model_route.models must contain 1-16 identities".into());
+            }
+            (
+                models.iter().collect(),
+                route.models.clone(),
+                Some(Duration::from_millis(route.attempt_timeout_ms)),
+                route.retry.as_ref(),
+                (route.timeout_cooldown_ms > 0)
+                    .then(|| Duration::from_millis(route.timeout_cooldown_ms)),
+            )
+        }
+        _ => {
+            return Err(
+                "configure either legacy model or the models plus model_route catalog, never both"
+                    .into(),
+            );
+        }
+    };
+
+    if let Some(timeout) = attempt_timeout
+        && !(1..=86_400_000).contains(&timeout.as_millis())
+    {
+        return Err("model_route.attempt_timeout_ms must be 1-86400000".into());
+    }
+    if timeout_cooldown.is_some_and(|cooldown| cooldown.as_millis() > 86_400_000) {
+        return Err("model_route.timeout_cooldown_ms must be 0-86400000".into());
+    }
+    if timeout_cooldown.is_some() && route.len() < 2 {
+        return Err("model_route.timeout_cooldown_ms requires at least two route models".into());
+    }
+    let retry_policy = retry_config
+        .map(|retry| {
+            ModelRetryPolicy::new(
+                retry.max_retries,
+                Duration::from_millis(retry.initial_delay_ms),
+                Duration::from_millis(retry.max_delay_ms),
+            )
+        })
+        .transpose()?;
+    let mut configured_ids = BTreeSet::new();
+    for model in &configured {
+        if !configured_ids.insert(model.id()) {
+            return Err(format!("duplicate configured model identity {}", model.id()).into());
+        }
+    }
+    let mut route_ids = BTreeSet::new();
+    for id in &route {
+        if !route_ids.insert(id) {
+            return Err(format!("model_route contains duplicate identity {id}").into());
+        }
+        if !configured_ids.contains(id.as_str()) {
+            return Err(format!("model_route references unknown model {id}").into());
+        }
+    }
+
+    let mut registry = ModelRegistry::new();
+    let mut demo_ids = BTreeSet::new();
+    for configured in configured {
+        let (origin, model, demo) = build_model(loaded, configured).await?;
+        let id = configured.id().to_owned();
+        registry.register(origin, model)?;
+        if demo {
+            demo_ids.insert(id);
+        }
+    }
+
+    Ok(ConfiguredModels {
+        registry,
+        demo_tools: route.iter().any(|id| demo_ids.contains(id)),
+        route,
+        attempt_timeout,
+        retry_policy,
+        timeout_cooldown,
+    })
+}
+
+async fn build_model(
+    loaded: &LoadedConfig,
+    configured: &ServiceModelConfig,
+) -> CliResult<(CapabilityOrigin, Arc<dyn LanguageModel>, bool)> {
+    match configured {
+        ServiceModelConfig::Demo { id } => {
+            if id != "local/demo" {
+                return Err("demo model id must be local/demo".into());
+            }
+            Ok((CapabilityOrigin::BuiltIn, Arc::new(DemoModel), true))
+        }
+        ServiceModelConfig::JsonCommand { id, process } => {
+            let (process, broker) =
+                build_json_process(loaded, process, &format!("JSON Model {id}"))?;
+            let model = Arc::new(JsonCommandModel::new(id, process, broker)?);
+            Ok((
+                CapabilityOrigin::External {
+                    id: format!("json-command-model/{id}"),
+                },
+                model,
+                false,
+            ))
+        }
         ServiceModelConfig::OpenAiResponses {
             id,
             model,
@@ -702,7 +1770,7 @@ async fn build_model(loaded: &LoadedConfig) -> CliResult<ConfiguredModel> {
             max_response_bytes,
             max_concurrency,
         } => {
-            build_openai_model(
+            let model = build_openai_model(
                 id,
                 model,
                 api_key_secret_reference,
@@ -712,7 +1780,14 @@ async fn build_model(loaded: &LoadedConfig) -> CliResult<ConfiguredModel> {
                 *max_response_bytes,
                 *max_concurrency,
             )
-            .await
+            .await?;
+            Ok((
+                CapabilityOrigin::TrustedExtension {
+                    id: "first-party-openai-responses".to_owned(),
+                },
+                model,
+                false,
+            ))
         }
         ServiceModelConfig::HttpsJsonGateway {
             id,
@@ -725,7 +1800,7 @@ async fn build_model(loaded: &LoadedConfig) -> CliResult<ConfiguredModel> {
             max_concurrency,
             exclusive_root_ca_pem_path,
         } => {
-            build_https_model(
+            let model = build_https_model(
                 loaded,
                 id,
                 endpoint,
@@ -737,7 +1812,14 @@ async fn build_model(loaded: &LoadedConfig) -> CliResult<ConfiguredModel> {
                 *max_concurrency,
                 exclusive_root_ca_pem_path.as_deref(),
             )
-            .await
+            .await?;
+            Ok((
+                CapabilityOrigin::TrustedExtension {
+                    id: "reference-https-json-gateway".to_owned(),
+                },
+                model,
+                false,
+            ))
         }
     }
 }
@@ -753,7 +1835,7 @@ async fn build_openai_model(
     connect_timeout_ms: u64,
     max_response_bytes: usize,
     max_concurrency: usize,
-) -> CliResult<ConfiguredModel> {
+) -> CliResult<Arc<dyn LanguageModel>> {
     let reference = SecretReference::new(api_key_secret_reference.to_owned())?;
     let secrets = Arc::new(EnvironmentSecretProvider::new(
         "service-environment",
@@ -774,14 +1856,7 @@ async fn build_openai_model(
         max_concurrency,
     )?;
     let model = OpenAiResponsesModel::new(id, config, secrets)?;
-    Ok(ConfiguredModel {
-        id: id.to_owned(),
-        origin: CapabilityOrigin::TrustedExtension {
-            id: "first-party-openai-responses".to_owned(),
-        },
-        model: Arc::new(model),
-        demo_tools: false,
-    })
+    Ok(Arc::new(model))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,7 +1870,7 @@ async fn build_openai_model(
     _connect_timeout_ms: u64,
     _max_response_bytes: usize,
     _max_concurrency: usize,
-) -> CliResult<ConfiguredModel> {
+) -> CliResult<Arc<dyn LanguageModel>> {
     Err(
         "OpenAI Responses configuration requires a binary built with `--features https-model`"
             .into(),
@@ -815,7 +1890,7 @@ async fn build_https_model(
     max_response_bytes: usize,
     max_concurrency: usize,
     root_ca_path: Option<&str>,
-) -> CliResult<ConfiguredModel> {
+) -> CliResult<Arc<dyn LanguageModel>> {
     let reference = SecretReference::new(bearer_secret_reference.to_owned())?;
     let secrets = Arc::new(EnvironmentSecretProvider::new(
         "service-environment",
@@ -844,14 +1919,7 @@ async fn build_https_model(
         )?)?;
     }
     let model = HttpsJsonModel::new(id, config, secrets)?;
-    Ok(ConfiguredModel {
-        id: id.to_owned(),
-        origin: CapabilityOrigin::TrustedExtension {
-            id: "reference-https-json-gateway".to_owned(),
-        },
-        model: Arc::new(model),
-        demo_tools: false,
-    })
+    Ok(Arc::new(model))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -867,7 +1935,7 @@ async fn build_https_model(
     _max_response_bytes: usize,
     _max_concurrency: usize,
     _root_ca_path: Option<&str>,
-) -> CliResult<ConfiguredModel> {
+) -> CliResult<Arc<dyn LanguageModel>> {
     Err("HTTPS model configuration requires a binary built with `--features https-model`".into())
 }
 
@@ -887,6 +1955,9 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
             config.schema_version
         )
         .into());
+    }
+    if !(1..=MAX_PARALLEL_TOOL_CALLS).contains(&config.max_parallel_tool_calls) {
+        return Err(format!("max_parallel_tool_calls must be 1-{MAX_PARALLEL_TOOL_CALLS}").into());
     }
     let root = path
         .parent()
@@ -954,8 +2025,96 @@ fn read_bounded(path: &Path, maximum: u64, kind: &str) -> CliResult<Vec<u8>> {
     Ok(bytes)
 }
 
+fn write_new_file(path: &Path, bytes: &[u8], kind: &str) -> CliResult<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let cleanup = fs::remove_file(path);
+        return match cleanup {
+            Ok(()) => Err(format!("cannot write {kind} {}: {error}", path.display()).into()),
+            Err(cleanup_error) => Err(format!(
+                "cannot write {kind} {}; cleanup also failed: {cleanup_error}",
+                path.display()
+            )
+            .into()),
+        };
+    }
+    Ok(())
+}
+
+fn verify_file_sha256(path: &Path, expected: &str, kind: &str) -> CliResult<()> {
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{kind} SHA-256 must be 64 lowercase hexadecimal characters").into());
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_PINNED_COMMAND_BYTES {
+        return Err(format!(
+            "{kind} exceeds the {MAX_PINNED_COMMAND_BYTES}-byte digest boundary: {}",
+            path.display()
+        )
+        .into());
+    }
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 65_536];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(u64::try_from(read)?)
+            .ok_or("command digest byte count overflow")?;
+        if bytes > MAX_PINNED_COMMAND_BYTES {
+            return Err(format!(
+                "{kind} exceeds the {MAX_PINNED_COMMAND_BYTES}-byte digest boundary: {}",
+                path.display()
+            )
+            .into());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut actual = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        actual.push(char::from(HEX[usize::from(byte >> 4)]));
+        actual.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    if actual != expected {
+        return Err(format!("{kind} SHA-256 mismatch: {}", path.display()).into());
+    }
+    Ok(())
+}
+
 const fn default_request_timeout_ms() -> u64 {
     60_000
+}
+
+const fn default_enabled() -> bool {
+    true
+}
+
+fn default_demo_model_id() -> String {
+    "local/demo".to_owned()
+}
+
+const fn default_model_attempt_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_model_retry_initial_delay_ms() -> u64 {
+    250
+}
+
+const fn default_model_retry_max_delay_ms() -> u64 {
+    5_000
 }
 
 const fn default_openai_request_timeout_ms() -> u64 {
@@ -978,12 +2137,20 @@ const fn default_max_concurrency() -> usize {
     16
 }
 
+const fn default_max_parallel_tool_calls() -> usize {
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS
+}
+
 fn default_current_directory() -> String {
     ".".to_owned()
 }
 
 const fn default_mcp_request_timeout_ms() -> u64 {
     45_000
+}
+
+const fn default_mcp_max_response_bytes() -> usize {
+    8_388_608
 }
 
 const fn default_memory_top_k() -> usize {
@@ -1008,17 +2175,50 @@ const fn default_tool_max_output_bytes() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceConfig, resolve_data_directory};
-    use std::path::Path;
+    use super::{
+        LoadedConfig, ServiceConfig, ServiceJsonProcessConfig, ServiceProcessLaunchConfig,
+        ServiceToolConfig, ToolBatchExecution, build_capabilities, build_models,
+        configured_skill_trust, load_config, resolve_data_directory, verify_file_sha256,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn config_is_strict_and_data_directory_cannot_escape() {
-        assert!(
-            serde_json::from_str::<ServiceConfig>(
-                r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"demo"}}"#
-            )
-            .is_ok()
+        let defaulted = serde_json::from_str::<ServiceConfig>(
+            r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"demo"}}"#,
+        )
+        .expect("minimal config");
+        assert_eq!(
+            defaulted.max_parallel_tool_calls,
+            super::DEFAULT_MAX_PARALLEL_TOOL_CALLS
         );
+        let explicitly_safe = serde_json::from_str::<ServiceConfig>(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "tools": [{
+                "type": "json_command",
+                "name": "pure",
+                "description": "pure fixture",
+                "input_schema": {},
+                "batch_execution": "parallel_safe",
+                "process": {
+                  "command": "/unused",
+                  "launch": {"type": "unrestricted", "max_concurrency": 1}
+                }
+              }]
+            }"#,
+        )
+        .expect("explicit Tool scheduling");
+        let ServiceToolConfig::JsonCommand {
+            batch_execution, ..
+        } = &explicitly_safe.tools[0];
+        assert_eq!(*batch_execution, ToolBatchExecution::ParallelSafe);
         assert!(
             serde_json::from_str::<ServiceConfig>(
                 r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"open_ai_responses","id":"openai/default","model":"model-explicit","api_key_secret_reference":"openai/default","api_key_environment":"OPENAI_API_KEY"}}"#
@@ -1034,6 +2234,134 @@ mod tests {
         assert!(resolve_data_directory(Path::new("/project"), "../outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), "/outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), ".").is_err());
+    }
+
+    #[test]
+    fn external_skill_trust_rejects_noncanonical_keys_and_invalid_policy() {
+        let noncanonical = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "skills": {
+                "package_files": [],
+                "external_package_files": [],
+                "activate": [],
+                "trust": {
+                  "publishers": [{
+                    "key_id": "publisher",
+                    "public_key_hex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                  }]
+                }
+              }
+            }"#,
+        );
+        let error = configured_skill_trust(&noncanonical)
+            .err()
+            .expect("reject noncanonical public key");
+        assert!(error.to_string().contains("lowercase hexadecimal"));
+
+        let reversed_window = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "skills": {
+                "package_files": [],
+                "external_package_files": [],
+                "activate": [],
+                "trust": {
+                  "publishers": [{
+                    "key_id": "publisher",
+                    "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                    "not_before_ms": 10,
+                    "not_after_ms": 10
+                  }]
+                }
+              }
+            }"#,
+        );
+        let error = configured_skill_trust(&reversed_window)
+            .err()
+            .expect("reject reversed validity");
+        assert!(error.to_string().contains("empty or reversed"));
+    }
+
+    #[test]
+    fn config_rejects_an_unbounded_parallel_tool_limit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "y-harness-parallel-config-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create config fixture");
+        let path = root.join("y-harness.json");
+        fs::write(
+            &path,
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "max_parallel_tool_calls": 0,
+              "model": {"type": "demo"}
+            }"#,
+        )
+        .expect("write invalid config");
+        let error = load_config(path.to_str().expect("UTF-8 fixture path"))
+            .err()
+            .expect("reject invalid parallel limit");
+        assert!(
+            error
+                .to_string()
+                .contains("max_parallel_tool_calls must be 1-64")
+        );
+        fs::remove_dir_all(root).expect("remove config fixture");
+    }
+
+    #[tokio::test]
+    async fn configured_json_tool_preserves_explicit_parallel_safety() {
+        let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical project");
+        let config = ServiceConfig {
+            tools: vec![ServiceToolConfig::JsonCommand {
+                name: "pure-command".to_owned(),
+                description: "pure command fixture".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+                batch_execution: ToolBatchExecution::ParallelSafe,
+                process: ServiceJsonProcessConfig {
+                    command: std::env::current_exe()
+                        .expect("current executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    args: Vec::new(),
+                    current_directory: ".".to_owned(),
+                    environment_from_host: std::collections::BTreeMap::new(),
+                    timeout_ms: 1_000,
+                    max_output_bytes: 1_024,
+                    launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },
+                },
+            }],
+            ..ServiceConfig::default()
+        };
+        let loaded = LoadedConfig {
+            config,
+            path: root.join("y-harness.json"),
+            data_directory: root.join(".y-harness"),
+            root,
+        };
+
+        let capabilities = build_capabilities(&loaded, false)
+            .await
+            .expect("configured Tool");
+        assert_eq!(
+            capabilities
+                .tools
+                .get("pure-command")
+                .map(|tool| tool.batch_execution),
+            Some(ToolBatchExecution::ParallelSafe)
+        );
     }
 
     #[test]
@@ -1054,5 +2382,220 @@ mod tests {
             "../../config/y-harness.skill.example.json"
         ))
         .expect("project Skill example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.route.example.json"
+        ))
+        .expect("explicit Model route example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.https-mcp.example.json"
+        ))
+        .expect("HTTPS MCP example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.command-model.example.json"
+        ))
+        .expect("JSON command Model example config");
+    }
+
+    #[tokio::test]
+    async fn model_catalog_validation_precedes_provider_construction() {
+        let mixed = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "models": [{"type": "demo"}],
+              "model_route": {"models": ["local/demo"]}
+            }"#,
+        );
+        let error = build_models(&mixed)
+            .await
+            .err()
+            .expect("reject mixed configuration");
+        assert!(error.to_string().contains("never both"));
+
+        let unknown = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {"models": ["missing/model"]}
+            }"#,
+        );
+        let error = build_models(&unknown)
+            .await
+            .err()
+            .expect("reject unknown route entry");
+        assert!(error.to_string().contains("unknown model"));
+
+        let invalid_timeout = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {
+                "models": ["local/demo"],
+                "attempt_timeout_ms": 0
+              }
+            }"#,
+        );
+        let error = build_models(&invalid_timeout)
+            .await
+            .err()
+            .expect("reject invalid attempt timeout");
+        assert!(error.to_string().contains("1-86400000"));
+
+        let invalid_cooldown = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {
+                "models": ["local/demo"],
+                "timeout_cooldown_ms": 86400001
+              }
+            }"#,
+        );
+        let error = build_models(&invalid_cooldown)
+            .await
+            .err()
+            .expect("reject invalid timeout cooldown");
+        assert!(error.to_string().contains("0-86400000"));
+
+        let single_cooldown = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {
+                "models": ["local/demo"],
+                "timeout_cooldown_ms": 1000
+              }
+            }"#,
+        );
+        let error = build_models(&single_cooldown)
+            .await
+            .err()
+            .expect("reject useless single-Model cooldown");
+        assert!(error.to_string().contains("at least two"));
+
+        let invalid_retries = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo", "id": "must-not-be-constructed"}],
+              "model_route": {
+                "models": ["must-not-be-constructed"],
+                "retry": {"max_retries": 0}
+              }
+            }"#,
+        );
+        let error = build_models(&invalid_retries)
+            .await
+            .err()
+            .expect("reject invalid retry count");
+        assert!(error.to_string().contains("1-8"));
+
+        let inverted_retry_delay = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {
+                "models": ["local/demo"],
+                "retry": {
+                  "max_retries": 2,
+                  "initial_delay_ms": 100,
+                  "max_delay_ms": 10
+                }
+              }
+            }"#,
+        );
+        let error = build_models(&inverted_retry_delay)
+            .await
+            .err()
+            .expect("reject inverted retry delay");
+        assert!(error.to_string().contains("cannot exceed"));
+
+        let configured_retry = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{"type": "demo"}],
+              "model_route": {
+                "models": ["local/demo"],
+                "retry": {"max_retries": 2}
+              }
+            }"#,
+        );
+        let configured_retry = build_models(&configured_retry)
+            .await
+            .expect("valid retry policy")
+            .retry_policy
+            .expect("enabled retry policy");
+        assert_eq!(configured_retry.max_retries(), 2);
+        assert_eq!(configured_retry.initial_delay(), Duration::from_millis(250));
+        assert_eq!(configured_retry.max_delay(), Duration::from_millis(5_000));
+    }
+
+    #[tokio::test]
+    async fn disabled_mcp_server_grants_no_process_or_tool_authority() {
+        let configured = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "mcp_servers": [{
+                "id": "disabled",
+                "enabled": false,
+                "command": "/path/that/must/not/be-opened",
+                "launch": {
+                  "type": "unrestricted",
+                  "max_concurrency": 1
+                },
+                "tools": {
+                  "namespace": "disabled",
+                  "allow": ["never"]
+                }
+              }]
+            }"#,
+        );
+        let capabilities = super::build_capabilities(&configured, true)
+            .await
+            .expect("disabled server");
+        assert!(capabilities.mcp_clients.is_empty());
+        assert_eq!(capabilities.mcp_configured, 1);
+        assert_eq!(capabilities.tools.descriptors().len(), 1);
+    }
+
+    #[test]
+    fn optional_mcp_command_pin_is_exact_and_content_sensitive() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "y-harness-mcp-command-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(&path, b"mcp").expect("write command fixture");
+        verify_file_sha256(
+            &path,
+            "10182ab855ff772753c05b2fea333666b5f312835d32936b6b03e08ef2cbd6d3",
+            "MCP command",
+        )
+        .expect("matching digest");
+        let error =
+            verify_file_sha256(&path, &"0".repeat(64), "MCP command").expect_err("digest mismatch");
+        assert!(error.to_string().contains("mismatch"));
+        fs::remove_file(path).expect("remove command fixture");
+    }
+
+    fn loaded(encoded: &str) -> LoadedConfig {
+        LoadedConfig {
+            config: serde_json::from_str(encoded).expect("test Service config"),
+            path: PathBuf::from("/project/y-harness.json"),
+            root: PathBuf::from("/project"),
+            data_directory: PathBuf::from("/project/.y-harness"),
+        }
     }
 }

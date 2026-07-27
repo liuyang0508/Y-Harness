@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "https_mcp_servers": [
+    {
+      "id": "remote-tools",
+      "endpoint": "https://mcp.example.com/mcp",
+      "bearer_secret_reference": "mcp/remote-tools",
+      "bearer_environment": "YH_MCP_TOKEN",
+      "request_timeout_ms": 45000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 8388608,
+      "tools": {
+        "namespace": "remote",
+        "allow": [
+          "lookup"
+        ]
+      }
+    }
+  ]
+}

@@ -29,15 +29,15 @@ use crate::{
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
     StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
     TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
-    TaskMessagePage, Thread, ThreadId, TurnExecutionOptions, TurnId,
-    WORKSPACE_PROVIDER_API_VERSION,
+    TaskMessagePage, Thread, ThreadId, ThreadSummary, TurnContextInput, TurnExecutionOptions,
+    TurnId, WORKSPACE_PROVIDER_API_VERSION,
 };
 
 use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "12";
+pub const PROTOCOL_VERSION: &str = "18";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -54,6 +54,7 @@ const DEFAULT_OPERATION_EVENT_PAGE: usize = 16;
 const MAX_OPERATION_EVENT_PAGE: usize = 32;
 const DEFAULT_EVENT_PAGE: usize = 16;
 const MAX_EVENT_PAGE: usize = 32;
+const DEFAULT_THREAD_PAGE: usize = 16;
 const DEFAULT_APPROVAL_PAGE: usize = 8;
 const MAX_APPROVAL_PAGE: usize = 16;
 const DEFAULT_TASK_RECORD_PAGE: usize = 16;
@@ -64,7 +65,7 @@ const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 23] = [
+const PROTOCOL_PERMISSIONS: [&str; 26] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -73,7 +74,10 @@ const PROTOCOL_PERMISSIONS: [&str; 23] = [
     "thread.capacity",
     "thread.create",
     "thread.events",
+    "thread.fork",
     "thread.get",
+    "thread.list",
+    "thread.name",
     "turn.start",
     "turn.steer",
     "approval.get",
@@ -110,6 +114,29 @@ pub enum ProtocolCommand {
     Initialize {},
     /// Creates a new Thread.
     CreateThread {},
+    /// Forks one terminal parent boundary under a caller-chosen child identity.
+    ForkThread {
+        /// Existing parent Thread identity.
+        parent_thread_id: String,
+        /// New child Thread identity and retry key.
+        child_thread_id: String,
+        /// Optional terminal Turn boundary; absent means the latest settled parent.
+        through_turn_id: Option<String>,
+    },
+    /// Lists recent Threads without loading their histories.
+    ListThreads {
+        /// Exclusive global sequence cursor for an older page.
+        before_sequence: Option<u64>,
+        /// Optional page size; the Engine enforces its finite maximum.
+        limit: Option<usize>,
+    },
+    /// Changes or clears one durable operator-authored Thread name.
+    SetThreadName {
+        /// Opaque Thread identity.
+        thread_id: String,
+        /// Trimmed display name, or `None` to clear it.
+        name: Option<String>,
+    },
     /// Loads one projected Thread.
     GetThread {
         /// Opaque Thread identity.
@@ -129,6 +156,9 @@ pub enum ProtocolCommand {
         /// Optional memory isolation scope.
         #[serde(default)]
         memory_scope: MemoryScope,
+        /// Optional non-authoritative reference context for this Turn.
+        #[serde(default)]
+        context: Vec<TurnContextInput>,
         /// Optional total external-work deadline.
         timeout_ms: Option<u64>,
     },
@@ -300,6 +330,9 @@ impl ProtocolCommand {
         match self {
             Self::Initialize {} => "initialize",
             Self::CreateThread {} => "thread.create",
+            Self::ForkThread { .. } => "thread.fork",
+            Self::ListThreads { .. } => "thread.list",
+            Self::SetThreadName { .. } => "thread.name",
             Self::GetThread { .. } => "thread.get",
             Self::GetThreadCapacity { .. } => "thread.capacity",
             Self::StartTurn { .. } => "turn.start",
@@ -483,6 +516,10 @@ pub struct ProtocolResponse {
 /// Top-level response settlement.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "inline typed results are a public pattern-matching contract, not a retained hot-path collection"
+)]
 pub enum ProtocolResponseBody {
     /// Command completed successfully.
     Success {
@@ -513,6 +550,25 @@ pub enum ProtocolResult {
     ThreadCreated {
         /// Projected Thread.
         thread: Thread,
+    },
+    /// Atomically created or idempotently recovered fork child.
+    ThreadForked {
+        /// Independent child Thread with immutable direct lineage.
+        thread: Thread,
+    },
+    /// Bounded recent-Thread page.
+    Threads {
+        /// Content-free recent Thread summaries.
+        threads: Vec<ThreadSummary>,
+        /// Exclusive sequence cursor for an older page.
+        next_before_sequence: Option<u64>,
+        /// Whether an older Thread was observed.
+        has_more: bool,
+    },
+    /// Durable Thread name mutation settlement.
+    ThreadNamed {
+        /// Name accepted by the Engine, or `None` when cleared.
+        name: Option<String>,
     },
     /// Loaded Thread or explicit absence.
     Thread {
@@ -1047,9 +1103,16 @@ impl ProtocolHandler {
                     "thread.create".to_owned(),
                     "thread.events".to_owned(),
                     "thread.get".to_owned(),
+                    "thread.name".to_owned(),
                     "turn.start".to_owned(),
                     "turn.steer".to_owned(),
                 ];
+                if self.runtime.supports_thread_listing() {
+                    capabilities.push("thread.list".to_owned());
+                }
+                if self.runtime.supports_thread_fork() {
+                    capabilities.push("thread.fork".to_owned());
+                }
                 if self.approvals.is_some() {
                     capabilities.extend([
                         "approval.get".to_owned(),
@@ -1095,6 +1158,47 @@ impl ProtocolHandler {
                 let thread = self.runtime.create_thread().await?;
                 Ok(ProtocolResult::ThreadCreated { thread })
             }
+            ProtocolCommand::ForkThread {
+                parent_thread_id,
+                child_thread_id,
+                through_turn_id,
+            } => {
+                validate_opaque_id("parent_thread_id", &parent_thread_id)?;
+                validate_opaque_id("child_thread_id", &child_thread_id)?;
+                if let Some(turn_id) = through_turn_id.as_deref() {
+                    validate_opaque_id("through_turn_id", turn_id)?;
+                }
+                let parent_thread_id = ThreadId::from_string(parent_thread_id);
+                let child_thread_id = ThreadId::from_string(child_thread_id);
+                let through_turn_id = through_turn_id.map(TurnId::from_string);
+                let thread = self
+                    .runtime
+                    .fork_thread(&parent_thread_id, child_thread_id, through_turn_id.as_ref())
+                    .await?;
+                Ok(ProtocolResult::ThreadForked { thread })
+            }
+            ProtocolCommand::ListThreads {
+                before_sequence,
+                limit,
+            } => {
+                let page = self
+                    .runtime
+                    .list_threads(before_sequence, limit.unwrap_or(DEFAULT_THREAD_PAGE))
+                    .await?;
+                Ok(ProtocolResult::Threads {
+                    threads: page.threads,
+                    next_before_sequence: page.next_before_sequence,
+                    has_more: page.has_more,
+                })
+            }
+            ProtocolCommand::SetThreadName { thread_id, name } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                let thread_id = ThreadId::from_string(thread_id);
+                self.runtime
+                    .set_thread_name(&thread_id, name.clone())
+                    .await?;
+                Ok(ProtocolResult::ThreadNamed { name })
+            }
             ProtocolCommand::GetThread { thread_id } => {
                 validate_opaque_id("thread_id", &thread_id)?;
                 let thread_id = ThreadId::from_string(thread_id);
@@ -1117,6 +1221,7 @@ impl ProtocolHandler {
                 thread_id,
                 prompt,
                 memory_scope,
+                context,
                 timeout_ms,
             } => {
                 if !self.lifecycle.accepting.load(Ordering::Acquire) {
@@ -1135,6 +1240,8 @@ impl ProtocolHandler {
                         "timeout_ms must be greater than zero".to_owned(),
                     ));
                 }
+                crate::context::validate_turn_context_inputs(&context)
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?;
                 let thread_id = ThreadId::from_string(thread_id);
                 if self.runtime.load_thread(&thread_id).await?.is_none() {
                     return Err(HarnessError::Protocol(format!(
@@ -1180,6 +1287,7 @@ impl ProtocolHandler {
                             TurnExecutionOptions {
                                 approval_requester,
                                 memory_scope,
+                                context,
                                 timeout: timeout_ms.map(Duration::from_millis),
                                 cancellation,
                                 model_event_sink: Some(events),
@@ -2093,13 +2201,14 @@ mod tests {
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
         ApprovalRecordStatus, ApprovalRequest, CapabilityOrigin, EventStore, HarnessFuture,
-        HarnessRuntime, InboxApprovalHandler, Item, ItemKind, LanguageModel, MemoryApprovalInbox,
-        MemoryEventStore, MemoryScope, MemoryTaskCoordinator, ModelContinuation, ModelEventSink,
-        ModelOutput, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, OperationId,
-        PendingEvent, PolicyDecision, PolicyEngine, RiskLevel, SnapshotMaintenanceConfig,
-        StateCapacityLevel, StateEngine, StateSnapshot, StoredEvent, TaskCompletion,
-        TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId,
-        ThreadId, Tool, ToolAuthorization, ToolContext, ToolDescriptor, ToolRegistry, TurnId,
+        HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
+        MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
+        ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelResponse, ModelStream,
+        ModelStreamEvent, OperationId, PendingEvent, PolicyDecision, PolicyEngine, RiskLevel,
+        SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine, StateEvent, StateSnapshot,
+        StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId,
+        TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool, ToolAuthorization, ToolCallBatch,
+        ToolCallBatchId, ToolContext, ToolDescriptor, ToolRegistry, TurnContextInput, TurnId,
         TurnStatus, WorkspaceMode,
     };
 
@@ -2407,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twelve_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_eighteen_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2415,14 +2524,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "12",
+                "protocol_version": "18",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "12",
+                "protocol_version": "18",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2431,7 +2540,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "12",
+                "protocol_version": "18",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2453,7 +2562,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "12",
+                "protocol_version": "18",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2532,6 +2641,141 @@ mod tests {
                 "model_step": 3
             })
         );
+        let batch = serde_json::to_value(StateEvent::ToolCallsAppended {
+            turn_id: TurnId::from_static("turn-fixture"),
+            calls: vec![
+                Item {
+                    id: ItemId::from_static("item-call-1"),
+                    created_at_ms: 1,
+                    kind: ItemKind::ToolCall {
+                        model_id: Some("openai/default".to_owned()),
+                        model_origin: Some(CapabilityOrigin::BuiltIn),
+                        call_id: "call-1".to_owned(),
+                        name: "echo".to_owned(),
+                        input: json!({"text": "first"}),
+                        batch: Some(ToolCallBatch {
+                            id: ToolCallBatchId::from_static("tool-batch-fixture"),
+                            index: 0,
+                            size: 2,
+                        }),
+                    },
+                },
+                Item {
+                    id: ItemId::from_static("item-call-2"),
+                    created_at_ms: 2,
+                    kind: ItemKind::ToolCall {
+                        model_id: Some("openai/default".to_owned()),
+                        model_origin: Some(CapabilityOrigin::BuiltIn),
+                        call_id: "call-2".to_owned(),
+                        name: "echo".to_owned(),
+                        input: json!({"text": "second"}),
+                        batch: Some(ToolCallBatch {
+                            id: ToolCallBatchId::from_static("tool-batch-fixture"),
+                            index: 1,
+                            size: 2,
+                        }),
+                    },
+                },
+            ],
+        })
+        .expect("encode schema-7 Tool-call batch evidence");
+        assert_eq!(batch["type"], "tool_calls_appended");
+        assert_eq!(batch["turn_id"], "turn-fixture");
+        assert_eq!(batch["calls"][0]["batch"]["index"], 0);
+        assert_eq!(batch["calls"][1]["batch"]["index"], 1);
+        assert_eq!(batch["calls"][1]["batch"]["size"], 2);
+
+        let named = serde_json::to_value(StateEvent::ThreadNamed {
+            name: Some("Harness design".to_owned()),
+        })
+        .expect("encode schema-8 Thread name evidence");
+        assert_eq!(
+            named,
+            json!({
+                "type": "thread_named",
+                "name": "Harness design"
+            })
+        );
+
+        let forked = serde_json::to_value(StateEvent::ThreadForked {
+            lineage: crate::ThreadLineage {
+                parent_thread_id: ThreadId::from_static("thread-parent"),
+                parent_through_sequence: 42,
+                parent_stream_version: 7,
+                parent_events_sha256: "0".repeat(64),
+            },
+        })
+        .expect("encode schema-9 Thread lineage evidence");
+        assert_eq!(
+            forked,
+            json!({
+                "type": "thread_forked",
+                "lineage": {
+                    "parent_thread_id": "thread-parent",
+                    "parent_through_sequence": 42,
+                    "parent_stream_version": 7,
+                    "parent_events_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            })
+        );
+        let imported = serde_json::to_value(StateEvent::ThreadImported {
+            origin: crate::ThreadImportOrigin {
+                source_thread_id: ThreadId::from_static("thread-source"),
+                source_stream_version: 7,
+                source_last_sequence: 42,
+                source_events_sha256: "1".repeat(64),
+                source_lineage: None,
+            },
+        })
+        .expect("encode schema-10 Thread import evidence");
+        assert_eq!(
+            imported,
+            json!({
+                "type": "thread_imported",
+                "origin": {
+                    "source_thread_id": "thread-source",
+                    "source_stream_version": 7,
+                    "source_last_sequence": 42,
+                    "source_events_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+            })
+        );
+        let lineage_summary = serde_json::to_value(crate::ThreadSummary {
+            thread_id: ThreadId::from_static("thread-child"),
+            name: Some("Branch".to_owned()),
+            lineage: Some(crate::ThreadLineage {
+                parent_thread_id: ThreadId::from_static("thread-parent"),
+                parent_through_sequence: 42,
+                parent_stream_version: 7,
+                parent_events_sha256: "0".repeat(64),
+            }),
+            last_sequence: 50,
+            updated_at_ms: 1_785_000_000_000,
+            stream_version: 9,
+        })
+        .expect("encode lineage-aware Thread summary");
+        assert_eq!(
+            lineage_summary["lineage"]["parent_thread_id"],
+            "thread-parent"
+        );
+        assert_eq!(lineage_summary["lineage"]["parent_stream_version"], 7);
+        let turn_context = serde_json::to_value(ProtocolCommand::StartTurn {
+            thread_id: "thread-fixture".to_owned(),
+            prompt: "continue".to_owned(),
+            memory_scope: MemoryScope::default(),
+            context: vec![TurnContextInput {
+                source: "branch-handoff".to_owned(),
+                reference: "thread:source/turn:terminal".to_owned(),
+                text: "bounded handoff".to_owned(),
+            }],
+            timeout_ms: Some(1_000),
+        })
+        .expect("encode Turn context");
+        assert_eq!(turn_context["context"][0]["source"], "branch-handoff");
+        assert_eq!(
+            turn_context["context"][0]["reference"],
+            "thread:source/turn:terminal"
+        );
 
         let commands = [
             (ProtocolCommand::Initialize {}, "initialize", "initialize"),
@@ -2539,6 +2783,31 @@ mod tests {
                 ProtocolCommand::CreateThread {},
                 "create_thread",
                 "thread.create",
+            ),
+            (
+                ProtocolCommand::ForkThread {
+                    parent_thread_id: "thread-parent".to_owned(),
+                    child_thread_id: "thread-child".to_owned(),
+                    through_turn_id: Some("turn-fixture".to_owned()),
+                },
+                "fork_thread",
+                "thread.fork",
+            ),
+            (
+                ProtocolCommand::ListThreads {
+                    before_sequence: Some(42),
+                    limit: Some(16),
+                },
+                "list_threads",
+                "thread.list",
+            ),
+            (
+                ProtocolCommand::SetThreadName {
+                    thread_id: "thread-fixture".to_owned(),
+                    name: Some("Harness design".to_owned()),
+                },
+                "set_thread_name",
+                "thread.name",
             ),
             (
                 ProtocolCommand::GetThread {
@@ -2559,6 +2828,7 @@ mod tests {
                     thread_id: "thread-fixture".to_owned(),
                     prompt: "hello".to_owned(),
                     memory_scope: MemoryScope::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
                 "start_turn",
@@ -3324,6 +3594,238 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_fork_is_capability_gated_and_retry_identified_by_child() {
+        let handler = handler(Arc::new(ImmediateModel));
+        let initialized = handler
+            .handle(request("init-fork", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. }
+            } if capabilities.contains(&"thread.fork".to_owned())
+        ));
+        let created = handler
+            .handle(request("create-parent", ProtocolCommand::CreateThread {}))
+            .await;
+        let parent_id = match created.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let child_id = ThreadId::from_static("protocol-fork-child");
+        for id in ["fork", "fork-retry"] {
+            let forked = handler
+                .handle(request(
+                    id,
+                    ProtocolCommand::ForkThread {
+                        parent_thread_id: parent_id.to_string(),
+                        child_thread_id: child_id.to_string(),
+                        through_turn_id: None,
+                    },
+                ))
+                .await;
+            assert!(matches!(
+                forked.body,
+                ProtocolResponseBody::Success {
+                    result: ProtocolResult::ThreadForked { thread }
+                } if thread.id == child_id
+                    && thread
+                        .lineage
+                        .as_ref()
+                        .is_some_and(|lineage| lineage.parent_thread_id == parent_id)
+                    && thread.turns.is_empty()
+            ));
+        }
+        let listed = handler
+            .handle(request(
+                "list-fork-lineage",
+                ProtocolCommand::ListThreads {
+                    before_sequence: None,
+                    limit: Some(8),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            listed.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Threads { threads, .. }
+            } if threads.iter().any(|summary| {
+                summary.thread_id == child_id
+                    && summary
+                        .lineage
+                        .as_ref()
+                        .is_some_and(|lineage| lineage.parent_thread_id == parent_id)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_threads_are_capability_gated_and_cursor_bounded() {
+        let handler = handler(Arc::new(ImmediateModel));
+        let initialized = handler
+            .handle(request("init-threads", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. }
+            } if capabilities.contains(&"thread.list".to_owned())
+        ));
+
+        for id in ["create-first", "create-second"] {
+            let created = handler
+                .handle(request(id, ProtocolCommand::CreateThread {}))
+                .await;
+            assert!(matches!(
+                created.body,
+                ProtocolResponseBody::Success {
+                    result: ProtocolResult::ThreadCreated { .. }
+                }
+            ));
+        }
+        let first = handler
+            .handle(request(
+                "list-first",
+                ProtocolCommand::ListThreads {
+                    before_sequence: None,
+                    limit: Some(1),
+                },
+            ))
+            .await;
+        let cursor = match first.body {
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Threads {
+                        threads,
+                        next_before_sequence: Some(cursor),
+                        has_more: true,
+                    },
+            } if threads.len() == 1 => cursor,
+            other => panic!("unexpected Thread page: {other:?}"),
+        };
+        let second = handler
+            .handle(request(
+                "list-second",
+                ProtocolCommand::ListThreads {
+                    before_sequence: Some(cursor),
+                    limit: Some(1),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            second.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Threads {
+                    threads,
+                    next_before_sequence: None,
+                    has_more: false,
+                }
+            } if threads.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn thread_names_are_authorized_durable_and_listed() {
+        let handler = handler(Arc::new(ImmediateModel));
+        let initialized = handler
+            .handle(request("init-name", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. }
+            } if capabilities.contains(&"thread.name".to_owned())
+        ));
+        let created = handler
+            .handle(request("create-name", ProtocolCommand::CreateThread {}))
+            .await;
+        let thread_id = match created.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let named = handler
+            .handle(request(
+                "name",
+                ProtocolCommand::SetThreadName {
+                    thread_id: thread_id.to_string(),
+                    name: Some("Harness design".to_owned()),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            named.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadNamed {
+                    name: Some(ref name)
+                }
+            } if name == "Harness design"
+        ));
+        let loaded = handler
+            .handle(request(
+                "load-name",
+                ProtocolCommand::GetThread {
+                    thread_id: thread_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            loaded.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Thread {
+                    thread: Some(Thread {
+                        name: Some(ref name),
+                        ..
+                    })
+                }
+            } if name == "Harness design"
+        ));
+        let listed = handler
+            .handle(request(
+                "list-name",
+                ProtocolCommand::ListThreads {
+                    before_sequence: None,
+                    limit: Some(1),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            listed.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Threads { threads, .. }
+            } if threads[0].name.as_deref() == Some("Harness design")
+        ));
+        let rejected = handler
+            .handle(request(
+                "invalid-name",
+                ProtocolCommand::SetThreadName {
+                    thread_id: thread_id.to_string(),
+                    name: Some(" padded ".to_owned()),
+                },
+            ))
+            .await;
+        assert!(matches!(rejected.body, ProtocolResponseBody::Error { .. }));
+        let cleared = handler
+            .handle(request(
+                "clear-name",
+                ProtocolCommand::SetThreadName {
+                    thread_id: thread_id.to_string(),
+                    name: None,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            cleared.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadNamed { name: None }
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn starts_and_polls_an_asynchronous_turn() {
         let handler = handler(Arc::new(ImmediateModel));
         let created = handler
@@ -3342,6 +3844,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "go".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
             ))
@@ -3447,6 +3950,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "initial".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(10_000),
                 },
             ))
@@ -3600,6 +4104,7 @@ mod tests {
                     thread_id: first_thread.to_string(),
                     prompt: "first".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
             ))
@@ -3643,6 +4148,7 @@ mod tests {
                     thread_id: second_thread.to_string(),
                     prompt: "second".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
             ))
@@ -3668,6 +4174,7 @@ mod tests {
                         thread_id: second_thread.to_string(),
                         prompt: "second".to_owned(),
                         memory_scope: Default::default(),
+                        context: Vec::new(),
                         timeout_ms: Some(1_000),
                     },
                 ))
@@ -3703,6 +4210,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "go".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
             ))
@@ -3917,7 +4425,7 @@ mod tests {
             )
             .with_approval_handler(Arc::new(approval_handler)),
         );
-        let handler = ProtocolHandler::new(runtime)
+        let handler = ProtocolHandler::new(runtime.clone())
             .with_approval_inbox(inbox.clone())
             .with_authorizer(Arc::new(authorizer));
         let created = handler
@@ -3941,6 +4449,11 @@ mod tests {
                         thread_id: thread_id.to_string(),
                         prompt: "request a protected action".to_owned(),
                         memory_scope: Default::default(),
+                        context: vec![TurnContextInput {
+                            source: "branch-handoff".to_owned(),
+                            reference: "thread:source/turn:terminal".to_owned(),
+                            text: "derived branch context".to_owned(),
+                        }],
                         timeout_ms: None,
                     },
                 ),
@@ -3964,6 +4477,18 @@ mod tests {
         .await
         .expect("approval request timeout");
         assert_eq!(record.request.requested_by, principal.approval_actor());
+        let projected = runtime
+            .load_thread(&thread_id)
+            .await
+            .expect("load attributed Turn")
+            .expect("Thread");
+        assert!(projected.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::ItemKind::InvocationContext { submitted_by, .. }
+                    if submitted_by == &principal.approval_actor()
+            )
+        }));
 
         let cancelled = handler
             .handle_as(
@@ -4068,6 +4593,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "wait".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: None,
                 },
             ))
@@ -4140,6 +4666,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "wait".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: None,
                 },
             ))
@@ -4182,6 +4709,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "again".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: None,
                 },
             ))
@@ -4226,6 +4754,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "block in State".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: None,
                 },
             ))
@@ -4288,6 +4817,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "finish".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: None,
                 },
             ))
@@ -4362,6 +4892,7 @@ mod tests {
                     thread_id: thread_id.to_string(),
                     prompt: "stream".to_owned(),
                     memory_scope: Default::default(),
+                    context: Vec::new(),
                     timeout_ms: Some(1_000),
                 },
             ))

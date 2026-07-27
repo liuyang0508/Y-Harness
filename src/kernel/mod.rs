@@ -17,10 +17,13 @@ pub(crate) use registry::{
 pub(crate) use types::now_ms;
 pub use types::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
-    Checkpoint, CheckpointId, EventId, ExecutionPhase, HarnessError, HarnessFuture, Item, ItemKind,
-    MemoryContextRecordStatus, ModelContinuation, ModelOutput, ModelRequest, ModelResponse,
-    ModelStreamEvent, ModelUsage, OperationId, PendingEvent, PolicyDecision, RiskLevel, StateEvent,
-    SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId,
-    ToolAuthorization, ToolContext, ToolDescriptor, Turn, TurnId, TurnOutcome, TurnStatus,
-    TurnStopReason, VerificationOutcome,
+    Checkpoint, CheckpointId, EventId, ExecutionPhase, HarnessError, HarnessFuture,
+    InvocationContextEvidence, Item, ItemId, ItemKind, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
+    MAX_MODEL_PROVIDER_RETRY_AFTER_MS, MAX_TOOL_CALLS_PER_BATCH, MemoryContextRecordStatus,
+    ModelContinuation, ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRequest,
+    ModelResponse, ModelStreamEvent, ModelToolCall, ModelUsage, NewStreamEvent, OperationId,
+    PendingEvent, PolicyDecision, RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId,
+    TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage,
+    ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
+    ToolDescriptor, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
 };

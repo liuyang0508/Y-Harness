@@ -60,12 +60,19 @@ direction:
   optional non-serializable mTLS client identity;
 - an optional direct OpenAI Responses adapter with environment-backed API-key
   resolution, pooled HTTPS, `store: false`, bounded JSON/SSE decoding, exact
-  function-call translation, provider usage evidence, and provider-side
-  parallel Tool calls disabled so Runtime retains scheduling authority;
+  function-call translation, provider usage evidence, ordered multi-call
+  proposals, and Harness-owned effect-safe Tool scheduling;
+- an additive configured JSON-command Model that reuses the bounded
+  language-neutral `ModelRequest`/`ModelOutput` contract, explicit Process
+  Broker authority, exact environment mapping, cancellation, route selection,
+  and External provenance without fabricating provider metadata or streaming;
 - opt-in exact NDJSON model-gateway streaming with incremental linear decoding,
   bounded frames/deltas/total bytes, exactly one mandatory final typed response,
   and no behavior change for requests without a provisional-event sink;
 - one registry path for built-in and extension tools;
+- a frozen fail-safe Tool batch declaration, whole-batch authorization,
+  maximal explicitly safe concurrent runs with a 1–64 Runtime ceiling,
+  sequential fences, and source-ordered durable result settlement;
 - one panic-isolated metadata capture boundary for Model, Tool, Memory, Token
   Counter, Conversation Compactor, Secret, Verifier, Grader, Process Broker,
   and Workspace Provider extensions, with validated snapshots;
@@ -132,8 +139,18 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-6 writer, and no mutation of authoritative history or
+  current schema-11 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
+- optional 1–64-block per-Turn reference Context with pre-State count/byte/
+  identity validation, fixed non-authoritative labeling, provider-specific
+  recounting, source/body SHA-256, authenticated caller attribution, and
+  schema-11 content-free evidence; callers cannot forge Skill, Memory, or
+  conversation-summary provenance;
+- a format-1, read-only Thread-handoff request compiler that finds the longest
+  identical Turn prefix, selects a whole-Turn source delta within explicit
+  count/byte bounds, binds it to both Thread identities and a canonical digest,
+  and delegates candidate synthesis to any host-selected summarizer before
+  re-entering the governed per-Turn Context path;
 - transport-independent prompt, Context block/aggregate, Tool output, Model
   request, error, and Agent Loop hard bounds;
 - one allocation-time JSON authority shared by Approval, Context, Evaluation,
@@ -142,23 +159,70 @@ direction:
   and materializing serializers stop at each subsystem's byte ceiling rather
   than checking a complete temporary buffer afterward;
 - distinct model context blocks and journaled memory-context observations;
-- an explicit ordered route of 1–16 registered Models that retries only
-  ordinary pre-output failures, applies a configurable per-attempt deadline
+- an explicit ordered route of 1–16 registered Models that falls through only
+  on ordinary pre-output failures, applies a configurable per-attempt deadline
   (30 seconds by default for multi-model routes), cancels before provider
   release, records every attempt in Observability, writes the settled Model
   identity/origin to State, and never crosses cancellation, the Turn deadline,
   or successfully delivered provisional output;
+- an optional process-local attempt-timeout cooldown that reorders only
+  Runtime-proven timed-out Models behind ready Route candidates, retains them
+  as last-resort fallbacks, preserves Provider Continuation affinity, and emits
+  explicit content-free skipped observations without inferring health from
+  ordinary Provider strings;
+- a bounded typed Model Provider failure contract that keeps Harness-owned and
+  legacy errors on `Model(String)`, preserves only proved remote facts in
+  `ModelProviderFailure`, and exposes content-free class/status/retry evidence
+  independently from failover, cooldown, and durable State policy;
+- an explicit default-disabled same-Model retry policy that accepts only typed
+  rate-limit, overload, server, and transport failures, shares one candidate
+  attempt deadline, honors only in-bound Provider delays, otherwise applies
+  bounded equal-jitter exponential backoff, remains cancellable, stops after
+  provisional output, and records every invoked retry index without replaying
+  a Turn or Tool effect;
+- a strict service-configured Model catalog whose operator-owned IDs are stable
+  aliases, whose credential references remain per Model, and whose explicit
+  route is validated before Provider construction without adding a second
+  router or implicit fallback;
 - a bounded, non-executable Provider Continuation contract that Runtime binds
   to the settled Model identity/origin, persists before the corresponding
   decision, filters per model attempt, and uses to suppress unsafe failover
   inside an unfinished Tool chain;
+- schema-7 atomic ordered 2–64-call Model decisions with exact batch
+  identity/position evidence, whole-batch validation and authorization before
+  effects, bounded explicitly safe execution with sequential fences and
+  source-order settlement, steering-safe synthetic results, and restart-safe
+  pre-effect approval continuation;
+- schema-8 explicit, clearable Thread names with bounded canonical input,
+  journal authority, same-transaction recent-list projection, and startup
+  drift validation;
+- schema-9 atomic terminal-boundary Thread forks with caller-owned retry
+  identity, immutable direct lineage, exact parent-prefix SHA-256, preserved
+  historical evidence identity, omitted recovery-only Checkpoints, and no
+  replay of Tool or approval effects;
+- schema-10 bounded portable Thread archives with an exact source-journal
+  digest, terminal export boundary, caller-owned import retry identity,
+  atomic target materialization, fresh Event identities, durable source
+  provenance, and no replay of Tool or approval effects;
+- schema-11 attributed invocation Context with ephemeral bodies, ordered
+  source/reference provenance, independent byte/token bounds, and no mutation
+  of conversation or branch authority;
+- content-free bounded Thread summaries that project the same direct lineage
+  for Protocol clients without loading full histories or creating a second
+  branch authority;
 - a persistent stdio MCP transport behind a provider-neutral client port, with
   a mandatory default-deny launch authority, explicit bounded unrestricted
   opt-in, reusable macOS Seatbelt write/network isolation, an exact absolute
   working directory, cleared child environments, discarded child stderr, Unix
   process-group settlement, bounded raw frames, finite tool
   pagination/catalog/results, bounded lifecycle/call timeouts, sanitized
-  failures, and reconnect-after-failure behavior;
+  failures, reconnect-after-failure behavior, explicit enablement, and optional
+  startup SHA-256 command-file drift detection;
+- an optional authenticated HTTPS MCP transport for the stateless
+  JSON-response subset, with exact credential-free URLs, per-request Secret
+  resolution, exclusive-CA support, no redirects/proxies/retries, bounded
+  JSON bodies and session IDs, and explicit rejection of SSE or
+  expired-session request replay;
 - atomic namespaced MCP catalog registration into the ordinary Tool registry,
   preserving external origin and all Policy/approval/State boundaries;
 - a first-party Agent Memory Hub adapter for search, bounded read, governed
@@ -175,6 +239,11 @@ direction:
 - optional exact-identity/digest-pinned public HTTPS Skill acquisition with
   TLS/no-redirect/no-proxy/no-retry policy, bounded streaming reads, aggregate
   package limits, and verify-before-register ordering;
+- a project lifecycle for signed External Skills that configures exact
+  publisher/log roots, validity/transparency/revocation policy, verifies before
+  create-new storage, preserves the complete signed envelope and External
+  origin, keeps activation separate, rechecks trust at startup and governed
+  Context use, and leaves revoked packages recoverably removable;
 - Context Engine loading of resolved Skill instructions in dependency order;
 - an Evaluation target/runner with two-level bounded concurrency, engine-owned
   case deadlines and cancellation, grader timeouts, panic isolation,
@@ -209,15 +278,19 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v12 negotiation with protocol-v2's asymmetric 2 MiB request/16 MiB
+- protocol-v18 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
   explicit Token Counter and Conversation Compactor API coordinate; protocol
-  12 retains protocol 11's bounded Task record/claim pages, server-clock
+  18 adds bounded per-Turn Context and schema-11 attribution, protocol 17
+  admits schema-10 Thread import provenance, protocol 16 adds direct lineage
+  to bounded content-free Thread summaries, while
+  protocol 15 retains protocol 14's bounded Task record/claim pages, server-clock
   leases, principal-derived worker ownership, exact fencing, conflict-only CAS
-  retries, and schema-5 Provider Continuation evidence while adding exact-ID,
-  actor-attributed schema-6 safe-boundary Turn steering and provisional-step
-  invalidation;
+  retries, schema-5 Provider Continuation evidence, exact-ID actor-attributed
+  schema-6 safe-boundary Turn steering, provisional-step invalidation, and
+  schema-7 atomic ordered Tool-call batches, schema-8 Engine-owned Thread
+  names, and schema-9 atomic Thread forks;
 - initialization-time compatibility coordinates for engine, State event,
   snapshot, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
   Conversation Compactor API, Secret API, Skill API, model-gateway API, and
@@ -235,12 +308,14 @@ direction:
   default;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service commands, explicitly launched
-  shell-free JSON Tools, exact-selected MCP Tools, explicitly activated
-  digest-verified project Skills, and Agent Memory Hub Context assembly;
+  shell-free JSON Models and Tools, exact-selected MCP Tools, explicitly
+  activated digest-verified project Skills, and Agent Memory Hub Context
+  assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v12, with authoritative Thread projection, bounded provisional streaming,
-  cancellation, event paging, and read-only Approval/Task inspection;
+  v18, with bounded recent-Thread navigation, authoritative Thread projection,
+  bounded provisional streaming, cancellation, event paging, and read-only
+  Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
   adapters for Tools and Models with the Runtime's exact Turn cancellation
@@ -301,6 +376,10 @@ loaded in full.
 Operations are not a second persistence layer. After service restart, clients
 reconcile Thread events; recovery marks unfinished Turns `interrupted` and never
 replays uncertain side effects.
+Stores may additionally expose a content-free recent-Thread index through an
+exclusive descending sequence cursor. Protocol advertises `thread.list` only
+when the configured store implements that bounded capability; clients still
+load one exact authoritative Thread before use.
 
 ## State, context, and memory boundary
 
