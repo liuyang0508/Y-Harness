@@ -444,7 +444,50 @@ SHA-256 与计量。`yh doctor` 会显示会话窗口和当前 compactor。进�
 Tokenizer；需要精确计数时由 Rust 宿主注册原生实现。详见
 [ADR 0105](adr/0105-configured-brokered-conversation-compaction.md)。
 
-## 10. 接入自有模型 Gateway
+## 10. 配置完成条件 Verifier
+
+`verifiers` 可按名称注册多个独立完成条件，不需要修改 Rust。复制模板：
+
+```bash
+cp /path/to/Y-Harness/config/y-harness.verifier.example.json y-harness.json
+export VERIFIER_API_KEY='replace-if-needed'
+yh doctor y-harness.json
+```
+
+每个程序会从 stdin 收到不含取消令牌的不可变候选快照：
+
+```json
+{
+  "thread_id": "thread-id",
+  "turn_id": "turn-id",
+  "items": [],
+  "candidate": "assistant candidate"
+}
+```
+
+通过时 stdout 返回：
+
+```json
+{"status":"passed","summary":"completion conditions satisfied"}
+```
+
+不通过时返回：
+
+```json
+{"status":"failed","reason":"missing required evidence","retryable":true}
+```
+
+`retryable: true` 会让 Agent Loop 进入下一次 Model 修正步骤；
+`false` 会明确令 Turn 失败。Runtime 会重新校验 outcome 文本和大小，
+按稳定名称顺序执行所有 Verifiers，并把每个结果写入 State。Verifier
+不能自行提交 Turn，也不能绕过 Tool Policy、Approval 或 State。
+
+完整 stdin 上限为 1 MiB，嵌套 Tool JSON 在启动进程前检查；stdout、
+stderr、并发和时间也独立有界。Turn 的精确取消令牌不交给外部程序，
+而是由 Runtime 单独传给 Process Broker。`unrestricted` 仍不是沙箱。
+详见 [ADR 0106](adr/0106-configured-brokered-verification.md)。
+
+## 11. 接入自有模型 Gateway
 
 复制生产配置模板：
 
@@ -497,7 +540,7 @@ attempt deadline 明确判定的超时；普通 Provider 字符串错误不会�
 冷却值和重试边界。修改目录或 Route 后需要受控重启服务；当前没有
 热加载、自动发现、通用错误熔断或按价格/负载猜测路由。
 
-## 11. 作为 Rust 引擎嵌入
+## 12. 作为 Rust 引擎嵌入
 
 最小 Agent Loop：
 
@@ -515,7 +558,7 @@ cargo run --locked --example orchestrated
 [`examples/embedded.rs`](../examples/embedded.rs) 和
 [`examples/orchestrated.rs`](../examples/orchestrated.rs)。
 
-## 12. 安全与产品边界
+## 13. 安全与产品边界
 
 - `serve` 是持久化 stdio 服务，适合由进程主管或受信宿主启动。
 - 网络暴露必须使用现有 mandatory-mTLS host，不能把裸 JSONL socket

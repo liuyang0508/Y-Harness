@@ -40,7 +40,7 @@ use crate::{
     ConversationCompactionTurn, ConversationCompactor, ConversationCompactorDescriptor,
     ExecutionPhase, HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest,
     ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
-    TurnId,
+    TurnId, VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
 };
 
@@ -927,6 +927,147 @@ impl ConversationCompactor for JsonCommandConversationCompactor {
     }
 }
 
+/// Cancellation-free JSON envelope delivered to an external completion verifier.
+///
+/// Cancellation stays under Runtime authority and is propagated separately to
+/// the selected [`ProcessBroker`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonVerificationRequest {
+    /// Owning Thread.
+    pub thread_id: ThreadId,
+    /// Active Turn.
+    pub turn_id: TurnId,
+    /// Ordered Runtime history including the assistant candidate.
+    pub items: Vec<crate::Item>,
+    /// Candidate text being considered for Turn completion.
+    pub candidate: String,
+}
+
+/// Strict JSON settlement returned by an external completion verifier.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JsonVerificationOutcome {
+    /// The candidate satisfies the completion condition.
+    Passed {
+        /// Optional bounded audit explanation.
+        summary: Option<String>,
+    },
+    /// The candidate violates the completion condition.
+    Failed {
+        /// Bounded actionable explanation.
+        reason: String,
+        /// Whether another Agent Loop step may correct the candidate.
+        retryable: bool,
+    },
+}
+
+impl From<JsonVerificationOutcome> for VerificationOutcome {
+    fn from(outcome: JsonVerificationOutcome) -> Self {
+        match outcome {
+            JsonVerificationOutcome::Passed { summary } => Self::Passed { summary },
+            JsonVerificationOutcome::Failed { reason, retryable } => {
+                Self::Failed { reason, retryable }
+            }
+        }
+    }
+}
+
+/// Completion verifier backed by one shell-free JSON command.
+pub struct JsonCommandVerifier {
+    descriptor: VerifierDescriptor,
+    config: JsonProcessConfig,
+    broker: Arc<dyn ProcessBroker>,
+    broker_descriptor: ProcessBrokerDescriptor,
+}
+
+impl JsonCommandVerifier {
+    /// Creates an external verifier after validating metadata and process configuration.
+    pub fn new(
+        descriptor: VerifierDescriptor,
+        config: JsonProcessConfig,
+        broker: Arc<dyn ProcessBroker>,
+    ) -> Result<Self, HarnessError> {
+        descriptor.validate()?;
+        config.validate()?;
+        let broker_descriptor =
+            capture_capability_metadata("process broker descriptor", || broker.descriptor())?;
+        validate_broker_descriptor(&broker_descriptor)?;
+        Ok(Self {
+            descriptor,
+            config,
+            broker,
+            broker_descriptor,
+        })
+    }
+
+    /// Returns the broker isolation visible to the embedding host.
+    #[must_use]
+    pub fn broker_descriptor(&self) -> ProcessBrokerDescriptor {
+        self.broker_descriptor.clone()
+    }
+}
+
+impl Verifier for JsonCommandVerifier {
+    fn descriptor(&self) -> VerifierDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn verify<'a>(
+        &'a self,
+        request: VerificationRequest,
+    ) -> HarnessFuture<'a, VerificationOutcome> {
+        Box::pin(async move {
+            validate_items_json_shapes(
+                &request.items,
+                "verifier input",
+                HarnessError::Verification,
+            )?;
+            let VerificationRequest {
+                thread_id,
+                turn_id,
+                items,
+                candidate,
+                cancellation,
+            } = request;
+            let request = JsonVerificationRequest {
+                thread_id,
+                turn_id,
+                items,
+                candidate,
+            };
+            let stdin =
+                crate::json::to_bounded_json_vec(&request, MAX_STDIN_BYTES).map_err(|error| {
+                    match error {
+                        crate::json::BoundedJsonError::LimitExceeded => HarnessError::Verification(
+                            format!("verifier request exceeds {MAX_STDIN_BYTES} bytes"),
+                        ),
+                        crate::json::BoundedJsonError::CannotEncode => {
+                            HarnessError::Verification("cannot encode verifier request".to_owned())
+                        }
+                    }
+                })?;
+            let output = self
+                .broker
+                .execute(
+                    self.config.request(stdin, ExecutionPhase::Verification),
+                    cancellation,
+                )
+                .await
+                .map_err(map_verifier_execution_error)?;
+            validate_process_success(&output, "verifier command")
+                .map_err(HarnessError::Verification)?;
+            let outcome: JsonVerificationOutcome =
+                serde_json::from_slice(&output.stdout).map_err(|error| {
+                    HarnessError::Verification(format!(
+                        "invalid verifier command JSON output: {error}"
+                    ))
+                })?;
+            Ok(outcome.into())
+        })
+    }
+}
+
 fn validate_broker_descriptor(descriptor: &ProcessBrokerDescriptor) -> Result<(), HarnessError> {
     validate_capability_name("process broker", &descriptor.name)?;
     if let ProcessIsolation::Sandboxed { mechanism } = &descriptor.isolation {
@@ -1047,24 +1188,43 @@ fn map_compactor_execution_error(error: HarnessError) -> HarnessError {
     }
 }
 
+fn map_verifier_execution_error(error: HarnessError) -> HarnessError {
+    match error {
+        HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
+        _ => HarnessError::Verification("verifier command failed".to_owned()),
+    }
+}
+
 fn validate_compaction_json_shapes(
     request: &ConversationCompactionRequest,
 ) -> Result<(), HarnessError> {
     for turn in &request.turns {
-        for item in &turn.items {
-            let value = match &item.kind {
-                crate::ItemKind::ToolCall { input, .. } => Some(input),
-                crate::ItemKind::ToolResult { output, .. } => Some(output),
-                _ => None,
-            };
-            if let Some(value) = value {
-                crate::json::validate_value_shape(value).map_err(|_| {
-                    HarnessError::Execution(
-                        "conversation compactor input exceeds the supported JSON depth or node count"
-                            .to_owned(),
-                    )
-                })?;
-            }
+        validate_items_json_shapes(
+            &turn.items,
+            "conversation compactor input",
+            HarnessError::Execution,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_items_json_shapes(
+    items: &[crate::Item],
+    kind: &str,
+    error: fn(String) -> HarnessError,
+) -> Result<(), HarnessError> {
+    for item in items {
+        let value = match &item.kind {
+            crate::ItemKind::ToolCall { input, .. } => Some(input),
+            crate::ItemKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        };
+        if let Some(value) = value {
+            crate::json::validate_value_shape(value).map_err(|_| {
+                error(format!(
+                    "{kind} exceeds the supported JSON depth or node count"
+                ))
+            })?;
         }
     }
     Ok(())
@@ -1241,8 +1401,9 @@ mod tests {
 
     use super::{
         DenyProcessBroker, JsonCommandConversationCompactor, JsonCommandModel, JsonCommandTool,
-        JsonConversationCompactionRequest, JsonProcessConfig, LocalProcessBroker, ProcessBroker,
-        ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput, ProcessRequest,
+        JsonCommandVerifier, JsonConversationCompactionRequest, JsonProcessConfig,
+        JsonVerificationRequest, LocalProcessBroker, ProcessBroker, ProcessBrokerDescriptor,
+        ProcessIsolation, ProcessOutput, ProcessRequest,
     };
     #[cfg(target_os = "macos")]
     use super::{MacOsSeatbeltBroker, NetworkAccess};
@@ -1251,7 +1412,8 @@ mod tests {
         ConversationCompactionRequest, ConversationCompactionTurn, ConversationCompactor,
         ConversationCompactorDescriptor, ExecutionPhase, HarnessError, HarnessFuture, Item,
         ItemKind, LanguageModel, ModelRequest, ModelStream, ThreadId, Tool, ToolBatchExecution,
-        ToolContext, ToolDescriptor, TurnId,
+        ToolContext, ToolDescriptor, TurnId, VerificationOutcome, VerificationRequest, Verifier,
+        VerifierDescriptor,
     };
 
     struct RecordingBroker {
@@ -1372,7 +1534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_model_and_tool_use_phase_specific_broker_requests() {
+    async fn json_command_adapters_use_phase_specific_broker_requests() {
         let model_broker = Arc::new(RecordingBroker {
             output: output(br#"{"type":"message","content":"ok"}"#),
             phases: Mutex::new(Vec::new()),
@@ -1489,6 +1651,52 @@ mod tests {
         assert_eq!(request.current_prompt, "current question");
         assert_eq!(request.output_budget_tokens, 128);
         assert_eq!(request.output_budget_bytes, 1_024);
+
+        let verifier_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"status":"passed","summary":"verified"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let verifier = JsonCommandVerifier::new(
+            VerifierDescriptor {
+                name: "fixture.verifier".to_owned(),
+                description: "Fixture completion verifier".to_owned(),
+            },
+            config(),
+            verifier_broker.clone(),
+        )
+        .expect("verifier adapter");
+        let outcome = verifier
+            .verify(VerificationRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: vec![Item::new(ItemKind::AssistantMessage {
+                    model_id: Some("fixture/model".to_owned()),
+                    model_origin: Some(CapabilityOrigin::BuiltIn),
+                    content: "candidate".to_owned(),
+                })],
+                candidate: "candidate".to_owned(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("verifier outcome");
+        assert_eq!(
+            outcome,
+            VerificationOutcome::Passed {
+                summary: Some("verified".to_owned())
+            }
+        );
+        assert_eq!(
+            *verifier_broker.phases.lock().expect("verifier phases"),
+            [ExecutionPhase::Verification]
+        );
+        let request: JsonVerificationRequest =
+            serde_json::from_slice(&verifier_broker.inputs.lock().expect("verifier inputs")[0])
+                .expect("verifier request");
+        assert_eq!(request.thread_id, ThreadId::from_static("thread-test"));
+        assert_eq!(request.turn_id, TurnId::from_static("turn-test"));
+        assert_eq!(request.candidate, "candidate");
+        assert_eq!(request.items.len(), 1);
     }
 
     #[tokio::test]
@@ -1568,6 +1776,43 @@ mod tests {
                 .phases
                 .lock()
                 .expect("compactor phases")
+                .is_empty()
+        );
+
+        let verifier_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"status":"passed","summary":null}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let verifier = JsonCommandVerifier::new(
+            VerifierDescriptor {
+                name: "fixture.verifier".to_owned(),
+                description: "Fixture completion verifier".to_owned(),
+            },
+            config(),
+            verifier_broker.clone(),
+        )
+        .expect("verifier adapter");
+        let error = verifier
+            .verify(VerificationRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: vec![Item::new(ItemKind::ToolResult {
+                    call_id: "call-test".to_owned(),
+                    output: nested.clone(),
+                    is_error: false,
+                })],
+                candidate: "candidate".to_owned(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("deep verifier input");
+        assert!(matches!(error, HarnessError::Verification(_)));
+        assert!(
+            verifier_broker
+                .phases
+                .lock()
+                .expect("verifier phases")
                 .is_empty()
         );
 
@@ -1759,6 +2004,82 @@ mod tests {
             HarnessError::Cancelled {
                 phase: ExecutionPhase::Context
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn json_verifier_propagates_runtime_cancellation_to_its_broker() {
+        let entered = Arc::new(Notify::new());
+        let verifier = JsonCommandVerifier::new(
+            VerifierDescriptor {
+                name: "fixture.cancellable-verifier".to_owned(),
+                description: "Cancellable fixture verifier".to_owned(),
+            },
+            config(),
+            Arc::new(CancellationBroker {
+                entered: entered.clone(),
+            }),
+        )
+        .expect("verifier adapter");
+        let cancellation = CancellationToken::new();
+        let cancelling = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                entered.notified().await;
+                cancellation.cancel();
+            }
+        });
+        let error = verifier
+            .verify(VerificationRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: Vec::new(),
+                candidate: "candidate".to_owned(),
+                cancellation,
+            })
+            .await
+            .expect_err("cancelled verifier");
+        cancelling.await.expect("canceller");
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Verification
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn json_verifier_rejects_unknown_response_fields() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(
+                br#"{"status":"passed","summary":"verified","authority":"complete turn"}"#,
+            ),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let verifier = JsonCommandVerifier::new(
+            VerifierDescriptor {
+                name: "fixture.verifier".to_owned(),
+                description: "Fixture completion verifier".to_owned(),
+            },
+            config(),
+            broker,
+        )
+        .expect("verifier adapter");
+        let error = verifier
+            .verify(VerificationRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: Vec::new(),
+                candidate: "candidate".to_owned(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("unknown response field");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid verifier command JSON output")
         );
     }
 

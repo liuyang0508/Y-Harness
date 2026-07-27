@@ -75,6 +75,14 @@ strict `conversation` object and its brokered JSON-command compactor are also
 additive service-schema-1 configuration; no State, Protocol, or Model Gateway
 shape changes. See
 [ADR 0105](adr/0105-configured-brokered-conversation-compaction.md).
+The optional `verifiers` list is another additive service-schema-1 field and
+reuses the existing `VerificationResult` State/Protocol shape. The public
+pre-1.0 `VerificationRequest` now carries the exact in-process
+`CancellationToken`; external implementations that construct or destructure
+that struct must add the field, and its previous `PartialEq` implementation was
+removed because comparing requests while ignoring cancellation identity would
+be misleading. The JSON-command wire uses a separate cancellation-free type.
+See [ADR 0106](adr/0106-configured-brokered-verification.md).
 The defaulted `max_parallel_tool_calls` field is bounded to 1–64, and JSON
 Tools may explicitly opt into `parallel_safe`; absent declarations remain
 sequential.

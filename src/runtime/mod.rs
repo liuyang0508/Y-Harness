@@ -892,6 +892,7 @@ impl HarnessRuntime {
                         turn_id: turn.id.clone(),
                         items: turn.items.clone(),
                         candidate: content.clone(),
+                        cancellation: options.cancellation.clone(),
                     };
                     let mut retry_candidate = false;
                     for registered in self.verification.registered() {

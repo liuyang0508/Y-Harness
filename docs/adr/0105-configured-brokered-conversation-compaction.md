@@ -94,7 +94,7 @@ different compactor under the larger core contract.
 
 ## Evidence
 
-- `execution::tests::json_model_and_tool_use_phase_specific_broker_requests`
+- `execution::tests::json_command_adapters_use_phase_specific_broker_requests`
 - `execution::tests::json_compactor_propagates_runtime_cancellation_to_its_broker`
 - `execution::tests::json_compactor_rejects_oversized_input_before_broker_execution`
 - `execution::tests::json_compactor_rejects_unknown_response_fields`

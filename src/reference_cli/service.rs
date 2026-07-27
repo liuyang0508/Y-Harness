@@ -20,17 +20,17 @@ use y_harness::{
     ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
     ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, HarnessRuntime,
     InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
-    JsonCommandModel, JsonCommandTool, JsonProcessConfig, LanguageModel, LocalProcessBroker,
-    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
-    MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
-    ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION, ProcessBroker,
-    ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
-    SignedSkillPackage, SkillEngine, SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry,
-    SkillTransparencyRequirement, SkillTrustStore, SqliteApprovalInbox, SqliteEventStore,
-    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
-    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor,
-    ToolRegistry, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
-    serve_stdio,
+    JsonCommandModel, JsonCommandTool, JsonCommandVerifier, JsonProcessConfig, LanguageModel,
+    LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker,
+    McpClient, MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
+    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
+    ProcessBroker, ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
+    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
+    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
+    SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine, StdioMcpClient,
+    StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
+    ToolBatchExecution, ToolDescriptor, ToolRegistry, VerificationRegistry, VerifierDescriptor,
+    decode_thread_archive, encode_thread_archive, register_selected_mcp_tools, serve_stdio,
 };
 
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
@@ -74,6 +74,8 @@ struct ServiceConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ServiceToolConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    verifiers: Vec<ServiceVerifierConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<ServiceMcpServerConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     https_mcp_servers: Vec<ServiceHttpsMcpServerConfig>,
@@ -97,6 +99,7 @@ impl Default for ServiceConfig {
             models: Vec::new(),
             model_route: None,
             tools: Vec::new(),
+            verifiers: Vec::new(),
             mcp_servers: Vec::new(),
             https_mcp_servers: Vec::new(),
             memory: None,
@@ -193,6 +196,14 @@ enum ServiceToolConfig {
         batch_execution: ToolBatchExecution,
         process: ServiceJsonProcessConfig,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceVerifierConfig {
+    name: String,
+    description: String,
+    process: ServiceJsonProcessConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -401,6 +412,7 @@ struct ConfiguredCapabilities {
     tools: ToolRegistry,
     policy: AllowListPolicy,
     context: ContextEngine,
+    verification: VerificationRegistry,
     mcp_clients: BTreeMap<String, ConfiguredMcpClient>,
     mcp_configured: usize,
     mcp_locked: usize,
@@ -737,6 +749,10 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         loaded.config.max_parallel_tool_calls
     );
     println!(
+        "verifiers: {}",
+        capabilities.verification.descriptors().len()
+    );
+    println!(
         "mcp servers: {} enabled / {} configured",
         capabilities.mcp_clients.len(),
         capabilities.mcp_configured
@@ -850,6 +866,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         tools,
         policy,
         context,
+        verification,
         mcp_clients,
         mcp_configured: _,
         mcp_locked: _,
@@ -894,6 +911,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let runtime = Arc::new(
         runtime
             .with_context_engine(context)
+            .with_verification(verification)
             .with_approval_handler(approval_handler),
     );
     let approval_port: Arc<dyn ApprovalInbox> = approvals;
@@ -911,6 +929,17 @@ async fn build_capabilities(
     loaded: &LoadedConfig,
     demo_tools: bool,
 ) -> CliResult<ConfiguredCapabilities> {
+    let mut verifier_names = BTreeSet::new();
+    for configured in &loaded.config.verifiers {
+        let descriptor = VerifierDescriptor {
+            name: configured.name.clone(),
+            description: configured.description.clone(),
+        };
+        descriptor.validate()?;
+        if !verifier_names.insert(&configured.name) {
+            return Err(format!("duplicate verifier {}", configured.name).into());
+        }
+    }
     let mut clients = BTreeMap::new();
     let mut configured_ids = BTreeSet::new();
     for configured in &loaded.config.mcp_servers {
@@ -1019,6 +1048,27 @@ async fn build_capabilities(
                 policy = policy.allow(name);
             }
         }
+    }
+    let mut verification = VerificationRegistry::new();
+    for configured in &loaded.config.verifiers {
+        let (process, broker) = build_json_process(
+            loaded,
+            &configured.process,
+            &format!("JSON verifier {}", configured.name),
+        )?;
+        verification.register(
+            CapabilityOrigin::External {
+                id: format!("json-command-verifier/{}", configured.name),
+            },
+            Arc::new(JsonCommandVerifier::new(
+                VerifierDescriptor {
+                    name: configured.name.clone(),
+                    description: configured.description.clone(),
+                },
+                process,
+                broker,
+            )?),
+        )?;
     }
     let mcp_exposures = enabled_servers
         .iter()
@@ -1177,6 +1227,7 @@ async fn build_capabilities(
         tools,
         policy,
         context,
+        verification,
         mcp_clients: clients,
         mcp_configured: loaded
             .config
@@ -2304,9 +2355,10 @@ const fn default_tool_max_output_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoadedConfig, ServiceConfig, ServiceJsonProcessConfig, ServiceProcessLaunchConfig,
-        ServiceToolConfig, ToolBatchExecution, build_capabilities, build_models,
-        configured_skill_trust, load_config, resolve_data_directory, verify_file_sha256,
+        CapabilityOrigin, LoadedConfig, ServiceConfig, ServiceJsonProcessConfig,
+        ServiceProcessLaunchConfig, ServiceToolConfig, ServiceVerifierConfig, ToolBatchExecution,
+        build_capabilities, build_models, configured_skill_trust, load_config,
+        resolve_data_directory, verify_file_sha256,
     };
     use std::{
         fs,
@@ -2492,6 +2544,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configured_json_verifier_retains_external_registry_origin() {
+        let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical project");
+        let config = ServiceConfig {
+            verifiers: vec![ServiceVerifierConfig {
+                name: "project.completion-gate".to_owned(),
+                description: "Fixture completion gate".to_owned(),
+                process: ServiceJsonProcessConfig {
+                    command: std::env::current_exe()
+                        .expect("current executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    args: Vec::new(),
+                    current_directory: ".".to_owned(),
+                    environment_from_host: std::collections::BTreeMap::new(),
+                    timeout_ms: 1_000,
+                    max_output_bytes: 1_024,
+                    launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },
+                },
+            }],
+            ..ServiceConfig::default()
+        };
+        let loaded = LoadedConfig {
+            config,
+            path: root.join("y-harness.json"),
+            data_directory: root.join(".y-harness"),
+            root,
+        };
+
+        let capabilities = build_capabilities(&loaded, false)
+            .await
+            .expect("configured Verifier");
+        assert_eq!(
+            capabilities
+                .verification
+                .get("project.completion-gate")
+                .map(|registered| &registered.origin),
+            Some(&CapabilityOrigin::External {
+                id: "json-command-verifier/project.completion-gate".to_owned()
+            })
+        );
+    }
+
     #[test]
     fn shipped_real_provider_configs_follow_the_strict_schema() {
         serde_json::from_str::<ServiceConfig>(include_str!(
@@ -2526,6 +2622,10 @@ mod tests {
             "../../config/y-harness.command-compactor.example.json"
         ))
         .expect("JSON command conversation compactor example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.verifier.example.json"
+        ))
+        .expect("JSON command Verifier example config");
     }
 
     #[tokio::test]

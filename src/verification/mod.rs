@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityOrigin, HarnessError, HarnessFuture, Item, ThreadId, TurnId, VerificationOutcome,
+    CancellationToken, CapabilityOrigin, HarnessError, HarnessFuture, Item, ThreadId, TurnId,
+    VerificationOutcome,
     kernel::{
         capture_capability_metadata, validate_capability_name, validate_capability_origin,
         validate_registry_growth,
@@ -16,7 +17,7 @@ const MAX_OUTCOME_MESSAGE_BYTES: usize = 4_096;
 const MAX_VERIFIER_DESCRIPTION_BYTES: usize = 4_096;
 
 /// Immutable candidate snapshot supplied to every verifier in one pass.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VerificationRequest {
     /// Owning thread.
     pub thread_id: ThreadId,
@@ -26,6 +27,8 @@ pub struct VerificationRequest {
     pub items: Vec<Item>,
     /// Candidate text being considered for Turn completion.
     pub candidate: String,
+    /// Cooperative Turn cancellation signal.
+    pub cancellation: CancellationToken,
 }
 
 /// Stable model-visible metadata for a completion verifier.
@@ -35,6 +38,13 @@ pub struct VerifierDescriptor {
     pub name: String,
     /// Human-readable completion condition.
     pub description: String,
+}
+
+impl VerifierDescriptor {
+    /// Validates stable identity and human-readable metadata.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_descriptor(self)
+    }
 }
 
 /// Completion-condition capability invoked before a Turn may complete.
@@ -79,15 +89,7 @@ impl VerificationRegistry {
         validate_registry_growth("verifier", self.verifiers.len(), 1)?;
         let descriptor =
             capture_capability_metadata("verifier descriptor", || verifier.descriptor())?;
-        validate_capability_name("verifier", &descriptor.name)?;
-        if descriptor.description.trim().is_empty()
-            || descriptor.description.len() > MAX_VERIFIER_DESCRIPTION_BYTES
-        {
-            return Err(HarnessError::InvalidCapability(format!(
-                "verifier {} description must be 1-{MAX_VERIFIER_DESCRIPTION_BYTES} bytes",
-                descriptor.name,
-            )));
-        }
+        validate_descriptor(&descriptor)?;
         if self.verifiers.contains_key(&descriptor.name) {
             return Err(HarnessError::DuplicateCapability(descriptor.name));
         }
@@ -120,6 +122,20 @@ impl VerificationRegistry {
     pub(crate) fn registered(&self) -> impl Iterator<Item = &RegisteredVerifier> {
         self.verifiers.values()
     }
+}
+
+fn validate_descriptor(descriptor: &VerifierDescriptor) -> Result<(), HarnessError> {
+    validate_capability_name("verifier", &descriptor.name)?;
+    if descriptor.description.trim().is_empty()
+        || descriptor.description.len() > MAX_VERIFIER_DESCRIPTION_BYTES
+        || descriptor.description.chars().any(char::is_control)
+    {
+        return Err(HarnessError::InvalidCapability(format!(
+            "verifier {} description must be 1-{MAX_VERIFIER_DESCRIPTION_BYTES} non-control bytes",
+            descriptor.name,
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_outcome(

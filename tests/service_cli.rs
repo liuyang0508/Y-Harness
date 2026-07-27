@@ -70,6 +70,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("protocol: 18"));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
+    assert!(report.contains("verifiers: 0"));
     assert!(report.contains("mcp servers: 0 enabled / 0 configured"));
     assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
     assert!(report.contains("skills: 0"));
@@ -802,6 +803,49 @@ fn invalid_json_command_compactor_is_rejected_before_environment_access() {
     fs::remove_dir_all(project).expect("remove invalid JSON command compactor project");
 }
 
+#[test]
+fn invalid_json_command_verifier_is_rejected_before_environment_access() {
+    let project = isolated_project("invalid-json-command-verifier");
+    fs::create_dir_all(&project).expect("create invalid JSON command verifier project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "verifiers": [{
+                "name": "external.fixture-verifier",
+                "description": "Fixture completion verifier",
+                "process": {
+                    "command": env!("CARGO_BIN_EXE_yh"),
+                    "current_directory": ".",
+                    "environment_from_host": {
+                        "VERIFIER_API_KEY": "MISSING_VERIFIER_SECRET"
+                    },
+                    "timeout_ms": 0,
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }]
+        }))
+        .expect("encode invalid JSON command verifier config"),
+    )
+    .expect("write invalid JSON command verifier config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose invalid JSON command verifier");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 doctor error");
+    assert!(error.contains("process timeout must be"));
+    assert!(!error.contains("MISSING_VERIFIER_SECRET"));
+    fs::remove_dir_all(project).expect("remove invalid JSON command verifier project");
+}
+
 #[cfg(feature = "https-model")]
 #[test]
 fn doctor_accepts_the_checked_in_https_gateway_template() {
@@ -1188,6 +1232,145 @@ printf '%s' '{"summary":"configured semantic summary"}'
         )
     }));
     fs::remove_dir_all(project).expect("remove JSON command compactor project");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_json_command_verifier_gates_a_real_service_turn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = isolated_project("json-command-verifier");
+    fs::create_dir_all(&project).expect("create JSON command verifier project");
+    let adapter = project.join("completion-verifier");
+    fs::write(
+        &adapter,
+        br#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"status":"passed","summary":"configured verification passed"}'
+"#,
+    )
+    .expect("write completion verifier");
+    let mut permissions = fs::metadata(&adapter)
+        .expect("completion verifier metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&adapter, permissions).expect("make completion verifier executable");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "verifiers": [{
+                "name": "external.fixture-verifier",
+                "description": "Fixture completion verifier",
+                "process": {
+                    "command": adapter,
+                    "current_directory": ".",
+                    "timeout_ms": 5_000,
+                    "max_output_bytes": 4_096,
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }]
+        }))
+        .expect("encode JSON command verifier config"),
+    )
+    .expect("write JSON command verifier config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["doctor", "y-harness.json"])
+        .current_dir(&project)
+        .output()
+        .expect("diagnose JSON command verifier service");
+    assert!(
+        doctor.status.success(),
+        "JSON command verifier doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .expect("UTF-8 verifier doctor report")
+            .contains("verifiers: 1")
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn JSON command verifier service");
+    let mut input = child.stdin.take().expect("service stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("service stdout"));
+    let initialized = exchange(
+        &mut input,
+        &mut output,
+        request("initialize", ProtocolCommand::Initialize {}),
+    );
+    assert!(matches!(
+        initialized.body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    let created = exchange(
+        &mut input,
+        &mut output,
+        request("create-thread", ProtocolCommand::CreateThread {}),
+    );
+    let thread_id = match created.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ThreadCreated { thread },
+        } => thread.id,
+        other => panic!("unexpected create Thread response: {other:?}"),
+    };
+    run_turn_to_completion(
+        &mut input,
+        &mut output,
+        &thread_id,
+        "verify this candidate",
+        "verifier-turn",
+    );
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle service");
+    assert!(
+        settled.status.success(),
+        "JSON command verifier service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build verifier evidence Runtime");
+    let thread = runtime.block_on(async {
+        StateEngine::new(Arc::new(
+            SqliteEventStore::open(project.join(".y-harness/state.db"))
+                .await
+                .expect("open JSON command verifier State"),
+        ))
+        .load_thread(&thread_id)
+        .await
+        .expect("load JSON command verifier Thread")
+        .expect("persisted JSON command verifier Thread")
+    });
+    assert!(thread.turns[0].items.iter().any(|item| {
+        matches!(
+            &item.kind,
+            ItemKind::VerificationResult {
+                verifier,
+                outcome: y_harness::VerificationOutcome::Passed {
+                    summary: Some(summary)
+                }
+            } if verifier == "external.fixture-verifier"
+                && summary == "configured verification passed"
+        )
+    }));
+    fs::remove_dir_all(project).expect("remove JSON command verifier project");
 }
 
 #[test]

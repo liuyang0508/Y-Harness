@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "verifiers": [
+    {
+      "name": "project.completion-gate",
+      "description": "Checks whether an assistant candidate satisfies project completion conditions",
+      "process": {
+        "command": "/absolute/path/to/completion-verifier",
+        "args": [],
+        "current_directory": ".",
+        "environment_from_host": {
+          "VERIFIER_API_KEY": "VERIFIER_API_KEY"
+        },
+        "timeout_ms": 30000,
+        "max_output_bytes": 4096,
+        "launch": {
+          "type": "unrestricted",
+          "max_concurrency": 2
+        }
+      }
+    }
+  ]
+}

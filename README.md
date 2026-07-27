@@ -799,9 +799,9 @@ on completion, cancellation, timeout, or future drop. The broker truthfully
 reports itself as unrestricted because process groups do not remove filesystem,
 network, credential, or syscall authority and can be escaped with a new
 session/group. Windows still has direct-child-only cleanup. JSON command
-adapters make the same boundary usable
-for external Tools and Models; Tools still pass through normal Policy and
-evidence ordering. JSON Tools default to sequential execution; an operator may
+adapters make the same boundary usable for external Tools, Models,
+Conversation Compactors, and Verifiers; Tools still pass through normal Policy
+and evidence ordering. JSON Tools default to sequential execution; an operator may
 declare `batch_execution: "parallel_safe"` only when the Tool is semantically
 safe against every other eligible same-response call, while
 `max_parallel_tool_calls` bounds the Runtime to 1–64 concurrent calls.
@@ -834,6 +834,17 @@ failure fails the Turn rather than silently claiming complete history. See
 [the example configuration](config/y-harness.command-compactor.example.json)
 and
 [ADR 0105](docs/adr/0105-configured-brokered-conversation-compaction.md).
+
+Completion gates are independently configurable through `verifiers`. Each
+shell-free JSON command receives one immutable candidate snapshot on stdin and
+returns a strict `passed` or `failed` outcome. Retryable failures send the Agent
+Loop back to the Model; hard failures fail the Turn; every settlement is
+journaled through the existing `VerificationResult` shape. The exact Turn
+cancellation token stays in-process and reaches the selected Process Broker
+separately. Verifiers never gain Tool, Policy, State, or completion authority:
+the Runtime validates their bounded outcome and owns final settlement. See
+[the example configuration](config/y-harness.verifier.example.json) and
+[ADR 0106](docs/adr/0106-configured-brokered-verification.md).
 
 On macOS, the first concrete sandbox broker uses Seatbelt to deny network by
 default and restrict writes to canonical operator-approved roots. Reads remain

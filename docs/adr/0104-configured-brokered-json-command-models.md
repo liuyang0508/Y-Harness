@@ -79,7 +79,7 @@ must not reinterpret the current stdout shape.
 
 - `configured_json_command_model_runs_a_real_service_turn`
 - `invalid_json_command_model_is_rejected_before_environment_access`
-- `execution::tests::json_model_and_tool_use_phase_specific_broker_requests`
+- `execution::tests::json_command_adapters_use_phase_specific_broker_requests`
 - `execution::tests::json_model_propagates_runtime_cancellation_to_its_broker`
 - strict checked-in `y-harness.command-model.example.json`
 - zero-default and all-feature workspace gates
