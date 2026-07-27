@@ -830,14 +830,18 @@ cooperatively stop work instead of relying only on future-drop cleanup.
 The reference service exposes the existing Model adapter as
 `model.type = "json_command"` in either the compatible single-Model form or the
 explicit routed catalog. The executable receives one bounded `ModelRequest` on
-stdin and must return one validated `ModelOutput` on stdout. It is registered
-with External provenance and reuses the same explicit launch, environment,
-timeout, output, cancellation, and cleanup boundaries as JSON Tools. This lets
-an operator bridge a vendor in any language without changing Rust, but it does
-not pretend the command reports provider usage, cost, continuation, typed HTTP
-failure, or provisional streaming. See
+stdin. The backward-compatible `output_v1` default returns one validated
+`ModelOutput`. Explicit `protocol: "settlement_v1"` instead returns one strict
+completed/failed envelope: completed results may preserve Provider-reported
+usage, exact cost, settled Model, request identity, and continuation; failures
+carry bounded typed facts that enter the existing Runtime retry/failover path.
+The registered Model identity and External provenance remain authoritative.
+Both protocols reuse the same explicit launch, environment, timeout, output,
+cancellation, and cleanup boundaries as JSON Tools. Neither protocol claims
+provisional streaming. See
 [the example configuration](config/y-harness.command-model.example.json) and
-[ADR 0104](docs/adr/0104-configured-brokered-json-command-models.md).
+[ADR 0104](docs/adr/0104-configured-brokered-json-command-models.md), plus
+[ADR 0108](docs/adr/0108-versioned-json-command-model-settlement.md).
 
 The reference service can also configure the Context Engine's existing
 semantic compaction port under `conversation.compaction`. A shell-free JSON

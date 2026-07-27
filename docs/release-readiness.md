@@ -9,10 +9,10 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 339 library, 10 CLI, 22 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 19 released-product adapter, and 4 fault-fixture tests | passing locally: 409 total plus 7 explicitly ignored fixtures |
+| Deterministic tests | 341 library, 10 CLI, 23 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 19 released-product adapter, and 4 fault-fixture tests | passing locally: 412 total plus 7 explicitly ignored fixtures |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, 218-file clean-room crate verification | passing locally from the committed clean tree |
+| Distribution package | `cargo package --locked -p y-harness`, 219-file clean-room crate verification | passing locally from the committed clean tree |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 289 locked crates | passing |
 | State performance | 1,000 events plus 64-Thread lineage page, 5 samples, SQLite WAL + FULL | 71.841 ms append; 2.957 ms full projection; 11.116 ms atomic fork; 0.288 ms Thread list; 2.454 ms snapshot load |
@@ -30,7 +30,7 @@ not release-ready while any blocking row remains open.
 | Encrypted network host | generated CA/server/client mTLS round trip and unauthenticated rejection | passing |
 | Private model gateway trust | generated private CA plus authenticated and mTLS HTTPS round trips | passing |
 | Direct OpenAI Responses adapter | fixed official HTTPS endpoint, environment Secret, `store: false`, explicit encrypted-reasoning inclusion, same-response multi-call decoding, Harness-owned effect-safe bounded scheduling, bounded JSON/SSE, Provider-reported Model/usage/request provenance, origin-bound continuation | local mapping, ordered/safe-parallel/fenced batch, approval-restart, streaming, persistence, replay, completed-chain release, tamper, and cross-model-failover suppression tests passing; live API environment-gated |
-| Brokered JSON-command Model | additive single/catalog configuration, typed bounded stdin/stdout, explicit Process Broker authority, cleared mapped environment, cancellation and settlement, External provenance | real configured service Turn and durable State-origin assertion passing on Unix; core broker phase/cancellation/output tests passing cross-platform; provider metadata and provisional streaming not claimed |
+| Brokered JSON-command Model | additive single/catalog configuration, compatible output-v1 plus explicit strict settlement-v1, typed bounded stdin/stdout, Provider evidence/failure facts, explicit Process Broker authority, cleared mapped environment, cancellation and settlement, External provenance | real compatible service Turn, durable State-origin assertion, and typed transient retry passing on Unix; core broker phase/cancellation/metadata/failure/strictness tests passing cross-platform; provisional streaming not claimed |
 | Brokered JSON-command Conversation Compactor | additive strict `conversation` configuration, bounded semantic request/response, Context-phase cancellation, explicit Process Broker authority, independent input/output budgets, immutable source history, content-free State provenance | real three-Turn service process invokes the command and records exact covered Turn/digests; invalid static process configuration precedes environment access; core phase/cancellation/deep-JSON/size gates passing |
 | Brokered JSON-command Verifier | strict multi-Verifier configuration, immutable bounded candidate snapshot, strict pass/fail wire outcome, Verification-phase cancellation, explicit Process Broker authority, Runtime-owned outcome validation/retry/final settlement | real service Turn passes the configured gate and records durable `VerificationResult`; invalid static process configuration precedes mapped environment access; core phase/cancellation/deep-JSON/unknown-field gates passing |
 | Brokered JSON-command Evaluation Grader | additive `evaluation` configuration, isolated in-memory target State, strict 4 MiB sample/response contract, independent case/Grader concurrency and cancellation, External origin, exact format-2 baseline | real configured CLI Evaluation and origin assertion passing; `serve` acquires no Grader authority; invalid static timeout precedes environment access; full workspace passing |
@@ -106,13 +106,13 @@ boundary remain explicit.
   adapters are not implemented. Ignored environment-gated Gateway and OpenAI
   tests define the remaining external evidence; local schema tests are not
   relabeled as a live vendor pass.
-- A configured JSON-command Model makes the existing language-neutral,
-  brokered `ModelRequest` → `ModelOutput` port available to the reference
-  service and route. It is real executable extension support, not a native
-  vendor protocol: stdout carries no Provider usage/cost/request identity,
-  settled Model, continuation, typed failure, or provisional stream. An
-  unrestricted broker grants the child the Runtime user's OS authority and is
-  not a sandbox.
+- A configured JSON-command Model makes a language-neutral brokered Model port
+  available to the reference service and route. The compatible `output_v1`
+  carries only `ModelOutput`; explicitly selected `settlement_v1` can carry
+  validated Provider usage/cost/request/model/continuation evidence or typed
+  failure facts. Neither is a native vendor protocol or provisional stream.
+  An unrestricted broker grants the child the Runtime user's OS authority and
+  is not a sandbox.
 - SQLite coordination provides single-host recovery and multi-process CAS, not
   multi-node consensus or distributed availability. Normal Turn startup is
   fenced from interrupting another Runtime's live Turn; explicit recovery still

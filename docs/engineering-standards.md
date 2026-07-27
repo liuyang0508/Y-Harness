@@ -215,9 +215,12 @@ internals or read Engine storage directly.
   explicitly mapped environment, finite time/output/concurrency, and explicit
   launch authority. Static process bounds and launch policy are validated
   before reading mapped host environment values. They retain External
-  provenance. Their legacy
-  `ModelOutput` stdout cannot be interpreted as provider usage, continuation,
-  provisional streaming, or typed retry evidence.
+  provenance. Missing protocol configuration means the compatible
+  `output_v1`; its bare `ModelOutput` cannot be interpreted as Provider usage,
+  continuation, provisional streaming, or typed retry evidence. The explicit
+  `settlement_v1` root is strict, revalidates completed `ModelResponse`
+  evidence, and constructs typed failure facts before existing Runtime policy
+  decides retry or failover. Neither protocol infers provisional streaming.
 - Durable SQLite `TEXT` from data-bearing tables must select its BLOB byte
   length and reject an over-limit value before converting it to Rust `String`.
   Decoded schema and domain validation remain mandatory.

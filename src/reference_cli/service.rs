@@ -21,18 +21,19 @@ use y_harness::{
     ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION,
     EvaluationBaseline, EvaluationEngine, EvaluationReport, EvaluationSuite, GraderDescriptor,
     GraderRegistry, HarnessRuntime, InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES,
-    JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel, JsonCommandTool,
-    JsonCommandVerifier, JsonProcessConfig, LanguageModel, LocalProcessBroker,
-    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
-    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
-    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
-    ProcessBroker, ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
-    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
-    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
-    SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine, StdioMcpClient,
-    StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
-    ToolBatchExecution, ToolDescriptor, ToolRegistry, VerificationRegistry, VerifierDescriptor,
-    decode_thread_archive, encode_thread_archive, register_selected_mcp_tools, serve_stdio,
+    JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel,
+    JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier, JsonProcessConfig,
+    LanguageModel, LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES,
+    MacOsSeatbeltBroker, McpClient, MemoryContextConfig, MemoryEventStore, MemoryFailureMode,
+    MemoryHealthStatus, MemoryProvider, MemoryRegistry, ModelRegistry, ModelRetryPolicy,
+    NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolHandler, SECRET_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
+    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
+    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine,
+    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
+    TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
+    VerificationRegistry, VerifierDescriptor, decode_thread_archive, encode_thread_archive,
+    register_selected_mcp_tools, serve_stdio,
 };
 
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
@@ -124,6 +125,8 @@ enum ServiceModelConfig {
     },
     JsonCommand {
         id: String,
+        #[serde(default)]
+        protocol: JsonCommandModelProtocol,
         process: ServiceJsonProcessConfig,
     },
     OpenAiResponses {
@@ -2088,10 +2091,15 @@ async fn build_model(
             }
             Ok((CapabilityOrigin::BuiltIn, Arc::new(DemoModel), true))
         }
-        ServiceModelConfig::JsonCommand { id, process } => {
+        ServiceModelConfig::JsonCommand {
+            id,
+            protocol,
+            process,
+        } => {
             let (process, broker) =
                 build_json_process(loaded, process, &format!("JSON Model {id}"))?;
-            let model = Arc::new(JsonCommandModel::new(id, process, broker)?);
+            let model =
+                Arc::new(JsonCommandModel::new(id, process, broker)?.with_protocol(*protocol));
             Ok((
                 CapabilityOrigin::External {
                     id: format!("json-command-model/{id}"),

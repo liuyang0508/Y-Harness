@@ -1119,6 +1119,126 @@ printf '%s' '{"type":"message","content":"configured command model"}'
 
 #[cfg(unix)]
 #[test]
+fn configured_json_model_settlement_drives_typed_runtime_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = isolated_project("json-command-model-settlement");
+    fs::create_dir_all(&project).expect("create settlement Model project");
+    let adapter = project.join("model-adapter");
+    fs::write(
+        &adapter,
+        br#"#!/bin/sh
+cat >/dev/null
+attempt=1
+if [ -f model-attempts ]; then
+  previous=$(cat model-attempts)
+  attempt=$((previous + 1))
+fi
+printf '%s' "$attempt" > model-attempts
+if [ "$attempt" -eq 1 ]; then
+  printf '%s' '{"status":"failed","kind":"rate_limited","message":"fixture rate limit","http_status":429,"retry_after_ms":1}'
+else
+  printf '%s' '{"status":"completed","output":{"type":"message","content":"settlement retry completed"},"usage":{"input_tokens":9,"output_tokens":4,"cached_input_tokens":0,"reasoning_tokens":0,"cost_usd_ticks":7},"provider_model":"provider/fixture-v2","provider_request_id":"fixture-request-2"}'
+fi
+"#,
+    )
+    .expect("write settlement Model adapter");
+    let mut permissions = fs::metadata(&adapter)
+        .expect("settlement Model adapter metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&adapter, permissions).expect("make settlement Model adapter executable");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "models": [{
+                "type": "json_command",
+                "id": "external/settlement-fixture",
+                "protocol": "settlement_v1",
+                "process": {
+                    "command": adapter,
+                    "current_directory": ".",
+                    "timeout_ms": 5_000,
+                    "max_output_bytes": 1_048_576,
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }],
+            "model_route": {
+                "models": ["external/settlement-fixture"],
+                "attempt_timeout_ms": 5_000,
+                "retry": {
+                    "max_retries": 1,
+                    "initial_delay_ms": 1,
+                    "max_delay_ms": 1
+                }
+            }
+        }))
+        .expect("encode settlement Model config"),
+    )
+    .expect("write settlement Model config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn settlement Model service");
+    let mut input = child.stdin.take().expect("service stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("service stdout"));
+    let initialized = exchange(
+        &mut input,
+        &mut output,
+        request("initialize", ProtocolCommand::Initialize {}),
+    );
+    assert!(matches!(
+        initialized.body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    let created = exchange(
+        &mut input,
+        &mut output,
+        request("create-thread", ProtocolCommand::CreateThread {}),
+    );
+    let thread_id = match created.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ThreadCreated { thread },
+        } => thread.id,
+        other => panic!("unexpected create Thread response: {other:?}"),
+    };
+    let final_text = run_turn_to_completion(
+        &mut input,
+        &mut output,
+        &thread_id,
+        "exercise typed Provider retry",
+        "settlement-model-turn",
+    );
+    assert_eq!(final_text, "settlement retry completed");
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle Model service");
+    assert!(
+        settled.status.success(),
+        "settlement Model service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("model-attempts")).expect("read Model attempt count"),
+        "2"
+    );
+    fs::remove_dir_all(project).expect("remove settlement Model project");
+}
+
+#[cfg(unix)]
+#[test]
 fn configured_json_command_compactor_records_real_service_summary_evidence() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -321,12 +321,14 @@ direction:
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
   adapters for Tools, Models, semantic Conversation Compactors, completion
-  Verifiers, and Evaluation Graders with exact owner cancellation propagated
-  into external Model, Context, Verification, and Evaluation execution; local
-  execution permits 1–4096 concurrent direct children, remains cancellable
-  during pipe settlement, bounds termination cleanup to five seconds, and on
-  Unix settles ordinary descendants that remain in a private per-execution
-  process group without claiming escape-resistant sandbox containment;
+  Verifiers, and Evaluation Graders; Models preserve the compatible bare-output
+  wire or explicitly select a strict Provider-evidence/failure settlement,
+  while exact owner cancellation propagates into external Model, Context,
+  Verification, and Evaluation execution; local execution permits 1–4096
+  concurrent direct children, remains cancellable during pipe settlement,
+  bounds termination cleanup to five seconds, and on Unix settles ordinary
+  descendants that remain in a private per-execution process group without
+  claiming escape-resistant sandbox containment;
 - trusted Ed25519 publisher roots and strict detached signatures for externally
   sourced Skill packages;
 - explicit Tool-specific compensation adapters that reconstruct the original

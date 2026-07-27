@@ -4,6 +4,7 @@
   "model": {
     "type": "json_command",
     "id": "external/model-adapter",
+    "protocol": "settlement_v1",
     "process": {
       "command": "/absolute/path/to/model-adapter",
       "args": [],

@@ -39,9 +39,10 @@ use crate::{
     CancellationToken, ConversationCompactionRequest, ConversationCompactionResponse,
     ConversationCompactionTurn, ConversationCompactor, ConversationCompactorDescriptor,
     EvaluationCase, EvaluationExecution, EvaluationSample, ExecutionPhase, Grade, Grader,
-    GraderDescriptor, HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest,
-    ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
-    TurnId, VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
+    GraderDescriptor, HarnessError, HarnessFuture, LanguageModel, ModelContinuation, ModelOutput,
+    ModelProviderFailure, ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream,
+    ModelUsage, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor, TurnId,
+    VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
 };
 
@@ -710,15 +711,63 @@ impl Tool for JsonCommandTool {
     }
 }
 
+/// Versioned stdout contract for a JSON-command Model.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonCommandModelProtocol {
+    /// Backward-compatible bare [`ModelOutput`] response.
+    #[default]
+    OutputV1,
+    /// Strict [`JsonModelSettlement`] with Provider evidence or failure facts.
+    SettlementV1,
+}
+
+/// Strict terminal response returned by a settlement-v1 JSON-command Model.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JsonModelSettlement {
+    /// Authoritative Model response and optional Provider-reported evidence.
+    Completed {
+        /// Decision consumed by the Agent Loop.
+        output: ModelOutput,
+        /// Provider-reported accounting, omitted when unavailable or incomplete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<ModelUsage>,
+        /// Provider-reported Model that settled this call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_model: Option<String>,
+        /// Opaque Provider request identity for support correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_request_id: Option<String>,
+        /// Provider-owned state required to continue this response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<ModelContinuation>,
+    },
+    /// Sanitized Provider failure evidence independent from retry policy.
+    Failed {
+        /// Stable failure classification.
+        kind: ModelProviderFailureKind,
+        /// Bounded, non-secret diagnostic prepared by the adapter.
+        message: String,
+        /// Provider HTTP status when one was observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
+        /// Exact Provider-requested retry delay when one was observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
+}
+
 /// Language Model adapter backed by one shell-free JSON command.
 ///
-/// A serialized [`ModelRequest`] is sent on stdin and exactly one serialized
-/// [`ModelOutput`] is expected on stdout.
+/// A serialized [`ModelRequest`] is sent on stdin. The default stdout remains
+/// one bare [`ModelOutput`]; callers may explicitly select settlement v1.
 pub struct JsonCommandModel {
     id: String,
     config: JsonProcessConfig,
     broker: Arc<dyn ProcessBroker>,
     broker_descriptor: ProcessBrokerDescriptor,
+    protocol: JsonCommandModelProtocol,
 }
 
 impl JsonCommandModel {
@@ -739,7 +788,15 @@ impl JsonCommandModel {
             config,
             broker,
             broker_descriptor,
+            protocol: JsonCommandModelProtocol::OutputV1,
         })
+    }
+
+    /// Selects the explicit stdout protocol without changing process authority.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: JsonCommandModelProtocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     /// Returns the broker isolation visible to the embedding host.
@@ -752,7 +809,7 @@ impl JsonCommandModel {
         &self,
         request: ModelRequest,
         cancellation: CancellationToken,
-    ) -> Result<ModelOutput, HarnessError> {
+    ) -> Result<ModelResponse, HarnessError> {
         crate::runtime::validate_model_request(&request)?;
         let stdin = crate::json::to_bounded_json_vec(&request, MAX_STDIN_BYTES).map_err(
             |error| match error {
@@ -773,11 +830,53 @@ impl JsonCommandModel {
             .await
             .map_err(map_model_execution_error)?;
         validate_process_success(&output, "model command").map_err(HarnessError::Model)?;
-        let output: ModelOutput = serde_json::from_slice(&output.stdout).map_err(|error| {
-            HarnessError::Model(format!("invalid model command JSON output: {error}"))
-        })?;
-        crate::runtime::validate_model_output(&output)?;
-        Ok(output)
+        let response = match self.protocol {
+            JsonCommandModelProtocol::OutputV1 => {
+                let output: ModelOutput =
+                    serde_json::from_slice(&output.stdout).map_err(|error| {
+                        HarnessError::Model(format!("invalid model command JSON output: {error}"))
+                    })?;
+                ModelResponse::from(output)
+            }
+            JsonCommandModelProtocol::SettlementV1 => {
+                let settlement: JsonModelSettlement = serde_json::from_slice(&output.stdout)
+                    .map_err(|_| {
+                        HarnessError::Model("invalid model command settlement JSON".to_owned())
+                    })?;
+                match settlement {
+                    JsonModelSettlement::Completed {
+                        output,
+                        usage,
+                        provider_model,
+                        provider_request_id,
+                        continuation,
+                    } => ModelResponse {
+                        output,
+                        usage,
+                        provider_model,
+                        provider_request_id,
+                        continuation,
+                    },
+                    JsonModelSettlement::Failed {
+                        kind,
+                        message,
+                        http_status,
+                        retry_after_ms,
+                    } => {
+                        let failure =
+                            ModelProviderFailure::new(kind, message, http_status, retry_after_ms)
+                                .map_err(|_| {
+                                HarnessError::Model(
+                                    "invalid model command Provider failure evidence".to_owned(),
+                                )
+                            })?;
+                        return Err(HarnessError::ModelProvider(failure));
+                    }
+                }
+            }
+        };
+        crate::runtime::validate_model_response(&response)?;
+        Ok(response)
     }
 }
 
@@ -787,6 +886,17 @@ impl LanguageModel for JsonCommandModel {
     }
 
     fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+        Box::pin(async move {
+            self.execute(request, CancellationToken::new())
+                .await
+                .map(|response| response.output)
+        })
+    }
+
+    fn complete_with_metadata<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> HarnessFuture<'a, ModelResponse> {
         Box::pin(async move { self.execute(request, CancellationToken::new()).await })
     }
 
@@ -795,11 +905,7 @@ impl LanguageModel for JsonCommandModel {
         request: ModelRequest,
         stream: ModelStream,
     ) -> HarnessFuture<'a, ModelResponse> {
-        Box::pin(async move {
-            self.execute(request, stream.cancellation_token())
-                .await
-                .map(ModelResponse::from)
-        })
+        Box::pin(async move { self.execute(request, stream.cancellation_token()).await })
     }
 }
 
@@ -1553,9 +1659,10 @@ mod tests {
 
     use super::{
         DenyProcessBroker, JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel,
-        JsonCommandTool, JsonCommandVerifier, JsonConversationCompactionRequest, JsonGradeRequest,
-        JsonProcessConfig, JsonVerificationRequest, LocalProcessBroker, ProcessBroker,
-        ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput, ProcessRequest,
+        JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
+        JsonConversationCompactionRequest, JsonGradeRequest, JsonProcessConfig,
+        JsonVerificationRequest, LocalProcessBroker, ProcessBroker, ProcessBrokerDescriptor,
+        ProcessIsolation, ProcessOutput, ProcessRequest,
     };
     #[cfg(target_os = "macos")]
     use super::{MacOsSeatbeltBroker, NetworkAccess};
@@ -1564,9 +1671,10 @@ mod tests {
         ConversationCompactionRequest, ConversationCompactionTurn, ConversationCompactor,
         ConversationCompactorDescriptor, EvaluationCase, EvaluationExecution, EvaluationSample,
         ExecutionPhase, Grade, Grader, GraderDescriptor, HarnessError, HarnessFuture, Item,
-        ItemKind, LanguageModel, MemoryScope, ModelRequest, ModelStream, ThreadId, Tool,
-        ToolBatchExecution, ToolContext, ToolDescriptor, TurnId, TurnOutcome, TurnStatus,
-        VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
+        ItemKind, LanguageModel, MemoryScope, ModelContinuation, ModelProviderFailureKind,
+        ModelRequest, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
+        TurnId, TurnOutcome, TurnStatus, VerificationOutcome, VerificationRequest, Verifier,
+        VerifierDescriptor,
     };
 
     struct RecordingBroker {
@@ -1940,6 +2048,144 @@ mod tests {
             request.execution,
             EvaluationExecution::Completed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn json_model_settlement_preserves_provider_evidence() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(
+                br#"{
+                    "status":"completed",
+                    "output":{"type":"message","content":"settled"},
+                    "usage":{
+                        "input_tokens":11,
+                        "output_tokens":7,
+                        "cached_input_tokens":3,
+                        "reasoning_tokens":2,
+                        "cost_usd_ticks":125
+                    },
+                    "provider_model":"provider/model-v2",
+                    "provider_request_id":"request-42",
+                    "continuation":{
+                        "format":"fixture.v1",
+                        "items":[{"id":"continuation-1"}]
+                    }
+                }"#,
+            ),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let model = JsonCommandModel::new("fixture/model", config(), broker)
+            .expect("model adapter")
+            .with_protocol(JsonCommandModelProtocol::SettlementV1);
+        let response = model
+            .complete_with_metadata(ModelRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: Vec::new(),
+                context: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await
+            .expect("settled response");
+
+        assert_eq!(
+            response.output,
+            crate::ModelOutput::Message {
+                content: "settled".to_owned()
+            }
+        );
+        assert_eq!(
+            response.usage.as_ref().map(|usage| usage.input_tokens),
+            Some(11)
+        );
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cost_usd_ticks),
+            Some(125)
+        );
+        assert_eq!(
+            response.provider_model.as_deref(),
+            Some("provider/model-v2")
+        );
+        assert_eq!(response.provider_request_id.as_deref(), Some("request-42"));
+        assert_eq!(
+            response
+                .continuation
+                .as_ref()
+                .map(ModelContinuation::format),
+            Some("fixture.v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn json_model_settlement_is_strict_and_returns_typed_failure() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(
+                br#"{
+                    "status":"failed",
+                    "kind":"rate_limited",
+                    "message":"provider rate limit",
+                    "http_status":429,
+                    "retry_after_ms":250
+                }"#,
+            ),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let model = JsonCommandModel::new("fixture/model", config(), broker)
+            .expect("model adapter")
+            .with_protocol(JsonCommandModelProtocol::SettlementV1);
+        let error = model
+            .complete(ModelRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: Vec::new(),
+                context: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await
+            .expect_err("typed failure");
+        let HarnessError::ModelProvider(failure) = error else {
+            panic!("expected typed Provider failure");
+        };
+        assert_eq!(failure.kind(), ModelProviderFailureKind::RateLimited);
+        assert_eq!(failure.http_status(), Some(429));
+        assert_eq!(failure.retry_after_ms(), Some(250));
+
+        let broker = Arc::new(RecordingBroker {
+            output: output(
+                br#"{
+                    "status":"failed",
+                    "kind":"rate_limited",
+                    "message":"provider rate limit",
+                    "retry":true
+                }"#,
+            ),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let model = JsonCommandModel::new("fixture/model", config(), broker)
+            .expect("model adapter")
+            .with_protocol(JsonCommandModelProtocol::SettlementV1);
+        let error = model
+            .complete(ModelRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turn_id: TurnId::from_static("turn-test"),
+                items: Vec::new(),
+                context: Vec::new(),
+                tools: Vec::new(),
+            })
+            .await
+            .expect_err("unknown settlement field");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid model command settlement JSON")
+        );
+        assert!(!error.to_string().contains("retry"));
     }
 
     #[tokio::test]

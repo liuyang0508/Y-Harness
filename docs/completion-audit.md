@@ -27,13 +27,13 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Headless embeddable Rust core | public contracts in `src/lib.rs`; zero-default build; external-view examples execute a Policy-controlled Model/Tool loop and a fenced Task DAG | compiled and run locally; CI-gated |
 | Reference-project derivation | primary-source comparison, immutable open-source snapshots, adopted/rejected decisions, code/ADR mapping in `reference-analysis.md` | documented and link-checked locally |
 | Serviceable typed protocol | language-neutral v18 specification, exact envelope and schema-11/API-7 compatibility coordinates, bounded per-Turn Context, lineage-aware Thread summaries, atomic retry-identified Thread forks, durable Thread names/import provenance, async Turn operations, exact-ID Steering, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS tests; passing locally |
-| Engine CLI | `yh init/doctor/serve/eval`, no-clobber `yh thread export` and atomic `yh thread import`, trusted/signed/HTTPS `yh skill install*` plus list/verify/remove, durable State/Approval/Task databases, deterministic demo, strict configured Model catalog/route, direct OpenAI Responses, HTTPS Gateways, brokered JSON-command Models, semantic Conversation Compactors, completion Verifiers, and Evaluation Graders, JSON/MCP Tool, project Skill and Agent Memory Hub assembly, `src/reference_cli`, process tests | archive round-trip/tamper/no-clobber, multi-Provider route diagnostics, real configured command-Model Turn with External State provenance, real command-compactor Turn with immutable source history and durable summary provenance, real command-Verifier completion gate and durable result, isolated command-Grader Evaluation with exact baseline, installed-binary, signed External Skill trust/revocation/transparency lifecycle, project Skill integrity, and restart tests passing locally; live OpenAI and public Skill endpoints environment-gated |
+| Engine CLI | `yh init/doctor/serve/eval`, no-clobber `yh thread export` and atomic `yh thread import`, trusted/signed/HTTPS `yh skill install*` plus list/verify/remove, durable State/Approval/Task databases, deterministic demo, strict configured Model catalog/route, direct OpenAI Responses, HTTPS Gateways, versioned brokered JSON-command Models, semantic Conversation Compactors, completion Verifiers, and Evaluation Graders, JSON/MCP Tool, project Skill and Agent Memory Hub assembly, `src/reference_cli`, process tests | archive round-trip/tamper/no-clobber, multi-Provider route diagnostics, real compatible command-Model Turn with External State provenance, real settlement-v1 typed retry, real command-compactor Turn with immutable source history and durable summary provenance, real command-Verifier completion gate and durable result, isolated command-Grader Evaluation with exact baseline, installed-binary, signed External Skill trust/revocation/transparency lifecycle, project Skill integrity, and restart tests passing locally; live OpenAI and public Skill endpoints environment-gated |
 | Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v18-only child transport, bounded lineage-aware recent-Thread navigation/resume, `/fork [terminal-turn-id]`, exact-ID active-Turn Steering, invalidated provisional-output handling, content-free continuation and ordered batch rendering, TestBackend render tests, real PTY Turn and fork | independently installable; local unit/lint/PTY gates passing; Pi-style entry-level in-place navigation is intentionally outside the Engine model |
 | Competitive benchmark tools | independent `y-harness-benchmark-runner` and `y-harness-fault-fixture` packages; bounded shell-free Claude Code JSON, Codex JSONL, Grok Build headless JSON, and Pi JSONL adapters; exact binary coordinates; external-run formats 1/2/3/4; deterministic stdio MCP crash-after-effect fixture and durable oracle | 23 adapter/fixture tests plus one real `claim_eligible: false` Claude conformance result; Codex, Grok Build, and Pi have no live records and no comparative case exists |
 | Install and operator path | Cargo-backed no-side-effect install script, strict config template, Chinese quick start, real language-neutral Task Worker, acceptance checklist | clean-prefix install and revision-6 worker lifecycle passing locally |
 | MCP tools | official SDK stdio plus optional authenticated HTTPS JSON-response clients, atomic namespaced Tool registration, explicit activation, optional command-file lock | stdio process and private-TLS remote service assembly passing; SSE/OAuth not claimed |
 | Agent Memory Hub | first-party provider adapter over persistent stdio MCP | live local round trip passing; CI environment-gated |
-| External model provider | exact-versioned HTTPS JSON/NDJSON gateway, direct OpenAI Responses JSON/SSE, and brokered language-neutral JSON-command `ModelOutput`; secret references, Provider-reported settled Model evidence where supported, exclusive private-CA trust and mTLS gateway identity, bounded origin-bound reasoning continuation | local private-gateway TLS, OpenAI mapping/stream/persistence/replay/tamper, and real command-Model service Turn passing; command Models deliberately do not claim provider metadata or streaming; live gateway and OpenAI API environment-gated |
+| External model provider | exact-versioned HTTPS JSON/NDJSON gateway, direct OpenAI Responses JSON/SSE, and brokered language-neutral JSON-command output-v1/settlement-v1; secret references, Provider-reported usage/settled Model/request evidence where supported, exclusive private-CA trust and mTLS gateway identity, bounded origin-bound continuation, typed failure facts | local private-gateway TLS, OpenAI mapping/stream/persistence/replay/tamper, compatible command-Model service Turn, settlement evidence, and typed retry passing; command Models deliberately do not claim provisional streaming; live gateway and OpenAI API environment-gated |
 | External executable capabilities | deny-by-default Process Broker and bounded JSON adapters | passing locally |
 | Desktop/Web/IM | intentionally independent optional products over the same protocol | future clients, never duplicate runtimes |
 
@@ -71,19 +71,19 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
   /isolated/project/y-harness.json
 ```
 
-The all-feature workspace run contains 339 passing library tests plus
-2 manual size tests, 10 CLI configuration tests, 22 Engine process/service tests, 11 TUI
+The all-feature workspace run contains 341 passing library tests plus
+2 manual size tests, 10 CLI configuration tests, 23 Engine process/service tests, 11 TUI
 unit/render tests, 2 local private-gateway TLS integration tests, 2 local
 private-MCP TLS integration tests, 19 released-product adapter tests, and 4
-deterministic fault-fixture tests: 409 passing plus 7 explicitly ignored
-fixtures in total. The no-default-feature workspace run contains 380 passing tests plus 3 ignored
+deterministic fault-fixture tests: 412 passing plus 7 explicitly ignored
+fixtures in total. The no-default-feature workspace run contains 383 passing tests plus 3 ignored
 manual/environment fixtures. The demo and configured PTY
 smoke gates submit real Turns, create atomic child Threads, verify parent/child
 history plus durable lineage in State, and check alternate-screen and
 bracketed-paste restoration. One additional 64 MiB migration test and one
 126.9 MiB Approval Inbox
 migration test are deliberately manual.
-The 218-file package archive verifies from the committed clean-tree candidate
+The 219-file package archive verifies from the committed clean-tree candidate
 without Cargo's `--allow-dirty` escape hatch.
 Five integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:

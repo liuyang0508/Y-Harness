@@ -196,17 +196,47 @@ State 权威仍全部属于 Y-Harness。若函数调用携带无法重放的 rea
 若 Provider 没有内置适配器，可复制
 [`y-harness.command-model.example.json`](../config/y-harness.command-model.example.json)。
 无需修改 Rust：配置中的绝对路径程序会从 stdin 收到一个完整
-`ModelRequest` JSON，并在 stdout 返回且仅返回一个 `ModelOutput`：
+`ModelRequest` JSON。样例显式选择 `protocol: "settlement_v1"`，stdout
+必须返回且仅返回一个终态对象：
 
 ```json
-{"type":"message","content":"final response"}
+{
+  "status": "completed",
+  "output": {"type": "message", "content": "final response"},
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 35,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 8,
+    "cost_usd_ticks": null
+  },
+  "provider_model": "vendor/model-version",
+  "provider_request_id": "request-id"
+}
 ```
 
-需要调用 Tool 时也可返回：
+需要调用 Tool 时，`output` 也可为：
 
 ```json
 {"type":"tool_call","call_id":"provider-call-1","name":"lookup","input":{"q":"Y-Harness"}}
 ```
+
+若 Provider 明确报告失败，可返回：
+
+```json
+{
+  "status": "failed",
+  "kind": "rate_limited",
+  "message": "provider rate limit",
+  "http_status": 429,
+  "retry_after_ms": 1000
+}
+```
+
+失败对象只提供事实；是否重试、切换 Model 或结束 Turn 仍由 Runtime
+策略决定。`message` 必须先由适配器去除响应正文和秘密。省略 `protocol`
+会保留兼容的 `output_v1`，此时 stdout 仍是一个裸 `ModelOutput`，不会
+自动探测或猜测 settlement。
 
 程序必须显式选择 `unrestricted` 或 macOS Seatbelt，工作目录会被规范化，
 继承环境会被清空，只传入 `environment_from_host` 中逐项映射的值。输入、
@@ -214,11 +244,12 @@ stdout、stderr、排队加执行时间和并发均有上限；取消 Turn 会�
 Process Broker。该 Model 以 External 来源进入普通 catalog/route、
 Agent Loop、Tool、Policy、State 和 Trace 路径。
 
-`unrestricted` 只表示显式允许，不是沙箱。当前 stdout 契约只承载
-`ModelOutput`，不会虚构 Provider usage、费用、request ID、实际结算模型、
-continuation、typed HTTP failure 或流式增量；需要这些能力时使用原生
-`LanguageModel` 或版本化 HTTPS Gateway。详见
-[ADR 0104](adr/0104-configured-brokered-json-command-models.md)。
+`unrestricted` 只表示显式允许，不是沙箱。settlement-v1 只保留 Provider
+实际提供且通过边界校验的 usage、费用、request ID、实际结算模型、
+continuation 和 typed failure；缺失值保持缺失。命令协议仍不支持
+provisional streaming。详见
+[ADR 0104](adr/0104-configured-brokered-json-command-models.md) 与
+[ADR 0108](adr/0108-versioned-json-command-model-settlement.md)。
 
 ## 7. 装配 Tool、MCP 与 Agent Memory Hub
 

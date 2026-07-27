@@ -84,8 +84,11 @@ cargo run --locked --example orchestrated
       Model 来源。
 - [ ] Turn 取消传播给 Model 进程；超时、future drop 和 Unix 子进程组
       按现有有界 settlement 规则清理。
-- [ ] command Model 不会伪造 usage、cost、Provider request/model、
-      continuation、typed HTTP failure 或 provisional stream。
+- [ ] 未配置 protocol 时严格保持 `output_v1`；不会从裸 `ModelOutput`
+      推断 usage、cost、Provider request/model、continuation 或失败类别。
+- [ ] 显式 `settlement_v1` 可保真返回 Provider 证据或有界 typed failure；
+      Runtime 而非 adapter 决定 retry/failover，未知字段失败关闭。
+- [ ] 两种 command Model protocol 都不伪装 provisional stream。
 
 ## G. MCP 扩展边界
 

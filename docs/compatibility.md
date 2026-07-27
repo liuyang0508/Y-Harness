@@ -70,7 +70,13 @@ coordinates. See
 [ADR 0100](adr/0100-typed-model-provider-failure-evidence.md) and
 [ADR 0101](adr/0101-bounded-typed-model-retry-policy.md), plus
 [ADR 0103](adr/0103-bounded-authenticated-https-mcp-json-transport.md) and
-[ADR 0104](adr/0104-configured-brokered-json-command-models.md). The optional
+[ADR 0104](adr/0104-configured-brokered-json-command-models.md). JSON-command
+Models still default to the original bare `output_v1` wire. The additive
+`protocol: "settlement_v1"` selector requires the strict completed/failed
+envelope and can preserve Provider evidence or typed failure facts; it is never
+auto-detected. This changes no existing configuration meaning, State,
+Protocol, or Model Gateway coordinate. See
+[ADR 0108](adr/0108-versioned-json-command-model-settlement.md). The optional
 strict `conversation` object and its brokered JSON-command compactor are also
 additive service-schema-1 configuration; no State, Protocol, or Model Gateway
 shape changes. See

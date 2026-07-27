@@ -41,9 +41,9 @@ configuration-extensible incomplete.
   process-group cleanup behavior.
 - Keep service configuration schema 1 because the new tagged variant is
   additive and no existing field changes meaning.
-- Do not infer provider-specific usage, cost, request identity, settled Model,
-  continuation, typed HTTP failure, or provisional streaming from stdout.
-  The current command contract returns `ModelOutput`, not `ModelResponse`.
+- Do not infer Provider-specific usage, cost, request identity, settled Model,
+  continuation, typed HTTP failure, or provisional streaming from the default
+  stdout contract. `output_v1` returns `ModelOutput`, not `ModelResponse`.
 
 ## Consequences
 
@@ -57,10 +57,11 @@ The executable is still code with the authority granted by its selected
 `ProcessBroker`. `unrestricted` is not a sandbox. Environment inheritance is
 cleared, but explicitly mapped credentials are visible to the bridge.
 
-Provider-rich metadata and provisional streaming remain available through a
-native `LanguageModel` implementation or the versioned HTTPS gateway. A future
-command protocol may add an exact negotiated `ModelResponse` envelope, but it
-must not reinterpret the current stdout shape.
+Provider-rich metadata and typed failure facts are now available through the
+separately selected settlement-v1 contract in
+[ADR 0108](0108-versioned-json-command-model-settlement.md). Provisional
+streaming still requires a native `LanguageModel` or versioned HTTPS adapter.
+The original stdout shape remains unchanged.
 
 ## Rejected alternatives
 
@@ -90,3 +91,4 @@ must not reinterpret the current stdout shape.
 - [ADR 0037: propagate Turn cancellation through the model-step handle](0037-model-step-cancellation-propagation.md)
 - [ADR 0070: explicit bounded Model failover](0070-explicit-bounded-model-failover.md)
 - [ADR 0087: explicit configured Model catalog and route](0087-explicit-configured-model-catalog-and-route.md)
+- [ADR 0108: versioned JSON-command Model settlement](0108-versioned-json-command-model-settlement.md)
