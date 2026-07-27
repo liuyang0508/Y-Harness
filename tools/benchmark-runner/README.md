@@ -199,5 +199,60 @@ validated Pi events. Pi has no built-in sandbox or documented hard monetary
 ceiling, and Tools are disabled, so this remains adapter-conformance evidence.
 There is no checked-in live Pi result or comparative run.
 
+The OpenCode adapter consumes the released CLI's line-delimited run events:
+
+```json
+{
+  "format_version": 5,
+  "run_id": "opencode-probe-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/absolute/path/to/opencode",
+  "expected_cli_version": "<exact-version>",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/isolated/workspace",
+  "workspace_snapshot": "empty-workspace-v1",
+  "profile": "bare",
+  "model": "openai/<exact-model>",
+  "variant": "low",
+  "system_prompt": "Return only the requested fixed text.",
+  "prompt": "Reply exactly YH-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "OPENAI_API_KEY",
+    "PATH"
+  ],
+  "home": "/absolute/empty/opencode-home"
+}
+```
+
+```bash
+cargo run --locked -p y-harness-benchmark-runner -- \
+  opencode /absolute/path/to/spec.json > external-run.json
+```
+
+`bare` requires an initially empty home, owns its XDG roots and empty
+authentication content, uses an in-memory database, and disables project
+configuration, default/external plugins, external Skills, LSP downloads,
+Claude compatibility inputs, and updates. `product` omits `home`; ambient
+authentication, global configuration, instructions, and MCP definitions
+remain. Both profiles generate one primary agent with
+all Tools denied, disable title generation and snapshots, send the user prompt
+only on stdin, and retain the requested agent prompt only by digest in the
+report. `variant` is optional. Model, variant, and agent prompt reject
+OpenCode's `{env:...}` / `{file:...}` configuration substitutions so recorded
+controls cannot be silently rewritten.
+
+External-run format 5 requires one stable Session identity and ordered
+`step_start`/`step_finish` JSONL pairs. It rejects Tool events, malformed
+settlement, cross-Session output, and events after a product error. Successful
+cost is summed only from validated `step-finish` records; error-stream cost and
+settled Model identity remain `null`/empty because OpenCode does not expose
+complete evidence for them. The requested agent prompt remains additive to
+OpenCode's own product/provider instructions, and the CLI exposes neither a
+hard monetary nor a hard provider-call ceiling. OpenCode may still initialize
+or update its plugin SDK dependency cache; that limitation is recorded rather
+than hidden. No live OpenCode result or comparative run is checked in.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

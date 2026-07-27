@@ -15,9 +15,11 @@ The persistent service can assemble an optional direct OpenAI Responses
 Provider, brokered shell-free JSON-command Models and Tools, exact-selected MCP
 Tools, and Agent Memory Hub Context without moving Policy or State authority
 into a client or provider. A configured command Model accepts one bounded
-`ModelRequest`, returns one validated `ModelOutput`, keeps External provenance,
-and participates in the same catalog/route without claiming unavailable
-provider metadata or streaming. Schema 5 adds bounded, origin-bound Provider Continuation so
+`ModelRequest`; compatible `output_v1` returns one validated `ModelOutput`,
+while explicit strict `settlement_v1` may preserve Provider usage, settled
+Model/request identity, continuation, or typed failure facts. Both keep
+External provenance and participate in the same catalog/route without
+claiming provisional streaming. Schema 5 adds bounded, origin-bound Provider Continuation so
 stateless OpenAI reasoning Tool loops can replay encrypted reasoning state
 without transferring Tool authority to the vendor.
 Schema 6 adds durable, actor-attributed, exact-Turn steering with crossed
@@ -84,6 +86,11 @@ lineage in those content-free summaries, and the Sessions panel renders the
 parent identity/version without projecting full histories.
 The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
 protocol; it keeps no title or branch store.
+The independent benchmark runner emits exact non-claim external-run formats
+for released Claude Code, Codex, Grok Build, Pi, and OpenCode CLIs. Format 5
+uses OpenCode's source-tested run JSONL surface, isolated bare configuration,
+Tool denial, exact executable/version pins, and missing-evidence preservation;
+no OpenCode live or comparative result is claimed.
 
 ## Start
 

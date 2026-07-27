@@ -135,6 +135,16 @@ yh skill verify "$project/y-harness.json"
       数据库；`yh serve` 不构造未使用的 Grader。
 - [ ] Grader 不能修改 Agent Loop、调用 Tool、替代 Verifier 或提交
       Turn。
+- [ ] `yh-bench opencode <spec>` 只接受 format 5、绝对程序路径、精确
+      CLI 版本与 SHA-256、`provider/model` 和显式环境变量名；`bare`
+      profile 独占空 Home/XDG/Auth/内存数据库边界。
+- [ ] OpenCode JSONL 跨 Session、重叠 Step、Tool 事件、非法 token/cost
+      或错误后的尾随事件失败关闭；错误流不得把未知费用写成零，也不得
+      把 requested Model 冒充 observed Model。
+- [ ] OpenCode Model、variant 与 system prompt 中的 `{env:...}` /
+      `{file:...}` 配置替换标记在启动进程前被拒绝。
+- [ ] 所有 released-product 适配器始终输出
+      `claim_eligible: false`；单产品 conformance 不能作为效果超越证据。
 
 ```bash
 cargo fmt --all -- --check

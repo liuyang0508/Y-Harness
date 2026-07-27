@@ -9,10 +9,10 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 341 library, 10 CLI, 23 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 19 released-product adapter, and 4 fault-fixture tests | passing locally: 412 total plus 7 explicitly ignored fixtures |
+| Deterministic tests | 341 library, 10 CLI, 23 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 23 released-product adapter, and 4 fault-fixture tests | passing locally: 416 total plus 7 explicitly ignored fixtures |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, 219-file clean-room crate verification | passing locally from the committed clean tree |
+| Distribution package | `cargo package --locked -p y-harness`, 220-file clean-room crate verification | passing locally from the committed clean tree |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 289 locked crates | passing |
 | State performance | 1,000 events plus 64-Thread lineage page, 5 samples, SQLite WAL + FULL | 71.841 ms append; 2.957 ms full projection; 11.116 ms atomic fork; 0.288 ms Thread list; 2.454 ms snapshot load |
@@ -41,7 +41,7 @@ not release-ready while any blocking row remains open.
 | Task workspace lifecycle | default deny, exact-attempt Provider lease, bounded prepare/release, cleanup-before-settlement, concurrent local isolation, marker/path replacement guards, detached pinned Git Worktree through Process Broker | passing with local directories and real local Git |
 | Task worker protocol | protocol-v18 conditional discovery, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests |
 | Harness regression evaluation | format-2, origin-bound 2-case × 2-grader end-to-end Runtime suite and exact baseline, plus configured external Grader path | `yh eval-smoke` and real isolated `yh eval` process test passing; machine-readable and nonzero on regression |
-| Released-product evidence tools | external-run formats 1/2/3/4; exact adapter/product hashes; bounded Claude Code JSON, Codex JSONL, Grok Build headless JSON, and Pi JSONL processes; unavailable facts preserved as unavailable; requested/observed Model and cost separation; exact-pinned MCP crash-after-effect fixture with durable oracle | 23 tests and one real Claude Code 2.1.143 conformance record passing; Codex, Grok Build, and Pi have contract evidence only; all explicitly ineligible for comparison claims |
+| Released-product evidence tools | external-run formats 1/2/3/4/5; exact adapter/product hashes; bounded Claude Code JSON, Codex JSONL, Grok Build headless JSON, Pi JSONL, and OpenCode JSONL processes; unavailable facts preserved as unavailable; requested/observed Model and cost separation; exact-pinned MCP crash-after-effect fixture with durable oracle | 27 adapter/fixture tests and one real Claude Code 2.1.143 conformance record passing; Codex, Grok Build, Pi, and OpenCode have contract evidence only; all explicitly ineligible for comparison claims |
 | Public API embedding | standalone zero-network hosts run a Policy-controlled Model/Tool loop and a durable fenced Task DAG through public contracts | `embedded` and `orchestrated` examples passing |
 
 The latest local performance figures were measured on 2026-07-28 and are environment

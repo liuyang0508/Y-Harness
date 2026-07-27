@@ -2,6 +2,7 @@
 
 mod codex;
 mod grok_build;
+mod opencode;
 mod pi;
 
 use std::{
@@ -210,13 +211,14 @@ async fn run() -> AppResult<ExternalRunReport> {
         "claude-code" => execute_claude(read_claude_spec(&spec_path)?).await,
         "codex" => codex::execute(codex::read_spec(&spec_path)?).await,
         "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?).await,
+        "opencode" => opencode::execute(opencode::read_spec(&spec_path)?).await,
         "pi" => pi::execute(pi::read_spec(&spec_path)?).await,
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex|grok-build|pi> <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex|grok-build|opencode|pi> <run-spec.json>".to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {

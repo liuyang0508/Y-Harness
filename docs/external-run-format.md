@@ -10,13 +10,16 @@ turning it into a comparative score. They are produced by the independent
 - format 3 adds Grok Build's headless JSON controls, optional complete cost
   with its exact integer tick evidence, and observed Model usage;
 - format 4 adds Pi's JSONL Agent-session lifecycle, explicit Provider and
-  reasoning controls, observed Model identity, and reported assistant cost.
+  reasoning controls, observed Model identity, and reported assistant cost;
+- format 5 adds OpenCode's run JSONL step lifecycle, isolated configuration
+  controls, and complete-step cost without inventing error cost or Model
+  identity.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1`, `2`, `3`, or `4`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1`, `2`, `3`, `4`, or `5`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
@@ -28,7 +31,8 @@ turning it into a comparative score. They are produced by the independent
 - product-reported total/API duration and actual cost; format 1 requires
   numbers, format 2 uses exact `null` when Codex does not expose them, and
   format 3 preserves Grok Build cost only when the product marks it complete,
-  while format 4 sums cost from validated completed Pi assistant messages;
+  while format 4 sums cost from validated completed Pi assistant messages and
+  format 5 sums only successful validated OpenCode `step-finish` records;
   complete format-3 settlements add `actual_cost_usd_ticks`, where
   `10_000_000_000` ticks equal one USD, and reject disagreement with the
   product's float projection; an adapter must never infer these fields;
@@ -117,6 +121,31 @@ does not expose distinct product/API durations, a hard monetary ceiling, or a
 built-in sandbox. Disabling Tools also means the adapter does not measure Pi's
 Harness loop effectiveness.
 
+The OpenCode adapter emits format 5 and fixes `claim_eligible: false`. `bare`
+requires an initially empty home, owns its XDG roots and empty authentication
+content, uses an in-memory product database, and disables default/external
+plugins, external Skills, LSP downloads, and Claude compatibility inputs.
+`product` deliberately retains ambient authentication, global configuration,
+instructions, and MCP definitions. Both profiles pass the prompt on stdin,
+select one exact `provider/model` plus optional variant, suppress project
+configuration, external plugins, updates, model refresh, compaction, sharing,
+snapshots, title generation, and formatter/LSP activation, and deny all Tools
+through a generated primary agent. Caller-controlled Model, variant, and agent
+prompt reject `{env:...}` / `{file:...}` configuration substitutions.
+
+Format 5 accepts only one stable Session's ordered `step_start`, optional
+reasoning/text, and `step_finish` records, or one final product error. Tool
+events, overlapping steps, cross-Session events, malformed token/cost facts,
+and trailing error events fail the adapter contract. A successful stream sums
+finite nonnegative completed-step cost and retains the terminal finish reason.
+An error stream has `actual_cost_usd: null`, because its final event does not
+prove complete failed-step cost. OpenCode's JSONL does not expose settled Model
+identity or distinct product/API duration, so those fields remain empty or
+`null`. Its agent prompt is additive to product/provider instructions, and
+neither a hard spend ceiling nor a hard provider-call ceiling is claimed.
+OpenCode may still initialize or update its plugin SDK dependency cache; the
+adapter records that unsupported control.
+
 ## Evidence
 
 The first real format-1 record and its exact input are preserved under
@@ -138,4 +167,9 @@ product evidence.
 The Pi adapter is source- and contract-tested against official snapshot
 [`cee5ff7`](https://github.com/earendil-works/pi/tree/cee5ff7520d8828bed9955ef00419e995d1f91e0).
 No real Pi result is checked in yet, so it contributes no live product
+evidence.
+
+The OpenCode adapter is source- and contract-tested against official snapshot
+[`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b).
+No real OpenCode result is checked in yet, so it contributes no live product
 evidence.
