@@ -60,11 +60,13 @@ commit.
 
 ## Open release blockers
 
-- The local candidate has no configured Git remote. GitHub App access identifies
-  `liuyang0508` as the intended owner and confirms that `Y-Harness` does not
-  already exist in the accessible repository set, but GitHub CLI has no
-  authenticated session. Therefore the remote repository cannot yet be created,
-  pushed, tagged, or used to produce remote Ubuntu/macOS/Windows CI evidence.
+- The clean local candidate has no configured Git remote. A read-only check on
+  2026-07-28 confirms that GitHub CLI is authenticated as `liuyang0508` and
+  `liuyang0508/Y-Harness` does not exist. Creating that external repository,
+  choosing its visibility, pushing, and tagging are publication actions rather
+  than local build steps; they have not been performed without explicit
+  publication authorization. Consequently no remote Ubuntu/macOS/Windows CI or
+  release-archive evidence exists yet.
 
 ## Declared non-blocking scope limitations
 
