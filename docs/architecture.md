@@ -308,9 +308,9 @@ direction:
   default;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service commands, explicitly launched
-  shell-free JSON Models and Tools, exact-selected MCP Tools, explicitly
-  activated digest-verified project Skills, and Agent Memory Hub Context
-  assembly;
+  shell-free JSON Models, Tools, and semantic Conversation Compactors,
+  exact-selected MCP Tools, explicitly activated digest-verified project
+  Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
   v18, with bounded recent-Thread navigation, authoritative Thread projection,
@@ -318,8 +318,9 @@ direction:
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
-  adapters for Tools and Models with the Runtime's exact Turn cancellation
-  signal propagated into external Model execution; local execution permits
+  adapters for Tools, Models, and semantic Conversation Compactors with the
+  Runtime's exact Turn cancellation signal propagated into external Model and
+  Context execution; local execution permits
   1–4096 concurrent direct children, remains cancellable during pipe settlement,
   bounds termination cleanup to five seconds, and on Unix settles ordinary
   descendants that remain in a private per-execution process group without

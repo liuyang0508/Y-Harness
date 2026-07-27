@@ -73,6 +73,8 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("mcp servers: 0 enabled / 0 configured"));
     assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
     assert!(report.contains("skills: 0"));
+    assert!(report.contains("conversation: 32 Turns / 65536 tokens / 65536 bytes"));
+    assert!(report.contains("conversation compactor: disabled"));
     assert!(report.contains("status: ok"));
     fs::remove_dir_all(project).expect("remove isolated project");
 }
@@ -754,6 +756,52 @@ fn invalid_json_command_model_is_rejected_before_environment_access() {
     fs::remove_dir_all(project).expect("remove invalid JSON command Model project");
 }
 
+#[test]
+fn invalid_json_command_compactor_is_rejected_before_environment_access() {
+    let project = isolated_project("invalid-json-command-compactor");
+    fs::create_dir_all(&project).expect("create invalid JSON command compactor project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "conversation": {
+                "max_turns": 1,
+                "compaction": {
+                    "name": "external.fixture-summary",
+                    "description": "Fixture summary command",
+                    "process": {
+                        "command": env!("CARGO_BIN_EXE_yh"),
+                        "current_directory": ".",
+                        "environment_from_host": {
+                            "PROVIDER_API_KEY": "MISSING_COMPACTOR_SECRET"
+                        },
+                        "timeout_ms": 0,
+                        "launch": {
+                            "type": "unrestricted",
+                            "max_concurrency": 1
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("encode invalid JSON command compactor config"),
+    )
+    .expect("write invalid JSON command compactor config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose invalid JSON command compactor");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 doctor error");
+    assert!(error.contains("process timeout must be"));
+    assert!(!error.contains("MISSING_COMPACTOR_SECRET"));
+    fs::remove_dir_all(project).expect("remove invalid JSON command compactor project");
+}
+
 #[cfg(feature = "https-model")]
 #[test]
 fn doctor_accepts_the_checked_in_https_gateway_template() {
@@ -924,56 +972,13 @@ printf '%s' '{"type":"message","content":"configured command model"}'
         } => thread.id,
         other => panic!("unexpected create Thread response: {other:?}"),
     };
-    let started = exchange(
+    let final_text = run_turn_to_completion(
         &mut input,
         &mut output,
-        request(
-            "start-turn",
-            ProtocolCommand::StartTurn {
-                thread_id: thread_id.to_string(),
-                prompt: "use configured adapter".to_owned(),
-                memory_scope: Default::default(),
-                context: Vec::new(),
-                timeout_ms: Some(5_000),
-            },
-        ),
+        &thread_id,
+        "use configured adapter",
+        "command-model-turn",
     );
-    let operation_id = match started.body {
-        ProtocolResponseBody::Success {
-            result: ProtocolResult::TurnStarted { operation_id },
-        } => operation_id,
-        other => panic!("unexpected start Turn response: {other:?}"),
-    };
-    let mut attempts = 0;
-    let final_text = loop {
-        attempts += 1;
-        assert!(attempts <= 200, "JSON command Model Turn did not settle");
-        let polled = exchange(
-            &mut input,
-            &mut output,
-            request(
-                "get-operation",
-                ProtocolCommand::GetOperation {
-                    operation_id: operation_id.to_string(),
-                },
-            ),
-        );
-        match polled.body {
-            ProtocolResponseBody::Success {
-                result:
-                    ProtocolResult::Operation {
-                        operation: OperationStatus::Running { .. },
-                    },
-            } => std::thread::sleep(Duration::from_millis(5)),
-            ProtocolResponseBody::Success {
-                result:
-                    ProtocolResult::Operation {
-                        operation: OperationStatus::Completed { final_text, .. },
-                    },
-            } => break final_text,
-            other => panic!("unexpected operation response: {other:?}"),
-        }
-    };
     assert_eq!(final_text, "configured command model");
 
     drop(input);
@@ -1020,6 +1025,169 @@ printf '%s' '{"type":"message","content":"configured command model"}'
             })
     );
     fs::remove_dir_all(project).expect("remove JSON command Model project");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_json_command_compactor_records_real_service_summary_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = isolated_project("json-command-compactor");
+    fs::create_dir_all(&project).expect("create JSON command compactor project");
+    let adapter = project.join("conversation-compactor");
+    fs::write(
+        &adapter,
+        br#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"summary":"configured semantic summary"}'
+"#,
+    )
+    .expect("write conversation compactor");
+    let mut permissions = fs::metadata(&adapter)
+        .expect("conversation compactor metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&adapter, permissions).expect("make conversation compactor executable");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "conversation": {
+                "max_turns": 1,
+                "budget_tokens": 65_536,
+                "budget_bytes": 65_536,
+                "compaction": {
+                    "name": "external.fixture-summary",
+                    "description": "Fixture semantic summary command",
+                    "max_input_turns": 2,
+                    "input_budget_bytes": 65_536,
+                    "output_budget_tokens": 1_024,
+                    "output_budget_bytes": 4_096,
+                    "process": {
+                        "command": adapter,
+                        "current_directory": ".",
+                        "timeout_ms": 5_000,
+                        "max_output_bytes": 4_096,
+                        "launch": {
+                            "type": "unrestricted",
+                            "max_concurrency": 1
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("encode JSON command compactor config"),
+    )
+    .expect("write JSON command compactor config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["doctor", "y-harness.json"])
+        .current_dir(&project)
+        .output()
+        .expect("diagnose JSON command compactor service");
+    assert!(
+        doctor.status.success(),
+        "JSON command compactor doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report = String::from_utf8(doctor.stdout).expect("UTF-8 compactor doctor report");
+    assert!(report.contains("conversation: 1 Turns / 65536 tokens / 65536 bytes"));
+    assert!(report.contains("conversation compactor: external.fixture-summary"));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn JSON command compactor service");
+    let mut input = child.stdin.take().expect("service stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("service stdout"));
+
+    let initialized = exchange(
+        &mut input,
+        &mut output,
+        request("initialize", ProtocolCommand::Initialize {}),
+    );
+    assert!(matches!(
+        initialized.body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    let created = exchange(
+        &mut input,
+        &mut output,
+        request("create-thread", ProtocolCommand::CreateThread {}),
+    );
+    let thread_id = match created.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ThreadCreated { thread },
+        } => thread.id,
+        other => panic!("unexpected create Thread response: {other:?}"),
+    };
+    for (index, prompt) in ["first", "second", "third"].into_iter().enumerate() {
+        run_turn_to_completion(
+            &mut input,
+            &mut output,
+            &thread_id,
+            prompt,
+            &format!("compaction-turn-{index}"),
+        );
+    }
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle service");
+    assert!(
+        settled.status.success(),
+        "JSON command compactor service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build compactor provenance Runtime");
+    let thread = runtime.block_on(async {
+        StateEngine::new(Arc::new(
+            SqliteEventStore::open(project.join(".y-harness/state.db"))
+                .await
+                .expect("open JSON command compactor State"),
+        ))
+        .load_thread(&thread_id)
+        .await
+        .expect("load JSON command compactor Thread")
+        .expect("persisted JSON command compactor Thread")
+    });
+    assert_eq!(thread.turns.len(), 3);
+    assert!(thread.turns[0].items.iter().any(|item| {
+        matches!(
+            &item.kind,
+            ItemKind::UserMessage { content } if content == "first"
+        )
+    }));
+    assert!(thread.turns[2].items.iter().any(|item| {
+        matches!(
+            &item.kind,
+            ItemKind::ConversationSummary {
+                compactor,
+                covered_turns,
+                older_omitted_turns: 0,
+                source_sha256,
+                content_sha256,
+                estimated_tokens,
+                serialized_bytes,
+            } if compactor == "external.fixture-summary"
+                && covered_turns == &[thread.turns[0].id.clone()]
+                && source_sha256.len() == 64
+                && content_sha256.len() == 64
+                && *estimated_tokens > 0
+                && *serialized_bytes > 0
+        )
+    }));
+    fs::remove_dir_all(project).expect("remove JSON command compactor project");
 }
 
 #[test]
@@ -1142,6 +1310,64 @@ fn exchange(
     let read = output.read_line(&mut line).expect("read protocol response");
     assert!(read > 0, "service ended before responding");
     serde_json::from_str(&line).expect("decode protocol response")
+}
+
+#[cfg(unix)]
+fn run_turn_to_completion(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    thread_id: &ThreadId,
+    prompt: &str,
+    request_prefix: &str,
+) -> String {
+    let started = exchange(
+        input,
+        output,
+        request(
+            &format!("{request_prefix}-start"),
+            ProtocolCommand::StartTurn {
+                thread_id: thread_id.to_string(),
+                prompt: prompt.to_owned(),
+                memory_scope: Default::default(),
+                context: Vec::new(),
+                timeout_ms: Some(5_000),
+            },
+        ),
+    );
+    let operation_id = match started.body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::TurnStarted { operation_id },
+        } => operation_id,
+        other => panic!("unexpected start Turn response: {other:?}"),
+    };
+    for attempt in 0..200 {
+        let polled = exchange(
+            input,
+            output,
+            request(
+                &format!("{request_prefix}-poll-{attempt}"),
+                ProtocolCommand::GetOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+        );
+        match polled.body {
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Operation {
+                        operation: OperationStatus::Running { .. },
+                    },
+            } => std::thread::sleep(Duration::from_millis(5)),
+            ProtocolResponseBody::Success {
+                result:
+                    ProtocolResult::Operation {
+                        operation: OperationStatus::Completed { final_text, .. },
+                    },
+            } => return final_text,
+            other => panic!("unexpected operation response: {other:?}"),
+        }
+    }
+    panic!("Turn did not settle")
 }
 
 fn serve(project: &Path, requests: Vec<ProtocolRequest>) -> Vec<ProtocolResponse> {

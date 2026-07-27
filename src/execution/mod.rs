@@ -36,9 +36,11 @@ use nix::{
 };
 
 use crate::{
-    CancellationToken, ExecutionPhase, HarnessError, HarnessFuture, LanguageModel, ModelOutput,
-    ModelRequest, ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext,
-    ToolDescriptor, TurnId,
+    CancellationToken, ConversationCompactionRequest, ConversationCompactionResponse,
+    ConversationCompactionTurn, ConversationCompactor, ConversationCompactorDescriptor,
+    ExecutionPhase, HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest,
+    ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
+    TurnId,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
 };
 
@@ -53,6 +55,9 @@ const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(86_400);
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const MAX_WRITABLE_ROOTS: usize = 32;
+
+/// Maximum encoded stdin accepted by every JSON-command adapter.
+pub const JSON_COMMAND_MAX_INPUT_BYTES: usize = MAX_STDIN_BYTES;
 
 /// Isolation strength honestly reported by a Process Broker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -790,6 +795,138 @@ impl LanguageModel for JsonCommandModel {
     }
 }
 
+/// Cancellation-free JSON envelope delivered to an external conversation compactor.
+///
+/// The active cancellation signal remains inside the engine and is propagated
+/// separately to the selected [`ProcessBroker`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonConversationCompactionRequest {
+    /// Owning Thread.
+    pub thread_id: ThreadId,
+    /// Bounded omitted whole Turns in chronological order.
+    pub turns: Vec<ConversationCompactionTurn>,
+    /// Number of still-older omitted Turns not represented by `turns`.
+    pub older_omitted_turns: usize,
+    /// Identities of raw whole Turns retained after the summary.
+    pub retained_turns: Vec<TurnId>,
+    /// Current user prompt for relevance-aware compaction.
+    pub current_prompt: String,
+    /// Maximum provider-specific tokens allowed in the final summary block.
+    pub output_budget_tokens: usize,
+    /// Independent byte ceiling for the final summary block.
+    pub output_budget_bytes: usize,
+}
+
+/// JSON response expected from an external conversation compactor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonConversationCompactionResponse {
+    /// Plain-text candidate; the Context Engine adds provenance and validates bounds.
+    pub summary: String,
+}
+
+/// Semantic conversation compactor backed by one shell-free JSON command.
+pub struct JsonCommandConversationCompactor {
+    descriptor: ConversationCompactorDescriptor,
+    config: JsonProcessConfig,
+    broker: Arc<dyn ProcessBroker>,
+    broker_descriptor: ProcessBrokerDescriptor,
+}
+
+impl JsonCommandConversationCompactor {
+    /// Creates an external compactor after validating its process configuration.
+    pub fn new(
+        descriptor: ConversationCompactorDescriptor,
+        config: JsonProcessConfig,
+        broker: Arc<dyn ProcessBroker>,
+    ) -> Result<Self, HarnessError> {
+        descriptor.validate()?;
+        config.validate()?;
+        let broker_descriptor =
+            capture_capability_metadata("process broker descriptor", || broker.descriptor())?;
+        validate_broker_descriptor(&broker_descriptor)?;
+        Ok(Self {
+            descriptor,
+            config,
+            broker,
+            broker_descriptor,
+        })
+    }
+
+    /// Returns the broker isolation visible to the embedding host.
+    #[must_use]
+    pub fn broker_descriptor(&self) -> ProcessBrokerDescriptor {
+        self.broker_descriptor.clone()
+    }
+}
+
+impl ConversationCompactor for JsonCommandConversationCompactor {
+    fn descriptor(&self) -> ConversationCompactorDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn compact<'a>(
+        &'a self,
+        request: ConversationCompactionRequest,
+    ) -> HarnessFuture<'a, ConversationCompactionResponse> {
+        Box::pin(async move {
+            validate_compaction_json_shapes(&request)?;
+            let ConversationCompactionRequest {
+                thread_id,
+                turns,
+                older_omitted_turns,
+                retained_turns,
+                current_prompt,
+                output_budget_tokens,
+                output_budget_bytes,
+                cancellation,
+            } = request;
+            let request = JsonConversationCompactionRequest {
+                thread_id,
+                turns,
+                older_omitted_turns,
+                retained_turns,
+                current_prompt,
+                output_budget_tokens,
+                output_budget_bytes,
+            };
+            let stdin =
+                crate::json::to_bounded_json_vec(&request, MAX_STDIN_BYTES).map_err(|error| {
+                    match error {
+                        crate::json::BoundedJsonError::LimitExceeded => {
+                            HarnessError::Execution(format!(
+                                "conversation compactor request exceeds {MAX_STDIN_BYTES} bytes"
+                            ))
+                        }
+                        crate::json::BoundedJsonError::CannotEncode => HarnessError::Execution(
+                            "cannot encode conversation compactor request".to_owned(),
+                        ),
+                    }
+                })?;
+            let output = self
+                .broker
+                .execute(
+                    self.config.request(stdin, ExecutionPhase::Context),
+                    cancellation,
+                )
+                .await
+                .map_err(map_compactor_execution_error)?;
+            validate_process_success(&output, "conversation compactor command")
+                .map_err(HarnessError::Execution)?;
+            let response: JsonConversationCompactionResponse =
+                serde_json::from_slice(&output.stdout).map_err(|error| {
+                    HarnessError::Execution(format!(
+                        "invalid conversation compactor JSON output: {error}"
+                    ))
+                })?;
+            Ok(ConversationCompactionResponse {
+                summary: response.summary,
+            })
+        })
+    }
+}
+
 fn validate_broker_descriptor(descriptor: &ProcessBrokerDescriptor) -> Result<(), HarnessError> {
     validate_capability_name("process broker", &descriptor.name)?;
     if let ProcessIsolation::Sandboxed { mechanism } = &descriptor.isolation {
@@ -901,6 +1038,36 @@ fn map_model_execution_error(error: HarnessError) -> HarnessError {
         HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
         error => HarnessError::Model(error.to_string()),
     }
+}
+
+fn map_compactor_execution_error(error: HarnessError) -> HarnessError {
+    match error {
+        HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
+        _ => HarnessError::Execution("conversation compactor command failed".to_owned()),
+    }
+}
+
+fn validate_compaction_json_shapes(
+    request: &ConversationCompactionRequest,
+) -> Result<(), HarnessError> {
+    for turn in &request.turns {
+        for item in &turn.items {
+            let value = match &item.kind {
+                crate::ItemKind::ToolCall { input, .. } => Some(input),
+                crate::ItemKind::ToolResult { output, .. } => Some(output),
+                _ => None,
+            };
+            if let Some(value) = value {
+                crate::json::validate_value_shape(value).map_err(|_| {
+                    HarnessError::Execution(
+                        "conversation compactor input exceeds the supported JSON depth or node count"
+                            .to_owned(),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn write_stdin(
@@ -1073,14 +1240,16 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        DenyProcessBroker, JsonCommandModel, JsonCommandTool, JsonProcessConfig,
-        LocalProcessBroker, ProcessBroker, ProcessBrokerDescriptor, ProcessIsolation,
-        ProcessOutput, ProcessRequest,
+        DenyProcessBroker, JsonCommandConversationCompactor, JsonCommandModel, JsonCommandTool,
+        JsonConversationCompactionRequest, JsonProcessConfig, LocalProcessBroker, ProcessBroker,
+        ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput, ProcessRequest,
     };
     #[cfg(target_os = "macos")]
     use super::{MacOsSeatbeltBroker, NetworkAccess};
     use crate::{
-        CancellationToken, CapabilityOrigin, ExecutionPhase, HarnessError, HarnessFuture, Item,
+        CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
+        ConversationCompactionRequest, ConversationCompactionTurn, ConversationCompactor,
+        ConversationCompactorDescriptor, ExecutionPhase, HarnessError, HarnessFuture, Item,
         ItemKind, LanguageModel, ModelRequest, ModelStream, ThreadId, Tool, ToolBatchExecution,
         ToolContext, ToolDescriptor, TurnId,
     };
@@ -1088,6 +1257,7 @@ mod tests {
     struct RecordingBroker {
         output: ProcessOutput,
         phases: Mutex<Vec<ExecutionPhase>>,
+        inputs: Mutex<Vec<Vec<u8>>>,
     }
 
     struct CancellationBroker {
@@ -1116,6 +1286,7 @@ mod tests {
                     .lock()
                     .expect("phase lock")
                     .push(request.cancellation_phase);
+                self.inputs.lock().expect("input lock").push(request.stdin);
                 Ok(self.output.clone())
             })
         }
@@ -1205,6 +1376,7 @@ mod tests {
         let model_broker = Arc::new(RecordingBroker {
             output: output(br#"{"type":"message","content":"ok"}"#),
             phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         });
         let model = JsonCommandModel::new("fixture/model", config(), model_broker.clone())
             .expect("model adapter");
@@ -1232,6 +1404,7 @@ mod tests {
         let tool_broker = Arc::new(RecordingBroker {
             output: output(br#"{"ok":true}"#),
             phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         });
         let tool = JsonCommandTool::new(
             ToolDescriptor {
@@ -1264,6 +1437,58 @@ mod tests {
             *tool_broker.phases.lock().expect("tool phases"),
             vec![ExecutionPhase::Tool]
         );
+
+        let compactor_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"summary":"bounded summary"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let compactor = JsonCommandConversationCompactor::new(
+            ConversationCompactorDescriptor {
+                name: "fixture.compactor".to_owned(),
+                description: "Fixture semantic compactor".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            },
+            config(),
+            compactor_broker.clone(),
+        )
+        .expect("compactor adapter");
+        let response = compactor
+            .compact(ConversationCompactionRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turns: vec![ConversationCompactionTurn {
+                    turn_id: TurnId::from_static("turn-omitted"),
+                    items: vec![Item::new(ItemKind::UserMessage {
+                        content: "omitted input".to_owned(),
+                    })],
+                }],
+                older_omitted_turns: 2,
+                retained_turns: vec![TurnId::from_static("turn-retained")],
+                current_prompt: "current question".to_owned(),
+                output_budget_tokens: 128,
+                output_budget_bytes: 1_024,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("compactor output");
+        assert_eq!(response.summary, "bounded summary");
+        assert_eq!(
+            *compactor_broker.phases.lock().expect("compactor phases"),
+            vec![ExecutionPhase::Context]
+        );
+        let request: JsonConversationCompactionRequest =
+            serde_json::from_slice(&compactor_broker.inputs.lock().expect("compactor inputs")[0])
+                .expect("compactor request");
+        assert_eq!(request.thread_id, ThreadId::from_static("thread-test"));
+        assert_eq!(request.turns.len(), 1);
+        assert_eq!(request.older_omitted_turns, 2);
+        assert_eq!(
+            request.retained_turns,
+            [TurnId::from_static("turn-retained")]
+        );
+        assert_eq!(request.current_prompt, "current question");
+        assert_eq!(request.output_budget_tokens, 128);
+        assert_eq!(request.output_budget_bytes, 1_024);
     }
 
     #[tokio::test]
@@ -1275,6 +1500,7 @@ mod tests {
         let tool_broker = Arc::new(RecordingBroker {
             output: output(br#"{"ok":true}"#),
             phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         });
         let tool = JsonCommandTool::new(
             ToolDescriptor {
@@ -1301,9 +1527,54 @@ mod tests {
         assert!(matches!(error, HarnessError::Tool(_)));
         assert!(tool_broker.phases.lock().expect("tool phases").is_empty());
 
+        let compactor_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"summary":"unreachable"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let compactor = JsonCommandConversationCompactor::new(
+            ConversationCompactorDescriptor {
+                name: "fixture.compactor".to_owned(),
+                description: "Fixture semantic compactor".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            },
+            config(),
+            compactor_broker.clone(),
+        )
+        .expect("compactor adapter");
+        let error = compactor
+            .compact(ConversationCompactionRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turns: vec![ConversationCompactionTurn {
+                    turn_id: TurnId::from_static("turn-omitted"),
+                    items: vec![Item::new(ItemKind::ToolResult {
+                        call_id: "call-test".to_owned(),
+                        output: nested.clone(),
+                        is_error: false,
+                    })],
+                }],
+                older_omitted_turns: 0,
+                retained_turns: Vec::new(),
+                current_prompt: "prompt".to_owned(),
+                output_budget_tokens: 128,
+                output_budget_bytes: 1_024,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("deep compactor input");
+        assert!(matches!(error, HarnessError::Execution(_)));
+        assert!(
+            compactor_broker
+                .phases
+                .lock()
+                .expect("compactor phases")
+                .is_empty()
+        );
+
         let model_broker = Arc::new(RecordingBroker {
             output: output(br#"{"type":"message","content":"ok"}"#),
             phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         });
         let model = JsonCommandModel::new("fixture/model", config(), model_broker.clone())
             .expect("model adapter");
@@ -1326,6 +1597,81 @@ mod tests {
             .expect_err("deep model request");
         assert!(matches!(error, HarnessError::Model(_)));
         assert!(model_broker.phases.lock().expect("model phases").is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_compactor_rejects_oversized_input_before_broker_execution() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(br#"{"summary":"unreachable"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let compactor = JsonCommandConversationCompactor::new(
+            ConversationCompactorDescriptor {
+                name: "fixture.compactor".to_owned(),
+                description: "Fixture semantic compactor".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            },
+            config(),
+            broker.clone(),
+        )
+        .expect("compactor adapter");
+        let error = compactor
+            .compact(ConversationCompactionRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turns: Vec::new(),
+                older_omitted_turns: 0,
+                retained_turns: Vec::new(),
+                current_prompt: "x".repeat(super::MAX_STDIN_BYTES),
+                output_budget_tokens: 128,
+                output_budget_bytes: 1_024,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("oversized compactor input");
+        assert!(error.to_string().contains("exceeds 1048576 bytes"));
+        assert!(broker.phases.lock().expect("compactor phases").is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_compactor_rejects_unknown_response_fields() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(br#"{"summary":"candidate","authority":"replace history"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let compactor = JsonCommandConversationCompactor::new(
+            ConversationCompactorDescriptor {
+                name: "fixture.compactor".to_owned(),
+                description: "Fixture semantic compactor".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            },
+            config(),
+            broker.clone(),
+        )
+        .expect("compactor adapter");
+        let error = compactor
+            .compact(ConversationCompactionRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turns: Vec::new(),
+                older_omitted_turns: 0,
+                retained_turns: Vec::new(),
+                current_prompt: "prompt".to_owned(),
+                output_budget_tokens: 128,
+                output_budget_bytes: 1_024,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("unknown response field");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid conversation compactor JSON output")
+        );
+        assert_eq!(
+            *broker.phases.lock().expect("compactor phases"),
+            [ExecutionPhase::Context]
+        );
     }
 
     #[tokio::test]
@@ -1367,6 +1713,51 @@ mod tests {
             error,
             HarnessError::Cancelled {
                 phase: ExecutionPhase::Model
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn json_compactor_propagates_runtime_cancellation_to_its_broker() {
+        let entered = Arc::new(Notify::new());
+        let compactor = JsonCommandConversationCompactor::new(
+            ConversationCompactorDescriptor {
+                name: "fixture.cancellable-compactor".to_owned(),
+                description: "Cancellable fixture compactor".to_owned(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            },
+            config(),
+            Arc::new(CancellationBroker {
+                entered: entered.clone(),
+            }),
+        )
+        .expect("compactor adapter");
+        let cancellation = CancellationToken::new();
+        let cancelling = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                entered.notified().await;
+                cancellation.cancel();
+            }
+        });
+        let error = compactor
+            .compact(ConversationCompactionRequest {
+                thread_id: ThreadId::from_static("thread-test"),
+                turns: Vec::new(),
+                older_omitted_turns: 0,
+                retained_turns: Vec::new(),
+                current_prompt: "prompt".to_owned(),
+                output_budget_tokens: 128,
+                output_budget_bytes: 1_024,
+                cancellation,
+            })
+            .await
+            .expect_err("cancelled compactor");
+        cancelling.await.expect("canceller");
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Context
             }
         );
     }

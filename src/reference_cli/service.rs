@@ -16,18 +16,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox,
-    CapabilityOrigin, ContextEngine, DEFAULT_MAX_PARALLEL_TOOL_CALLS, HarnessRuntime,
-    InboxApprovalHandler, JsonCommandModel, JsonCommandTool, JsonProcessConfig, LanguageModel,
-    LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker,
-    McpClient, MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
-    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
-    ProcessBroker, ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
-    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
-    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
-    SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine, StdioMcpClient,
-    StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
-    ToolBatchExecution, ToolDescriptor, ToolRegistry, decode_thread_archive, encode_thread_archive,
-    register_selected_mcp_tools, serve_stdio,
+    CONVERSATION_COMPACTOR_API_VERSION, CapabilityOrigin, ContextEngine,
+    ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
+    ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, HarnessRuntime,
+    InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
+    JsonCommandModel, JsonCommandTool, JsonProcessConfig, LanguageModel, LocalProcessBroker,
+    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
+    MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
+    ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION, ProcessBroker,
+    ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
+    SignedSkillPackage, SkillEngine, SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry,
+    SkillTransparencyRequirement, SkillTrustStore, SqliteApprovalInbox, SqliteEventStore,
+    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
+    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor,
+    ToolRegistry, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
+    serve_stdio,
 };
 
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
@@ -77,6 +80,8 @@ struct ServiceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory: Option<ServiceMemoryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation: Option<ServiceConversationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     skills: Option<ServiceSkillsConfig>,
 }
 
@@ -95,6 +100,7 @@ impl Default for ServiceConfig {
             mcp_servers: Vec::new(),
             https_mcp_servers: Vec::new(),
             memory: None,
+            conversation: None,
             skills: None,
         }
     }
@@ -336,6 +342,35 @@ enum ServiceMemoryConfig {
         #[serde(default)]
         failure_mode: ServiceMemoryFailureMode,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceConversationConfig {
+    #[serde(default = "default_conversation_max_turns")]
+    max_turns: usize,
+    #[serde(default = "default_conversation_budget_tokens")]
+    budget_tokens: usize,
+    #[serde(default = "default_conversation_budget_bytes")]
+    budget_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction: Option<ServiceConversationCompactionConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceConversationCompactionConfig {
+    name: String,
+    description: String,
+    #[serde(default = "default_compaction_max_input_turns")]
+    max_input_turns: usize,
+    #[serde(default = "default_compaction_input_budget_bytes")]
+    input_budget_bytes: usize,
+    #[serde(default = "default_compaction_output_budget_tokens")]
+    output_budget_tokens: usize,
+    #[serde(default = "default_compaction_output_budget_bytes")]
+    output_budget_bytes: usize,
+    process: ServiceJsonProcessConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -719,6 +754,26 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     } else {
         println!("memory: disabled");
     }
+    if let Some(conversation) = &loaded.config.conversation {
+        println!(
+            "conversation: {} Turns / {} tokens / {} bytes",
+            conversation.max_turns, conversation.budget_tokens, conversation.budget_bytes
+        );
+        println!(
+            "conversation compactor: {}",
+            conversation
+                .compaction
+                .as_ref()
+                .map_or("disabled", |compaction| compaction.name.as_str())
+        );
+    } else {
+        let defaults = ConversationContextConfig::default();
+        println!(
+            "conversation: {} Turns / {} tokens / {} bytes",
+            defaults.max_turns, defaults.budget_tokens, defaults.budget_bytes
+        );
+        println!("conversation compactor: disabled");
+    }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
         "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
@@ -1046,6 +1101,51 @@ async fn build_capabilities(
             (ContextEngine::with_memory(memories, config), health)
         }
     };
+    if let Some(configured) = &loaded.config.conversation {
+        context = context.with_conversation_config(ConversationContextConfig {
+            max_turns: configured.max_turns,
+            budget_tokens: configured.budget_tokens,
+            budget_bytes: configured.budget_bytes,
+        })?;
+        if let Some(compaction) = &configured.compaction {
+            let config = ConversationCompactionConfig {
+                compactor: compaction.name.clone(),
+                max_input_turns: compaction.max_input_turns,
+                input_budget_bytes: compaction.input_budget_bytes,
+                output_budget_tokens: compaction.output_budget_tokens,
+                output_budget_bytes: compaction.output_budget_bytes,
+            };
+            config.validate()?;
+            if config.input_budget_bytes > JSON_COMMAND_MAX_INPUT_BYTES {
+                return Err(format!(
+                    "JSON conversation compactor input_budget_bytes must be 1-{JSON_COMMAND_MAX_INPUT_BYTES}"
+                )
+                .into());
+            }
+            let descriptor = ConversationCompactorDescriptor {
+                name: compaction.name.clone(),
+                description: compaction.description.clone(),
+                api_version: CONVERSATION_COMPACTOR_API_VERSION,
+            };
+            descriptor.validate()?;
+            let (process, broker) = build_json_process(
+                loaded,
+                &compaction.process,
+                &format!("JSON conversation compactor {}", compaction.name),
+            )?;
+            let compactor = Arc::new(JsonCommandConversationCompactor::new(
+                descriptor, process, broker,
+            )?);
+            let mut registry = ConversationCompactorRegistry::new();
+            registry.register(
+                CapabilityOrigin::External {
+                    id: format!("json-command-compactor/{}", compaction.name),
+                },
+                compactor,
+            )?;
+            context = context.with_conversation_compactor(registry, config)?;
+        }
+    }
     let skill_locks = if let Some(resolved) = load_project_skills(loaded, &tools)? {
         let locks = resolved
             .skills
@@ -2161,6 +2261,34 @@ const fn default_memory_budget_tokens() -> usize {
     2_000
 }
 
+const fn default_conversation_max_turns() -> usize {
+    32
+}
+
+const fn default_conversation_budget_tokens() -> usize {
+    65_536
+}
+
+const fn default_conversation_budget_bytes() -> usize {
+    65_536
+}
+
+const fn default_compaction_max_input_turns() -> usize {
+    32
+}
+
+const fn default_compaction_input_budget_bytes() -> usize {
+    524_288
+}
+
+const fn default_compaction_output_budget_tokens() -> usize {
+    4_096
+}
+
+const fn default_compaction_output_budget_bytes() -> usize {
+    262_144
+}
+
 const fn default_skill_budget_tokens() -> usize {
     8_192
 }
@@ -2394,6 +2522,10 @@ mod tests {
             "../../config/y-harness.command-model.example.json"
         ))
         .expect("JSON command Model example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.command-compactor.example.json"
+        ))
+        .expect("JSON command conversation compactor example config");
     }
 
     #[tokio::test]

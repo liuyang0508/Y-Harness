@@ -821,6 +821,20 @@ failure, or provisional streaming. See
 [the example configuration](config/y-harness.command-model.example.json) and
 [ADR 0104](docs/adr/0104-configured-brokered-json-command-models.md).
 
+The reference service can also configure the Context Engine's existing
+semantic compaction port under `conversation.compaction`. A shell-free JSON
+command receives one bounded, cancellation-free
+`JsonConversationCompactionRequest` on stdin and returns exactly
+`{"summary":"..."}` on stdout; the Turn cancellation signal stays inside the
+engine and is passed separately to the Process Broker. The engine adds the
+non-authoritative marker, validates independent token/byte ceilings, preserves
+all original Items, and journals only content-free coverage and digest
+evidence. The complete command envelope is capped at 1 MiB. A configured
+failure fails the Turn rather than silently claiming complete history. See
+[the example configuration](config/y-harness.command-compactor.example.json)
+and
+[ADR 0105](docs/adr/0105-configured-brokered-conversation-compaction.md).
+
 On macOS, the first concrete sandbox broker uses Seatbelt to deny network by
 default and restrict writes to canonical operator-approved roots. Reads remain
 available, and the broker reports that scoped guarantee rather than claiming

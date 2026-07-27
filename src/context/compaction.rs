@@ -32,6 +32,13 @@ pub struct ConversationCompactorDescriptor {
     pub api_version: u32,
 }
 
+impl ConversationCompactorDescriptor {
+    /// Validates identity, description, and API compatibility.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_descriptor(self)
+    }
+}
+
 /// Explicit input and output bounds for one selected conversation compactor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationCompactionConfig {
@@ -45,6 +52,13 @@ pub struct ConversationCompactionConfig {
     pub output_budget_tokens: usize,
     /// Independent byte ceiling for the final model-visible summary.
     pub output_budget_bytes: usize,
+}
+
+impl ConversationCompactionConfig {
+    /// Validates the selected identity and all semantic input/output bounds.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_config(self)
+    }
 }
 
 /// One complete omitted Turn supplied to a semantic compactor.

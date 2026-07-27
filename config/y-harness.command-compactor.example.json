@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "conversation": {
+    "max_turns": 8,
+    "budget_tokens": 32768,
+    "budget_bytes": 262144,
+    "compaction": {
+      "name": "project.semantic-summary",
+      "description": "Summarizes bounded omitted conversation Turns",
+      "max_input_turns": 32,
+      "input_budget_bytes": 524288,
+      "output_budget_tokens": 4096,
+      "output_budget_bytes": 262144,
+      "process": {
+        "command": "/absolute/path/to/conversation-compactor",
+        "args": [],
+        "current_directory": ".",
+        "environment_from_host": {
+          "PROVIDER_API_KEY": "PROVIDER_API_KEY"
+        },
+        "timeout_ms": 60000,
+        "max_output_bytes": 1048576,
+        "launch": {
+          "type": "unrestricted",
+          "max_concurrency": 2
+        }
+      }
+    }
+  }
+}

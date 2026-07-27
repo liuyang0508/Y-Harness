@@ -70,7 +70,11 @@ coordinates. See
 [ADR 0100](adr/0100-typed-model-provider-failure-evidence.md) and
 [ADR 0101](adr/0101-bounded-typed-model-retry-policy.md), plus
 [ADR 0103](adr/0103-bounded-authenticated-https-mcp-json-transport.md) and
-[ADR 0104](adr/0104-configured-brokered-json-command-models.md).
+[ADR 0104](adr/0104-configured-brokered-json-command-models.md). The optional
+strict `conversation` object and its brokered JSON-command compactor are also
+additive service-schema-1 configuration; no State, Protocol, or Model Gateway
+shape changes. See
+[ADR 0105](adr/0105-configured-brokered-conversation-compaction.md).
 The defaulted `max_parallel_tool_calls` field is bounded to 1–64, and JSON
 Tools may explicitly opt into `parallel_safe`; absent declarations remain
 sequential.

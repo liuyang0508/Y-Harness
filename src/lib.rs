@@ -51,9 +51,11 @@ pub use evaluation::{
 };
 pub use execution::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
-    DenyProcessBroker, JsonCommandModel, JsonCommandTool, JsonProcessConfig, JsonToolRequest,
-    LocalProcessBroker, MacOsSeatbeltBroker, NetworkAccess, ProcessBroker, ProcessBrokerDescriptor,
-    ProcessIsolation, ProcessOutput, ProcessRequest, ToolCompensator,
+    DenyProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
+    JsonCommandModel, JsonCommandTool, JsonConversationCompactionRequest,
+    JsonConversationCompactionResponse, JsonProcessConfig, JsonToolRequest, LocalProcessBroker,
+    MacOsSeatbeltBroker, NetworkAccess, ProcessBroker, ProcessBrokerDescriptor, ProcessIsolation,
+    ProcessOutput, ProcessRequest, ToolCompensator,
 };
 pub use kernel::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,

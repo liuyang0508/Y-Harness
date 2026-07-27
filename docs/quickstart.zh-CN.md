@@ -396,7 +396,55 @@ yh skill remove concise-assistant@1.0.0 y-harness.json
 演示模型保持确定性，不用于证明模型遵循 instructions；真实 Provider
 会通过普通 `ModelRequest.context` 接收已解析 Skill。
 
-## 9. 接入自有模型 Gateway
+## 9. 配置长会话语义压缩
+
+Context Engine 的语义压缩接口可由任意语言实现，不需要修改 Rust。复制
+配置模板：
+
+```bash
+cp /path/to/Y-Harness/config/y-harness.command-compactor.example.json y-harness.json
+export PROVIDER_API_KEY='replace-if-the-compactor-needs-a-model'
+yh doctor y-harness.json
+```
+
+把 `conversation.compaction.process.command` 改成已有的绝对可执行文件。
+每次需要压缩时，该程序从 stdin 收到一个 JSON 对象：
+
+```json
+{
+  "thread_id": "thread-id",
+  "turns": [],
+  "older_omitted_turns": 0,
+  "retained_turns": [],
+  "current_prompt": "current question",
+  "output_budget_tokens": 4096,
+  "output_budget_bytes": 262144
+}
+```
+
+程序在 stdout 返回且仅返回：
+
+```json
+{"summary":"bounded semantic summary"}
+```
+
+`turns` 是按时间排序、经过边界检查的完整遗漏 Turns；取消信号不会序列
+化给子进程，而是由 Runtime 直接传给 Process Broker。完整 stdin 信封
+上限为 1 MiB，`input_budget_bytes` 还单独限制遗漏历史，摘要再经过
+独立 Token/字节预算、非权威标记和结构校验。命令失败、输出为空、格式
+错误或超预算都会令当前 Turn 明确失败，不会静默伪装为完整上下文。
+
+原始 Items 永远保留在 State；摘要正文只作为当次派生 Context，
+State 仅保存 compactor 名称、覆盖 Turn IDs、未覆盖数量、源/内容
+SHA-256 与计量。`yh doctor` 会显示会话窗口和当前 compactor。进程仍
+必须显式选择 `unrestricted` 或 macOS Seatbelt；前者不是沙箱。
+
+该命令适配器只用于异步 `ConversationCompactor`。`TokenCounter` 是
+模型请求热路径上的同步接口，参考服务不会用阻塞子进程伪装成精确
+Tokenizer；需要精确计数时由 Rust 宿主注册原生实现。详见
+[ADR 0105](adr/0105-configured-brokered-conversation-compaction.md)。
+
+## 10. 接入自有模型 Gateway
 
 复制生产配置模板：
 
@@ -449,7 +497,7 @@ attempt deadline 明确判定的超时；普通 Provider 字符串错误不会�
 冷却值和重试边界。修改目录或 Route 后需要受控重启服务；当前没有
 热加载、自动发现、通用错误熔断或按价格/负载猜测路由。
 
-## 10. 作为 Rust 引擎嵌入
+## 11. 作为 Rust 引擎嵌入
 
 最小 Agent Loop：
 
@@ -467,7 +515,7 @@ cargo run --locked --example orchestrated
 [`examples/embedded.rs`](../examples/embedded.rs) 和
 [`examples/orchestrated.rs`](../examples/orchestrated.rs)。
 
-## 11. 安全与产品边界
+## 12. 安全与产品边界
 
 - `serve` 是持久化 stdio 服务，适合由进程主管或受信宿主启动。
 - 网络暴露必须使用现有 mandatory-mTLS host，不能把裸 JSONL socket
