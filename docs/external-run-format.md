@@ -16,17 +16,27 @@ turning it into a comparative score. They are produced by the independent
   identity;
 - format 6 adds Hermes Agent's one-shot response plus strict bounded usage
   sidecar, observed Provider/Model identity, and explicit estimated-cost
-  semantics.
+  semantics; and
+- format 7 is a separate Codex CF-003 fault-conformance envelope. It correlates
+  a deterministic local Responses Provider, released-product JSONL, and the
+  independent MCP effect oracle without turning them into a score.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, or `6`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, `6`, or `7`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/provider/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
 | `execution` | Exactly one `completed`, `product_error`, or `adapter_error` settlement. |
+
+The table's execution variants describe formats 1–6. Format 7 keeps the same
+adapter, coordinate, and non-claim control principles but has a fault-specific
+execution object: bounded process evidence, strict Codex JSONL, deterministic
+Provider request summaries, and a separately validated fixture observation.
+Its `passed` field means only that this one pre-registered fault experiment
+satisfied all four contracts.
 
 `completed` and `product_error` contain the same `settlement` shape:
 
@@ -91,6 +101,30 @@ an empty `observed_models` list and `null` for those unavailable numeric
 fields. Codex built-in Tools also remain available within its read-only
 sandbox. These differences make the adapter suitable for conformance evidence,
 not a controlled Harness comparison.
+
+The Codex CF-003 driver emits format 7 and fixes both the released product and
+the analyzed official source to Codex `0.145.0`. It requires empty workspace
+and `CODEX_HOME` directories, clears ambient environment, supplies only the
+owned home and a loopback Provider token, disables request compression,
+multi-Agent Tools, user configuration, rules, web search, persistence, and
+interactive approval, and preapproves only the configured fixture MCP Tool.
+The product sandbox is read-only; the outer Process Broker remains explicitly
+unrestricted rather than being mislabeled as containment.
+
+The loopback Provider accepts only bounded, uncompressed
+`POST /v1/responses` requests with exact authentication. It follows Codex's
+source-defined deferred Tool path: the first response selects `tool_search`,
+the second selects the surfaced namespaced MCP Tool, and the third settles only
+after receiving the failed `function_call_output`. Request bodies and both
+Tool outputs are fingerprinted. The fixture report independently pins its
+executable, semantic spec, and journal. Format 7 passes only when Codex settles
+normally, all three Provider requests validate, and the oracle observes one
+invocation and one effect without replay.
+
+Format 7 remains `claim_eligible: false`. Codex built-in Tools are still
+advertised, the deterministic Provider does not measure reasoning quality, the
+released binary has not been reproducibly derived from the analyzed source,
+and product restart/resume is not exercised.
 
 The Grok Build adapter emits format 3 and also fixes
 `claim_eligible: false`. `bare` runs inject empty exact `HOME`, `USERPROFILE`,
@@ -187,10 +221,16 @@ The run used Claude Code `2.1.143`, returned the requested fixed text, and
 observed `MiniMax-M2.7` behind requested model alias `haiku`. This is adapter
 conformance evidence only.
 
-The Codex adapter is source- and contract-tested against official snapshot
+The ordinary format-2 Codex adapter is source- and contract-tested against official snapshot
 [`61a4488`](https://github.com/openai/codex/tree/61a44880a85d2fd0d8770908dea5733495e571c8).
-No real Codex result is checked in yet, so it contributes no live product
-evidence.
+It has no live fixed-output record.
+
+The source-pinned format-7 driver is additionally tested against official tag
+[`rust-v0.145.0`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
+One real released-product CF-003 record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe/).
+It passed the narrow no-replay oracle and remains non-comparative,
+`claim_eligible: false` evidence.
 
 The Grok Build adapter is source- and contract-tested against official snapshot
 [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2).

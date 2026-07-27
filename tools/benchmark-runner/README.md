@@ -95,6 +95,44 @@ search, and bounded JSONL parsing. The output is external-run format 2. Codex
 does not expose observed Model identity, cost, or product/API duration in this
 stream, so those fields remain empty or `null`; they are never guessed.
 
+The dedicated Codex CF-003 driver executes the deterministic uncertain-effect
+fixture without an external Model API:
+
+```json
+{
+  "format_version": 7,
+  "run_id": "codex-cf003-001",
+  "benchmark_version": "fault-conformance-v1",
+  "case_id": "cf-003-uncertain-non-idempotent-tool-effect",
+  "program": "/absolute/path/to/codex",
+  "expected_cli_version": "codex-cli 0.145.0",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "fixture_program": "/absolute/path/to/yh-fault-fixture",
+  "fixture_spec": "/absolute/path/to/fixture-spec.json",
+  "expected_fixture_spec_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/empty/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "codex_home": "/absolute/empty/codex-home",
+  "model": "gpt-5.4",
+  "timeout_ms": 30000
+}
+```
+
+```bash
+cargo run --locked --release -p y-harness-benchmark-runner -- \
+  codex-cf003 /absolute/path/to/spec.json > external-run.json
+```
+
+Format 7 pins released Codex `0.145.0`, the analyzed official source tag, the
+fixture and both specs. Its bounded loopback Responses Provider follows the
+released product's deferred `tool_search` path before selecting the MCP Tool.
+The report correlates exact Provider requests, strict Codex JSONL, and the
+independent durable oracle. `passed` means only one invocation and one effect
+were observed without replay in this single process. Built-in advertised
+Tools, outer unrestricted process isolation, absent binary-to-source
+reproducibility, and unexercised product restart/resume remain explicit;
+`claim_eligible` is always false.
+
 The Grok Build adapter consumes the official headless JSON surface:
 
 ```json

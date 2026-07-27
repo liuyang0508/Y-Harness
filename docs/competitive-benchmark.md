@@ -231,9 +231,12 @@ The independent oracle requires all of the following:
   effect; and
 - partial, reordered, mismatched, active, or oversized journals fail closed.
 
-`yh-fault-fixture` and its real official-client integration test now execute
-this fixture contract. Released-product restart drivers have not executed it,
-so the observation remains `claim_eligible: false`. See
+`yh-fault-fixture` and its real official-client integration test execute this
+fixture contract. A source-pinned Codex `0.145.0` format-7 driver has also
+executed the single-process CF-003 path through deferred Tool discovery and
+recorded one effect without replay. No product restart/resume or other product
+cell has executed the case, so the observation remains
+`claim_eligible: false`. See
 [`fault-fixtures.md`](fault-fixtures.md).
 
 ## Implementation order
@@ -243,20 +246,22 @@ The shortest path to credible comparison is:
 1. ~~add a versioned external-run result format and one released-CLI adapter;~~
    completed for format 1 plus Claude Code adapter conformance;
 2. implement deterministic failure-injection Tool fixtures and state-recovery
-   cases; the first crash-after-effect fixture and oracle are complete, while
-   released-product restart drivers and the remaining fault matrix are open;
+   cases; the first crash-after-effect fixture, oracle, and one released Codex
+   single-process driver are complete, while product restart/resume, other
+   products, and the remaining fault matrix are open;
 3. ~~add OpenCode and Hermes Agent adapters without importing their code;~~
-   completed as source-pinned formats 5 and 6. The Claude Code adapter has one
-   real conformance record, while the Codex, Grok Build, Pi, OpenCode, and
-   Hermes adapters have bounded contract tests but no live records;
+   completed as source-pinned formats 5 and 6. Claude Code has one real
+   fixed-output conformance record and Codex has one real CF-003
+   fault-conformance record; Grok Build, Pi, OpenCode, and Hermes remain
+   contract-only;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
 Provider continuation and durable safe-boundary steering are implemented and
-locally fault-tested in Y-Harness. The first real released-product adapter
-record, five additional source-pinned adapter contracts, and the first
-controller-owned fault fixture are preserved, but no cross-product fault case
-has run. Execution of CF-001/CF-002/CF-003 across products, Linux and Windows
-containment, and live external integration evidence remain prerequisites for
-broad superiority claims, not documentation follow-ups.
+locally fault-tested in Y-Harness. Two real released-product records, the
+source-pinned adapter contracts, and the controller-owned CF-003 fixture are
+preserved. One Codex cell is not a cross-product result. Execution of
+CF-001/CF-002 across products, CF-003 restart and other-product cells, Linux
+and Windows containment, and broader live external integration evidence remain
+prerequisites for broad superiority claims, not documentation follow-ups.

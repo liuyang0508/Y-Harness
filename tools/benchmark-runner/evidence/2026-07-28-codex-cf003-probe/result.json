@@ -1,0 +1,238 @@
+{
+  "format_version": 7,
+  "adapter": {
+    "name": "codex-cf003-responses-mcp-v1",
+    "version": "0.1.0",
+    "product": "codex",
+    "cli_version": "codex-cli 0.145.0",
+    "adapter_executable_sha256": "ff9828fa78be06e6e4707fb119ccba00f244a63f1b56c746e7b827e8bc7ab0c3",
+    "product_executable_sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+    "fixture_executable_sha256": "c3c4b764ad1dec9cb5cf8866d23546da7672bad7d33e651aee883b6237631179"
+  },
+  "source_analysis": {
+    "repository": "https://github.com/openai/codex",
+    "source_ref": "rust-v0.145.0",
+    "commit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
+    "binary_source_equivalence_verified": false
+  },
+  "coordinate": {
+    "run_id": "codex-cf003-20260728-009",
+    "benchmark_version": "fault-conformance-v1",
+    "case_id": "cf-003-uncertain-non-idempotent-tool-effect",
+    "workspace_snapshot": "empty-directory-v1",
+    "started_at_ms": 1785195984037,
+    "host_os": "macos",
+    "host_arch": "aarch64"
+  },
+  "controls": {
+    "track": "fault_conformance",
+    "claim_eligible": false,
+    "profile": "bare",
+    "requested_provider": "deterministic_loopback_responses",
+    "requested_model": "gpt-5.4",
+    "requested_tool": "mcp__yh_fault__commit_effect",
+    "permission_mode": "never_with_fixture_tool_preapproved",
+    "product_sandbox": "read_only",
+    "process_isolation": {
+      "kind": "unrestricted"
+    },
+    "supplied_environment_names": [
+      "CODEX_HOME",
+      "YH_FAULT_PROVIDER_TOKEN"
+    ],
+    "timeout_ms": 30000,
+    "product_restart_exercised": false,
+    "unsupported_controls": [
+      "this is one-product fault conformance evidence, not a comparative result",
+      "the released binary has not been reproducibly derived from the analyzed source commit",
+      "Codex built-in Tools remain advertised even though the Provider selects only the pinned MCP Tool",
+      "the deterministic Provider does not measure Model reasoning quality",
+      "product restart and resume are not exercised by this format"
+    ]
+  },
+  "execution": {
+    "passed": true,
+    "wall_time_ms": 1252,
+    "process": {
+      "success": true,
+      "exit_code": 0,
+      "stdout_bytes": 1054,
+      "stdout_sha256": "d7c4a758cb20d93c6263320a4748e3fe9df44ec3f9cf510b4ca536aebedd8297",
+      "stdout_truncated": false,
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_truncated": false
+    },
+    "codex": {
+      "valid": true,
+      "terminal": "turn.completed",
+      "final_message_sha256": "935e286477d5a33bc6fc56df2dd9d0a314c7ac9b13afa0a5e60f3ba0be6a62e2",
+      "error": null,
+      "events": [
+        {
+          "thread_id": "019fa5f8-f4d4-7031-be2d-f8b442a90c31",
+          "type": "thread.started"
+        },
+        {
+          "type": "turn.started"
+        },
+        {
+          "item": {
+            "arguments": {
+              "operation_id": "effect-codex-0145-009",
+              "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "error": null,
+            "id": "item_0",
+            "result": null,
+            "server": "yh_fault",
+            "status": "in_progress",
+            "tool": "commit_effect",
+            "type": "mcp_tool_call"
+          },
+          "type": "item.started"
+        },
+        {
+          "item": {
+            "arguments": {
+              "operation_id": "effect-codex-0145-009",
+              "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "error": {
+              "message": "tool call error: tool call failed for `yh_fault/commit_effect`\n\nCaused by:\n    Transport closed"
+            },
+            "id": "item_0",
+            "result": null,
+            "server": "yh_fault",
+            "status": "failed",
+            "tool": "commit_effect",
+            "type": "mcp_tool_call"
+          },
+          "type": "item.completed"
+        },
+        {
+          "item": {
+            "id": "item_1",
+            "text": "CF003_OBSERVED",
+            "type": "agent_message"
+          },
+          "type": "item.completed"
+        },
+        {
+          "type": "turn.completed",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0
+          }
+        }
+      ]
+    },
+    "provider": {
+      "valid": true,
+      "request_count": 3,
+      "requests": [
+        {
+          "ordinal": 1,
+          "body_sha256": "19004bafdd6883fb796d03d27c4a8c613d89785d4d3717617c5d96fc04f0eb25",
+          "model": "gpt-5.4",
+          "advertised_tools": [
+            "exec_command",
+            "write_stdin",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+            "update_plan",
+            "request_user_input",
+            "type:custom",
+            "view_image",
+            "type:tool_search"
+          ],
+          "input_item_types": [
+            "message"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "body_sha256": "a6a58be66415086d224bf6be9d4271adf7b7482015eded3fe49b96982a1bbbc5",
+          "model": "gpt-5.4",
+          "advertised_tools": [
+            "exec_command",
+            "write_stdin",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+            "update_plan",
+            "request_user_input",
+            "type:custom",
+            "view_image",
+            "type:tool_search"
+          ],
+          "input_item_types": [
+            "message",
+            "tool_search_call",
+            "tool_search_output"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "body_sha256": "abb7f3a8e46cbc6a76cf97f11ca4a53a9e578b866e0683518a27ceb96ab47def",
+          "model": "gpt-5.4",
+          "advertised_tools": [
+            "exec_command",
+            "write_stdin",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+            "update_plan",
+            "request_user_input",
+            "type:custom",
+            "view_image",
+            "type:tool_search"
+          ],
+          "input_item_types": [
+            "function_call",
+            "function_call_output",
+            "message",
+            "tool_search_call",
+            "tool_search_output"
+          ]
+        }
+      ],
+      "tool_search_output_present": true,
+      "tool_search_output_sha256": "c8420a5ce1ada0de98049d070d3dc326b4e7b35014ddfac5d239aa9bcf2238a8",
+      "function_call_output_present": true,
+      "function_call_output_sha256": "9cdba251dad1e8de9b45ca582dba65ea922bec9ba1519219036e18b8f4421972",
+      "error": null
+    }
+  },
+  "fixture": {
+    "spec_file_sha256": "d3179e864bb54dd9ffe5b690b783955d3c7aec0f5b93b4391017c6310a1bca7e",
+    "prepared": {
+      "format_version": 1,
+      "fixture_id": "cf003-codex-0145-20260728-009",
+      "fixture_executable_sha256": "c3c4b764ad1dec9cb5cf8866d23546da7672bad7d33e651aee883b6237631179",
+      "fixture_spec_sha256": "5a53d5b2b156177ed686d4f49635ab7226c113f504030155e62a0089e9d49dce",
+      "journal_sha256": "bc58dd831a027ae8204a32339c90c3cfdbbb2855ed7fd234e1a020dc8c409606"
+    },
+    "observed": {
+      "format_version": 1,
+      "track": "fixture_oracle",
+      "claim_eligible": false,
+      "fixture_id": "cf003-codex-0145-20260728-009",
+      "case": "crash_after_first_effect",
+      "fixture_executable_sha256": "c3c4b764ad1dec9cb5cf8866d23546da7672bad7d33e651aee883b6237631179",
+      "fixture_spec_sha256": "5a53d5b2b156177ed686d4f49635ab7226c113f504030155e62a0089e9d49dce",
+      "journal_sha256": "9f089ecafe9a6ca304aeef15e92eb4b0102829be2f4051f95063425b989494ea",
+      "invocation_count": 1,
+      "effect_count": 1,
+      "tail": "effect_committed",
+      "oracle": {
+        "passed": true,
+        "classification": "uncertain_effect_not_replayed"
+      }
+    }
+  }
+}

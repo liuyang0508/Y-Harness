@@ -1,6 +1,7 @@
 //! Released-product benchmark adapters kept outside the Harness semantic core.
 
 mod codex;
+mod codex_fault;
 mod grok_build;
 mod hermes;
 mod opencode;
@@ -138,6 +139,13 @@ enum RunExecution {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum BenchmarkReport {
+    External(Box<ExternalRunReport>),
+    CodexFault(Box<codex_fault::Report>),
+}
+
+#[derive(Serialize)]
 struct ProductSettlement {
     exit_code: Option<i32>,
     wall_time_ms: u64,
@@ -199,7 +207,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> AppResult<ExternalRunReport> {
+async fn run() -> AppResult<BenchmarkReport> {
     let mut arguments = env::args_os();
     let _ = arguments.next();
     let adapter = arguments
@@ -211,18 +219,34 @@ async fn run() -> AppResult<ExternalRunReport> {
         return Err(usage());
     }
     match adapter.as_str() {
-        "claude-code" => execute_claude(read_claude_spec(&spec_path)?).await,
-        "codex" => codex::execute(codex::read_spec(&spec_path)?).await,
-        "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?).await,
-        "hermes" => hermes::execute(hermes::read_spec(&spec_path)?).await,
-        "opencode" => opencode::execute(opencode::read_spec(&spec_path)?).await,
-        "pi" => pi::execute(pi::read_spec(&spec_path)?).await,
+        "claude-code" => execute_claude(read_claude_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
+        "codex" => codex::execute(codex::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
+        "codex-cf003" => codex_fault::execute(codex_fault::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::CodexFault(Box::new(report))),
+        "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
+        "hermes" => hermes::execute(hermes::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
+        "opencode" => opencode::execute(opencode::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
+        "pi" => pi::execute(pi::read_spec(&spec_path)?)
+            .await
+            .map(|report| BenchmarkReport::External(Box::new(report))),
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex|grok-build|hermes|opencode|pi> <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex|codex-cf003|grok-build|hermes|opencode|pi> <run-spec.json>"
+        .to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {

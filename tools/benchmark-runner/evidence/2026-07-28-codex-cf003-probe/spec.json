@@ -1,0 +1,17 @@
+{
+  "format_version": 7,
+  "run_id": "codex-cf003-20260728-009",
+  "benchmark_version": "fault-conformance-v1",
+  "case_id": "cf-003-uncertain-non-idempotent-tool-effect",
+  "program": "/Users/liuyang/.local/bin/codex",
+  "expected_cli_version": "codex-cli 0.145.0",
+  "expected_product_executable_sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "fixture_program": "/Users/liuyang/Desktop/AIAgent/Y-Harness/target/release/yh-fault-fixture",
+  "fixture_spec": "/tmp/yh-codex-cf003-20260728.mHe4ak/controller/fixture-spec.json",
+  "expected_fixture_spec_sha256": "d3179e864bb54dd9ffe5b690b783955d3c7aec0f5b93b4391017c6310a1bca7e",
+  "workspace": "/tmp/yh-codex-cf003-20260728.mHe4ak/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "codex_home": "/tmp/yh-codex-cf003-20260728.mHe4ak/codex-home",
+  "model": "gpt-5.4",
+  "timeout_ms": 30000
+}

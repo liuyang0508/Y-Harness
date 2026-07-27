@@ -63,12 +63,21 @@ fails the fixture oracle even if the second call returns successfully.
 ## Claim and authority boundary
 
 The journal must be outside product-writable workspaces, and the benchmark
-cell must disable every unrelated Tool. The initial fixture report has
+cell must disable unrelated Tools where the released product exposes that
+control and record every Tool that cannot be removed. The fixture report has
 `track: fixture_oracle` and `claim_eligible: false`. It becomes one input to a
 case result only after a released-product adapter records the corresponding
 process lifecycle, restart policy, granted authority, and exact build.
 
-This first fixture does not yet run product restarts, kill a Harness process at
+The first released Codex `0.145.0` format-7 run now correlates the fixture with
+a hash-pinned product, a deterministic loopback Provider, its source-defined
+deferred Tool-search path, exact advertised Tool identities, and a successful
+one-effect/no-replay oracle. It explicitly records that product restart was not
+exercised and that Codex built-in Tools remained advertised. The record is
+preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe/).
+
+This first fixture still does not run product restarts, kill a Harness process at
 every State settlement boundary, or cover timeout, oversized result, malformed
 protocol, descendant cleanup, or sandbox escape. Those remain separate
 versioned cases; they must not be inferred from CF-003.

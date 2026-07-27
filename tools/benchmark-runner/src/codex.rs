@@ -34,10 +34,10 @@ pub(super) struct RunSpec {
     codex_home: Option<PathBuf>,
 }
 
-struct NormalizedResult {
-    is_error: bool,
-    subtype: &'static str,
-    raw: Value,
+pub(super) struct NormalizedResult {
+    pub(super) is_error: bool,
+    pub(super) subtype: &'static str,
+    pub(super) raw: Value,
 }
 
 pub(super) fn read_spec(path: &Path) -> AppResult<RunSpec> {
@@ -314,7 +314,7 @@ fn arguments(spec: &RunSpec) -> AppResult<Vec<String>> {
     Ok(args)
 }
 
-fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
+pub(super) fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
     let mut events = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -365,8 +365,13 @@ fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
                 saw_turn = true;
             }
             "item.started" | "item.updated" | "item.completed" => {
-                if !saw_turn {
-                    return Err("Codex item event precedes turn.started".to_owned());
+                // Codex 0.145.0 forwards app-server notifications
+                // asynchronously. A Tool item can therefore reach JSONL
+                // before turn.started even though both belong to the same
+                // in-flight Turn. The terminal event still requires the
+                // unique turn.started marker below.
+                if !saw_thread {
+                    return Err("Codex item event precedes thread.started".to_owned());
                 }
                 if kind == "item.completed"
                     && event
@@ -547,6 +552,14 @@ mod tests {
         assert!(!normalized.is_error);
         assert_eq!(normalized.subtype, "turn.completed");
         assert_eq!(normalized.raw.as_array().map(Vec::len), Some(4));
+
+        let crossed = br#"{"type":"thread.started","thread_id":"thread-1"}
+{"type":"item.started","item":{"id":"item-1","type":"mcp_tool_call","server":"fixture","tool":"commit_effect","arguments":{},"status":"in_progress"}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"YH-OK"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}
+"#;
+        assert!(normalize_result(crossed).is_ok());
 
         let trailing = [
             completed.as_slice(),

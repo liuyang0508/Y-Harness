@@ -8,9 +8,10 @@ endorsement of every implementation choice in those projects.
 The baseline source snapshot was reviewed on 2026-07-25, the Turn-steering and
 Grok Build deltas on 2026-07-26, and the current Pi capability delta on
 2026-07-27. The released Hermes CLI adapter delta was reviewed on 2026-07-28.
-Every source observation below links to an immutable commit. The repositories
-were inspected locally from shallow checkouts; their full test suites were not
-executed as part of this audit.
+The released Codex CF-003 delta was also reviewed on 2026-07-28. Every source
+observation below links to an immutable commit. The repositories were inspected
+locally from shallow checkouts; their full test suites were not executed as
+part of this audit.
 
 Evidence has three levels:
 
@@ -52,6 +53,13 @@ package `0.19.0`, at
 [`3ef6bbd`](https://github.com/NousResearch/hermes-agent/tree/3ef6bbd201263d354fd83ec55b3c306ded2eb72a).
 That coordinate supports only the released-CLI findings and does not relabel
 the earlier architectural observations.
+
+The dedicated Codex fault driver additionally pins official tag
+`rust-v0.145.0`, released CLI `0.145.0`, at
+[`25af12f`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
+That coordinate supports only the deferred MCP exposure, JSONL lifecycle, and
+CF-003 findings in the checked non-comparative record; it does not relabel the
+earlier architectural observations or prove binary-to-source equivalence.
 
 The Pi snapshot supersedes the earlier `5bc1c2c` audit coordinate after a
 source-level revalidation. The old coordinate remains in historical ADR links
@@ -182,7 +190,7 @@ recovery are still unmeasured.
 | Orchestration | Codex and Claude Code expose mature multi-agent/product workflows. OpenCode has subagents and worktree/control-plane code. Hermes has delegation across many surfaces. Pi has simple steering/follow-up semantics. Grok Build exposes Subagents, workflows, goals, worktrees, and long-running task paths. | Task DAGs, leases, fencing, mailbox, and workspace lifecycle are architecturally substantial. Multi-node consensus, durable orphan reaping, remote executors, and comparative task success are not proven. |
 | Verification | Claude Code has stop hooks and verification-oriented skills; Codex has review/hook paths; Hermes records verification evidence. | Verification is a first-class engine layer rather than only a prompt convention. Its real-world graders and false-completion rate still need competitive measurement. |
 | Observability | Codex has OpenTelemetry modules and rich runtime events. Hermes has a versioned observer contract. OpenCode uses Effect/OTel. Claude Code and Pi expose extensive events. | Failure-isolated, content-free evidence now includes typed Provider failure class/status/retry facts without diagnostics. Exporter breadth, distributed traces, operator UX, and overhead comparisons are open. |
-| Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner plus configured origin-bound external Graders, not a competitive result. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
+| Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner plus configured origin-bound external Graders and one real non-comparative Codex CF-003 conformance record. One fault cell is not a competitive result. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
 
 The architectural boundary is competitive; the product effect is not yet
 competitive evidence. A typed abstraction, a passing unit test, or a larger
@@ -397,6 +405,9 @@ engine-owned invariants:
 - [Exact-ID Turn steering at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/app-server/src/request_processors/turn_processor.rs)
 - [Bounded client recovery slots at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/exec-server/src/client_recovery.rs)
 - [Typed Thread fork boundaries at `61a4488`](https://github.com/openai/codex/blob/61a44880a85d2fd0d8770908dea5733495e571c8/codex-rs/app-server/README.md)
+- [Deferred MCP Tool exposure at `25af12f`](https://github.com/openai/codex/blob/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/core/src/mcp_tool_exposure.rs)
+- [Search Tool request behavior at `25af12f`](https://github.com/openai/codex/blob/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/core/tests/suite/search_tool.rs)
+- [Exec JSONL lifecycle projection at `25af12f`](https://github.com/openai/codex/blob/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/exec/src/event_processor_with_jsonl_output.rs)
 - [Official Codex documentation](https://developers.openai.com/codex/)
 
 ### Hermes Agent

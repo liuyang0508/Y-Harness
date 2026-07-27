@@ -93,8 +93,12 @@ Hermes `0.19.0` one-shot stdout plus its strict bounded usage sidecar, an
 isolated bare home, static empty Tool set, exact Provider/Model identity, and
 estimated-cost preservation without relabeling it as actual cost. Hermes's
 argv prompt exposure and missing system-role/workspace-rule parity remain
-explicit limitations; no OpenCode or Hermes live/comparative result is
-claimed.
+explicit limitations. Dedicated format 7 drives released Codex `0.145.0`
+through a source-pinned deferred Tool-search and MCP crash-after-effect path,
+then validates the durable fixture journal independently. Its checked CF-003
+record is non-comparative and claim-ineligible: product restart/resume,
+binary-to-source equivalence, and same-Model parity remain unproven. No
+OpenCode or Hermes live/comparative result is claimed.
 
 ## Start
 

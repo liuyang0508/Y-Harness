@@ -1,0 +1,3 @@
+{"type":"initialized","format_version":1,"sequence":0,"fixture_id":"cf003-codex-0145-20260728-009","case":"crash_after_first_effect","operation_id":"effect-codex-0145-009","expected_payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fixture_spec_sha256":"5a53d5b2b156177ed686d4f49635ab7226c113f504030155e62a0089e9d49dce"}
+{"type":"invocation_started","sequence":1,"call_ordinal":1,"operation_id":"effect-codex-0145-009","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+{"type":"effect_committed","sequence":2,"call_ordinal":1,"operation_id":"effect-codex-0145-009","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}

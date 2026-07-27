@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "fixture_id": "cf003-codex-0145-20260728-009",
+  "case": "crash_after_first_effect",
+  "expected_fixture_executable_sha256": "c3c4b764ad1dec9cb5cf8866d23546da7672bad7d33e651aee883b6237631179",
+  "journal": "/tmp/yh-codex-cf003-20260728.mHe4ak/controller/journal.jsonl",
+  "operation_id": "effect-codex-0145-009",
+  "expected_payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
