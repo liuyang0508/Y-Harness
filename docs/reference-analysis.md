@@ -7,9 +7,10 @@ endorsement of every implementation choice in those projects.
 
 The baseline source snapshot was reviewed on 2026-07-25, the Turn-steering and
 Grok Build deltas on 2026-07-26, and the current Pi capability delta on
-2026-07-27. Every source observation below links to an immutable commit. The
-repositories were inspected locally from shallow checkouts; their full test
-suites were not executed as part of this audit.
+2026-07-27. The released Hermes CLI adapter delta was reviewed on 2026-07-28.
+Every source observation below links to an immutable commit. The repositories
+were inspected locally from shallow checkouts; their full test suites were not
+executed as part of this audit.
 
 Evidence has three levels:
 
@@ -46,6 +47,12 @@ and Hermes at
 These newer coordinates are used only for the delta findings below; they do not
 silently relabel observations made against the earlier baseline.
 
+The released Hermes adapter additionally pins official tag `v2026.7.20`,
+package `0.19.0`, at
+[`3ef6bbd`](https://github.com/NousResearch/hermes-agent/tree/3ef6bbd201263d354fd83ec55b3c306ded2eb72a).
+That coordinate supports only the released-CLI findings and does not relabel
+the earlier architectural observations.
+
 The Pi snapshot supersedes the earlier `5bc1c2c` audit coordinate after a
 source-level revalidation. The old coordinate remains in historical ADR links
 where it is evidence for the decision made at that time.
@@ -66,7 +73,7 @@ gate.
 | Tool, MCP, and isolation | Pi ships useful file/shell/image Tools and rich hooks, but intentionally has no built-in MCP, permission popups, or sandbox. Extensions run with the launching user's authority. | `src/execution`, `src/transport`, `src/runtime/policy.rs`, and `src/approval` provide governed Tool registration, stdio plus authenticated HTTPS JSON-response MCP, durable approval, and bounded process/network authority. | **Different strengths.** Preserve Y-Harness authority boundaries while adding multi-Tool ergonomics; bounded SSE/OAuth and broader Tool catalogs remain open, and ambient in-process extension authority stays rejected. |
 | Packages, Skills, and extensions | `pi install/remove/list/update/config` manages npm, git, URL, local, user, project, and temporary sources. Packages may provide executable TypeScript extensions, Skills, prompts, and themes; `/reload` hot-loads resources. | `src/skill` verifies exact identity, dependencies, budgets, digests, publisher signatures, revocation, and transparency evidence. `yh skill install`, `install-external`, and `install-https` manage bounded declarative stores while preserving local versus signed-External trust and keeping activation separate. | **Partially aligned with stronger supply-chain authority.** Local and exact public-HTTPS installation are implemented without ambient execution. Dependency download, update/catalog/private-registry UX, hot reload, executable-extension isolation, and ecosystem breadth remain open. |
 | Session and product surface | JSONL session trees support resume, tree navigation, fork, clone, compaction, import/export, and RPC. `getTree()` defensively assembles the entry DAG; `createBranchedSession` extracts the root-to-leaf path, preserves entry identities, re-chains retained entries, records `parentSession`, and writes the new file incrementally. `navigateTree()` may summarize the abandoned old-leaf suffix and append that derived text on the selected branch. | Authoritative SQLite Thread/Turn/Item State, recovery, checkpoints, bounded lineage-aware recent-Thread Protocol paging, explicit durable names, Protocol-backed TUI resume, schema-10 portable archives, and schema-11 attributed per-Turn Context are implemented. Fork preserves historical evidence identity and exact lineage; archive import is atomic. Format-1 Thread handoff preparation computes a bounded source-only Turn delta, binds it to source/target identities and a canonical digest, and converts any host-generated candidate into attributed content-free Context evidence. | **Partially aligned by a different State model.** Durable fork/clone-at-head, bounded recent-page forests, integrity-bound import/export, and read-only Thread-handoff preparation are Engine-owned. Pi's entry-level mutable leaf and automatic in-session navigation are deliberately rejected as a second branch authority. Candidate synthesis remains provider/host-selected and its factual quality requires evaluation. JSON is a bounded interchange format, not authoritative State. |
-| Evaluation | `packages/evals` contains an executable Pi harness adapter. OpenCode exposes source-tested `run --format json` step events. | External-run format 4 drives the released Pi JSONL CLI; format 5 drives the released OpenCode JSONL CLI. Both pin binary/version, bound process output, isolate their bare profiles, disable Tools, and preserve only product-reported lifecycle/cost facts. | **Partially aligned.** Contract tests pass, but neither product has a live record or deterministic same-model comparison. Superiority remains unverified. |
+| Evaluation | `packages/evals` contains an executable Pi harness adapter. OpenCode exposes source-tested `run --format json` step events. Hermes `0.19.0` exposes one-shot stdout plus a JSON usage sidecar. | External-run formats 4, 5, and 6 drive the released Pi, OpenCode, and Hermes CLIs. They pin binary/version, bound process evidence, isolate bare state, disable Tools, and preserve only source-supported lifecycle/identity/cost facts. Hermes estimated cost remains distinct from actual cost. | **Partially aligned.** Contract tests pass, but none of these three products has a live record or deterministic same-model comparison. Superiority remains unverified. |
 
 The adoption rule is therefore selective rather than superficial: take Pi's
 small loop, provider normalization, ordered multi-Tool semantics, package UX,

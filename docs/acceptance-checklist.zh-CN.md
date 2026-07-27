@@ -143,6 +143,16 @@ yh skill verify "$project/y-harness.json"
       把 requested Model 冒充 observed Model。
 - [ ] OpenCode Model、variant 与 system prompt 中的 `{env:...}` /
       `{file:...}` 配置替换标记在启动进程前被拒绝。
+- [ ] `yh-bench hermes <spec>` 只接受 format 6 的 `bare` profile、精确
+      `Hermes Agent v<version> (<date>)` 首行（源码安装可含 Hermes 自带的
+      revision 后缀）、Provider/Model，以及工作区外相互分离的空
+      `hermes_home` 与 `usage_directory`。
+- [ ] Hermes 版本探测不访问更新网络；静态空 `context_engine` toolset
+      不暴露 Tool；用量文件必须是 64 KiB 内的普通文件并严格校验字段、
+      完成状态、API 调用上限和观测到的 Provider/Model。
+- [ ] Hermes 的 estimated cost 不得写成 actual cost；system prompt
+      降级为 user 前缀、prompt 位于 argv、workspace rules 未被证明关闭、
+      Python launcher 哈希不覆盖依赖图等限制必须进入报告。
 - [ ] 所有 released-product 适配器始终输出
       `claim_eligible: false`；单产品 conformance 不能作为效果超越证据。
 

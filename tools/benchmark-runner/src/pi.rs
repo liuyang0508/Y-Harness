@@ -264,6 +264,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                 Profile::Bare => "bare",
                 Profile::Product => "product",
             },
+            requested_provider: None,
             requested_model: format!("{}/{}", spec.provider, spec.model),
             observed_models,
             prompt_sha256,

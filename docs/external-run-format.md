@@ -13,16 +13,19 @@ turning it into a comparative score. They are produced by the independent
   reasoning controls, observed Model identity, and reported assistant cost;
 - format 5 adds OpenCode's run JSONL step lifecycle, isolated configuration
   controls, and complete-step cost without inventing error cost or Model
-  identity.
+  identity;
+- format 6 adds Hermes Agent's one-shot response plus strict bounded usage
+  sidecar, observed Provider/Model identity, and explicit estimated-cost
+  semantics.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1`, `2`, `3`, `4`, or `5`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, or `6`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
-| `controls` | Requested profile/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
+| `controls` | Requested profile/provider/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
 | `execution` | Exactly one `completed`, `product_error`, or `adapter_error` settlement. |
 
 `completed` and `product_error` contain the same `settlement` shape:
@@ -33,6 +36,8 @@ turning it into a comparative score. They are produced by the independent
   format 3 preserves Grok Build cost only when the product marks it complete,
   while format 4 sums cost from validated completed Pi assistant messages and
   format 5 sums only successful validated OpenCode `step-finish` records;
+  format 6 keeps Hermes's estimate in raw evidence and reports actual cost as
+  unavailable;
   complete format-3 settlements add `actual_cost_usd_ticks`, where
   `10_000_000_000` ticks equal one USD, and reject disagreement with the
   product's float projection; an adapter must never infer these fields;
@@ -146,6 +151,34 @@ neither a hard spend ceiling nor a hard provider-call ceiling is claimed.
 OpenCode may still initialize or update its plugin SDK dependency cache; the
 adapter records that unsupported control.
 
+The Hermes Agent adapter emits format 6 and fixes `claim_eligible: false`.
+Only `bare` is supported. The caller supplies initially empty, pairwise
+disjoint Hermes-home and usage directories outside the workspace. The adapter
+owns Hermes configuration/safe-mode environment, disables the system managed
+scope, creates an empty private `.env`, selects the static empty
+`context_engine` toolset, and uses the source-pinned 90-call product default as
+a validation ceiling rather than pretending it is caller-selectable. Its
+offline version-probe cache prevents `hermes --version` from checking for
+updates.
+
+Hermes `0.19.0` has no one-shot stdin or system-prompt control. Format 6
+therefore records that both requested instruction and prompt appear in process
+arguments and that the instruction is only a labeled user-level prefix.
+Workspace instructions are not claimed disabled. The create-exclusive usage
+file is owner-only on Unix, limited to 64 KiB, and must contain the pinned flat
+schema. Success requires a nonempty UTF-8 response, coherent completion flags,
+one or more API calls, observed Model and Provider identities, and all token
+fields. A coherent product failure may retain nullable fields. Contradictory
+exit/completion state, unknown/missing fields, excessive API calls, malformed
+numbers, or a missing sidecar are adapter errors.
+
+The usage report labels cost as estimated. Format 6 preserves that value,
+status, and source only under `raw_result.usage`; `actual_cost_usd` remains
+`null`. The product persists isolated session state, its source-checkout
+`.env` fallback can fill otherwise undeclared variables, and the hashed Python
+launcher need not identify its dependency graph. These are explicit
+unsupported controls.
+
 ## Evidence
 
 The first real format-1 record and its exact input are preserved under
@@ -172,4 +205,10 @@ evidence.
 The OpenCode adapter is source- and contract-tested against official snapshot
 [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b).
 No real OpenCode result is checked in yet, so it contributes no live product
+evidence.
+
+The Hermes Agent adapter is source- and contract-tested against official
+release `v2026.7.20`, commit
+[`3ef6bbd`](https://github.com/NousResearch/hermes-agent/tree/3ef6bbd201263d354fd83ec55b3c306ded2eb72a).
+No real Hermes result is checked in yet, so it contributes no live product
 evidence.

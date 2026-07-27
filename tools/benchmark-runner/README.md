@@ -254,5 +254,64 @@ hard monetary nor a hard provider-call ceiling. OpenCode may still initialize
 or update its plugin SDK dependency cache; that limitation is recorded rather
 than hidden. No live OpenCode result or comparative run is checked in.
 
+The Hermes Agent adapter consumes its released one-shot output plus the
+side-channel usage report:
+
+```json
+{
+  "format_version": 6,
+  "run_id": "hermes-probe-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/absolute/path/to/hermes",
+  "expected_cli_version": "Hermes Agent v0.19.0 (2026.7.20)",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/isolated/workspace",
+  "workspace_snapshot": "empty-workspace-v1",
+  "profile": "bare",
+  "provider": "openrouter",
+  "model": "openai/gpt-5.5",
+  "system_prompt": "Return only the requested fixed text.",
+  "prompt": "Reply exactly YH-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "OPENROUTER_API_KEY"
+  ],
+  "hermes_home": "/absolute/empty/hermes-home",
+  "usage_directory": "/absolute/empty/usage-directory"
+}
+```
+
+```bash
+cargo run --locked -p y-harness-benchmark-runner -- \
+  hermes /absolute/path/to/spec.json > external-run.json
+```
+
+Format 6 supports only `bare`. It requires initially empty, pairwise-disjoint
+Hermes-home and usage directories outside the workspace, clears undeclared
+environment values, disables the system managed-scope overlay, enables safe
+mode, and selects Hermes's static empty `context_engine` toolset. The adapter
+pre-seeds the product's update cache solely for the version probe, so
+`hermes --version` does not perform its normal update network request. The
+usage file is create-exclusive, owner-only on Unix, bounded to 64 KiB, parsed
+strictly, and removed after the run.
+
+`expected_cli_version` is the exact first `--version` line. A packaged install
+normally uses the base line shown above; a source install may append Hermes's
+own ` · upstream …` / ` · local …` revision suffix, which must also match
+exactly.
+
+Hermes `0.19.0` accepts one-shot input only in a process argument and exposes
+no separate system-prompt flag. The adapter therefore sends the requested
+instruction as a labeled user-message prefix; it records both limitations
+instead of claiming system-role parity or prompt secrecy. The released
+one-shot path also does not prove that workspace instructions are ignored.
+`estimated_cost_usd` remains raw estimated evidence and is never promoted to
+`actual_cost_usd`. Observed Model identity, Provider, tokens, API-call count,
+and completion flags come only from the validated usage report. A Python
+console-launcher digest may not identify the installed package graph, so that
+limitation is machine-readable too. No live Hermes result or comparative run
+is checked in.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

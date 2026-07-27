@@ -87,10 +87,14 @@ parent identity/version without projecting full histories.
 The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
 protocol; it keeps no title or branch store.
 The independent benchmark runner emits exact non-claim external-run formats
-for released Claude Code, Codex, Grok Build, Pi, and OpenCode CLIs. Format 5
-uses OpenCode's source-tested run JSONL surface, isolated bare configuration,
-Tool denial, exact executable/version pins, and missing-evidence preservation;
-no OpenCode live or comparative result is claimed.
+for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
+CLIs. Format 5 uses OpenCode's source-tested run JSONL surface. Format 6 uses
+Hermes `0.19.0` one-shot stdout plus its strict bounded usage sidecar, an
+isolated bare home, static empty Tool set, exact Provider/Model identity, and
+estimated-cost preservation without relabeling it as actual cost. Hermes's
+argv prompt exposure and missing system-role/workspace-rule parity remain
+explicit limitations; no OpenCode or Hermes live/comparative result is
+claimed.
 
 ## Start
 

@@ -2,6 +2,7 @@
 
 mod codex;
 mod grok_build;
+mod hermes;
 mod opencode;
 mod pi;
 
@@ -99,6 +100,8 @@ struct RunControls {
     track: &'static str,
     claim_eligible: bool,
     profile: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_provider: Option<String>,
     requested_model: String,
     observed_models: Vec<String>,
     prompt_sha256: String,
@@ -211,6 +214,7 @@ async fn run() -> AppResult<ExternalRunReport> {
         "claude-code" => execute_claude(read_claude_spec(&spec_path)?).await,
         "codex" => codex::execute(codex::read_spec(&spec_path)?).await,
         "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?).await,
+        "hermes" => hermes::execute(hermes::read_spec(&spec_path)?).await,
         "opencode" => opencode::execute(opencode::read_spec(&spec_path)?).await,
         "pi" => pi::execute(pi::read_spec(&spec_path)?).await,
         _ => Err(usage()),
@@ -218,7 +222,7 @@ async fn run() -> AppResult<ExternalRunReport> {
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex|grok-build|opencode|pi> <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex|grok-build|hermes|opencode|pi> <run-spec.json>".to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {
@@ -537,6 +541,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
                 ClaudeProfile::Bare => "bare",
                 ClaudeProfile::Product => "product",
             },
+            requested_provider: None,
             requested_model: spec.model,
             observed_models,
             prompt_sha256,
