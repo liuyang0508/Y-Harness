@@ -71,6 +71,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
     assert!(report.contains("verifiers: 0"));
+    assert!(report.contains("evaluation graders: 0"));
     assert!(report.contains("mcp servers: 0 enabled / 0 configured"));
     assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
     assert!(report.contains("skills: 0"));
@@ -846,6 +847,51 @@ fn invalid_json_command_verifier_is_rejected_before_environment_access() {
     fs::remove_dir_all(project).expect("remove invalid JSON command verifier project");
 }
 
+#[test]
+fn invalid_json_command_grader_is_rejected_before_environment_access() {
+    let project = isolated_project("invalid-json-command-grader");
+    fs::create_dir_all(&project).expect("create invalid JSON command grader project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "evaluation": {
+                "grader_timeout_ms": 0,
+                "graders": [{
+                    "name": "external.fixture-grader",
+                    "description": "Fixture Evaluation Grader",
+                    "process": {
+                        "command": env!("CARGO_BIN_EXE_yh"),
+                        "current_directory": ".",
+                        "environment_from_host": {
+                            "GRADER_API_KEY": "MISSING_GRADER_SECRET"
+                        },
+                        "launch": {
+                            "type": "unrestricted",
+                            "max_concurrency": 1
+                        }
+                    }
+                }]
+            }
+        }))
+        .expect("encode invalid JSON command grader config"),
+    )
+    .expect("write invalid JSON command grader config");
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("diagnose invalid JSON command grader");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 doctor error");
+    assert!(error.contains("grader timeout must be"));
+    assert!(!error.contains("MISSING_GRADER_SECRET"));
+    fs::remove_dir_all(project).expect("remove invalid JSON command grader project");
+}
+
 #[cfg(feature = "https-model")]
 #[test]
 fn doctor_accepts_the_checked_in_https_gateway_template() {
@@ -1371,6 +1417,186 @@ printf '%s' '{"status":"passed","summary":"configured verification passed"}'
         )
     }));
     fs::remove_dir_all(project).expect("remove JSON command verifier project");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_json_command_grader_runs_an_isolated_real_evaluation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = isolated_project("json-command-grader");
+    fs::create_dir_all(&project).expect("create JSON command grader project");
+    let adapter = project.join("evaluation-grader");
+    fs::write(
+        &adapter,
+        br#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
+"#,
+    )
+    .expect("write Evaluation Grader");
+    let mut permissions = fs::metadata(&adapter)
+        .expect("Evaluation Grader metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&adapter, permissions).expect("make Evaluation Grader executable");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {"type": "demo"},
+            "evaluation": {
+                "case_concurrency": 2,
+                "grader_concurrency": 2,
+                "default_case_timeout_ms": 5_000,
+                "grader_timeout_ms": 5_000,
+                "graders": [{
+                    "name": "external.fixture-grader",
+                    "description": "Fixture Evaluation Grader",
+                    "process": {
+                        "command": adapter,
+                        "current_directory": ".",
+                        "timeout_ms": 5_000,
+                        "max_output_bytes": 4_096,
+                        "launch": {
+                            "type": "unrestricted",
+                            "max_concurrency": 1
+                        }
+                    }
+                }]
+            }
+        }))
+        .expect("encode JSON command grader config"),
+    )
+    .expect("write JSON command grader config");
+    fs::write(
+        project.join("suite.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format_version": 2,
+            "name": "configured-grader-test",
+            "cases": [{
+                "id": "configured-case",
+                "prompt": "grade this candidate",
+                "memory_scope": {
+                    "project": "configured-grader-test",
+                    "tenant_id": null,
+                    "tags": ["isolated"]
+                },
+                "timeout_ms": 5_000,
+                "metadata": {"criterion": "must complete"}
+            }]
+        }))
+        .expect("encode configured Evaluation suite"),
+    )
+    .expect("write configured Evaluation suite");
+    fs::write(
+        project.join("baseline.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format_version": 2,
+            "requirements": [{
+                "case_id": "configured-case",
+                "grader": "external.fixture-grader",
+                "grader_origin": {
+                    "kind": "external",
+                    "id": "json-command-grader/external.fixture-grader"
+                },
+                "minimum_score": 1.0,
+                "must_pass": true
+            }]
+        }))
+        .expect("encode configured Evaluation baseline"),
+    )
+    .expect("write configured Evaluation baseline");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["doctor", "y-harness.json"])
+        .current_dir(&project)
+        .output()
+        .expect("diagnose JSON command grader");
+    assert!(
+        doctor.status.success(),
+        "JSON command grader doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .expect("UTF-8 grader doctor report")
+            .contains("evaluation graders: 1")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["eval", "suite.json", "baseline.json", "y-harness.json"])
+        .current_dir(&project)
+        .output()
+        .expect("run configured Evaluation");
+    assert!(
+        output.status.success(),
+        "configured Evaluation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("configured Evaluation JSON");
+    assert_eq!(
+        report
+            .pointer("/comparison/passed")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        report
+            .pointer("/report/cases/0/grades/0/grader_origin/id")
+            .and_then(serde_json::Value::as_str),
+        Some("json-command-grader/external.fixture-grader")
+    );
+    assert_eq!(
+        report
+            .pointer("/report/cases/0/grades/0/outcome/rationale")
+            .and_then(serde_json::Value::as_str),
+        Some("configured grade passed")
+    );
+    fs::write(
+        project.join("regressed-baseline.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format_version": 2,
+            "requirements": [{
+                "case_id": "configured-case",
+                "grader": "missing.required-grader",
+                "grader_origin": {
+                    "kind": "external",
+                    "id": "json-command-grader/missing.required-grader"
+                },
+                "minimum_score": 1.0,
+                "must_pass": true
+            }]
+        }))
+        .expect("encode regressed Evaluation baseline"),
+    )
+    .expect("write regressed Evaluation baseline");
+    let regressed = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args([
+            "eval",
+            "suite.json",
+            "regressed-baseline.json",
+            "y-harness.json",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("run regressed configured Evaluation");
+    assert!(!regressed.status.success());
+    let regressed_report: serde_json::Value =
+        serde_json::from_slice(&regressed.stdout).expect("regressed Evaluation JSON");
+    assert_eq!(
+        regressed_report
+            .pointer("/comparison/passed")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        !project.join(".y-harness").exists(),
+        "configured Evaluation must not open persistent service State"
+    );
+    fs::remove_dir_all(project).expect("remove JSON command grader project");
 }
 
 #[test]

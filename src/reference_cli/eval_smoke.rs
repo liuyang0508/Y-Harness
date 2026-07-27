@@ -72,7 +72,11 @@ impl Grader for ExactOutputGrader {
         }
     }
 
-    fn grade<'a>(&'a self, sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade> {
+    fn grade<'a>(
+        &'a self,
+        sample: Arc<EvaluationSample>,
+        _cancellation: y_harness::CancellationToken,
+    ) -> HarnessFuture<'a, Grade> {
         Box::pin(async move {
             let expected = sample
                 .case
@@ -102,7 +106,11 @@ impl Grader for StateContractGrader {
         }
     }
 
-    fn grade<'a>(&'a self, sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade> {
+    fn grade<'a>(
+        &'a self,
+        sample: Arc<EvaluationSample>,
+        _cancellation: y_harness::CancellationToken,
+    ) -> HarnessFuture<'a, Grade> {
         Box::pin(async move {
             let valid = match &sample.execution {
                 EvaluationExecution::Completed { outcome } => {

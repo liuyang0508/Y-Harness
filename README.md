@@ -47,8 +47,8 @@ The API key is resolved from the named environment variable and never stored
 in configuration or State. The adapter sends `store: false`, disables
 provider-side storage, accepts ordered multi-call proposals, and keeps Tool
 execution, Policy, and State inside Y-Harness. Configured shell-free JSON
-Models/Tools, selected MCP Tools, and Agent Memory Hub remain optional; see the
-[Chinese quick start](docs/quickstart.zh-CN.md).
+Models/Tools, selected MCP Tools, Agent Memory Hub, and Evaluation Graders
+remain optional; see the [Chinese quick start](docs/quickstart.zh-CN.md).
 
 Create and validate a persistent Harness service:
 
@@ -558,17 +558,17 @@ and restart the service. See
 
 Evaluation is a separate comparison layer: validated cases run through an
 `EvaluationTarget` with engine-owned cancellation and deadlines. Cases and
-graders execute with independently bounded concurrency; panics, timeouts, and
-ordinary failures become isolated report outcomes. Immutable samples are
-shared without copying full Turn outcomes, output order is deterministic, and
-exact case/grader baselines detect missing results, errors, score regressions,
-required-pass failures, and same-name Grader origin changes. Format-2 suites,
-baselines, and reports are self-describing; every grade and requirement retains
-the registered Grader's trust-bearing origin. Graders cannot alter live
-Verification or Agent Loop control. The materialized report API admits at most
-64 cases per batch; larger datasets must be chunked by the caller. Deserialized
-suites, baselines, and reports are revalidated at their execution/comparison
-boundaries.
+graders execute with independently bounded concurrency and cancellation;
+panics, timeouts, and ordinary failures become isolated report outcomes.
+Immutable samples are shared without copying full Turn outcomes, output order
+is deterministic, and exact case/grader baselines detect missing results,
+errors, score regressions, required-pass failures, and same-name Grader origin
+changes. Format-2 suites, baselines, and reports are self-describing; every
+grade and requirement retains the registered Grader's trust-bearing origin.
+Graders cannot alter live Verification or Agent Loop control. The materialized
+report API admits at most 64 cases per batch; larger datasets must be chunked
+by the caller. Deserialized suites, baselines, and reports are revalidated at
+their execution/comparison boundaries.
 
 The checked-in `evals/harness-smoke-suite.json` and
 `evals/harness-smoke-baseline.json` form the first executable regression
@@ -579,6 +579,24 @@ narrow Harness contract smoke gate, not a claim about hosted-model quality or
 application usefulness. See
 [ADR 0067](docs/adr/0067-versioned-harness-smoke-evaluation-gate.md) and
 [ADR 0069](docs/adr/0069-origin-bound-versioned-evaluation-artifacts.md).
+
+Projects may additionally configure external JSON-command Graders. After
+replacing the template's executable and any environment mapping, run:
+
+```bash
+yh eval evals/configured-example-suite.json \
+  evals/configured-example-baseline.json \
+  config/y-harness.eval.example.json
+```
+
+Each Grader receives one strict, immutable case/execution sample and returns a
+strict score/pass/rationale object. The complete input is capped at 4 MiB; the
+Evaluation Engine owns per-grade cancellation, normalization, deterministic
+ordering, baseline comparison, and exit status. Configured evaluation uses
+in-memory State and never opens the production State, Approval, or Task
+databases. `yh serve` does not construct configured Graders. See
+[the example configuration](config/y-harness.eval.example.json) and
+[ADR 0107](docs/adr/0107-configured-brokered-evaluation-graders.md).
 
 Orchestration Core provides validated Task DAGs, deterministic priority
 scheduling, expiring leases with fencing tokens, transitive failure blocking,
@@ -800,10 +818,10 @@ reports itself as unrestricted because process groups do not remove filesystem,
 network, credential, or syscall authority and can be escaped with a new
 session/group. Windows still has direct-child-only cleanup. JSON command
 adapters make the same boundary usable for external Tools, Models,
-Conversation Compactors, and Verifiers; Tools still pass through normal Policy
-and evidence ordering. JSON Tools default to sequential execution; an operator may
-declare `batch_execution: "parallel_safe"` only when the Tool is semantically
-safe against every other eligible same-response call, while
+Conversation Compactors, Verifiers, and Evaluation Graders; Tools still pass
+through normal Policy and evidence ordering. JSON Tools default to sequential
+execution; an operator may declare `batch_execution: "parallel_safe"` only when
+the Tool is semantically safe against every other eligible same-response call, while
 `max_parallel_tool_calls` bounds the Runtime to 1–64 concurrent calls.
 Runtime-driven external Models receive the same Turn
 cancellation token through their model-step handle, so a custom broker can
@@ -845,6 +863,15 @@ separately. Verifiers never gain Tool, Policy, State, or completion authority:
 the Runtime validates their bounded outcome and owns final settlement. See
 [the example configuration](config/y-harness.verifier.example.json) and
 [ADR 0106](docs/adr/0106-configured-brokered-verification.md).
+
+Evaluation Graders use the same explicit process authority without becoming
+Runtime capabilities. `evaluation.graders` is loaded only by `doctor` and
+`eval`; each process receives a cancellation-free sample on stdin while its
+exact per-grade token reaches the Process Broker separately under the
+`evaluation` phase. Unknown response fields and unbounded/deep samples fail
+closed. The Evaluation Engine—not the process—owns score validation, report
+provenance, baseline comparison, and command success. See
+[ADR 0107](docs/adr/0107-configured-brokered-evaluation-graders.md).
 
 On macOS, the first concrete sandbox broker uses Seatbelt to deny network by
 default and restrict writes to canonical operator-approved roots. Reads remain

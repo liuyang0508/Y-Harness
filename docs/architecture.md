@@ -246,11 +246,11 @@ direction:
   Context use, and leaves revoked packages recoverably removable;
 - Context Engine loading of resolved Skill instructions in dependency order;
 - an Evaluation target/runner with two-level bounded concurrency, engine-owned
-  case deadlines and cancellation, grader timeouts, panic isolation,
+  case and per-Grader deadlines/cancellation, panic isolation,
   deterministic report ordering, root-boundary revalidation, bounded
   materialized batches, format-2 self-describing artifacts, Grader-origin-bound
-  case/grader regression baselines, and a versioned end-to-end `eval-smoke`
-  gate;
+  case/grader regression baselines, a configured JSON-command Grader path, and
+  a versioned end-to-end `eval-smoke` gate;
 - a serializable Task DAG with deterministic ready ordering, fenced leases,
   failure propagation, messages, Artifacts, workspace requirements, and
   preflighted 64-Task claim windows, plus a domain-authoritative conservative
@@ -307,9 +307,10 @@ direction:
   filters advertised capabilities, and trusts only local-process callers by
   default;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
-  deterministic demo, persistent stdio service commands, explicitly launched
-  shell-free JSON Models, Tools, semantic Conversation Compactors, and
-  completion Verifiers,
+  deterministic demo, persistent stdio service and isolated configured
+  Evaluation commands, explicitly launched shell-free JSON Models, Tools,
+  semantic Conversation Compactors, completion Verifiers, and Evaluation
+  Graders,
   exact-selected MCP Tools, explicitly activated digest-verified project
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
@@ -319,13 +320,13 @@ direction:
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
-  adapters for Tools, Models, semantic Conversation Compactors, and completion
-  Verifiers with the Runtime's exact Turn cancellation signal propagated into
-  external Model, Context, and Verification execution; local execution permits
-  1–4096 concurrent direct children, remains cancellable during pipe settlement,
-  bounds termination cleanup to five seconds, and on Unix settles ordinary
-  descendants that remain in a private per-execution process group without
-  claiming escape-resistant sandbox containment;
+  adapters for Tools, Models, semantic Conversation Compactors, completion
+  Verifiers, and Evaluation Graders with exact owner cancellation propagated
+  into external Model, Context, Verification, and Evaluation execution; local
+  execution permits 1–4096 concurrent direct children, remains cancellable
+  during pipe settlement, bounds termination cleanup to five seconds, and on
+  Unix settles ordinary descendants that remain in a private per-execution
+  process group without claiming escape-resistant sandbox containment;
 - trusted Ed25519 publisher roots and strict detached signatures for externally
   sourced Skill packages;
 - explicit Tool-specific compensation adapters that reconstruct the original

@@ -260,9 +260,10 @@ internals or read Engine storage directly.
   non-serializable `SecretValue`, is parsed while constructing the pooled
   client, and never enters State, protocol, Model configuration, or debug
   output. Rotation constructs a new client rather than mutating live trust.
-- Evaluation targets receive an engine-owned cancellation signal. Case and
-  grader work has independent concurrency and time bounds; task panics become
-  content-free per-item errors, never batch failure or leaked panic payload.
+- Evaluation targets and every individual Grader receive distinct engine-owned
+  cancellation signals. Case and Grader work has independent concurrency and
+  time bounds; timeout cancels before bounded cleanup, and task panics become
+  content-free per-item errors rather than batch failure or leaked payload.
 - Materialized Evaluation batches bound case count, encoded input, captured
   execution size, grader count, and concurrency. Result ordering follows
   stable identities rather than nondeterministic task completion.
@@ -272,6 +273,9 @@ internals or read Engine storage directly.
 - Evaluation artifact roots carry the exact current format coordinate. Every
   Grade and baseline requirement binds both Grader name and trust-bearing
   origin; missing legacy origin is never inferred as built-in trust.
+- Configured Evaluation Graders use strict bounded Process Broker requests and
+  are constructed only by diagnostic/Evaluation surfaces. Ordinary service
+  startup must not acquire unused Grader environment or process authority.
 - `yh eval-smoke` is the minimum executable behavioral regression gate. Its
   versioned suite and baseline must change in the same review as an intentional
   contract change; weakening a threshold solely to accept a regression is not

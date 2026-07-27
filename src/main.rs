@@ -30,6 +30,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reject_extra_argument(args.next())?;
             reference_cli::run_eval_smoke().await
         }
+        Some("eval") => {
+            let suite = required_argument(args.next(), "Evaluation suite")?;
+            let baseline = required_argument(args.next(), "Evaluation baseline")?;
+            let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+            reject_extra_argument(args.next())?;
+            reference_cli::run_evaluation(suite, baseline, config).await
+        }
         Some("state-migrate") => {
             let database = required_argument(args.next(), "database")?;
             let backup = required_argument(args.next(), "backup")?;

@@ -487,7 +487,41 @@ stderr、并发和时间也独立有界。Turn 的精确取消令牌不交给外
 而是由 Runtime 单独传给 Process Broker。`unrestricted` 仍不是沙箱。
 详见 [ADR 0106](adr/0106-configured-brokered-verification.md)。
 
-## 11. 接入自有模型 Gateway
+## 11. 配置独立 Evaluation Grader
+
+Evaluation 与在线完成判定严格分离。复制模板并把 Grader `command`
+改成现存绝对路径：
+
+```bash
+cp /path/to/Y-Harness/config/y-harness.eval.example.json y-harness.json
+export GRADER_API_KEY='replace-if-needed'
+yh doctor y-harness.json
+yh eval \
+  /path/to/Y-Harness/evals/configured-example-suite.json \
+  /path/to/Y-Harness/evals/configured-example-baseline.json \
+  y-harness.json
+```
+
+每个 Grader 从 stdin 收到一个不可变的 `case + execution` 快照，从
+stdout 返回：
+
+```json
+{"score":0.95,"passed":true,"rationale":"required evidence is present"}
+```
+
+输入完整上限为 4 MiB，嵌套 metadata 与 Tool JSON 在启动进程前检查；
+输出字段严格、分数和理由由 Evaluation Engine 再次规范化。每个
+Grader 有独立取消令牌、超时和并发边界，来源写入 format-2 report，
+baseline 必须匹配精确来源。
+
+`yh eval` 使用配置中的 Model、Tool、Context、Verification、Skill 和
+Memory，但 State 为进程内隔离实例，不会打开项目的生产 State、
+Approval 或 Task 数据库。`yh serve` 不构造 Evaluation Grader，也不
+获取其环境或进程权限。Grader 不能修改 Agent Loop、调用 Tool 或提交
+Turn；需要在线完成门禁时使用上一节的 Verifier。详见
+[ADR 0107](adr/0107-configured-brokered-evaluation-graders.md)。
+
+## 12. 接入自有模型 Gateway
 
 复制生产配置模板：
 
@@ -540,7 +574,7 @@ attempt deadline 明确判定的超时；普通 Provider 字符串错误不会�
 冷却值和重试边界。修改目录或 Route 后需要受控重启服务；当前没有
 热加载、自动发现、通用错误熔断或按价格/负载猜测路由。
 
-## 12. 作为 Rust 引擎嵌入
+## 13. 作为 Rust 引擎嵌入
 
 最小 Agent Loop：
 
@@ -558,7 +592,7 @@ cargo run --locked --example orchestrated
 [`examples/embedded.rs`](../examples/embedded.rs) 和
 [`examples/orchestrated.rs`](../examples/orchestrated.rs)。
 
-## 13. 安全与产品边界
+## 14. 安全与产品边界
 
 - `serve` 是持久化 stdio 服务，适合由进程主管或受信宿主启动。
 - 网络暴露必须使用现有 mandatory-mTLS host，不能把裸 JSONL socket

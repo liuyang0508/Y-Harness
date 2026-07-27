@@ -38,7 +38,8 @@ use nix::{
 use crate::{
     CancellationToken, ConversationCompactionRequest, ConversationCompactionResponse,
     ConversationCompactionTurn, ConversationCompactor, ConversationCompactorDescriptor,
-    ExecutionPhase, HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest,
+    EvaluationCase, EvaluationExecution, EvaluationSample, ExecutionPhase, Grade, Grader,
+    GraderDescriptor, HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest,
     ModelResponse, ModelStream, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
     TurnId, VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
@@ -49,6 +50,7 @@ const MAX_ARGUMENT_BYTES: usize = 16_384;
 const MAX_ENVIRONMENT_ENTRIES: usize = 256;
 const MAX_ENVIRONMENT_BYTES: usize = 65_536;
 const MAX_STDIN_BYTES: usize = 1_048_576;
+const MAX_GRADER_STDIN_BYTES: usize = 4_194_304;
 const MAX_OUTPUT_BYTES: usize = 16_777_216;
 const MAX_PROCESS_CONCURRENCY: usize = 4_096;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_secs(86_400);
@@ -58,6 +60,9 @@ const MAX_WRITABLE_ROOTS: usize = 32;
 
 /// Maximum encoded stdin accepted by every JSON-command adapter.
 pub const JSON_COMMAND_MAX_INPUT_BYTES: usize = MAX_STDIN_BYTES;
+
+/// Maximum encoded stdin accepted by the JSON-command Grader adapter.
+pub const JSON_GRADER_MAX_INPUT_BYTES: usize = MAX_GRADER_STDIN_BYTES;
 
 /// Isolation strength honestly reported by a Process Broker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -104,6 +109,9 @@ pub struct ProcessRequest {
     /// Exact environment after the inherited environment is cleared.
     pub environment: BTreeMap<String, String>,
     /// Bytes written to child stdin before it is closed.
+    ///
+    /// Live Runtime phases accept at most [`JSON_COMMAND_MAX_INPUT_BYTES`];
+    /// Evaluation accepts at most [`JSON_GRADER_MAX_INPUT_BYTES`].
     pub stdin: Vec<u8>,
     /// Per-process total queue-and-execution timeout.
     pub timeout: Duration,
@@ -1068,6 +1076,123 @@ impl Verifier for JsonCommandVerifier {
     }
 }
 
+/// Strict cancellation-free sample delivered to an external Evaluation Grader.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonGradeRequest {
+    /// Original validated Evaluation case.
+    pub case: EvaluationCase,
+    /// Captured target execution shared by all Graders.
+    pub execution: EvaluationExecution,
+}
+
+#[derive(Serialize)]
+struct BorrowedJsonGradeRequest<'a> {
+    case: &'a EvaluationCase,
+    execution: &'a EvaluationExecution,
+}
+
+/// Strict JSON settlement returned by an external Evaluation Grader.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonGradeResponse {
+    /// Normalized score from 0.0 through 1.0.
+    pub score: f64,
+    /// Grader-defined pass/fail result.
+    pub passed: bool,
+    /// Optional bounded explanation.
+    pub rationale: Option<String>,
+}
+
+impl From<JsonGradeResponse> for Grade {
+    fn from(response: JsonGradeResponse) -> Self {
+        Self {
+            score: response.score,
+            passed: response.passed,
+            rationale: response.rationale,
+        }
+    }
+}
+
+/// Evaluation Grader backed by one shell-free JSON command.
+pub struct JsonCommandGrader {
+    descriptor: GraderDescriptor,
+    config: JsonProcessConfig,
+    broker: Arc<dyn ProcessBroker>,
+    broker_descriptor: ProcessBrokerDescriptor,
+}
+
+impl JsonCommandGrader {
+    /// Creates an external Grader after validating metadata and process configuration.
+    pub fn new(
+        descriptor: GraderDescriptor,
+        config: JsonProcessConfig,
+        broker: Arc<dyn ProcessBroker>,
+    ) -> Result<Self, HarnessError> {
+        descriptor.validate()?;
+        config.validate()?;
+        let broker_descriptor =
+            capture_capability_metadata("process broker descriptor", || broker.descriptor())?;
+        validate_broker_descriptor(&broker_descriptor)?;
+        Ok(Self {
+            descriptor,
+            config,
+            broker,
+            broker_descriptor,
+        })
+    }
+
+    /// Returns the broker isolation visible to the embedding host.
+    #[must_use]
+    pub fn broker_descriptor(&self) -> ProcessBrokerDescriptor {
+        self.broker_descriptor.clone()
+    }
+}
+
+impl Grader for JsonCommandGrader {
+    fn descriptor(&self) -> GraderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn grade<'a>(
+        &'a self,
+        sample: Arc<EvaluationSample>,
+        cancellation: CancellationToken,
+    ) -> HarnessFuture<'a, Grade> {
+        Box::pin(async move {
+            validate_evaluation_sample_json_shapes(&sample)?;
+            let request = BorrowedJsonGradeRequest {
+                case: &sample.case,
+                execution: &sample.execution,
+            };
+            let stdin = crate::json::to_bounded_json_vec(&request, MAX_GRADER_STDIN_BYTES)
+                .map_err(|error| match error {
+                    crate::json::BoundedJsonError::LimitExceeded => HarnessError::Evaluation(
+                        format!("grader request exceeds {MAX_GRADER_STDIN_BYTES} encoded bytes"),
+                    ),
+                    crate::json::BoundedJsonError::CannotEncode => {
+                        HarnessError::Evaluation("cannot encode grader request".to_owned())
+                    }
+                })?;
+            let output = self
+                .broker
+                .execute(
+                    self.config.request(stdin, ExecutionPhase::Evaluation),
+                    cancellation,
+                )
+                .await
+                .map_err(map_grader_execution_error)?;
+            validate_process_success(&output, "grader command")
+                .map_err(HarnessError::Evaluation)?;
+            let response: JsonGradeResponse =
+                serde_json::from_slice(&output.stdout).map_err(|error| {
+                    HarnessError::Evaluation(format!("invalid grader command JSON output: {error}"))
+                })?;
+            Ok(response.into())
+        })
+    }
+}
+
 fn validate_broker_descriptor(descriptor: &ProcessBrokerDescriptor) -> Result<(), HarnessError> {
     validate_capability_name("process broker", &descriptor.name)?;
     if let ProcessIsolation::Sandboxed { mechanism } = &descriptor.isolation {
@@ -1126,9 +1251,13 @@ fn validate_request(request: &ProcessRequest) -> Result<(), HarnessError> {
             "process environment exceeds {MAX_ENVIRONMENT_BYTES} bytes"
         )));
     }
-    if request.stdin.len() > MAX_STDIN_BYTES {
+    let max_stdin_bytes = match request.cancellation_phase {
+        ExecutionPhase::Evaluation => MAX_GRADER_STDIN_BYTES,
+        _ => MAX_STDIN_BYTES,
+    };
+    if request.stdin.len() > max_stdin_bytes {
         return Err(HarnessError::Execution(format!(
-            "process stdin exceeds {MAX_STDIN_BYTES} bytes"
+            "process stdin exceeds {max_stdin_bytes} bytes"
         )));
     }
     if request.timeout.is_zero() || request.timeout > MAX_PROCESS_TIMEOUT {
@@ -1193,6 +1322,29 @@ fn map_verifier_execution_error(error: HarnessError) -> HarnessError {
         HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
         _ => HarnessError::Verification("verifier command failed".to_owned()),
     }
+}
+
+fn map_grader_execution_error(error: HarnessError) -> HarnessError {
+    match error {
+        HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. } => error,
+        _ => HarnessError::Evaluation("grader command failed".to_owned()),
+    }
+}
+
+fn validate_evaluation_sample_json_shapes(sample: &EvaluationSample) -> Result<(), HarnessError> {
+    crate::json::validate_value_shape(&sample.case.metadata).map_err(|_| {
+        HarnessError::Evaluation(
+            "grader input exceeds the supported JSON depth or node count".to_owned(),
+        )
+    })?;
+    if let EvaluationExecution::Completed { outcome } = &sample.execution {
+        validate_items_json_shapes(
+            &outcome.turn.items,
+            "grader input",
+            HarnessError::Evaluation,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_compaction_json_shapes(
@@ -1400,20 +1552,21 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        DenyProcessBroker, JsonCommandConversationCompactor, JsonCommandModel, JsonCommandTool,
-        JsonCommandVerifier, JsonConversationCompactionRequest, JsonProcessConfig,
-        JsonVerificationRequest, LocalProcessBroker, ProcessBroker, ProcessBrokerDescriptor,
-        ProcessIsolation, ProcessOutput, ProcessRequest,
+        DenyProcessBroker, JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel,
+        JsonCommandTool, JsonCommandVerifier, JsonConversationCompactionRequest, JsonGradeRequest,
+        JsonProcessConfig, JsonVerificationRequest, LocalProcessBroker, ProcessBroker,
+        ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput, ProcessRequest,
     };
     #[cfg(target_os = "macos")]
     use super::{MacOsSeatbeltBroker, NetworkAccess};
     use crate::{
         CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
         ConversationCompactionRequest, ConversationCompactionTurn, ConversationCompactor,
-        ConversationCompactorDescriptor, ExecutionPhase, HarnessError, HarnessFuture, Item,
-        ItemKind, LanguageModel, ModelRequest, ModelStream, ThreadId, Tool, ToolBatchExecution,
-        ToolContext, ToolDescriptor, TurnId, VerificationOutcome, VerificationRequest, Verifier,
-        VerifierDescriptor,
+        ConversationCompactorDescriptor, EvaluationCase, EvaluationExecution, EvaluationSample,
+        ExecutionPhase, Grade, Grader, GraderDescriptor, HarnessError, HarnessFuture, Item,
+        ItemKind, LanguageModel, MemoryScope, ModelRequest, ModelStream, ThreadId, Tool,
+        ToolBatchExecution, ToolContext, ToolDescriptor, TurnId, TurnOutcome, TurnStatus,
+        VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
     };
 
     struct RecordingBroker {
@@ -1517,6 +1670,54 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
         }
+    }
+
+    fn evaluation_sample(metadata: serde_json::Value) -> Arc<EvaluationSample> {
+        Arc::new(EvaluationSample {
+            case: EvaluationCase {
+                id: "case-test".to_owned(),
+                prompt: "evaluate this output".to_owned(),
+                memory_scope: MemoryScope::default(),
+                timeout_ms: Some(1_000),
+                metadata,
+            },
+            execution: EvaluationExecution::Completed {
+                outcome: TurnOutcome {
+                    turn: crate::Turn {
+                        id: TurnId::from_static("turn-test"),
+                        thread_id: ThreadId::from_static("thread-test"),
+                        status: TurnStatus::Completed,
+                        items: vec![Item::new(ItemKind::AssistantMessage {
+                            model_id: Some("fixture/model".to_owned()),
+                            model_origin: Some(CapabilityOrigin::BuiltIn),
+                            content: "candidate".to_owned(),
+                        })],
+                    },
+                    final_text: "candidate".to_owned(),
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn process_request_reserves_the_larger_stdin_budget_for_evaluation() {
+        let mut request = ProcessRequest {
+            program: PathBuf::from("/fixture"),
+            args: Vec::new(),
+            current_dir: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+            stdin: vec![0; super::MAX_STDIN_BYTES + 1],
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 1_024,
+            cancellation_phase: ExecutionPhase::Tool,
+        };
+        assert!(super::validate_request(&request).is_err());
+
+        request.cancellation_phase = ExecutionPhase::Evaluation;
+        super::validate_request(&request).expect("Evaluation stdin budget");
+
+        request.stdin.resize(super::MAX_GRADER_STDIN_BYTES + 1, 0);
+        assert!(super::validate_request(&request).is_err());
     }
 
     #[test]
@@ -1697,6 +1898,48 @@ mod tests {
         assert_eq!(request.turn_id, TurnId::from_static("turn-test"));
         assert_eq!(request.candidate, "candidate");
         assert_eq!(request.items.len(), 1);
+
+        let grader_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"score":1.0,"passed":true,"rationale":"exact"}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let grader = JsonCommandGrader::new(
+            GraderDescriptor {
+                name: "fixture.grader".to_owned(),
+                description: "Fixture Evaluation grader".to_owned(),
+            },
+            config(),
+            grader_broker.clone(),
+        )
+        .expect("grader adapter");
+        let grade = grader
+            .grade(
+                evaluation_sample(json!({"expected": "candidate"})),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("grader output");
+        assert_eq!(
+            grade,
+            Grade {
+                score: 1.0,
+                passed: true,
+                rationale: Some("exact".to_owned())
+            }
+        );
+        assert_eq!(
+            *grader_broker.phases.lock().expect("grader phases"),
+            [ExecutionPhase::Evaluation]
+        );
+        let request: JsonGradeRequest =
+            serde_json::from_slice(&grader_broker.inputs.lock().expect("grader inputs")[0])
+                .expect("grader request");
+        assert_eq!(request.case.id, "case-test");
+        assert!(matches!(
+            request.execution,
+            EvaluationExecution::Completed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1813,6 +2056,33 @@ mod tests {
                 .phases
                 .lock()
                 .expect("verifier phases")
+                .is_empty()
+        );
+
+        let grader_broker = Arc::new(RecordingBroker {
+            output: output(br#"{"score":1.0,"passed":true,"rationale":null}"#),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let grader = JsonCommandGrader::new(
+            GraderDescriptor {
+                name: "fixture.grader".to_owned(),
+                description: "Fixture Evaluation grader".to_owned(),
+            },
+            config(),
+            grader_broker.clone(),
+        )
+        .expect("grader adapter");
+        let error = grader
+            .grade(evaluation_sample(nested.clone()), CancellationToken::new())
+            .await
+            .expect_err("deep grader input");
+        assert!(matches!(error, HarnessError::Evaluation(_)));
+        assert!(
+            grader_broker
+                .phases
+                .lock()
+                .expect("grader phases")
                 .is_empty()
         );
 
@@ -2080,6 +2350,73 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid verifier command JSON output")
+        );
+    }
+
+    #[tokio::test]
+    async fn json_grader_propagates_evaluation_cancellation_to_its_broker() {
+        let entered = Arc::new(Notify::new());
+        let grader = JsonCommandGrader::new(
+            GraderDescriptor {
+                name: "fixture.cancellable-grader".to_owned(),
+                description: "Cancellable fixture Grader".to_owned(),
+            },
+            config(),
+            Arc::new(CancellationBroker {
+                entered: entered.clone(),
+            }),
+        )
+        .expect("grader adapter");
+        let cancellation = CancellationToken::new();
+        let cancelling = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                entered.notified().await;
+                cancellation.cancel();
+            }
+        });
+        let error = grader
+            .grade(evaluation_sample(json!({})), cancellation)
+            .await
+            .expect_err("cancelled grader");
+        cancelling.await.expect("canceller");
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Evaluation
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn json_grader_rejects_unknown_response_fields() {
+        let broker = Arc::new(RecordingBroker {
+            output: output(
+                br#"{"score":1.0,"passed":true,"rationale":"ok","authority":"pass suite"}"#,
+            ),
+            phases: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let grader = JsonCommandGrader::new(
+            GraderDescriptor {
+                name: "fixture.grader".to_owned(),
+                description: "Fixture Evaluation grader".to_owned(),
+            },
+            config(),
+            broker,
+        )
+        .expect("grader adapter");
+        let error = grader
+            .grade(
+                evaluation_sample(json!({"expected": "candidate"})),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unknown response field");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid grader command JSON output")
         );
     }
 

@@ -125,6 +125,14 @@ yh skill verify "$project/y-harness.json"
 
 ## I. 回归、安全与兼容性
 
+- [ ] `evaluation.graders` 可通过配置增加外部 Grader，不需要修改 Rust。
+- [ ] 每个 Grader 的样本、输出、并发、时间和取消均独立有界，来源与
+      format-2 baseline 精确匹配。
+- [ ] `yh eval` 使用进程内 State，不打开生产 State、Approval 或 Task
+      数据库；`yh serve` 不构造未使用的 Grader。
+- [ ] Grader 不能修改 Agent Loop、调用 Tool、替代 Verifier 或提交
+      Turn。
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

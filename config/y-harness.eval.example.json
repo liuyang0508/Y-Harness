@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "evaluation": {
+    "case_concurrency": 4,
+    "grader_concurrency": 4,
+    "default_case_timeout_ms": 300000,
+    "grader_timeout_ms": 30000,
+    "graders": [
+      {
+        "name": "project.quality",
+        "description": "Scores one immutable target execution against project evaluation metadata",
+        "process": {
+          "command": "/absolute/path/to/evaluation-grader",
+          "args": [],
+          "current_directory": ".",
+          "environment_from_host": {
+            "GRADER_API_KEY": "GRADER_API_KEY"
+          },
+          "timeout_ms": 30000,
+          "max_output_bytes": 4096,
+          "launch": {
+            "type": "unrestricted",
+            "max_concurrency": 4
+          }
+        }
+      }
+    ]
+  }
+}

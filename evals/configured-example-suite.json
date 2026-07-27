@@ -1,0 +1,21 @@
+{
+  "format_version": 2,
+  "name": "configured-example",
+  "cases": [
+    {
+      "id": "configured-tool-loop",
+      "prompt": "evaluate configured Harness behavior",
+      "memory_scope": {
+        "project": "configured-example",
+        "tenant_id": null,
+        "tags": [
+          "evaluation"
+        ]
+      },
+      "timeout_ms": 30000,
+      "metadata": {
+        "criterion": "The target must complete the configured Tool loop."
+      }
+    }
+  ]
+}

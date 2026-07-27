@@ -51,9 +51,10 @@ pub use evaluation::{
 };
 pub use execution::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
-    DenyProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
-    JsonCommandModel, JsonCommandTool, JsonCommandVerifier, JsonConversationCompactionRequest,
-    JsonConversationCompactionResponse, JsonProcessConfig, JsonToolRequest,
+    DenyProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES, JSON_GRADER_MAX_INPUT_BYTES,
+    JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel, JsonCommandTool,
+    JsonCommandVerifier, JsonConversationCompactionRequest, JsonConversationCompactionResponse,
+    JsonGradeRequest, JsonGradeResponse, JsonProcessConfig, JsonToolRequest,
     JsonVerificationOutcome, JsonVerificationRequest, LocalProcessBroker, MacOsSeatbeltBroker,
     NetworkAccess, ProcessBroker, ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput,
     ProcessRequest, ToolCompensator,

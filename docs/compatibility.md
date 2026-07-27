@@ -83,6 +83,16 @@ that struct must add the field, and its previous `PartialEq` implementation was
 removed because comparing requests while ignoring cancellation identity would
 be misleading. The JSON-command wire uses a separate cancellation-free type.
 See [ADR 0106](adr/0106-configured-brokered-verification.md).
+The optional strict `evaluation` object adds process Graders plus independent
+case/Grader concurrency and timeout controls to service schema 1. It is
+constructed by `doctor` and `eval`, not ordinary `serve`. The public pre-1.0
+`Grader::grade` contract now receives a distinct engine-owned
+`CancellationToken`, and `ExecutionPhase` adds `Evaluation`; external Grader
+implementations and exhaustive phase matches require a source update. The
+format-2 suite, baseline, report, State, Protocol, and Model Gateway shapes do
+not change. Evaluation-phase cancellation is process-local and never becomes
+Turn stop evidence. See
+[ADR 0107](adr/0107-configured-brokered-evaluation-graders.md).
 The defaulted `max_parallel_tool_calls` field is bounded to 1–64, and JSON
 Tools may explicitly opt into `parallel_safe`; absent declarations remain
 sequential.

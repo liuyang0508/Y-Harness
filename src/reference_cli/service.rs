@@ -18,11 +18,13 @@ use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox,
     CONVERSATION_COMPACTOR_API_VERSION, CapabilityOrigin, ContextEngine,
     ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
-    ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, HarnessRuntime,
-    InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
-    JsonCommandModel, JsonCommandTool, JsonCommandVerifier, JsonProcessConfig, LanguageModel,
-    LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker,
-    McpClient, MemoryContextConfig, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
+    ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION,
+    EvaluationBaseline, EvaluationEngine, EvaluationReport, EvaluationSuite, GraderDescriptor,
+    GraderRegistry, HarnessRuntime, InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES,
+    JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel, JsonCommandTool,
+    JsonCommandVerifier, JsonProcessConfig, LanguageModel, LocalProcessBroker,
+    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
+    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
     MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
     ProcessBroker, ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
     STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
@@ -55,6 +57,7 @@ const MAX_CONFIG_BYTES: u64 = 65_536;
 const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 16_777_216;
 const MAX_PROJECT_SKILL_FILES: usize = 4_096;
 const MAX_PINNED_COMMAND_BYTES: u64 = 268_435_456;
+const MAX_EVALUATION_ARTIFACT_BYTES: u64 = 16_777_216;
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
 const MAX_CA_BYTES: u64 = 1_048_576;
 
@@ -85,6 +88,8 @@ struct ServiceConfig {
     conversation: Option<ServiceConversationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skills: Option<ServiceSkillsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evaluation: Option<ServiceEvaluationConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -105,6 +110,7 @@ impl Default for ServiceConfig {
             memory: None,
             conversation: None,
             skills: None,
+            evaluation: None,
         }
     }
 }
@@ -201,6 +207,29 @@ enum ServiceToolConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceVerifierConfig {
+    name: String,
+    description: String,
+    process: ServiceJsonProcessConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceEvaluationConfig {
+    #[serde(default = "default_evaluation_case_concurrency")]
+    case_concurrency: usize,
+    #[serde(default = "default_evaluation_grader_concurrency")]
+    grader_concurrency: usize,
+    #[serde(default = "default_evaluation_case_timeout_ms")]
+    default_case_timeout_ms: u64,
+    #[serde(default = "default_evaluation_grader_timeout_ms")]
+    grader_timeout_ms: u64,
+    #[serde(default)]
+    graders: Vec<ServiceGraderConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceGraderConfig {
     name: String,
     description: String,
     process: ServiceJsonProcessConfig,
@@ -419,6 +448,34 @@ struct ConfiguredCapabilities {
     mcp_stdio_enabled: usize,
     memory_health: Option<MemoryHealthStatus>,
     skill_locks: Vec<String>,
+}
+
+struct ConfiguredEvaluation {
+    graders: GraderRegistry,
+    case_concurrency: usize,
+    grader_concurrency: usize,
+    default_case_timeout: Duration,
+    grader_timeout: Duration,
+}
+
+impl ConfiguredEvaluation {
+    fn engine(self) -> Result<EvaluationEngine, y_harness::HarnessError> {
+        EvaluationEngine::new(self.graders)
+            .with_concurrency(self.case_concurrency, self.grader_concurrency)?
+            .with_timeouts(self.default_case_timeout, self.grader_timeout)
+    }
+}
+
+struct ConfiguredRuntime {
+    runtime: HarnessRuntime,
+    mcp_clients: BTreeMap<String, ConfiguredMcpClient>,
+}
+
+#[derive(Serialize)]
+struct ConfiguredEvaluationOutput {
+    schema_version: u32,
+    report: EvaluationReport,
+    comparison: y_harness::BaselineComparison,
 }
 
 enum ConfiguredMcpClient {
@@ -689,6 +746,7 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
 /// Validates configuration, provider construction, credentials, and storage boundaries.
 pub async fn run_doctor(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
+    let evaluation = build_evaluation(&loaded)?;
     let models = build_models(&loaded).await?;
     let data_state = if loaded.data_directory.exists() {
         require_contained_directory(&loaded.root, &loaded.data_directory)?;
@@ -751,6 +809,12 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     println!(
         "verifiers: {}",
         capabilities.verification.descriptors().len()
+    );
+    println!(
+        "evaluation graders: {}",
+        evaluation
+            .as_ref()
+            .map_or(0, |configured| configured.graders.descriptors().len())
     );
     println!(
         "mcp servers: {} enabled / {} configured",
@@ -862,6 +926,99 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
 
     let configured_models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
+    let state = StateEngine::new(Arc::new(
+        SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
+    ));
+    let ConfiguredRuntime {
+        runtime,
+        mcp_clients,
+    } = assemble_configured_runtime(&loaded, configured_models, capabilities, state)?;
+    let approvals =
+        Arc::new(SqliteApprovalInbox::open(loaded.data_directory.join("approvals.db")).await?);
+    let tasks =
+        Arc::new(SqliteTaskCoordinator::open(loaded.data_directory.join("tasks.db")).await?);
+
+    let approval_handler = Arc::new(InboxApprovalHandler::new(
+        approvals.clone(),
+        Duration::from_millis(250),
+    )?);
+    let runtime = Arc::new(runtime.with_approval_handler(approval_handler));
+    let approval_port: Arc<dyn ApprovalInbox> = approvals;
+    let task_port: Arc<dyn TaskCoordinator> = tasks;
+    let handler = ProtocolHandler::new(runtime)
+        .with_approval_inbox(approval_port)
+        .with_task_coordinator(task_port);
+    let served = serve_stdio(handler).await;
+    let shutdown = shutdown_mcp_clients(&mcp_clients).await;
+    served?;
+    shutdown
+}
+
+/// Runs one configured Evaluation suite and exact baseline without opening service State.
+pub async fn run_evaluation(
+    suite_path: String,
+    baseline_path: String,
+    config_path: String,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let configured_evaluation = build_evaluation(&loaded)?
+        .ok_or("evaluation configuration with at least one Grader is required")?;
+    if configured_evaluation.graders.descriptors().is_empty() {
+        return Err("evaluation configuration must contain at least one Grader".into());
+    }
+    let suite_path = canonical_regular_file(&suite_path, "Evaluation suite")?;
+    let baseline_path = canonical_regular_file(&baseline_path, "Evaluation baseline")?;
+    let suite: EvaluationSuite = serde_json::from_slice(&read_bounded(
+        &suite_path,
+        MAX_EVALUATION_ARTIFACT_BYTES,
+        "Evaluation suite",
+    )?)
+    .map_err(|error| format!("Evaluation suite is malformed: {error}"))?;
+    let baseline: EvaluationBaseline = serde_json::from_slice(&read_bounded(
+        &baseline_path,
+        MAX_EVALUATION_ARTIFACT_BYTES,
+        "Evaluation baseline",
+    )?)
+    .map_err(|error| format!("Evaluation baseline is malformed: {error}"))?;
+    let configured_models = build_models(&loaded).await?;
+    let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
+    let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+    let ConfiguredRuntime {
+        runtime,
+        mcp_clients,
+    } = assemble_configured_runtime(&loaded, configured_models, capabilities, state)?;
+    let evaluation = configured_evaluation.engine()?;
+    let evaluated = async {
+        let report = evaluation.run(Arc::new(runtime), suite).await?;
+        let comparison = baseline.compare(&report)?;
+        Ok::<_, y_harness::HarnessError>((report, comparison))
+    }
+    .await;
+    let shutdown = shutdown_mcp_clients(&mcp_clients).await;
+    let (report, comparison) = evaluated?;
+    shutdown?;
+    let passed = comparison.passed;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&ConfiguredEvaluationOutput {
+            schema_version: EVALUATION_FORMAT_VERSION,
+            report,
+            comparison,
+        })?
+    );
+    if passed {
+        Ok(())
+    } else {
+        Err("configured Evaluation baseline regressed".into())
+    }
+}
+
+fn assemble_configured_runtime(
+    loaded: &LoadedConfig,
+    configured_models: ConfiguredModels,
+    capabilities: ConfiguredCapabilities,
+    state: StateEngine,
+) -> CliResult<ConfiguredRuntime> {
     let ConfiguredCapabilities {
         tools,
         policy,
@@ -874,18 +1031,6 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         memory_health: _,
         skill_locks: _,
     } = capabilities;
-    let state = StateEngine::new(Arc::new(
-        SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
-    ));
-    let approvals =
-        Arc::new(SqliteApprovalInbox::open(loaded.data_directory.join("approvals.db")).await?);
-    let tasks =
-        Arc::new(SqliteTaskCoordinator::open(loaded.data_directory.join("tasks.db")).await?);
-
-    let approval_handler = Arc::new(InboxApprovalHandler::new(
-        approvals.clone(),
-        Duration::from_millis(250),
-    )?);
     let route = configured_models
         .route
         .iter()
@@ -908,21 +1053,65 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         runtime = runtime.with_model_timeout_cooldown(cooldown)?;
     }
     runtime = runtime.with_max_parallel_tool_calls(loaded.config.max_parallel_tool_calls)?;
-    let runtime = Arc::new(
-        runtime
+    Ok(ConfiguredRuntime {
+        runtime: runtime
             .with_context_engine(context)
-            .with_verification(verification)
-            .with_approval_handler(approval_handler),
-    );
-    let approval_port: Arc<dyn ApprovalInbox> = approvals;
-    let task_port: Arc<dyn TaskCoordinator> = tasks;
-    let handler = ProtocolHandler::new(runtime)
-        .with_approval_inbox(approval_port)
-        .with_task_coordinator(task_port);
-    let served = serve_stdio(handler).await;
-    let shutdown = shutdown_mcp_clients(&mcp_clients).await;
-    served?;
-    shutdown
+            .with_verification(verification),
+        mcp_clients,
+    })
+}
+
+fn build_evaluation(loaded: &LoadedConfig) -> CliResult<Option<ConfiguredEvaluation>> {
+    let Some(configured) = &loaded.config.evaluation else {
+        return Ok(None);
+    };
+    let default_case_timeout = Duration::from_millis(configured.default_case_timeout_ms);
+    let grader_timeout = Duration::from_millis(configured.grader_timeout_ms);
+    EvaluationEngine::new(GraderRegistry::new())
+        .with_concurrency(configured.case_concurrency, configured.grader_concurrency)?
+        .with_timeouts(default_case_timeout, grader_timeout)?;
+
+    let mut names = BTreeSet::new();
+    for grader in &configured.graders {
+        GraderDescriptor {
+            name: grader.name.clone(),
+            description: grader.description.clone(),
+        }
+        .validate()?;
+        if !names.insert(&grader.name) {
+            return Err(format!("duplicate evaluation Grader {}", grader.name).into());
+        }
+    }
+
+    let mut graders = GraderRegistry::new();
+    for grader in &configured.graders {
+        let (process, broker) = build_json_process(
+            loaded,
+            &grader.process,
+            &format!("JSON Evaluation Grader {}", grader.name),
+        )?;
+        graders.register(
+            CapabilityOrigin::External {
+                id: format!("json-command-grader/{}", grader.name),
+            },
+            Arc::new(JsonCommandGrader::new(
+                GraderDescriptor {
+                    name: grader.name.clone(),
+                    description: grader.description.clone(),
+                },
+                process,
+                broker,
+            )?),
+        )?;
+    }
+
+    Ok(Some(ConfiguredEvaluation {
+        graders,
+        case_concurrency: configured.case_concurrency,
+        grader_concurrency: configured.grader_concurrency,
+        default_case_timeout,
+        grader_timeout,
+    }))
 }
 
 async fn build_capabilities(
@@ -2344,6 +2533,22 @@ const fn default_skill_budget_tokens() -> usize {
     8_192
 }
 
+const fn default_evaluation_case_concurrency() -> usize {
+    4
+}
+
+const fn default_evaluation_grader_concurrency() -> usize {
+    4
+}
+
+const fn default_evaluation_case_timeout_ms() -> u64 {
+    300_000
+}
+
+const fn default_evaluation_grader_timeout_ms() -> u64 {
+    30_000
+}
+
 const fn default_tool_timeout_ms() -> u64 {
     30_000
 }
@@ -2355,9 +2560,10 @@ const fn default_tool_max_output_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityOrigin, LoadedConfig, ServiceConfig, ServiceJsonProcessConfig,
+        CapabilityOrigin, EvaluationBaseline, EvaluationSuite, LoadedConfig, ServiceConfig,
+        ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig,
         ServiceProcessLaunchConfig, ServiceToolConfig, ServiceVerifierConfig, ToolBatchExecution,
-        build_capabilities, build_models, configured_skill_trust, load_config,
+        build_capabilities, build_evaluation, build_models, configured_skill_trust, load_config,
         resolve_data_directory, verify_file_sha256,
     };
     use std::{
@@ -2589,6 +2795,56 @@ mod tests {
     }
 
     #[test]
+    fn configured_json_grader_retains_external_registry_origin() {
+        let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical project");
+        let config = ServiceConfig {
+            evaluation: Some(ServiceEvaluationConfig {
+                case_concurrency: 2,
+                grader_concurrency: 2,
+                default_case_timeout_ms: 1_000,
+                grader_timeout_ms: 1_000,
+                graders: vec![ServiceGraderConfig {
+                    name: "project.quality".to_owned(),
+                    description: "Fixture Evaluation quality Grader".to_owned(),
+                    process: ServiceJsonProcessConfig {
+                        command: std::env::current_exe()
+                            .expect("current executable")
+                            .to_string_lossy()
+                            .into_owned(),
+                        args: Vec::new(),
+                        current_directory: ".".to_owned(),
+                        environment_from_host: std::collections::BTreeMap::new(),
+                        timeout_ms: 1_000,
+                        max_output_bytes: 1_024,
+                        launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },
+                    },
+                }],
+            }),
+            ..ServiceConfig::default()
+        };
+        let loaded = LoadedConfig {
+            config,
+            path: root.join("y-harness.json"),
+            data_directory: root.join(".y-harness"),
+            root,
+        };
+
+        let configured = build_evaluation(&loaded)
+            .expect("configured Evaluation")
+            .expect("Evaluation enabled");
+        assert_eq!(
+            configured
+                .graders
+                .get("project.quality")
+                .map(|registered| &registered.origin),
+            Some(&CapabilityOrigin::External {
+                id: "json-command-grader/project.quality".to_owned()
+            })
+        );
+    }
+
+    #[test]
     fn shipped_real_provider_configs_follow_the_strict_schema() {
         serde_json::from_str::<ServiceConfig>(include_str!(
             "../../config/y-harness.openai.example.json"
@@ -2626,6 +2882,19 @@ mod tests {
             "../../config/y-harness.verifier.example.json"
         ))
         .expect("JSON command Verifier example config");
+        serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.eval.example.json"
+        ))
+        .expect("JSON command Evaluation Grader example config");
+        let suite: EvaluationSuite =
+            serde_json::from_str(include_str!("../../evals/configured-example-suite.json"))
+                .expect("configured Evaluation example suite");
+        EvaluationSuite::new(suite.name, suite.cases).expect("validated Evaluation example suite");
+        let baseline: EvaluationBaseline =
+            serde_json::from_str(include_str!("../../evals/configured-example-baseline.json"))
+                .expect("configured Evaluation example baseline");
+        EvaluationBaseline::new(baseline.requirements)
+            .expect("validated Evaluation example baseline");
     }
 
     #[tokio::test]

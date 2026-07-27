@@ -210,8 +210,12 @@ pub struct GraderDescriptor {
 pub trait Grader: Send + Sync {
     /// Returns stable registration metadata.
     fn descriptor(&self) -> GraderDescriptor;
-    /// Scores one immutable sample.
-    fn grade<'a>(&'a self, sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade>;
+    /// Scores one immutable sample under an engine-owned cancellation signal.
+    fn grade<'a>(
+        &'a self,
+        sample: Arc<EvaluationSample>,
+        cancellation: CancellationToken,
+    ) -> HarnessFuture<'a, Grade>;
 }
 
 /// Successful grader settlement before report normalization.
@@ -314,15 +318,7 @@ impl GraderRegistry {
             )));
         }
         let descriptor = capture_capability_metadata("grader descriptor", || grader.descriptor())?;
-        validate_capability_name("grader", &descriptor.name)?;
-        if descriptor.description.trim().is_empty()
-            || descriptor.description.len() > MAX_RATIONALE_BYTES
-        {
-            return Err(HarnessError::InvalidCapability(format!(
-                "grader {} description must be 1-{MAX_RATIONALE_BYTES} bytes",
-                descriptor.name
-            )));
-        }
+        descriptor.validate()?;
         if self.graders.contains_key(&descriptor.name) {
             return Err(HarnessError::DuplicateCapability(descriptor.name));
         }
@@ -343,8 +339,34 @@ impl GraderRegistry {
         self.graders.get(name)
     }
 
+    /// Returns descriptors in deterministic name order.
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<GraderDescriptor> {
+        self.graders
+            .values()
+            .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
     fn registered(&self) -> impl Iterator<Item = &RegisteredGrader> {
         self.graders.values()
+    }
+}
+
+impl GraderDescriptor {
+    /// Validates stable identity and human-readable metadata.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_capability_name("grader", &self.name)?;
+        if self.description.trim().is_empty()
+            || self.description.len() > MAX_RATIONALE_BYTES
+            || self.description.chars().any(char::is_control)
+        {
+            return Err(HarnessError::InvalidCapability(format!(
+                "grader {} description must be 1-{MAX_RATIONALE_BYTES} non-control bytes",
+                self.name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -647,14 +669,22 @@ fn spawn_grader(
 ) {
     let identity = task.identity.clone();
     let handle = tasks.spawn(async move {
-        let outcome = match tokio::time::timeout(timeout, task.grader.grade(sample)).await {
-            Ok(Ok(grade)) => normalize_grade(grade),
-            Ok(Err(error)) => GradeOutcome::Error {
-                message: bounded_message(&error.to_string()),
+        let cancellation = CancellationToken::new();
+        let mut grading = task.grader.grade(sample, cancellation.clone());
+        let outcome = tokio::select! {
+            result = &mut grading => match result {
+                Ok(grade) => normalize_grade(grade),
+                Err(error) => GradeOutcome::Error {
+                    message: bounded_message(&error.to_string()),
+                },
             },
-            Err(_) => GradeOutcome::Error {
-                message: "grader timed out".to_owned(),
-            },
+            () = tokio::time::sleep(timeout) => {
+                cancellation.cancel();
+                let _ = tokio::time::timeout(EVALUATION_CLEANUP_GRACE, &mut grading).await;
+                GradeOutcome::Error {
+                    message: "grader timed out".to_owned(),
+                }
+            }
         };
         GradeRecord {
             grader: task.identity.name,
@@ -1081,7 +1111,11 @@ mod tests {
             }
         }
 
-        fn grade<'a>(&'a self, sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade> {
+        fn grade<'a>(
+            &'a self,
+            sample: Arc<EvaluationSample>,
+            _cancellation: crate::CancellationToken,
+        ) -> HarnessFuture<'a, Grade> {
             Box::pin(async move {
                 let expected = sample
                     .case
@@ -1113,7 +1147,11 @@ mod tests {
             }
         }
 
-        fn grade<'a>(&'a self, _sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade> {
+        fn grade<'a>(
+            &'a self,
+            _sample: Arc<EvaluationSample>,
+            _cancellation: crate::CancellationToken,
+        ) -> HarnessFuture<'a, Grade> {
             Box::pin(async move {
                 panic!("grader fixture panic");
             })
@@ -1173,7 +1211,9 @@ mod tests {
         }
     }
 
-    struct SlowGrader;
+    struct SlowGrader {
+        cancellation_observed: Arc<AtomicUsize>,
+    }
 
     impl Grader for SlowGrader {
         fn descriptor(&self) -> GraderDescriptor {
@@ -1183,13 +1223,16 @@ mod tests {
             }
         }
 
-        fn grade<'a>(&'a self, _sample: Arc<EvaluationSample>) -> HarnessFuture<'a, Grade> {
+        fn grade<'a>(
+            &'a self,
+            _sample: Arc<EvaluationSample>,
+            cancellation: crate::CancellationToken,
+        ) -> HarnessFuture<'a, Grade> {
             Box::pin(async move {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok(Grade {
-                    score: 1.0,
-                    passed: true,
-                    rationale: None,
+                cancellation.cancelled().await;
+                self.cancellation_observed.store(1, Ordering::SeqCst);
+                Err(HarnessError::Cancelled {
+                    phase: crate::ExecutionPhase::Evaluation,
                 })
             })
         }
@@ -1539,9 +1582,15 @@ mod tests {
         let mut slow_case = case("slow-case", "wait", "wait");
         slow_case.timeout_ms = None;
         let suite = EvaluationSuite::new("timeouts", vec![slow_case]).expect("suite");
+        let grader_cancellation_observed = Arc::new(AtomicUsize::new(0));
         let mut graders = GraderRegistry::new();
         graders
-            .register(CapabilityOrigin::BuiltIn, Arc::new(SlowGrader))
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SlowGrader {
+                    cancellation_observed: grader_cancellation_observed.clone(),
+                }),
+            )
             .expect("slow grader");
         let cancellation_observed = Arc::new(AtomicUsize::new(0));
         let report = EvaluationEngine::new(graders)
@@ -1557,6 +1606,7 @@ mod tests {
             .expect("timeout report");
 
         assert_eq!(cancellation_observed.load(Ordering::SeqCst), 1);
+        assert_eq!(grader_cancellation_observed.load(Ordering::SeqCst), 1);
         assert!(matches!(
             &report.cases[0].execution,
             EvaluationExecution::Failed { error }

@@ -419,7 +419,10 @@ pub enum MemoryContextRecordStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-/// Externally controlled execution phase used for stop evidence.
+/// Externally controlled execution phase.
+///
+/// Live Turn phases may enter durable stop evidence. Evaluation is an
+/// out-of-loop process phase and is never written as Turn stop evidence.
 pub enum ExecutionPhase {
     /// Long-term memory retrieval and context compilation.
     Context,
@@ -433,6 +436,8 @@ pub enum ExecutionPhase {
     Tool,
     /// Candidate-result verification.
     Verification,
+    /// Offline or online evaluation grading outside the live Agent Loop.
+    Evaluation,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
