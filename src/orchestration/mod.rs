@@ -1,6 +1,7 @@
 //! Deterministic Task DAG scheduling, fenced leases, messages, and artifacts.
 
 mod coordinator;
+mod migration;
 mod runner;
 mod workspace;
 
@@ -16,6 +17,7 @@ pub use coordinator::{
     MemoryTaskCoordinator, SqliteTaskCoordinator, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator,
     TaskGraphSnapshot,
 };
+pub use migration::{TaskMigrationReport, TaskMigrationStatus};
 pub use runner::{Orchestrator, TaskExecutionRequest, TaskExecutor, TaskMailbox};
 pub use workspace::{
     DenyWorkspaceProvider, GitWorktreeWorkspaceProvider, LocalDirectoryWorkspaceProvider,

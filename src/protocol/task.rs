@@ -5,9 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HarnessError, TaskClaim, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph,
-    TaskGraphId, TaskGraphSnapshot, TaskId, TaskLease, TaskLeaseId, TaskMessage, TaskMessagePage,
-    TaskRecord, TaskStatus,
+    AuthorityContext, HarnessError, TaskClaim, TaskCompletion, TaskCoordinator, TaskDefinition,
+    TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, TaskLease, TaskLeaseId, TaskMessage,
+    TaskMessagePage, TaskRecord, TaskStatus,
     json::{BoundedJsonError, bounded_serialized_size},
     kernel::now_ms,
 };
@@ -23,6 +23,9 @@ const MAX_TASK_LEASE_DURATION_MS: u64 = 604_800_000;
 pub struct TaskGraphSummary {
     /// Stable Task Graph identity.
     pub graph_id: TaskGraphId,
+    /// Immutable tenant boundary, or absent for an unscoped graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     /// Current optimistic-concurrency revision.
     pub revision: u64,
     /// Number of Task records.
@@ -50,6 +53,23 @@ pub struct TaskRecordPage {
     pub has_more: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TaskWorkerAccess<'a> {
+    task_id: &'a TaskId,
+    lease_id: &'a TaskLeaseId,
+    worker: &'a str,
+}
+
+impl<'a> TaskWorkerAccess<'a> {
+    pub(crate) fn new(task_id: &'a TaskId, lease_id: &'a TaskLeaseId, worker: &'a str) -> Self {
+        Self {
+            task_id,
+            lease_id,
+            worker,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TaskProtocolService {
     coordinator: Arc<dyn TaskCoordinator>,
@@ -64,18 +84,23 @@ impl TaskProtocolService {
         &self,
         graph_id: TaskGraphId,
         definitions: Vec<TaskDefinition>,
+        authority: &AuthorityContext,
     ) -> Result<TaskGraphSummary, HarnessError> {
         let graph = TaskGraph::new(definitions)?;
-        let snapshot = self.coordinator.create(graph_id, graph).await?;
+        let snapshot = self
+            .coordinator
+            .create_as(graph_id, graph, authority)
+            .await?;
         summary(&snapshot)
     }
 
     pub(crate) async fn summary(
         &self,
         graph_id: &TaskGraphId,
+        authority: &AuthorityContext,
     ) -> Result<Option<TaskGraphSummary>, HarnessError> {
         self.coordinator
-            .load(graph_id)
+            .load_as(graph_id, authority)
             .await?
             .as_ref()
             .map(summary)
@@ -87,13 +112,14 @@ impl TaskProtocolService {
         graph_id: &TaskGraphId,
         after_task_id: Option<&str>,
         limit: usize,
+        authority: &AuthorityContext,
     ) -> Result<TaskRecordPage, HarnessError> {
         if !(1..=MAX_TASK_RECORD_PAGE).contains(&limit) {
             return Err(HarnessError::Protocol(format!(
                 "Task record limit must be 1-{MAX_TASK_RECORD_PAGE}"
             )));
         }
-        let snapshot = self.load(graph_id).await?;
+        let snapshot = self.load(graph_id, authority).await?;
         let mut records = Vec::new();
         let mut encoded_bytes = 0_usize;
         let mut has_more = false;
@@ -143,6 +169,7 @@ impl TaskProtocolService {
         worker: &str,
         lease_duration_ms: u64,
         maximum: usize,
+        authority: &AuthorityContext,
     ) -> Result<(u64, Vec<TaskClaim>), HarnessError> {
         validate_lease_duration(lease_duration_ms)?;
         if !(1..=MAX_TASK_CLAIMS).contains(&maximum) {
@@ -152,7 +179,7 @@ impl TaskProtocolService {
         }
         let mut last_conflict = None;
         for _ in 0..MAX_TASK_CAS_ATTEMPTS {
-            let mut snapshot = self.load(graph_id).await?;
+            let mut snapshot = self.load(graph_id, authority).await?;
             let claims =
                 snapshot
                     .graph_mut()
@@ -173,7 +200,11 @@ impl TaskProtocolService {
                     ));
                 }
             }
-            match self.coordinator.compare_and_swap(snapshot).await {
+            match self
+                .coordinator
+                .compare_and_swap_as(snapshot, authority)
+                .await
+            {
                 Ok(saved) => return Ok((saved.revision(), claims)),
                 Err(error @ HarnessError::OrchestrationConflict { .. }) => {
                     last_conflict = Some(error);
@@ -192,17 +223,16 @@ impl TaskProtocolService {
     pub(crate) async fn heartbeat(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
         lease_duration_ms: u64,
+        authority: &AuthorityContext,
     ) -> Result<(u64, u64), HarnessError> {
         validate_lease_duration(lease_duration_ms)?;
-        self.mutate_worker(graph_id, task_id, lease_id, worker, |graph, now, lease| {
+        self.mutate_worker(graph_id, access, authority, |graph, now, lease| {
             let expires_at_ms = now.checked_add(lease_duration_ms).ok_or_else(|| {
                 HarnessError::Protocol("Task heartbeat expiration overflow".to_owned())
             })?;
-            graph.heartbeat(task_id, &lease.id, now, expires_at_ms)?;
+            graph.heartbeat(access.task_id, &lease.id, now, expires_at_ms)?;
             Ok(expires_at_ms)
         })
         .await
@@ -211,14 +241,13 @@ impl TaskProtocolService {
     pub(crate) async fn complete(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
         completion: TaskCompletion,
+        authority: &AuthorityContext,
     ) -> Result<u64, HarnessError> {
         let (revision, ()) = self
-            .mutate_worker(graph_id, task_id, lease_id, worker, |graph, now, lease| {
-                graph.complete(task_id, &lease.id, now, completion.clone())
+            .mutate_worker(graph_id, access, authority, |graph, now, lease| {
+                graph.complete(access.task_id, &lease.id, now, completion.clone())
             })
             .await?;
         Ok(revision)
@@ -227,14 +256,13 @@ impl TaskProtocolService {
     pub(crate) async fn fail(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
         reason: String,
+        authority: &AuthorityContext,
     ) -> Result<u64, HarnessError> {
         let (revision, ()) = self
-            .mutate_worker(graph_id, task_id, lease_id, worker, |graph, now, lease| {
-                graph.fail(task_id, &lease.id, now, reason.clone())
+            .mutate_worker(graph_id, access, authority, |graph, now, lease| {
+                graph.fail(access.task_id, &lease.id, now, reason.clone())
             })
             .await?;
         Ok(revision)
@@ -246,8 +274,9 @@ impl TaskProtocolService {
         task_id: &TaskId,
         expected_revision: u64,
         reason: String,
+        authority: &AuthorityContext,
     ) -> Result<u64, HarnessError> {
-        let mut snapshot = self.load(graph_id).await?;
+        let mut snapshot = self.load(graph_id, authority).await?;
         if snapshot.revision() != expected_revision {
             return Err(HarnessError::OrchestrationConflict {
                 graph_id: graph_id.clone(),
@@ -258,7 +287,7 @@ impl TaskProtocolService {
         snapshot.graph_mut().cancel(task_id, reason)?;
         Ok(self
             .coordinator
-            .compare_and_swap(snapshot)
+            .compare_and_swap_as(snapshot, authority)
             .await?
             .revision())
     }
@@ -266,31 +295,29 @@ impl TaskProtocolService {
     pub(crate) async fn inbox(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
         after_sequence: u64,
         limit: usize,
+        authority: &AuthorityContext,
     ) -> Result<(u64, TaskMessagePage), HarnessError> {
-        let snapshot = self.load(graph_id).await?;
-        require_worker_lease(snapshot.graph(), task_id, lease_id, worker, now_ms())?;
+        let snapshot = self.load(graph_id, authority).await?;
+        require_worker_lease(snapshot.graph(), access, now_ms())?;
         let page = snapshot
             .graph()
-            .messages_page_for(task_id, after_sequence, limit)?;
+            .messages_page_for(access.task_id, after_sequence, limit)?;
         Ok((snapshot.revision(), page))
     }
 
     pub(crate) async fn send(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
         to: &TaskId,
         body: String,
+        authority: &AuthorityContext,
     ) -> Result<(u64, TaskMessage), HarnessError> {
-        self.mutate_worker(graph_id, task_id, lease_id, worker, |graph, now, _lease| {
-            graph.send_message(task_id, to, body.clone(), now)
+        self.mutate_worker(graph_id, access, authority, |graph, now, _lease| {
+            graph.send_message(access.task_id, to, body.clone(), now)
         })
         .await
     }
@@ -298,19 +325,21 @@ impl TaskProtocolService {
     async fn mutate_worker<T>(
         &self,
         graph_id: &TaskGraphId,
-        task_id: &TaskId,
-        lease_id: &TaskLeaseId,
-        worker: &str,
+        access: TaskWorkerAccess<'_>,
+        authority: &AuthorityContext,
         mut mutation: impl FnMut(&mut TaskGraph, u64, &TaskLease) -> Result<T, HarnessError>,
     ) -> Result<(u64, T), HarnessError> {
         let mut last_conflict = None;
         for _ in 0..MAX_TASK_CAS_ATTEMPTS {
-            let mut snapshot = self.load(graph_id).await?;
+            let mut snapshot = self.load(graph_id, authority).await?;
             let now = now_ms();
-            let lease =
-                require_worker_lease(snapshot.graph(), task_id, lease_id, worker, now)?.clone();
+            let lease = require_worker_lease(snapshot.graph(), access, now)?.clone();
             let output = mutation(snapshot.graph_mut(), now, &lease)?;
-            match self.coordinator.compare_and_swap(snapshot).await {
+            match self
+                .coordinator
+                .compare_and_swap_as(snapshot, authority)
+                .await
+            {
                 Ok(saved) => return Ok((saved.revision(), output)),
                 Err(error @ HarnessError::OrchestrationConflict { .. }) => {
                     last_conflict = Some(error);
@@ -326,9 +355,13 @@ impl TaskProtocolService {
         }))
     }
 
-    async fn load(&self, graph_id: &TaskGraphId) -> Result<TaskGraphSnapshot, HarnessError> {
+    async fn load(
+        &self,
+        graph_id: &TaskGraphId,
+        authority: &AuthorityContext,
+    ) -> Result<TaskGraphSnapshot, HarnessError> {
         self.coordinator
-            .load(graph_id)
+            .load_as(graph_id, authority)
             .await?
             .ok_or_else(|| HarnessError::Protocol(format!("Task Graph {graph_id} does not exist")))
     }
@@ -337,6 +370,7 @@ impl TaskProtocolService {
 fn summary(snapshot: &TaskGraphSnapshot) -> Result<TaskGraphSummary, HarnessError> {
     Ok(TaskGraphSummary {
         graph_id: snapshot.id().clone(),
+        tenant_id: snapshot.tenant_id().map(str::to_owned),
         revision: snapshot.revision(),
         task_count: snapshot
             .graph()
@@ -364,17 +398,15 @@ fn summary(snapshot: &TaskGraphSnapshot) -> Result<TaskGraphSummary, HarnessErro
 
 fn require_worker_lease<'a>(
     graph: &'a TaskGraph,
-    task_id: &TaskId,
-    lease_id: &TaskLeaseId,
-    worker: &str,
+    access: TaskWorkerAccess<'_>,
     now_ms: u64,
 ) -> Result<&'a TaskLease, HarnessError> {
     graph
-        .task(task_id)
+        .task(access.task_id)
         .and_then(|record| match &record.status {
             TaskStatus::Running { lease }
-                if &lease.id == lease_id
-                    && lease.owner == worker
+                if &lease.id == access.lease_id
+                    && lease.owner == access.worker
                     && lease.expires_at_ms > now_ms =>
             {
                 Some(lease)

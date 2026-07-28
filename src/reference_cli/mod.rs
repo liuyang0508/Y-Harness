@@ -10,8 +10,8 @@ use y_harness::{
     AllowListPolicy, ApprovalMigrationStatus, CapabilityOrigin, HarnessError, HarnessFuture,
     HarnessRuntime, ItemKind, LanguageModel, MemoryTaskCoordinator, ModelOutput, ModelRequest,
     ModelResponse, ModelStream, ProtocolHandler, SqliteApprovalInbox, SqliteEventStore,
-    StateEngine, StateMigrationStatus, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
-    ToolRegistry, export_jsonl, serve_stdio,
+    SqliteTaskCoordinator, StateEngine, StateMigrationStatus, TaskMigrationStatus, Tool,
+    ToolBatchExecution, ToolContext, ToolDescriptor, ToolRegistry, export_jsonl, serve_stdio,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -210,6 +210,34 @@ pub async fn run_approval_migrate(database: String, backup: String) -> CliResult
     Ok(())
 }
 
+/// Performs the explicit backup-first SQLite Task Graph migration.
+pub async fn run_task_migrate(database: String, backup: String) -> CliResult<()> {
+    let report = SqliteTaskCoordinator::migrate(&database, &backup).await?;
+    match report.status {
+        TaskMigrationStatus::Migrated => {
+            let Some(backup_path) = report.backup_path.as_deref() else {
+                return Err("Task Graph migration completed without a backup path".into());
+            };
+            println!(
+                "migrated Task Graph schema {} -> {}; graphs: {}; required backup bytes: {}; available backup bytes: {}; backup: {}",
+                report.from_graph_schema,
+                report.to_graph_schema,
+                report.historical_graphs,
+                report.required_backup_bytes,
+                report.available_backup_bytes,
+                backup_path.display()
+            );
+        }
+        TaskMigrationStatus::AlreadyCurrent => {
+            println!(
+                "Task Graph schema {} is already current; graphs: {}",
+                report.to_graph_schema, report.historical_graphs
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Installs one validated declarative Skill into a project-local store.
 pub fn run_skill_install(package: String, config: String) -> CliResult<()> {
     service::run_skill_install(package, config)
@@ -276,7 +304,7 @@ pub async fn run_evaluation(suite: String, baseline: String, config: String) -> 
 /// Prints the reference binary command surface.
 pub fn print_help() {
     println!(
-        "Y-Harness\n\nUsage:\n  yh init [directory]\n  yh doctor [config]\n  yh serve [config]\n  yh demo [message]\n  yh serve-demo\n  yh eval <suite> <baseline> [config]\n  yh eval-smoke\n  yh thread export <thread-id> <archive> [config]\n  yh thread import <archive> <target-thread-id> [config]\n  yh skill install <package> [config]\n  yh skill install-external <signed-package> [config]\n  yh skill install-https <url> <name@version> <sha256> [config]\n  yh skill list [config]\n  yh skill verify [config]\n  yh skill remove <name@version> [config]\n  yh state-migrate <database> <backup>\n  yh approval-migrate <database> <backup>\n  yh --version\n  yh --help\n\n`init` creates a no-clobber local project; config defaults to y-harness.json.\n`doctor` validates config, model authority, credentials, storage boundaries, and configured Evaluation Graders.\n`serve` opens durable State, Approval, and Task SQLite stores and speaks the current typed JSONL Protocol over stdin/stdout.\n`eval` runs an isolated in-memory target with the configured Model, capabilities, and external Graders; configured process and network authority still applies.\nThread export accepts terminal histories and never overwrites an archive; import atomically creates the caller-named target.\nSkill commands manage validated declarative packages under the config project; signed packages require configured trust and activation remains explicit.\nHTTPS Skill installation also requires the optional `https-skill` Cargo feature.\nDemo and `eval-smoke` are local and perform no network requests.\nMigration commands require all corresponding writers to be stopped and never overwrite their backup.\nThe optional full-screen product is installed separately as `yh-tui`."
+        "Y-Harness\n\nUsage:\n  yh init [directory]\n  yh doctor [config]\n  yh serve [config]\n  yh demo [message]\n  yh serve-demo\n  yh eval <suite> <baseline> [config]\n  yh eval-smoke\n  yh thread export <thread-id> <archive> [config]\n  yh thread import <archive> <target-thread-id> [config]\n  yh skill install <package> [config]\n  yh skill install-external <signed-package> [config]\n  yh skill install-https <url> <name@version> <sha256> [config]\n  yh skill list [config]\n  yh skill verify [config]\n  yh skill remove <name@version> [config]\n  yh state-migrate <database> <backup>\n  yh approval-migrate <database> <backup>\n  yh task-migrate <database> <backup>\n  yh --version\n  yh --help\n\n`init` creates a no-clobber local project; config defaults to y-harness.json.\n`doctor` validates config, model authority, credentials, storage boundaries, and configured Evaluation Graders.\n`serve` opens durable State, Approval, and Task SQLite stores and speaks the current typed JSONL Protocol over stdin/stdout.\n`eval` runs an isolated in-memory target with the configured Model, capabilities, and external Graders; configured process and network authority still applies.\nThread export accepts terminal histories and never overwrites an archive; import atomically creates the caller-named target.\nSkill commands manage validated declarative packages under the config project; signed packages require configured trust and activation remains explicit.\nHTTPS Skill installation also requires the optional `https-skill` Cargo feature.\nDemo and `eval-smoke` are local and perform no network requests.\nMigration commands require all corresponding writers to be stopped and never overwrite their backup.\nThe optional full-screen product is installed separately as `yh-tui`."
     );
 }
 

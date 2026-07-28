@@ -8,12 +8,13 @@ use std::{
 use y_harness::{
     ApprovalId, ApprovalInbox, ApprovalRecordStatus, PROTOCOL_VERSION, ProtocolCommand,
     ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult, SqliteApprovalInbox,
-    TaskDefinition, TaskId, WorkspaceMode,
+    SqliteTaskCoordinator, TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, WorkspaceMode,
 };
 
 const STATE_V1_FIXTURE: &str = include_str!("fixtures/state-v1.sql");
 const APPROVAL_V1_FIXTURE: &str = include_str!("fixtures/approval-v1.sql");
 const APPROVAL_V2_FIXTURE: &str = include_str!("fixtures/approval-v2.sql");
+const TASK_V1_FIXTURE: &str = include_str!("fixtures/task-v1.sql");
 
 #[test]
 fn stdio_server_preserves_one_response_per_request_and_stdout_purity() {
@@ -224,6 +225,44 @@ async fn approval_migration_cli_orphans_unattributed_pending_requests() {
     SqliteApprovalInbox::open(&schema_two)
         .await
         .expect("open migrated v2 fixture");
+    let _ = fs::remove_dir_all(&working_directory);
+}
+
+#[tokio::test]
+async fn task_migration_cli_preserves_legacy_graphs_as_unscoped() {
+    let working_directory = isolated_working_directory("task-migration");
+    fs::create_dir_all(&working_directory).expect("create isolated working directory");
+    let source = working_directory.join("task-v1.db");
+    let backup = working_directory.join("task-v1.backup.db");
+    rusqlite::Connection::open(&source)
+        .expect("create v1 Task database")
+        .execute_batch(TASK_V1_FIXTURE)
+        .expect("apply Task v1 fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("task-migrate")
+        .arg(&source)
+        .arg(&backup)
+        .output()
+        .expect("run Task migration");
+    assert!(
+        output.status.success(),
+        "Task migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(backup.is_file());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Task Graph schema 1 -> 2"));
+
+    let coordinator = SqliteTaskCoordinator::open(&source)
+        .await
+        .expect("open migrated Task store");
+    let snapshot = coordinator
+        .load(&TaskGraphId::from_static("task-graph-v1"))
+        .await
+        .expect("load migrated graph")
+        .expect("legacy graph");
+    assert_eq!(snapshot.tenant_id(), None);
+    assert_eq!(snapshot.revision(), 4);
     let _ = fs::remove_dir_all(&working_directory);
 }
 

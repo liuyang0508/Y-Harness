@@ -49,6 +49,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reject_extra_argument(args.next())?;
             reference_cli::run_approval_migrate(database, backup).await
         }
+        Some("task-migrate") => {
+            let database = required_argument(args.next(), "database")?;
+            let backup = required_argument(args.next(), "backup")?;
+            reject_extra_argument(args.next())?;
+            reference_cli::run_task_migrate(database, backup).await
+        }
         Some("skill") => match args.next().as_deref() {
             Some("install") => {
                 let package = required_argument(args.next(), "Skill package")?;

@@ -8,20 +8,23 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task};
 
 use super::{MAX_TASK_GRAPH_JSON_BYTES, TaskGraph};
-use crate::{HarnessError, HarnessFuture, TaskGraphId, sqlite::bounded_text};
+use crate::{AuthorityContext, HarnessError, HarnessFuture, TaskGraphId, sqlite::bounded_text};
 
 /// Current durable Task Coordinator graph schema.
-pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 1;
+pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 2;
 
 /// Revisioned, durable Task Graph aggregate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TaskGraphSnapshot {
     /// Stable graph identity.
     id: TaskGraphId,
+    /// Immutable tenant boundary, or `None` for an unscoped graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
     /// Positive optimistic-concurrency revision.
     revision: u64,
     /// Complete validated graph projection.
@@ -33,6 +36,12 @@ impl TaskGraphSnapshot {
     #[must_use]
     pub fn id(&self) -> &TaskGraphId {
         &self.id
+    }
+
+    /// Returns the immutable tenant owner, or `None` for an unscoped graph.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
     }
 
     /// Returns the observed optimistic-concurrency revision.
@@ -55,30 +64,67 @@ impl TaskGraphSnapshot {
 
 /// Atomic persistence boundary for Task Graph coordination.
 pub trait TaskCoordinator: Send + Sync {
-    /// Creates a graph at revision one, rejecting identity replacement.
+    /// Creates an unscoped graph at revision one.
     fn create<'a>(
         &'a self,
         graph_id: TaskGraphId,
         graph: TaskGraph,
+    ) -> HarnessFuture<'a, TaskGraphSnapshot> {
+        Box::pin(async move {
+            self.create_as(graph_id, graph, &AuthorityContext::local_process())
+                .await
+        })
+    }
+
+    /// Creates a graph under the exact trusted tenant authority.
+    fn create_as<'a>(
+        &'a self,
+        graph_id: TaskGraphId,
+        graph: TaskGraph,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot>;
 
-    /// Loads one current graph snapshot.
+    /// Loads one current unscoped graph snapshot.
     fn load<'a>(
         &'a self,
         graph_id: &'a TaskGraphId,
+    ) -> HarnessFuture<'a, Option<TaskGraphSnapshot>> {
+        Box::pin(async move {
+            self.load_as(graph_id, &AuthorityContext::local_process())
+                .await
+        })
+    }
+
+    /// Loads one graph only when its tenant exactly matches the authority.
+    fn load_as<'a>(
+        &'a self,
+        graph_id: &'a TaskGraphId,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, Option<TaskGraphSnapshot>>;
 
-    /// Atomically saves a mutation only if its observed revision is current.
+    /// Atomically saves an unscoped mutation at its observed revision.
     fn compare_and_swap<'a>(
         &'a self,
         snapshot: TaskGraphSnapshot,
+    ) -> HarnessFuture<'a, TaskGraphSnapshot> {
+        Box::pin(async move {
+            self.compare_and_swap_as(snapshot, &AuthorityContext::local_process())
+                .await
+        })
+    }
+
+    /// Atomically saves a mutation inside the exact tenant boundary.
+    fn compare_and_swap_as<'a>(
+        &'a self,
+        snapshot: TaskGraphSnapshot,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot>;
 }
 
 /// In-memory coordinator with the same revision semantics as SQLite.
 #[derive(Default)]
 pub struct MemoryTaskCoordinator {
-    graphs: Mutex<BTreeMap<TaskGraphId, TaskGraphSnapshot>>,
+    graphs: Mutex<BTreeMap<(String, TaskGraphId), TaskGraphSnapshot>>,
 }
 
 impl MemoryTaskCoordinator {
@@ -90,51 +136,73 @@ impl MemoryTaskCoordinator {
 }
 
 impl TaskCoordinator for MemoryTaskCoordinator {
-    fn create<'a>(
+    fn create_as<'a>(
         &'a self,
         graph_id: TaskGraphId,
         graph: TaskGraph,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&graph_id)?;
             validate_graph(&graph)?;
             let mut graphs = self.graphs.lock().await;
-            if graphs.contains_key(&graph_id) {
+            let key = (
+                tenant_storage_key(authority.tenant_id()).to_owned(),
+                graph_id.clone(),
+            );
+            if graphs.contains_key(&key) {
                 return Err(HarnessError::Orchestration(format!(
                     "Task Graph {graph_id} already exists"
                 )));
             }
             let snapshot = TaskGraphSnapshot {
                 id: graph_id.clone(),
+                tenant_id: authority.tenant_id().map(str::to_owned),
                 revision: 1,
                 graph,
             };
-            graphs.insert(graph_id, snapshot.clone());
+            graphs.insert(key, snapshot.clone());
             Ok(snapshot)
         })
     }
 
-    fn load<'a>(
+    fn load_as<'a>(
         &'a self,
         graph_id: &'a TaskGraphId,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, Option<TaskGraphSnapshot>> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(graph_id)?;
-            Ok(self.graphs.lock().await.get(graph_id).cloned())
+            let key = (
+                tenant_storage_key(authority.tenant_id()).to_owned(),
+                graph_id.clone(),
+            );
+            Ok(self.graphs.lock().await.get(&key).cloned())
         })
     }
 
-    fn compare_and_swap<'a>(
+    fn compare_and_swap_as<'a>(
         &'a self,
         snapshot: TaskGraphSnapshot,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&snapshot.id)?;
             validate_graph(&snapshot.graph)?;
+            if snapshot.tenant_id() != authority.tenant_id() {
+                return Err(graph_does_not_exist(&snapshot.id));
+            }
             let mut graphs = self.graphs.lock().await;
-            let current = graphs.get(&snapshot.id).ok_or_else(|| {
-                HarnessError::Orchestration(format!("Task Graph {} does not exist", snapshot.id))
-            })?;
+            let key = (
+                tenant_storage_key(authority.tenant_id()).to_owned(),
+                snapshot.id.clone(),
+            );
+            let current = graphs
+                .get(&key)
+                .ok_or_else(|| graph_does_not_exist(&snapshot.id))?;
             if current.revision != snapshot.revision {
                 return Err(HarnessError::OrchestrationConflict {
                     graph_id: snapshot.id,
@@ -147,10 +215,11 @@ impl TaskCoordinator for MemoryTaskCoordinator {
             })?;
             let saved = TaskGraphSnapshot {
                 id: snapshot.id.clone(),
+                tenant_id: snapshot.tenant_id,
                 revision: next_revision,
                 graph: snapshot.graph,
             };
-            graphs.insert(snapshot.id, saved.clone());
+            graphs.insert(key, saved.clone());
             Ok(saved)
         })
     }
@@ -191,15 +260,17 @@ impl SqliteTaskCoordinator {
                     PRAGMA synchronous = FULL;
                     PRAGMA foreign_keys = ON;
                     CREATE TABLE IF NOT EXISTS task_graphs (
-                        graph_id       TEXT PRIMARY KEY,
+                        tenant_id      TEXT NOT NULL,
+                        graph_id       TEXT NOT NULL,
                         schema_version INTEGER NOT NULL,
                         revision       INTEGER NOT NULL CHECK(revision > 0),
-                        graph_json     TEXT NOT NULL
+                        graph_json     TEXT NOT NULL,
+                        PRIMARY KEY (tenant_id, graph_id)
                     );
                     ",
                 )
                 .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-            ensure_schema_column(&connection)?;
+            validate_current_table(&connection)?;
             Ok(connection)
         })
         .await
@@ -233,23 +304,28 @@ impl SqliteTaskCoordinator {
 }
 
 impl TaskCoordinator for SqliteTaskCoordinator {
-    fn create<'a>(
+    fn create_as<'a>(
         &'a self,
         graph_id: TaskGraphId,
         graph: TaskGraph,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&graph_id)?;
-            let graph_json = encode_graph(&graph)?;
+            let tenant_id = authority.tenant_id().map(str::to_owned);
+            let stored_tenant = tenant_storage_key(tenant_id.as_deref()).to_owned();
+            let graph_json = encode_graph(&graph, tenant_id.as_deref())?;
             let stored_id = graph_id.clone();
             let changed = self
                 .with_connection(move |connection| {
                     connection
                         .execute(
                             "INSERT OR IGNORE INTO task_graphs
-                                (graph_id, schema_version, revision, graph_json)
-                             VALUES (?1, ?2, 1, ?3)",
+                                (tenant_id, graph_id, schema_version, revision, graph_json)
+                             VALUES (?1, ?2, ?3, 1, ?4)",
                             params![
+                                stored_tenant,
                                 stored_id.as_str(),
                                 i64::from(TASK_GRAPH_SCHEMA_VERSION),
                                 graph_json
@@ -265,35 +341,42 @@ impl TaskCoordinator for SqliteTaskCoordinator {
             }
             Ok(TaskGraphSnapshot {
                 id: graph_id,
+                tenant_id,
                 revision: 1,
                 graph,
             })
         })
     }
 
-    fn load<'a>(
+    fn load_as<'a>(
         &'a self,
         graph_id: &'a TaskGraphId,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, Option<TaskGraphSnapshot>> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(graph_id)?;
             let requested_id = graph_id.clone();
+            let requested_tenant = tenant_storage_key(authority.tenant_id()).to_owned();
             let loaded = self
                 .with_connection(move |connection| {
                     connection
                         .query_row(
-                            "SELECT schema_version, revision,
+                            "SELECT length(CAST(tenant_id AS BLOB)), tenant_id,
+                                    schema_version, revision,
                                     length(CAST(graph_json AS BLOB)), graph_json
-                             FROM task_graphs WHERE graph_id = ?1",
-                            params![requested_id.as_str()],
+                             FROM task_graphs
+                             WHERE tenant_id = ?1 AND graph_id = ?2",
+                            params![requested_tenant, requested_id.as_str()],
                             |row| {
                                 Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, i64>(1)?,
+                                    bounded_text(row, 0, 1, 256, "stored Task tenant")?,
+                                    row.get::<_, i64>(2)?,
+                                    row.get::<_, i64>(3)?,
                                     bounded_text(
                                         row,
-                                        2,
-                                        3,
+                                        4,
+                                        5,
                                         MAX_TASK_GRAPH_JSON_BYTES,
                                         "stored Task Graph snapshot",
                                     )?,
@@ -305,20 +388,31 @@ impl TaskCoordinator for SqliteTaskCoordinator {
                 })
                 .await?;
             loaded
-                .map(|(schema_version, revision, graph_json)| {
-                    decode_snapshot(graph_id.clone(), schema_version, revision, &graph_json)
+                .map(|(stored_tenant, schema_version, revision, graph_json)| {
+                    decode_snapshot(
+                        graph_id.clone(),
+                        &stored_tenant,
+                        schema_version,
+                        revision,
+                        &graph_json,
+                    )
                 })
                 .transpose()
         })
     }
 
-    fn compare_and_swap<'a>(
+    fn compare_and_swap_as<'a>(
         &'a self,
         snapshot: TaskGraphSnapshot,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, TaskGraphSnapshot> {
         Box::pin(async move {
+            authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&snapshot.id)?;
-            let graph_json = encode_graph(&snapshot.graph)?;
+            if snapshot.tenant_id() != authority.tenant_id() {
+                return Err(graph_does_not_exist(&snapshot.id));
+            }
+            let graph_json = encode_graph(&snapshot.graph, snapshot.tenant_id())?;
             let expected = snapshot.revision;
             let next_revision = expected.checked_add(1).ok_or_else(|| {
                 HarnessError::Orchestration("Task Graph revision overflow".to_owned())
@@ -327,6 +421,7 @@ impl TaskCoordinator for SqliteTaskCoordinator {
             let next_sql = sql_revision(next_revision)?;
             let graph_id = snapshot.id.clone();
             let conflict_id = snapshot.id.clone();
+            let stored_tenant = tenant_storage_key(snapshot.tenant_id()).to_owned();
             self.with_connection(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -334,15 +429,13 @@ impl TaskCoordinator for SqliteTaskCoordinator {
                 let (schema_version, actual_sql) = transaction
                     .query_row(
                         "SELECT schema_version, revision
-                         FROM task_graphs WHERE graph_id = ?1",
-                        params![graph_id.as_str()],
+                         FROM task_graphs WHERE tenant_id = ?1 AND graph_id = ?2",
+                        params![stored_tenant, graph_id.as_str()],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                     )
                     .optional()
                     .map_err(|error| HarnessError::Orchestration(error.to_string()))?
-                    .ok_or_else(|| {
-                        HarnessError::Orchestration(format!("Task Graph {graph_id} does not exist"))
-                    })?;
+                    .ok_or_else(|| graph_does_not_exist(&graph_id))?;
                 validate_schema_version(schema_version)?;
                 let actual = revision_from_sql(actual_sql)?;
                 if actual != expected {
@@ -356,8 +449,14 @@ impl TaskCoordinator for SqliteTaskCoordinator {
                     .execute(
                         "UPDATE task_graphs
                          SET revision = ?1, graph_json = ?2
-                         WHERE graph_id = ?3 AND revision = ?4",
-                        params![next_sql, graph_json, graph_id.as_str(), expected_sql],
+                         WHERE tenant_id = ?3 AND graph_id = ?4 AND revision = ?5",
+                        params![
+                            next_sql,
+                            graph_json,
+                            stored_tenant,
+                            graph_id.as_str(),
+                            expected_sql
+                        ],
                     )
                     .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
                 if changed != 1 {
@@ -372,6 +471,7 @@ impl TaskCoordinator for SqliteTaskCoordinator {
             .await?;
             Ok(TaskGraphSnapshot {
                 id: snapshot.id,
+                tenant_id: snapshot.tenant_id,
                 revision: next_revision,
                 graph: snapshot.graph,
             })
@@ -403,9 +503,26 @@ fn validate_graph(graph: &TaskGraph) -> Result<(), HarnessError> {
     Ok(())
 }
 
-fn encode_graph(graph: &TaskGraph) -> Result<String, HarnessError> {
+#[derive(Deserialize)]
+struct StoredTaskGraph {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+    graph: TaskGraph,
+}
+
+#[derive(Serialize)]
+struct StoredTaskGraphRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<&'a str>,
+    graph: &'a TaskGraph,
+}
+
+pub(super) fn encode_graph(
+    graph: &TaskGraph,
+    tenant_id: Option<&str>,
+) -> Result<String, HarnessError> {
     graph.validate_integrity()?;
-    let json = serde_json::to_string(graph)
+    let json = serde_json::to_string(&StoredTaskGraphRef { tenant_id, graph })
         .map_err(|error| HarnessError::Orchestration(format!("encode Task Graph: {error}")))?;
     if json.len() > MAX_TASK_GRAPH_JSON_BYTES {
         return Err(HarnessError::Orchestration(format!(
@@ -415,8 +532,9 @@ fn encode_graph(graph: &TaskGraph) -> Result<String, HarnessError> {
     Ok(json)
 }
 
-fn decode_snapshot(
+pub(super) fn decode_snapshot(
     id: TaskGraphId,
+    stored_tenant: &str,
     schema_version: i64,
     revision: i64,
     graph_json: &str,
@@ -427,13 +545,20 @@ fn decode_snapshot(
             "stored Task Graph snapshot exceeds {MAX_TASK_GRAPH_JSON_BYTES} bytes"
         )));
     }
-    let graph: TaskGraph = serde_json::from_str(graph_json)
+    let stored: StoredTaskGraph = serde_json::from_str(graph_json)
         .map_err(|error| HarnessError::Orchestration(format!("decode Task Graph: {error}")))?;
-    graph.validate_integrity()?;
+    let tenant_id = tenant_from_storage_key(stored_tenant)?;
+    if stored.tenant_id.as_deref() != tenant_id.as_deref() {
+        return Err(HarnessError::Orchestration(
+            "stored Task Graph tenant projection does not match its body".to_owned(),
+        ));
+    }
+    stored.graph.validate_integrity()?;
     Ok(TaskGraphSnapshot {
         id,
+        tenant_id,
         revision: revision_from_sql(revision)?,
-        graph,
+        graph: stored.graph,
     })
 }
 
@@ -447,33 +572,92 @@ fn validate_schema_version(schema_version: i64) -> Result<(), HarnessError> {
     }
 }
 
-fn ensure_schema_column(connection: &Connection) -> Result<(), HarnessError> {
+fn validate_current_table(connection: &Connection) -> Result<(), HarnessError> {
     let mut statement = connection
         .prepare("PRAGMA table_info(task_graphs)")
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
     let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-    let mut has_schema_version = false;
+    let mut column_count = 0_usize;
+    let mut tenant_primary_key = 0;
+    let mut graph_primary_key = 0;
+    let mut tenant_not_null = false;
+    let mut graph_not_null = false;
+    let mut schema_not_null = false;
+    let mut revision_not_null = false;
+    let mut graph_json_not_null = false;
     for column in columns {
-        if column.map_err(|error| HarnessError::Orchestration(error.to_string()))?
-            == "schema_version"
-        {
-            has_schema_version = true;
-            break;
+        let (name, not_null, primary_key) =
+            column.map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+        column_count = column_count.saturating_add(1);
+        match name.as_str() {
+            "tenant_id" => {
+                tenant_not_null = not_null == 1;
+                tenant_primary_key = primary_key;
+            }
+            "graph_id" => {
+                graph_not_null = not_null == 1;
+                graph_primary_key = primary_key;
+            }
+            "schema_version" => schema_not_null = not_null == 1,
+            "revision" => revision_not_null = not_null == 1,
+            "graph_json" => graph_json_not_null = not_null == 1,
+            _ => {}
         }
     }
     drop(statement);
-    if !has_schema_version {
-        connection
-            .execute(
-                "ALTER TABLE task_graphs
-                 ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
-                [],
-            )
-            .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+    if column_count != 5
+        || !tenant_not_null
+        || !graph_not_null
+        || !schema_not_null
+        || !revision_not_null
+        || !graph_json_not_null
+        || tenant_primary_key != 1
+        || graph_primary_key != 2
+    {
+        return Err(HarnessError::Orchestration(
+            "SQLite Task Graph migration required; run `yh task-migrate <database> <backup>` before opening this store"
+                .to_owned(),
+        ));
+    }
+    let unsupported: Option<i64> = connection
+        .query_row(
+            "SELECT schema_version FROM task_graphs
+             WHERE schema_version != ?1 LIMIT 1",
+            [i64::from(TASK_GRAPH_SCHEMA_VERSION)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+    if let Some(version) = unsupported {
+        return Err(HarnessError::Orchestration(format!(
+            "unsupported Task Graph schema version {version}"
+        )));
     }
     Ok(())
+}
+
+fn tenant_storage_key(tenant_id: Option<&str>) -> &str {
+    tenant_id.unwrap_or("")
+}
+
+fn tenant_from_storage_key(value: &str) -> Result<Option<String>, HarnessError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    AuthorityContext::validate_tenant(value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn graph_does_not_exist(graph_id: &TaskGraphId) -> HarnessError {
+    HarnessError::Orchestration(format!("Task Graph {graph_id} does not exist"))
 }
 
 fn sql_revision(revision: u64) -> Result<i64, HarnessError> {
@@ -495,7 +679,8 @@ mod tests {
 
     use super::{MemoryTaskCoordinator, SqliteTaskCoordinator, TaskCoordinator};
     use crate::{
-        HarnessError, TaskCompletion, TaskDefinition, TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
+        ActorIdentity, AuthorityContext, HarnessError, TaskCompletion, TaskDefinition, TaskGraph,
+        TaskGraphId, TaskId, WorkspaceMode,
     };
 
     fn graph() -> TaskGraph {
@@ -628,47 +813,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_adds_the_dev_baseline_column_and_rejects_unknown_schema() {
+    async fn tenant_ownership_fences_memory_and_sqlite_graph_access() {
         let path = temporary_database_path();
-        let legacy = Connection::open(&path).expect("open legacy database");
-        legacy
-            .execute_batch(
-                "
-                CREATE TABLE task_graphs (
-                    graph_id   TEXT PRIMARY KEY,
-                    revision   INTEGER NOT NULL CHECK(revision > 0),
-                    graph_json TEXT NOT NULL
-                );
-                ",
-            )
-            .expect("create legacy table");
-        drop(legacy);
+        let sqlite = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("sqlite coordinator");
+        assert_tenant_fencing(&MemoryTaskCoordinator::new()).await;
+        assert_tenant_fencing(&sqlite).await;
+        drop(sqlite);
+        let reopened = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("reopen sqlite coordinator");
+        let graph_id = TaskGraphId::from_static("shared-graph");
+        assert_eq!(
+            reopened
+                .load_as(&graph_id, &authority("tenant-a"))
+                .await
+                .expect("load tenant a after reopen")
+                .expect("tenant a graph")
+                .tenant_id(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            reopened
+                .load_as(&graph_id, &authority("tenant-b"))
+                .await
+                .expect("load tenant b after reopen")
+                .expect("tenant b graph")
+                .tenant_id(),
+            Some("tenant-b")
+        );
+        remove_database_files(&path);
+    }
 
+    #[tokio::test]
+    async fn sqlite_rejects_task_tenant_projection_drift() {
+        let path = temporary_database_path();
         let coordinator = SqliteTaskCoordinator::open(&path)
             .await
-            .expect("add schema baseline");
-        let graph_id = TaskGraphId::from_static("graph-schema");
+            .expect("create current store");
+        let graph_id = TaskGraphId::from_static("graph-drift");
+        let tenant_a = authority("tenant-a");
         coordinator
-            .create(graph_id.clone(), graph())
+            .create_as(graph_id.clone(), graph(), &tenant_a)
             .await
-            .expect("create versioned graph");
+            .expect("create tenant graph");
         drop(coordinator);
 
         let corrupt = Connection::open(&path).expect("open versioned database");
         corrupt
             .execute(
-                "UPDATE task_graphs SET schema_version = 99 WHERE graph_id = ?1",
+                "UPDATE task_graphs SET tenant_id = 'tenant-b' WHERE graph_id = ?1",
                 [graph_id.as_str()],
             )
-            .expect("inject unknown schema");
+            .expect("inject tenant drift");
         drop(corrupt);
         let coordinator = SqliteTaskCoordinator::open(&path).await.expect("reopen");
+        let tenant_b = authority("tenant-b");
         let error = coordinator
-            .load(&graph_id)
+            .load_as(&graph_id, &tenant_b)
             .await
-            .expect_err("unknown schema must fail closed");
+            .expect_err("tenant projection drift must fail closed");
         assert!(matches!(error, HarnessError::Orchestration(_)));
         remove_database_files(&path);
+    }
+
+    async fn assert_tenant_fencing(coordinator: &dyn TaskCoordinator) {
+        let graph_id = TaskGraphId::from_static("shared-graph");
+        let tenant_a = authority("tenant-a");
+        let tenant_b = authority("tenant-b");
+        let created_a = coordinator
+            .create_as(graph_id.clone(), graph(), &tenant_a)
+            .await
+            .expect("create tenant a");
+        let created_b = coordinator
+            .create_as(graph_id.clone(), graph(), &tenant_b)
+            .await
+            .expect("create tenant b with same graph id");
+        assert_eq!(created_a.tenant_id(), Some("tenant-a"));
+        assert_eq!(created_b.tenant_id(), Some("tenant-b"));
+        assert!(
+            coordinator
+                .load(&graph_id)
+                .await
+                .expect("unscoped load")
+                .is_none()
+        );
+        assert_eq!(
+            coordinator
+                .load_as(&graph_id, &tenant_a)
+                .await
+                .expect("tenant a load")
+                .expect("tenant a graph")
+                .tenant_id(),
+            Some("tenant-a")
+        );
+        let error = coordinator
+            .compare_and_swap_as(created_a, &tenant_b)
+            .await
+            .expect_err("cross-tenant CAS");
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    fn authority(tenant: &str) -> AuthorityContext {
+        AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "task-test".to_owned(),
+            },
+            Some(tenant.to_owned()),
+        )
+        .expect("authority")
     }
 
     fn temporary_database_path() -> PathBuf {

@@ -97,9 +97,10 @@ pub use orchestration::{
     MemoryTaskCoordinator, Orchestrator, SqliteTaskCoordinator, TASK_GRAPH_SCHEMA_VERSION,
     TaskArtifact, TaskClaim, TaskCompletion, TaskCoordinator, TaskDefinition, TaskExecutionRequest,
     TaskExecutor, TaskGraph, TaskGraphSnapshot, TaskLease, TaskMailbox, TaskMessage,
-    TaskMessagePage, TaskRecord, TaskStatus, TaskWorkspace, WORKSPACE_PROVIDER_API_VERSION,
-    WorkspaceDisposition, WorkspaceLease, WorkspaceMode, WorkspaceProvider,
-    WorkspaceProviderDescriptor, WorkspaceProvisioning, WorkspaceRequest,
+    TaskMessagePage, TaskMigrationReport, TaskMigrationStatus, TaskRecord, TaskStatus,
+    TaskWorkspace, WORKSPACE_PROVIDER_API_VERSION, WorkspaceDisposition, WorkspaceLease,
+    WorkspaceMode, WorkspaceProvider, WorkspaceProviderDescriptor, WorkspaceProvisioning,
+    WorkspaceRequest,
 };
 pub use protocol::{
     CompatibilityManifest, FingerprintProtocolAuthorizer, OperationStatus, OperationStreamEvent,

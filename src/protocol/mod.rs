@@ -33,11 +33,11 @@ use crate::{
     TurnId, WORKSPACE_PROVIDER_API_VERSION,
 };
 
-use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
+use task::{TaskProtocolService, TaskWorkerAccess};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "21";
+pub const PROTOCOL_VERSION: &str = "22";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -365,22 +365,6 @@ impl ProtocolCommand {
             Self::GetTaskMessages { .. } => "task.worker.messages.read",
             Self::SendTaskMessage { .. } => "task.worker.messages.send",
         }
-    }
-
-    fn requires_task_tenant_ownership(&self) -> bool {
-        matches!(
-            self,
-            Self::CreateTaskGraph { .. }
-                | Self::GetTaskGraph { .. }
-                | Self::GetTaskRecords { .. }
-                | Self::CancelTask { .. }
-                | Self::ClaimTasks { .. }
-                | Self::HeartbeatTask { .. }
-                | Self::CompleteTask { .. }
-                | Self::FailTask { .. }
-                | Self::GetTaskMessages { .. }
-                | Self::SendTaskMessage { .. }
-        )
     }
 }
 
@@ -1142,11 +1126,6 @@ impl ProtocolHandler {
         principal: &ProtocolPrincipal,
         authority: &AuthorityContext,
     ) -> Result<ProtocolResult, HarnessError> {
-        if authority.tenant_id().is_some() && command.requires_task_tenant_ownership() {
-            return Err(HarnessError::Protocol(
-                "tenant-scoped Task access requires durable tenant ownership".to_owned(),
-            ));
-        }
         match command {
             ProtocolCommand::Initialize {} => {
                 let mut capabilities = vec![
@@ -1176,7 +1155,7 @@ impl ProtocolHandler {
                         "approval.settle".to_owned(),
                     ]);
                 }
-                if self.tasks.is_some() && authority.tenant_id().is_none() {
+                if self.tasks.is_some() {
                     capabilities.extend([
                         "task.graph.cancel".to_owned(),
                         "task.graph.create".to_owned(),
@@ -1649,7 +1628,7 @@ impl ProtocolHandler {
                 validate_task_identity("graph_id", &graph_id)?;
                 let graph = self
                     .task_service()?
-                    .create(TaskGraphId::from_string(graph_id), definitions)
+                    .create(TaskGraphId::from_string(graph_id), definitions, authority)
                     .await?;
                 Ok(ProtocolResult::TaskGraphCreated { graph })
             }
@@ -1657,7 +1636,7 @@ impl ProtocolHandler {
                 validate_task_identity("graph_id", &graph_id)?;
                 let graph = self
                     .task_service()?
-                    .summary(&TaskGraphId::from_string(graph_id))
+                    .summary(&TaskGraphId::from_string(graph_id), authority)
                     .await?;
                 Ok(ProtocolResult::TaskGraph { graph })
             }
@@ -1676,6 +1655,7 @@ impl ProtocolHandler {
                         &TaskGraphId::from_string(graph_id),
                         after_task_id.as_deref(),
                         limit.unwrap_or(DEFAULT_TASK_RECORD_PAGE),
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskRecords { page })
@@ -1697,7 +1677,7 @@ impl ProtocolHandler {
                 let task_id = TaskId::from_string(task_id);
                 let revision = self
                     .task_service()?
-                    .cancel(&graph_id, &task_id, expected_revision, reason)
+                    .cancel(&graph_id, &task_id, expected_revision, reason, authority)
                     .await?;
                 Ok(ProtocolResult::TaskCancelled {
                     graph_id,
@@ -1720,6 +1700,7 @@ impl ProtocolHandler {
                         &worker,
                         lease_duration_ms,
                         maximum.unwrap_or(DEFAULT_TASK_CLAIM_MAXIMUM),
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TasksClaimed {
@@ -1739,14 +1720,14 @@ impl ProtocolHandler {
                 let graph_id = TaskGraphId::from_string(graph_id);
                 let task_id = TaskId::from_string(task_id);
                 let lease_id = TaskLeaseId::from_string(lease_id);
+                let worker = principal.task_worker_identity();
                 let (revision, expires_at_ms) = self
                     .task_service()?
                     .heartbeat(
                         &graph_id,
-                        &task_id,
-                        &lease_id,
-                        &principal.task_worker_identity(),
+                        TaskWorkerAccess::new(&task_id, &lease_id, &worker),
                         lease_duration_ms,
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskHeartbeat {
@@ -1766,14 +1747,15 @@ impl ProtocolHandler {
                 validate_task_worker_ids(&graph_id, &task_id, &lease_id)?;
                 let graph_id = TaskGraphId::from_string(graph_id);
                 let task_id = TaskId::from_string(task_id);
+                let lease_id = TaskLeaseId::from_string(lease_id);
+                let worker = principal.task_worker_identity();
                 let revision = self
                     .task_service()?
                     .complete(
                         &graph_id,
-                        &task_id,
-                        &TaskLeaseId::from_string(lease_id),
-                        &principal.task_worker_identity(),
+                        TaskWorkerAccess::new(&task_id, &lease_id, &worker),
                         completion,
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskCompleted {
@@ -1791,14 +1773,15 @@ impl ProtocolHandler {
                 validate_task_worker_ids(&graph_id, &task_id, &lease_id)?;
                 let graph_id = TaskGraphId::from_string(graph_id);
                 let task_id = TaskId::from_string(task_id);
+                let lease_id = TaskLeaseId::from_string(lease_id);
+                let worker = principal.task_worker_identity();
                 let revision = self
                     .task_service()?
                     .fail(
                         &graph_id,
-                        &task_id,
-                        &TaskLeaseId::from_string(lease_id),
-                        &principal.task_worker_identity(),
+                        TaskWorkerAccess::new(&task_id, &lease_id, &worker),
                         reason,
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskFailed {
@@ -1816,15 +1799,17 @@ impl ProtocolHandler {
             } => {
                 validate_task_worker_ids(&graph_id, &task_id, &lease_id)?;
                 let graph_id = TaskGraphId::from_string(graph_id);
+                let task_id = TaskId::from_string(task_id);
+                let lease_id = TaskLeaseId::from_string(lease_id);
+                let worker = principal.task_worker_identity();
                 let (revision, page) = self
                     .task_service()?
                     .inbox(
                         &graph_id,
-                        &TaskId::from_string(task_id),
-                        &TaskLeaseId::from_string(lease_id),
-                        &principal.task_worker_identity(),
+                        TaskWorkerAccess::new(&task_id, &lease_id, &worker),
                         after_sequence.unwrap_or(0),
                         limit.unwrap_or(DEFAULT_TASK_MESSAGE_PAGE),
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskMessages {
@@ -1843,15 +1828,17 @@ impl ProtocolHandler {
                 validate_task_worker_ids(&graph_id, &task_id, &lease_id)?;
                 validate_task_identity("to", &to)?;
                 let graph_id = TaskGraphId::from_string(graph_id);
+                let task_id = TaskId::from_string(task_id);
+                let lease_id = TaskLeaseId::from_string(lease_id);
+                let worker = principal.task_worker_identity();
                 let (revision, message) = self
                     .task_service()?
                     .send(
                         &graph_id,
-                        &TaskId::from_string(task_id),
-                        &TaskLeaseId::from_string(lease_id),
-                        &principal.task_worker_identity(),
+                        TaskWorkerAccess::new(&task_id, &lease_id, &worker),
                         &TaskId::from_string(to),
                         body,
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TaskMessageSent {
@@ -2399,24 +2386,27 @@ mod tests {
     struct PanickingTaskCoordinator;
 
     impl TaskCoordinator for PanickingTaskCoordinator {
-        fn create<'a>(
+        fn create_as<'a>(
             &'a self,
             _graph_id: TaskGraphId,
             _graph: TaskGraph,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, TaskGraphSnapshot> {
             panic!("sensitive Task Coordinator constructor panic")
         }
 
-        fn load<'a>(
+        fn load_as<'a>(
             &'a self,
             _graph_id: &'a TaskGraphId,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, Option<TaskGraphSnapshot>> {
             Box::pin(async { panic!("sensitive Task Coordinator poll panic") })
         }
 
-        fn compare_and_swap<'a>(
+        fn compare_and_swap_as<'a>(
             &'a self,
             _snapshot: TaskGraphSnapshot,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, TaskGraphSnapshot> {
             Box::pin(async { panic!("sensitive Task Coordinator CAS panic") })
         }
@@ -2736,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_one_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_two_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2744,14 +2734,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "21",
+                "protocol_version": "22",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "21",
+                "protocol_version": "22",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2760,7 +2750,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "21",
+                "protocol_version": "22",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2782,7 +2772,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "21",
+                "protocol_version": "22",
                 "body": {
                     "status": "success",
                     "result": {
@@ -5056,6 +5046,7 @@ mod tests {
             .expect("submit tenant B approval");
         let handler = handler(Arc::new(ImmediateModel))
             .with_approval_inbox(inbox)
+            .with_task_coordinator(Arc::new(MemoryTaskCoordinator::new()))
             .with_authorizer(Arc::new(authorizer));
 
         let initialized = handler
@@ -5076,7 +5067,7 @@ mod tests {
                 assert!(
                     capabilities
                         .iter()
-                        .all(|capability| !capability.starts_with("task."))
+                        .any(|capability| capability == "task.graph.create")
                 );
             }
             other => panic!("unexpected initialize response: {other:?}"),
@@ -5263,11 +5254,37 @@ mod tests {
                 result: ProtocolResult::ApprovalSettled { approval }
             } if approval.tenant_id() == Some("tenant-a")
         ));
-        let task = handler
+        let created_task = handler
             .handle_as(
                 &tenant_a,
                 request(
-                    "task-tenant-a",
+                    "create-task-tenant-a",
+                    ProtocolCommand::CreateTaskGraph {
+                        graph_id: "tenant-graph".to_owned(),
+                        definitions: vec![TaskDefinition {
+                            id: TaskId::from_static("task-a"),
+                            description: "tenant work".to_owned(),
+                            dependencies: BTreeSet::new(),
+                            priority: 0,
+                            workspace: WorkspaceMode::Isolated,
+                        }],
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            created_task.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TaskGraphCreated {
+                    graph: TaskGraphSummary { tenant_id, .. }
+                }
+            } if tenant_id.as_deref() == Some("tenant-a")
+        ));
+        let hidden_task = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "get-cross-tenant-task",
                     ProtocolCommand::GetTaskGraph {
                         graph_id: "tenant-graph".to_owned(),
                     },
@@ -5275,9 +5292,36 @@ mod tests {
             )
             .await;
         assert!(matches!(
-            task.body,
-            ProtocolResponseBody::Error { error }
-                if error.message.contains("durable tenant ownership")
+            hidden_task.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TaskGraph { graph: None }
+            }
+        ));
+        let tenant_b_same_id = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "create-task-tenant-b",
+                    ProtocolCommand::CreateTaskGraph {
+                        graph_id: "tenant-graph".to_owned(),
+                        definitions: vec![TaskDefinition {
+                            id: TaskId::from_static("task-b"),
+                            description: "other tenant work".to_owned(),
+                            dependencies: BTreeSet::new(),
+                            priority: 0,
+                            workspace: WorkspaceMode::Isolated,
+                        }],
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            tenant_b_same_id.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TaskGraphCreated {
+                    graph: TaskGraphSummary { tenant_id, .. }
+                }
+            } if tenant_id.as_deref() == Some("tenant-b")
         ));
     }
 
