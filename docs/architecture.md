@@ -10,6 +10,8 @@ embedded host ──────────────────────
                                                    \
 CLI · TUI · GUI · LUI · VUI · IDE · API ─ protocol ─ Runtime ─ Core
         independent optional products
+
+optional Domain Pack control plane ─ verified execution binding ─┘
 ```
 
 The service mode must not implement a second agent loop. It hosts the same
@@ -60,6 +62,10 @@ direction:
   references, non-serializable zeroizing values, debug redaction,
   trusted-authority resolution, a global environment allow-list adapter for
   unscoped hosts, and an exact tenant/reference adapter with no fallback;
+- an optional control-plane crate above Core with immutable digest-bound
+  Domain Pack snapshots, exact component inventories, tenant-partitioned
+  Memory/SQLite lifecycle records, independent evaluation approval,
+  revision-CAS activation/rollback, and current-inventory execution binding;
 - an exact-versioned HTTPS JSON model-gateway adapter with TLS 1.2+, on-demand
   bearer resolution, disabled redirects/proxies/retries/referers, bounded
   concurrency/time/body retention, pooled connections, client-safe errors, and
@@ -390,9 +396,12 @@ Linux/Windows
 sandbox brokers, Skill catalogs/private registry authentication and append-only
 transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
-reference-service tenant Secret maps, tenant-partitioned MCP sessions, Artifact
-and Domain Pack tenant ownership, role and delegation claims, revocation, and
-policy hot reload remain explicit subsequent slices.
+reference-service tenant Secret maps, tenant-partitioned MCP sessions, external
+Artifact storage and authorization, Domain Pack service/protocol integration,
+role and delegation claims, revocation, and policy hot reload remain explicit
+subsequent slices. Task Artifact reference metadata is already part of its
+tenant-fenced Task Graph; this does not authorize or store the referenced
+external content.
 
 ## Client protocol boundary
 

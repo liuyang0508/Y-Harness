@@ -8,9 +8,9 @@ Agent = LLM × Harness = X × Y
 ```
 
 It ships an embeddable Rust Core/Runtime, Protocol v23 service, thin engine CLI,
-an independently installable full-screen TUI, durable SQLite
-State/Approval/Task coordination, governed extension contracts, evaluation
-gates, and executable examples.
+an independently installable full-screen TUI, an optional Domain Pack
+control-plane library, durable SQLite State/Approval/Task coordination,
+governed extension contracts, evaluation gates, and executable examples.
 The persistent service can assemble an optional direct OpenAI Responses
 Provider, brokered shell-free JSON-command Models and Tools, exact-selected MCP
 Tools, and Agent Memory Hub Context without moving Policy or State authority
@@ -64,6 +64,13 @@ Provider. Exact tenant/reference environment mappings have no global fallback;
 legacy Secret Providers and shared MCP sessions fail closed for tenant-scoped
 operations. Reference-service tenant credential configuration and
 tenant-partitioned MCP sessions remain explicit open work.
+The optional `y-harness-domain-pack` crate remains above Core and outside
+Protocol v23. Format/store schema 1 pins immutable component snapshots and a
+mandatory Evaluation suite, records terminal evaluation and independent
+approval, tenant-fences release/activation identity, and supports SQLite CAS,
+bounded rollback, and execution-time inventory/revision binding. The embedding
+control service remains responsible for role authorization and component
+locking; no business workflow is added to the Agent Loop.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the
@@ -170,11 +177,14 @@ yh serve
 
 - Rust crate: `0.1.0`
 - optional TUI package: `0.1.0`
+- optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `21`
+- client protocol: `23`
 - State event/snapshot schema: `12` / `12`
 - Approval Inbox schema: `3`
-- Task Coordinator schema: `1`
+- Task Coordinator schema: `2`
+- Secret Provider API: `2`
+- Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`
 
 Before upgrading older State or Approval databases, stop all writers and use

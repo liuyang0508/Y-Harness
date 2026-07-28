@@ -35,12 +35,13 @@ reason to duplicate Runtime or State.
 
 | Existing primitive | It does not yet prove |
 |---|---|
-| signed, revocable Skill lifecycle | atomic Domain Pack promotion and rollback |
-| transport Principal plus durable Thread/Operation/Approval tenant ownership | tenant-partitioned Task, Secret, Artifact, and Domain Pack resources |
+| optional immutable Domain Pack snapshots plus tenant-fenced promotion, activation, rollback, and execution binding | Engine service/API exposure, role authorization, canary rollout, or multi-node control-plane HA |
+| transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
+| authority-aware Secret Provider API plus exact embedded tenant/reference adapter | reference-service tenant credential maps or a general Secret-manager backend |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
 | durable Approval Inbox | ownership transfer or Human Handoff |
 | digest-bound Thread handoff input | Human Handoff |
-| reproducible Evaluation runner | Domain Pack release promotion |
+| reproducible Evaluation runner and digest-bound Pack evaluation evidence | domain-specific suites, canary evidence, or automatic promotion policy |
 | SQLite recovery and multi-process CAS | multi-node high availability |
 
 ## Ordered implementation
@@ -72,17 +73,36 @@ reason to duplicate Runtime or State.
    - Prefer API/SDK/Webhook before new GUI products so remote authority,
      resumability, idempotency, and event delivery are exercised first.
 
-## Current authority slice
+## Current authority and Domain Pack slice
 
 ADR 0116 introduces trusted Turn authority and binds remote Memory scope,
 Policy, and Tool execution to it. ADR 0117 adds authoritative schema-12 tenant
 ownership and exact access fencing for Thread, Turn, recovery, archive,
 handoff, and Protocol Operation state across Memory and SQLite stores. ADR
 0118 adds schema-3 durable Approval ownership, exact tenant list/get/settle,
-restart continuation, and non-inferential schema-2 migration.
+restart continuation, and non-inferential schema-2 migration. ADR 0119 adds
+schema-2 Task Graph ownership across Tasks, leases, messages, and Artifact
+reference metadata. ADR 0120 carries trusted authority into Secret resolution
+and fails closed for tenant-scoped legacy Providers and shared MCP sessions.
 
-This is not a complete multi-tenant claim. Tenant-scoped Task protocol
-capabilities still fail closed and are not advertised until Task Graphs bind
-ownership. Secret, Artifact, Domain Pack activation, quota, and retention
-boundaries are also still open. The next compatible slice is Task Graph and
-worker ownership; no tenant value will be inferred for legacy records.
+ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
+Format-1 snapshots pin exact components and a mandatory Evaluation suite.
+Store schema 1 makes release and activation identity tenant-partitioned,
+records terminal evaluation plus independent approval, and uses cross-process
+SQLite CAS for activation, deactivation, and bounded rollback. A
+constructor-only execution binding is issued only when the approved active
+release, full inventory digest, activation revision, and tenant still agree.
+
+This remains deliberately outside Core and the v23 client protocol. The
+embedding control service must authenticate and authorize install, evaluation,
+approval, and activation operations, collect truthful component inventories,
+and keep the binding valid for the assembled execution. No customer-service,
+tutoring, coding, or other business behavior is present.
+
+This is not a complete multi-tenant claim. Task `Artifact` records contain
+only bounded reference metadata (`uri`, digest, media type, and size) inside a
+tenant-fenced Graph; Y-Harness does not yet store or authorize the external
+blob addressed by that URI. Reference-service tenant Secret configuration,
+tenant-partitioned MCP sessions, durable Workflow waits/timers, Human Handoff,
+quota, retention, canary rollout, and multi-node control-plane availability
+remain open.

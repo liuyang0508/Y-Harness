@@ -9,15 +9,15 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 380 library, 11 CLI, 24 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 490 total plus 8 explicitly ignored manual/environment fixtures |
+| Deterministic tests | 380 Core library, 8 Domain Pack control-plane, 11 CLI, 24 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 498 total plus 8 explicitly ignored manual/environment fixtures |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, 235-file / 3.2 MiB clean-room crate verification (708.9 KiB compressed) | passing locally with State-12, Approval-3, Task-2, Secret-2, and Protocol-23 coordinates |
+| Distribution package | `cargo package --locked -p y-harness`, 237-file / 3.2 MiB clean-room Core crate verification (714.2 KiB compressed) | passing locally with State-12, Approval-3, Task-2, Secret-2, and Protocol-23 coordinates; optional control-plane crate remains a separate workspace package |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
-| Dependency security | `cargo-audit 0.22.2 --deny warnings` over 289 locked crates | passing |
+| Dependency security | `cargo-audit 0.22.2 --deny warnings` over 290 locked crates | passing |
 | State performance | schema-12 tenant-fenced 1,000 events plus 64-Thread lineage page, 5 samples, SQLite WAL + FULL | 93.103 ms append; 2.711 ms full projection; 9.175 ms atomic fork; 0.278 ms Thread list; 2.410 ms snapshot load |
 | State migration | schemas 1/2/3/4/5/6/7/8/9/10/11 → 12, immutable-history backup-first path | schema-1 through schema-11 sources, coordinate- and SHA-256-bound, restartable; nullable tenant projection added without inferring legacy ownership; prior maximum-size schema-4 measurement retained as historical evidence |
-| Tenant-owned Thread State | schema-12 authoritative creation evidence plus disposable validated projections; exact Authority tenant on Thread, Turn, recovery, fork, handoff, archive, and retained Operation access | Memory/SQLite cross-tenant denial, archive rebind, protocol capability fail-closed, and SQLite reopen tests passing; Artifact and Domain Pack ownership remain open |
+| Tenant-owned Thread State | schema-12 authoritative creation evidence plus disposable validated projections; exact Authority tenant on Thread, Turn, recovery, fork, handoff, archive, and retained Operation access | Memory/SQLite cross-tenant denial, archive rebind, protocol capability fail-closed, and SQLite reopen tests passing; external Artifact blob authorization and Domain Pack service integration remain open |
 | Atomic Thread fork | terminal Turn boundary, caller-owned child retry identity, direct lineage, Memory/SQLite atomic creation | boundary/idempotency/reopen tests passing; injected SQLite uniqueness failure leaves no child stream or projection |
 | Portable Thread archive | bounded format-2 source journal and SHA-256, terminal-only export, no-clobber CLI file adapter, schema-10 import provenance, schema-12 target-tenant rebind, caller-owned idempotency identity, Memory/SQLite atomic import | round-trip/tamper/unknown-field/conflict/reopen/snapshot/cross-tenant tests passing; schema-12 1,000-Item export/import medians 4.462/7.575 ms |
 | Per-Turn reference Context | 64-block/1 MiB pre-State bounds, caller attribution, source/body SHA-256, schema-11 content-free evidence, approval-resume request binding, Skill-only provider instruction authority | Context/Runtime/State/Protocol/OpenAI mapping tests passing; branch-summary synthesis remains an optional-module gap |
@@ -25,6 +25,7 @@ not release-ready while any blocking row remains open.
 | Task Graph migration | schema 1 → 2, one near-limit 1,000-Task Graph, including the earlier unversioned development layout | 1,199.172 ms release build; backup-first, SHA-256-bound, restartable; historical Graphs preserved as unscoped |
 | JSON authority | 64-level / 65,536-node structural guards plus bounded streaming serialization | passing across embedded, durable, process, MCP, model, evaluation, and trace paths |
 | Authority-aware Secrets | Secret Provider API 2, trusted in-process Model authority, exact tenant/reference environment mapping, no serialized principal data, legacy-provider and shared-MCP fail-closed defaults | direct gateway, Runtime propagation, serialization, unscoped compatibility, and cross-tenant denial tests passing; reference-service tenant maps and tenant-partitioned MCP sessions remain open |
+| Optional Domain Pack control plane | format/store schema 1, immutable exact component pins, mandatory pinned Evaluation suite, terminal evaluation, independent approval, tenant-partitioned release/activation records, SQLite CAS, bounded rollback, and execution-time inventory binding | canonical/tamper/inventory tests plus Memory/SQLite lifecycle, reopen, cross-tenant, projection-drift, and two-connection CAS tests passing; Engine Protocol integration, role authorization, canary, and multi-node HA remain open |
 | Secret hygiene | bounded source-tree pattern scan | no matches |
 | Source hygiene | no source artifact above 1 MiB; crate forbids `unsafe` | passing |
 | macOS process isolation | real Seatbelt allow/deny test | passing |
@@ -146,12 +147,22 @@ boundary remain explicit.
   actor and tenant, binds remote Memory scope, and reaches State, Policy, Tool,
   Task, direct Model Secret resolution, and MCP admission. Schema-12 Threads,
   State reads/mutations, recovery, retained Operations, schema-3 Approval
-  records, and schema-2 Task Graphs are tenant-fenced. Secret API 2 supports
-  exact embedded tenant/reference mappings; legacy Providers and current shared
-  MCP sessions fail closed. Reference-service tenant credential maps,
-  tenant-partitioned MCP sessions, Artifact storage, Domain Packs, quotas, and
-  retention remain open, so this is not a complete multi-tenant isolation
-  claim.
+  records, schema-2 Task Graphs, and the optional Domain Pack control-plane
+  store are tenant-fenced. Secret API 2 supports exact embedded
+  tenant/reference mappings; legacy Providers and current shared MCP sessions
+  fail closed. Task Artifact reference metadata is fenced with its Graph, but
+  the external URI target has no Y-Harness storage or authorization boundary.
+  Reference-service tenant credential maps, tenant-partitioned MCP sessions,
+  external Artifact storage, quotas, and retention remain open, so this is not
+  a complete multi-tenant isolation claim.
+- Domain Pack format/store schema 1 governs immutable component snapshots,
+  terminal pinned-suite evaluation, independent approval, activation,
+  deactivation, rollback, and current-inventory execution binding in a separate
+  optional crate above Core. `AuthorityContext` provides attribution and tenant
+  fencing, not role permission; an embedding control service must authorize
+  actions and lock the bound inventory. Protocol/CLI service integration,
+  registries, signed remote Pack acquisition, canary rollout, retention, and
+  distributed control-plane fencing are not implemented.
 - Publisher and transparency-log keys now support live validity and immutable
   revocation, and signed receipts bind log/entry/time metadata to the exact
   package and publisher signature. Exact pin-bound public HTTPS acquisition is

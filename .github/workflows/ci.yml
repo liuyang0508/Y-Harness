@@ -44,6 +44,11 @@ jobs:
             -D clippy::expect_used \
             -D clippy::panic \
             -D warnings
+          cargo clippy --locked -p y-harness-domain-pack --lib -- \
+            -D clippy::unwrap_used \
+            -D clippy::expect_used \
+            -D clippy::panic \
+            -D warnings
           cargo clippy --locked -p y-harness-benchmark-runner --bin yh-bench -- \
             -D clippy::unwrap_used \
             -D clippy::expect_used \

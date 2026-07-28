@@ -11,7 +11,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Context Engine | deterministic blocks, whole-Turn history, memory packs, registered Token Counters and semantic Compactors, configured brokered JSON-command compaction, independent byte/token budgets, derived-summary provenance, attributed per-Turn Context, and format-1 digest-bound Thread-handoff preparation | `src/context`, `src/execution`, real service-process compaction, Context/Runtime compaction, invocation-context, and handoff tests, ADRs 0021/0059/0060/0061/0064/0096/0097/0105 | local baseline passing |
 | Agent Loop | bounded model/tool/verification loop, atomic same-response multi-Tool decisions with explicit bounded safe-run concurrency, sequential fences, source-ordered settlement, explicit ordered and attempt-deadlined Model failover, observable timeout-only cooldown with last-resort fail-open, bounded typed Provider failure evidence, default-disabled typed same-Model retries with shared deadlines and provisional-output fencing, independent retry/failover attempt budget per step and derived whole-Turn ceiling, cancellation, deadlines, concurrency admission, permissioned exact-Turn recovery, fingerprinted pre-Tool and batch approval resume | `src/runtime`, typed-failure/retry/trace, shared attempt-budget retry/failover tests, safe-parallel/fence/timeout, cooldown/trace/fail-open, ordered-batch, approval-restart, failover/provenance, Memory/SQLite restart tests, and process-level CF-003 recovery, ADRs 0065/0070/0086/0098/0099/0100/0101/0113/0114 | local baseline passing; calls hidden inside arbitrary extension implementations and distributed lease/fencing ownership remain explicit open contracts |
 | Tool Runtime | typed registry, configured shell-free JSON Tools, exact-selected stdio or authenticated HTTPS JSON-response MCP Tools, explicit activation and optional command lock, default-deny bounded MCP launch, bounded cancellation/deadline session settlement, tenant-scoped shared-session denial, Unix process-group settlement, reusable macOS sandbox, explicit compensation | `src/execution`, `src/transport`, Runtime cancellation/deadline and tenant-admission tests, real hold-after-effect stdio fixture, ADRs 0013/0036/0043/0054/0056/0062/0066/0076/0088/0103/0115/0120 | local and private-TLS remote unscoped baselines passing; tenant-partitioned sessions, bounded SSE/OAuth, escape-resistant Linux, and Linux/Windows persistent containment open |
-| State Engine | typed journal, memory/SQLite stores, CAS, checkpoints, snapshots, capacity/recovery bounds, schema-1 through schema-11 to schema-12 backup-first migration, authoritative optional Thread tenant ownership with validated lookup projections, origin-bound Provider Continuation, durable safe-boundary Steering, atomic ordered Tool-call batches, explicit Thread names, terminal-boundary atomic forks, lineage-aware bounded summaries, portable integrity-bound Thread archives, and caller-attributed content-free invocation Context | `src/state`, schema-1 through schema-11 migration fixtures, cross-tenant Memory/SQLite/reopen/archive tests, invocation-context provenance tests, archive tamper/no-clobber/idempotency/reopen tests, fork rollback/reopen/idempotency/summary, name drift, batch, continuation, and Steering fault tests, ADRs 0061/0065/0068/0077/0078/0086/0092/0093/0094/0095/0096/0117 | local baseline passing; Artifact tenant ownership and destructive archival/offload open |
+| State Engine | typed journal, memory/SQLite stores, CAS, checkpoints, snapshots, capacity/recovery bounds, schema-1 through schema-11 to schema-12 backup-first migration, authoritative optional Thread tenant ownership with validated lookup projections, origin-bound Provider Continuation, durable safe-boundary Steering, atomic ordered Tool-call batches, explicit Thread names, terminal-boundary atomic forks, lineage-aware bounded summaries, portable integrity-bound Thread archives, and caller-attributed content-free invocation Context | `src/state`, schema-1 through schema-11 migration fixtures, cross-tenant Memory/SQLite/reopen/archive tests, invocation-context provenance tests, archive tamper/no-clobber/idempotency/reopen tests, fork rollback/reopen/idempotency/summary, name drift, batch, continuation, and Steering fault tests, ADRs 0061/0065/0068/0077/0078/0086/0092/0093/0094/0095/0096/0117 | local baseline passing; external Artifact blob storage/authorization and destructive archival/offload open |
 | Memory Engine | versioned provider port, scoped provenance, Agent Memory Hub MCP adapter and configured Context assembly | `src/memory`, service host, unit tests and environment-gated real MCP test | adapter, service health probe, and sandboxed local round trip passing; remote CI environment-gated |
 | Skill Engine | exact dependency graph, budgets, signatures, live revocation, transparency receipts, pinned HTTPS source, bounded trusted and signed-External install/list/verify/recoverable-remove lifecycle, explicit project-configured activation and publisher/log diagnostic locks | `src/skill`, service host, ADRs 0009/0014/0032/0033/0085/0088/0091/0102 | local governed lifecycle and public-HTTPS install path passing by composed contract; automatic update, dependency acquisition, catalog/private registry, and live public fixture remain open |
 | Policy Engine | deny/allow/ask, risk class, trusted per-Turn actor/tenant Authority Context, attributed durable approval, exact-tenant Memory/SQLite fencing, restart-safe inbox and continuation, CAS, exact-actor separation of duty, validated lookup projection, backup-first schema-1/schema-2 migration | `src/runtime/policy.rs`, `src/approval`, Authority propagation, tenant-fencing, migration, restart, and drift tests, ADRs 0007/0024/0049–0051/0063/0065/0116–0118 | local baseline passing; role/quorum policy, signed receipts, delegation, and tenant transfer open |
@@ -29,6 +29,7 @@ blockers remain in [`release-readiness.md`](release-readiness.md).
 | Serviceable typed protocol | language-neutral v23 specification, exact envelope and State-12/Approval-3/Task-2/Secret-2/Model-Gateway-7 compatibility coordinates, panic-isolated trusted Authority resolution, exact Thread/Operation/Approval/Task tenant fencing, permissioned expected-Turn recovery takeover, bounded per-Turn Context, lineage-aware Thread summaries, atomic retry-identified Thread forks, durable Thread names/import provenance, async Turn operations, exact-ID Steering, conditional Task Graph discovery, authenticated fenced worker lifecycle, bounded paging, cancellation, shutdown | `docs/protocol.md`, `src/protocol`, process/TLS/fault tests; passing locally |
 | Engine CLI | `yh init/doctor/serve/eval`, no-clobber `yh thread export` and atomic `yh thread import`, trusted/signed/HTTPS `yh skill install*` plus list/verify/remove, durable State/Approval/Task databases, deterministic demo, strict configured Model catalog/route, direct OpenAI Responses, HTTPS Gateways, versioned brokered JSON-command Models, semantic Conversation Compactors, completion Verifiers, and Evaluation Graders, JSON/MCP Tool, project Skill and Agent Memory Hub assembly, `src/reference_cli`, process tests | archive round-trip/tamper/no-clobber, multi-Provider route diagnostics, real compatible command-Model Turn with External State provenance, real settlement-v1 typed retry, real command-compactor Turn with immutable source history and durable summary provenance, real command-Verifier completion gate and durable result, isolated command-Grader Evaluation with exact baseline, installed-binary, signed External Skill trust/revocation/transparency lifecycle, project Skill integrity, and restart tests passing locally; live OpenAI and public Skill endpoints environment-gated |
 | Optional full-screen TUI | separate `y-harness-tui` package and `yh-tui` binary in `clients/tui`; Protocol-v23-only child transport, bounded tenant/lineage-aware recent-Thread navigation/resume, `/fork [terminal-turn-id]`, exact-ID active-Turn Steering, invalidated provisional-output handling, content-free continuation and ordered batch rendering, TestBackend render tests, real PTY Turn and fork | independently installable; local unit/lint/PTY gates passing; Pi-style entry-level in-place navigation is intentionally outside the Engine model |
+| Optional Domain Pack control plane | separate `y-harness-domain-pack` library in `control/domain-pack`; format/store schema 1, immutable exact component pins, pinned-suite evaluation, independent approval, tenant-fenced Memory/SQLite activation and bounded rollback, execution-time inventory/revision binding | public zero-network lifecycle example plus canonical/tamper, lifecycle, cross-tenant, reopen, projection-drift, failed-evaluation, inventory-drift, and two-connection CAS tests passing; no Protocol/CLI integration or business behavior in Core |
 | Competitive benchmark tools | independent `y-harness-benchmark-runner` and `y-harness-fault-fixture` packages; bounded shell-free Claude Code JSON, Codex JSONL, Grok Build headless JSON, Pi JSONL, OpenCode JSONL, Hermes one-shot/usage, and Y-Harness service-restart adapters; exact binary coordinates; external-run formats 1–6, Codex CF-003 formats 7/8, and Y-Harness CF-003 format 9; deterministic loopback Messages/Responses Providers, stdio MCP crash/hold-after-effect fixture, spec-bound JSON-command Model, and durable oracle | contract tests plus real `claim_eligible: false` Claude, Codex, Grok, Pi, OpenCode, and Hermes fixed-output, Codex single-process/restart and Y-Harness explicit-recovery CF-003 records; no comparative case exists |
 | Install and operator path | Cargo-backed no-side-effect install script, strict config template, Chinese quick start, real language-neutral Task Worker, acceptance checklist | clean-prefix install and revision-6 worker lifecycle passing locally |
 | MCP tools | official SDK stdio plus optional authenticated HTTPS JSON-response clients, atomic namespaced Tool registration, explicit activation, optional command-file lock, bounded cooperative cancellation and session settlement, default tenant-scoped shared-session denial | Runtime cancellation/deadline/tenant-admission, real stdio hold-after-effect/process settlement, and private-TLS unscoped remote service assembly passing; tenant-partitioned sessions, SSE/OAuth, and protocol-level rollback acknowledgement not claimed |
@@ -56,6 +57,7 @@ cargo test --locked -p y-harness-tui
 cargo clippy --locked -p y-harness-tui --all-targets -- -D warnings
 cargo run --locked --example embedded
 cargo run --locked --example orchestrated
+cargo run --locked -p y-harness-domain-pack --example governed_release
 cargo run --locked -- eval-smoke
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo audit --deny warnings
@@ -73,20 +75,20 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
   /isolated/project/y-harness.json
 ```
 
-The all-feature workspace run contains 380 passing library tests plus
-3 manual size tests, 11 CLI configuration tests, 24 Engine process/service
-tests, 11 TUI unit/render tests, 2 local private-gateway TLS integration tests,
-2 local private-MCP TLS integration tests, 53 product/Engine evidence-adapter
-tests, and 7 deterministic fault-fixture tests: 490 passing plus 8 explicitly
-ignored fixtures in total. The
-no-default-feature workspace run contains 460 passing tests plus 4 ignored
+The all-feature workspace run contains 380 passing Core library tests plus
+3 manual size tests, 8 Domain Pack control-plane tests, 11 CLI configuration
+tests, 24 Engine process/service tests, 11 TUI unit/render tests, 2 local
+private-gateway TLS integration tests, 2 local private-MCP TLS integration
+tests, 53 product/Engine evidence-adapter tests, and 7 deterministic
+fault-fixture tests: 498 passing plus 8 explicitly ignored fixtures in total.
+The no-default-feature workspace run contains 468 passing tests plus 4 ignored
 manual/environment fixtures. The demo and configured PTY
 smoke gates submit real Turns, create atomic child Threads, verify parent/child
 history plus durable lineage in State, and check alternate-screen and
 bracketed-paste restoration. The 64 MiB State migration, 126.9 MiB Approval
 Inbox migration, and near-limit 1,000-Task Graph migration tests are
 deliberately manual.
-The 235-file package archive verifies from the current
+The 237-file Core package archive verifies from the current
 State-12/Approval-3/Task-2/Secret-2/Protocol-23 candidate
 without Cargo's `--allow-dirty` escape hatch.
 Five integration tests are ignored by the ordinary suite unless their explicit
@@ -102,6 +104,11 @@ library:
 
 ```bash
 cargo clippy --locked --lib --all-features -- \
+  -D clippy::unwrap_used \
+  -D clippy::expect_used \
+  -D clippy::panic \
+  -D warnings
+cargo clippy --locked -p y-harness-domain-pack --lib -- \
   -D clippy::unwrap_used \
   -D clippy::expect_used \
   -D clippy::panic \

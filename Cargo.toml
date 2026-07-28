@@ -1,5 +1,10 @@
 [workspace]
-members = ["clients/tui", "tools/benchmark-runner", "tools/fault-fixture"]
+members = [
+    "clients/tui",
+    "control/domain-pack",
+    "tools/benchmark-runner",
+    "tools/fault-fixture",
+]
 resolver = "3"
 
 [package]
@@ -13,7 +18,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/liuyang0508/Y-Harness"
 homepage = "https://github.com/liuyang0508/Y-Harness"
 readme = "README.md"
-exclude = ["clients/", "scripts/install-tui.sh", "scripts/smoke-tui.py"]
+exclude = ["clients/", "control/", "scripts/install-tui.sh", "scripts/smoke-tui.py"]
 keywords = ["agent", "harness", "runtime", "llm", "orchestration"]
 categories = ["development-tools", "asynchronous"]
 

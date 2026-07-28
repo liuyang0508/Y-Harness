@@ -89,13 +89,14 @@ independent, replaceable client module that renders and controls the same
 engine through its public contract. Clients do not open engine databases,
 construct providers, own authoritative Agent state, or bypass Policy.
 
-The repository currently ships two separately installable runtime packages
-and two non-runtime benchmark tools:
+The repository currently ships two separately installable runtime products,
+one optional control-plane library, and two non-runtime evidence tools:
 
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
 | `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v23 |
+| `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -548,6 +549,20 @@ calls before remote invocation unless an embedding host supplies a genuinely
 tenant-partitioned client. See
 [ADR 0120](docs/adr/0120-authority-aware-secret-resolution.md).
 
+The optional `y-harness-domain-pack` crate sits above the semantic Core. Its
+format-1 immutable snapshots pin exact Workflow, Skill, Tool, Policy,
+Evaluation, and Schema coordinates and require a pinned Evaluation suite.
+Store schema 1 provides tenant-partitioned install, terminal evaluation,
+independent approval, activation, deactivation, and bounded rollback with
+revision CAS in memory or SQLite. Activation requires an exact installed
+inventory; execution binding rechecks the active release, complete inventory
+digest, and activation revision so extension drift fails closed. Domain
+behavior does not enter the Agent Loop, and the current Engine service does not
+implicitly activate Packs. An embedding control service must authorize each
+control-plane action and retain the returned binding while assembling an
+execution. See the [Domain Pack governance guide](docs/domain-pack-governance.md)
+and [ADR 0121](docs/adr/0121-domain-pack-control-plane.md).
+
 Completion verifiers are registered through a typed, collision-safe registry.
 All must pass before an assistant candidate completes the Turn. Retryable
 failures return structured feedback to the Agent Loop; hard failures terminate
@@ -761,10 +776,13 @@ exact allow-list gates every protocol capability before execution;
 revocation, and hot policy reload are intentionally not yet claimed. A host
 authorizer may resolve a transport principal to a validated per-Turn
 actor/tenant Authority Context. That tenant now fences durable Thread,
-Operation, Approval, and Task state and reaches Memory, Policy, Tool, Model
-Secret resolution, and MCP admission. Artifact storage, Domain Packs, quotas,
-retention, reference-service tenant credential maps, and tenant-partitioned
-MCP sessions remain outside the current claim.
+Operation, Approval, Task, and optional Domain Pack control-plane records and
+reaches Memory, Policy, Tool, Model Secret resolution, and MCP admission. Task
+Artifact reference metadata inherits its owning Graph's tenant fence, but the
+external blob named by its URI has no Y-Harness storage or authorization
+layer. Quotas, retention, reference-service tenant credential maps,
+tenant-partitioned MCP sessions, and external Artifact storage remain outside
+the current claim.
 
 Streaming model providers can emit provisional text through a kernel-owned
 failure-isolated handle. Deltas and total Turn output are byte-bounded; protocol
