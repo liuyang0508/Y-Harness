@@ -37,7 +37,7 @@ use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "19";
+pub const PROTOCOL_VERSION: &str = "20";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -365,6 +365,25 @@ impl ProtocolCommand {
             Self::GetTaskMessages { .. } => "task.worker.messages.read",
             Self::SendTaskMessage { .. } => "task.worker.messages.send",
         }
+    }
+
+    fn requires_pending_tenant_partition(&self) -> bool {
+        matches!(
+            self,
+            Self::GetPendingApprovals { .. }
+                | Self::GetApproval { .. }
+                | Self::SettleApproval { .. }
+                | Self::CreateTaskGraph { .. }
+                | Self::GetTaskGraph { .. }
+                | Self::GetTaskRecords { .. }
+                | Self::CancelTask { .. }
+                | Self::ClaimTasks { .. }
+                | Self::HeartbeatTask { .. }
+                | Self::CompleteTask { .. }
+                | Self::FailTask { .. }
+                | Self::GetTaskMessages { .. }
+                | Self::SendTaskMessage { .. }
+        )
     }
 }
 
@@ -841,6 +860,7 @@ pub struct CompatibilityManifest {
 }
 
 struct ManagedOperation {
+    tenant_id: Option<String>,
     status: OperationStatus,
     cancellation: CancellationToken,
     events: Arc<OperationEventBuffer>,
@@ -1125,6 +1145,12 @@ impl ProtocolHandler {
         principal: &ProtocolPrincipal,
         authority: &AuthorityContext,
     ) -> Result<ProtocolResult, HarnessError> {
+        if authority.tenant_id().is_some() && command.requires_pending_tenant_partition() {
+            return Err(HarnessError::Protocol(
+                "tenant-scoped Approval and Task access requires durable tenant ownership"
+                    .to_owned(),
+            ));
+        }
         match command {
             ProtocolCommand::Initialize {} => {
                 let mut capabilities = vec![
@@ -1147,14 +1173,14 @@ impl ProtocolHandler {
                 if self.runtime.supports_thread_fork() {
                     capabilities.push("thread.fork".to_owned());
                 }
-                if self.approvals.is_some() {
+                if self.approvals.is_some() && authority.tenant_id().is_none() {
                     capabilities.extend([
                         "approval.get".to_owned(),
                         "approval.pending".to_owned(),
                         "approval.settle".to_owned(),
                     ]);
                 }
-                if self.tasks.is_some() {
+                if self.tasks.is_some() && authority.tenant_id().is_none() {
                     capabilities.extend([
                         "task.graph.cancel".to_owned(),
                         "task.graph.create".to_owned(),
@@ -1189,7 +1215,7 @@ impl ProtocolHandler {
                 })
             }
             ProtocolCommand::CreateThread {} => {
-                let thread = self.runtime.create_thread().await?;
+                let thread = self.runtime.create_thread_as(authority).await?;
                 Ok(ProtocolResult::ThreadCreated { thread })
             }
             ProtocolCommand::ForkThread {
@@ -1207,7 +1233,12 @@ impl ProtocolHandler {
                 let through_turn_id = through_turn_id.map(TurnId::from_string);
                 let thread = self
                     .runtime
-                    .fork_thread(&parent_thread_id, child_thread_id, through_turn_id.as_ref())
+                    .fork_thread_as(
+                        authority,
+                        &parent_thread_id,
+                        child_thread_id,
+                        through_turn_id.as_ref(),
+                    )
                     .await?;
                 Ok(ProtocolResult::ThreadForked { thread })
             }
@@ -1217,7 +1248,11 @@ impl ProtocolHandler {
             } => {
                 let page = self
                     .runtime
-                    .list_threads(before_sequence, limit.unwrap_or(DEFAULT_THREAD_PAGE))
+                    .list_threads_as(
+                        before_sequence,
+                        limit.unwrap_or(DEFAULT_THREAD_PAGE),
+                        authority,
+                    )
                     .await?;
                 Ok(ProtocolResult::Threads {
                     threads: page.threads,
@@ -1229,14 +1264,14 @@ impl ProtocolHandler {
                 validate_opaque_id("thread_id", &thread_id)?;
                 let thread_id = ThreadId::from_string(thread_id);
                 self.runtime
-                    .set_thread_name(&thread_id, name.clone())
+                    .set_thread_name_as(&thread_id, name.clone(), authority)
                     .await?;
                 Ok(ProtocolResult::ThreadNamed { name })
             }
             ProtocolCommand::GetThread { thread_id } => {
                 validate_opaque_id("thread_id", &thread_id)?;
                 let thread_id = ThreadId::from_string(thread_id);
-                let thread = self.runtime.load_thread(&thread_id).await?;
+                let thread = self.runtime.load_thread_as(&thread_id, authority).await?;
                 Ok(ProtocolResult::Thread { thread })
             }
             ProtocolCommand::RecoverThread {
@@ -1248,18 +1283,20 @@ impl ProtocolHandler {
                 let thread_id = ThreadId::from_string(thread_id);
                 let expected_turn_id = TurnId::from_string(expected_turn_id);
                 if self.operations.lock().await.values().any(|operation| {
-                    matches!(
-                        &operation.status,
-                        OperationStatus::Running {
-                            thread_id: active_thread
-                        } if active_thread == &thread_id
-                    )
+                    operation.tenant_id.as_deref() == authority.tenant_id()
+                        && matches!(
+                            &operation.status,
+                            OperationStatus::Running {
+                                thread_id: active_thread
+                            } if active_thread == &thread_id
+                        )
                 }) {
                     return Err(HarnessError::Protocol(format!(
                         "thread {thread_id} still has a live operation in this protocol host"
                     )));
                 }
-                let Some(current) = self.runtime.load_thread(&thread_id).await? else {
+                let Some(current) = self.runtime.load_thread_as(&thread_id, authority).await?
+                else {
                     return Ok(ProtocolResult::ThreadRecovered { thread: None });
                 };
                 let expected = current
@@ -1285,20 +1322,20 @@ impl ProtocolHandler {
                 }
                 let thread = self
                     .runtime
-                    .recover_thread(&thread_id, &expected_turn_id)
+                    .recover_thread_as(&thread_id, &expected_turn_id, authority)
                     .await?;
                 Ok(ProtocolResult::ThreadRecovered { thread })
             }
             ProtocolCommand::GetThreadCapacity { thread_id } => {
                 validate_opaque_id("thread_id", &thread_id)?;
                 let thread_id = ThreadId::from_string(thread_id);
-                let capacity =
-                    self.runtime
-                        .thread_capacity(&thread_id)
-                        .await?
-                        .ok_or_else(|| {
-                            HarnessError::Protocol(format!("thread {thread_id} does not exist"))
-                        })?;
+                let capacity = self
+                    .runtime
+                    .thread_capacity_as(&thread_id, authority)
+                    .await?
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(format!("thread {thread_id} does not exist"))
+                    })?;
                 Ok(ProtocolResult::ThreadCapacity { capacity })
             }
             ProtocolCommand::StartTurn {
@@ -1327,7 +1364,12 @@ impl ProtocolHandler {
                 crate::context::validate_turn_context_inputs(&context)
                     .map_err(|error| HarnessError::Protocol(error.to_string()))?;
                 let thread_id = ThreadId::from_string(thread_id);
-                if self.runtime.load_thread(&thread_id).await?.is_none() {
+                if self
+                    .runtime
+                    .load_thread_as(&thread_id, authority)
+                    .await?
+                    .is_none()
+                {
                     return Err(HarnessError::Protocol(format!(
                         "thread {thread_id} does not exist"
                     )));
@@ -1350,6 +1392,7 @@ impl ProtocolHandler {
                 operations.insert(
                     operation_id.clone(),
                     ManagedOperation {
+                        tenant_id: authority.tenant_id().map(str::to_owned),
                         status: OperationStatus::Running {
                             thread_id: thread_id.clone(),
                         },
@@ -1427,11 +1470,11 @@ impl ProtocolHandler {
                 }
                 let receipt = self
                     .runtime
-                    .steer_turn(
+                    .steer_turn_as(
                         &ThreadId::from_string(thread_id),
                         &TurnId::from_string(expected_turn_id),
                         content,
-                        authority.actor().clone(),
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::TurnSteered {
@@ -1447,6 +1490,7 @@ impl ProtocolHandler {
                     .lock()
                     .await
                     .get(&operation_id)
+                    .filter(|operation| operation.tenant_id.as_deref() == authority.tenant_id())
                     .map(|operation| operation.status.clone())
                     .ok_or_else(|| {
                         HarnessError::Protocol(format!("operation {operation_id} does not exist"))
@@ -1471,6 +1515,7 @@ impl ProtocolHandler {
                     .lock()
                     .await
                     .get(&operation_id)
+                    .filter(|operation| operation.tenant_id.as_deref() == authority.tenant_id())
                     .map(|operation| operation.events.clone())
                     .ok_or_else(|| {
                         HarnessError::Protocol(format!("operation {operation_id} does not exist"))
@@ -1489,9 +1534,12 @@ impl ProtocolHandler {
                 validate_opaque_id("operation_id", &operation_id)?;
                 let operation_id = OperationId::from_string(operation_id);
                 let operations = self.operations.lock().await;
-                let operation = operations.get(&operation_id).ok_or_else(|| {
-                    HarnessError::Protocol(format!("operation {operation_id} does not exist"))
-                })?;
+                let operation = operations
+                    .get(&operation_id)
+                    .filter(|operation| operation.tenant_id.as_deref() == authority.tenant_id())
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(format!("operation {operation_id} does not exist"))
+                    })?;
                 let accepted = matches!(operation.status, OperationStatus::Running { .. });
                 if accepted {
                     operation.cancellation.cancel();
@@ -1505,9 +1553,12 @@ impl ProtocolHandler {
                 validate_opaque_id("operation_id", &operation_id)?;
                 let operation_id = OperationId::from_string(operation_id);
                 let mut operations = self.operations.lock().await;
-                let operation = operations.get(&operation_id).ok_or_else(|| {
-                    HarnessError::Protocol(format!("operation {operation_id} does not exist"))
-                })?;
+                let operation = operations
+                    .get(&operation_id)
+                    .filter(|operation| operation.tenant_id.as_deref() == authority.tenant_id())
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(format!("operation {operation_id} does not exist"))
+                    })?;
                 if matches!(operation.status, OperationStatus::Running { .. }) {
                     return Err(HarnessError::Protocol(format!(
                         "operation {operation_id} is still running"
@@ -1531,9 +1582,14 @@ impl ProtocolHandler {
                 let thread_id = ThreadId::from_string(thread_id);
                 let after_sequence = after_sequence.unwrap_or(0);
                 let (events, has_more) = self
-                    .bounded_event_page(&thread_id, after_sequence, limit)
+                    .bounded_event_page(&thread_id, after_sequence, limit, authority)
                     .await?;
-                if events.is_empty() && self.runtime.events_page(&thread_id, 0, 1).await?.is_empty()
+                if events.is_empty()
+                    && self
+                        .runtime
+                        .events_page_as(&thread_id, 0, 1, authority)
+                        .await?
+                        .is_empty()
                 {
                     return Err(HarnessError::Protocol(format!(
                         "thread {thread_id} does not exist"
@@ -1860,6 +1916,7 @@ impl ProtocolHandler {
         thread_id: &ThreadId,
         after_sequence: u64,
         limit: usize,
+        authority: &AuthorityContext,
     ) -> Result<(Vec<StoredEvent>, bool), HarnessError> {
         let mut events = Vec::new();
         let mut cursor = after_sequence;
@@ -1869,13 +1926,16 @@ impl ProtocolHandler {
             if remaining == 0 {
                 let has_more = !self
                     .runtime
-                    .events_page(thread_id, cursor, 1)
+                    .events_page_as(thread_id, cursor, 1, authority)
                     .await?
                     .is_empty();
                 return Ok((events, has_more));
             }
             let fetch = remaining.saturating_add(1).min(EVENT_FETCH_BATCH);
-            let page = self.runtime.events_page(thread_id, cursor, fetch).await?;
+            let page = self
+                .runtime
+                .events_page_as(thread_id, cursor, fetch, authority)
+                .await?;
             if page.is_empty() {
                 return Ok((events, false));
             }
@@ -2474,6 +2534,31 @@ mod tests {
         }
     }
 
+    struct TenantMapAuthorizer {
+        tenants: BTreeMap<String, String>,
+    }
+
+    impl ProtocolAuthorizer for TenantMapAuthorizer {
+        fn allows(&self, _principal: &ProtocolPrincipal, _permission: &str) -> bool {
+            true
+        }
+
+        fn authority_context(
+            &self,
+            principal: &ProtocolPrincipal,
+        ) -> Result<AuthorityContext, HarnessError> {
+            let fingerprint = principal.mtls_sha256().ok_or_else(|| {
+                HarnessError::InvalidConfiguration(
+                    "tenant fixture requires a certificate principal".to_owned(),
+                )
+            })?;
+            let tenant_id = self.tenants.get(fingerprint).cloned().ok_or_else(|| {
+                HarnessError::InvalidConfiguration("certificate has no tenant mapping".to_owned())
+            })?;
+            AuthorityContext::new(principal.actor_identity(), Some(tenant_id))
+        }
+    }
+
     struct PanickingAuthorityResolver;
 
     impl ProtocolAuthorizer for PanickingAuthorityResolver {
@@ -2614,6 +2699,14 @@ mod tests {
             self.inner
                 .events_page(thread_id, after_sequence, limit, max_recovery_bytes)
         }
+
+        fn thread_accessible<'a>(
+            &'a self,
+            thread_id: &'a ThreadId,
+            tenant_id: Option<String>,
+        ) -> HarnessFuture<'a, bool> {
+            self.inner.thread_accessible(thread_id, tenant_id)
+        }
     }
 
     fn handler(model: Arc<dyn LanguageModel>) -> ProtocolHandler {
@@ -2647,7 +2740,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_nineteen_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2655,14 +2748,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "19",
+                "protocol_version": "20",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "19",
+                "protocol_version": "20",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2671,7 +2764,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "19",
+                "protocol_version": "20",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2693,7 +2786,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "19",
+                "protocol_version": "20",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2816,6 +2909,20 @@ mod tests {
         assert_eq!(batch["calls"][1]["batch"]["index"], 1);
         assert_eq!(batch["calls"][1]["batch"]["size"], 2);
 
+        let created = serde_json::to_value(StateEvent::ThreadCreated {
+            created_at_ms: 1_785_000_000_000,
+            tenant_id: Some("tenant-a".to_owned()),
+        })
+        .expect("encode schema-12 Thread tenant evidence");
+        assert_eq!(
+            created,
+            json!({
+                "type": "thread_created",
+                "created_at_ms": 1_785_000_000_000_u64,
+                "tenant_id": "tenant-a"
+            })
+        );
+
         let named = serde_json::to_value(StateEvent::ThreadNamed {
             name: Some("Harness design".to_owned()),
         })
@@ -2873,6 +2980,7 @@ mod tests {
         );
         let lineage_summary = serde_json::to_value(crate::ThreadSummary {
             thread_id: ThreadId::from_static("thread-child"),
+            tenant_id: Some("tenant-a".to_owned()),
             name: Some("Branch".to_owned()),
             lineage: Some(crate::ThreadLineage {
                 parent_thread_id: ThreadId::from_static("thread-parent"),
@@ -2889,6 +2997,7 @@ mod tests {
             lineage_summary["lineage"]["parent_thread_id"],
             "thread-parent"
         );
+        assert_eq!(lineage_summary["tenant_id"], "tenant-a");
         assert_eq!(lineage_summary["lineage"]["parent_stream_version"], 7);
         let turn_context = serde_json::to_value(ProtocolCommand::StartTurn {
             thread_id: "thread-fixture".to_owned(),
@@ -4838,7 +4947,10 @@ mod tests {
             BTreeSet::from(["initialize".to_owned(), "thread.get".to_owned()]),
         )]))
         .expect("authorizer");
-        let handler = handler(Arc::new(ImmediateModel)).with_authorizer(Arc::new(authorizer));
+        let handler = handler(Arc::new(ImmediateModel))
+            .with_approval_inbox(Arc::new(MemoryApprovalInbox::new()))
+            .with_task_coordinator(Arc::new(MemoryTaskCoordinator::new()))
+            .with_authorizer(Arc::new(authorizer));
 
         let initialized = handler
             .handle_as(&principal, request("init", ProtocolCommand::Initialize {}))
@@ -4894,6 +5006,192 @@ mod tests {
             handler.resolve_authority(&principal).expect("authority"),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_tenant_fencing_hides_threads_operations_and_pending_resources() {
+        let tenant_a = ProtocolPrincipal::from_mtls_certificate(b"tenant-a-certificate");
+        let tenant_b = ProtocolPrincipal::from_mtls_certificate(b"tenant-b-certificate");
+        let authorizer = TenantMapAuthorizer {
+            tenants: BTreeMap::from([
+                (
+                    tenant_a
+                        .mtls_sha256()
+                        .expect("tenant A fingerprint")
+                        .to_owned(),
+                    "tenant-a".to_owned(),
+                ),
+                (
+                    tenant_b
+                        .mtls_sha256()
+                        .expect("tenant B fingerprint")
+                        .to_owned(),
+                    "tenant-b".to_owned(),
+                ),
+            ]),
+        };
+        let handler = handler(Arc::new(ImmediateModel)).with_authorizer(Arc::new(authorizer));
+
+        let initialized = handler
+            .handle_as(
+                &tenant_a,
+                request("initialize-tenant-a", ProtocolCommand::Initialize {}),
+            )
+            .await;
+        match initialized.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. },
+            } => {
+                assert!(
+                    capabilities
+                        .iter()
+                        .all(|capability| !capability.starts_with("approval.")
+                            && !capability.starts_with("task."))
+                );
+            }
+            other => panic!("unexpected initialize response: {other:?}"),
+        }
+
+        let created = handler
+            .handle_as(
+                &tenant_a,
+                request("create-tenant-a", ProtocolCommand::CreateThread {}),
+            )
+            .await;
+        let thread_id = match created.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => {
+                assert_eq!(thread.tenant_id(), Some("tenant-a"));
+                thread.id
+            }
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let hidden = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "get-cross-tenant",
+                    ProtocolCommand::GetThread {
+                        thread_id: thread_id.to_string(),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            hidden.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Thread { thread: None }
+            }
+        ));
+        let listed = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "list-cross-tenant",
+                    ProtocolCommand::ListThreads {
+                        before_sequence: None,
+                        limit: None,
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            listed.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Threads { threads, .. }
+            } if threads.is_empty()
+        ));
+
+        let started = handler
+            .handle_as(
+                &tenant_a,
+                request(
+                    "start-tenant-a",
+                    ProtocolCommand::StartTurn {
+                        thread_id: thread_id.to_string(),
+                        prompt: "hello".to_owned(),
+                        memory_scope: Default::default(),
+                        context: Vec::new(),
+                        timeout_ms: Some(1_000),
+                    },
+                ),
+            )
+            .await;
+        let operation_id = match started.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected start response: {other:?}"),
+        };
+        for (request_id, command) in [
+            (
+                "get-cross-tenant-operation",
+                ProtocolCommand::GetOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+            (
+                "stream-cross-tenant-operation",
+                ProtocolCommand::GetOperationEvents {
+                    operation_id: operation_id.to_string(),
+                    after_sequence: None,
+                    limit: None,
+                },
+            ),
+            (
+                "cancel-cross-tenant-operation",
+                ProtocolCommand::CancelOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+            (
+                "forget-cross-tenant-operation",
+                ProtocolCommand::ForgetOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+        ] {
+            let hidden_operation = handler
+                .handle_as(&tenant_b, request(request_id, command))
+                .await;
+            assert!(matches!(
+                hidden_operation.body,
+                ProtocolResponseBody::Error { error } if error.code == "invalid_request"
+            ));
+        }
+
+        let pending = handler
+            .handle_as(
+                &tenant_a,
+                request(
+                    "pending-tenant-a",
+                    ProtocolCommand::GetPendingApprovals { limit: None },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            pending.body,
+            ProtocolResponseBody::Error { error }
+                if error.message.contains("durable tenant ownership")
+        ));
+        let task = handler
+            .handle_as(
+                &tenant_a,
+                request(
+                    "task-tenant-a",
+                    ProtocolCommand::GetTaskGraph {
+                        graph_id: "tenant-graph".to_owned(),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            task.body,
+            ProtocolResponseBody::Error { error }
+                if error.message.contains("durable tenant ownership")
+        ));
     }
 
     #[tokio::test]

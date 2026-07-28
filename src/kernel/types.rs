@@ -100,6 +100,9 @@ fn next_id(prefix: &str) -> String {
 pub struct Thread {
     /// Stable thread identity.
     pub id: ThreadId,
+    /// Immutable tenant boundary established by trusted creation authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tenant_id: Option<String>,
     /// Optional operator-authored display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -121,8 +124,13 @@ impl Thread {
     /// Creates an empty thread with a generated identity.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_in_tenant(None)
+    }
+
+    pub(crate) fn new_in_tenant(tenant_id: Option<String>) -> Self {
         Self {
             id: ThreadId::generate(),
+            tenant_id,
             name: None,
             lineage: None,
             import_origin: None,
@@ -130,6 +138,12 @@ impl Thread {
             turns: Vec::new(),
             checkpoints: Vec::new(),
         }
+    }
+
+    /// Returns the immutable tenant boundary, if this Thread is tenant-scoped.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
     }
 }
 
@@ -995,6 +1009,9 @@ pub enum StateEvent {
     ThreadCreated {
         /// Thread creation time in Unix milliseconds.
         created_at_ms: u64,
+        /// Trusted tenant boundary, absent for unscoped and legacy Threads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant_id: Option<String>,
     },
     /// Changes or clears the operator-authored Thread name.
     ThreadNamed {

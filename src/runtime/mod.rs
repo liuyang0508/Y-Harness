@@ -158,6 +158,7 @@ struct ToolCapabilityInvocation {
 
 struct ActiveTurnControl {
     turn_id: TurnId,
+    authority: AuthorityContext,
     accepting_steering: bool,
     pending_steering: VecDeque<PendingSteering>,
     pending_steering_bytes: usize,
@@ -387,9 +388,26 @@ impl HarnessRuntime {
         self.state.create_thread().await
     }
 
+    /// Creates a Thread owned by the trusted authority's tenant boundary.
+    pub async fn create_thread_as(
+        &self,
+        authority: &AuthorityContext,
+    ) -> Result<Thread, HarnessError> {
+        self.state.create_thread_as(authority).await
+    }
+
     /// Loads a projected Thread without mutating it.
     pub async fn load_thread(&self, thread_id: &ThreadId) -> Result<Option<Thread>, HarnessError> {
         self.state.load_thread(thread_id).await
+    }
+
+    /// Loads a Thread only inside the trusted authority's tenant boundary.
+    pub async fn load_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<Thread>, HarnessError> {
+        self.state.load_thread_as(thread_id, authority).await
     }
 
     /// Whether the configured State store supports atomic Thread forks.
@@ -410,9 +428,36 @@ impl HarnessRuntime {
             .await
     }
 
+    /// Forks a Thread inside the trusted authority's tenant boundary.
+    pub async fn fork_thread_as(
+        &self,
+        authority: &AuthorityContext,
+        parent_thread_id: &ThreadId,
+        child_thread_id: ThreadId,
+        through_turn_id: Option<&TurnId>,
+    ) -> Result<Thread, HarnessError> {
+        self.state
+            .fork_thread_as(
+                authority,
+                parent_thread_id,
+                child_thread_id,
+                through_turn_id,
+            )
+            .await
+    }
+
     /// Exports one terminal Thread as a portable integrity-bound archive.
     pub async fn export_thread(&self, thread_id: &ThreadId) -> Result<ThreadArchive, HarnessError> {
         self.state.export_thread(thread_id).await
+    }
+
+    /// Exports a Thread only inside the trusted authority's tenant boundary.
+    pub async fn export_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<ThreadArchive, HarnessError> {
+        self.state.export_thread_as(thread_id, authority).await
     }
 
     /// Whether the configured State store supports atomic Thread imports.
@@ -430,6 +475,18 @@ impl HarnessRuntime {
         self.state.import_thread(archive, target_thread_id).await
     }
 
+    /// Imports an archive into the trusted authority's tenant boundary.
+    pub async fn import_thread_as(
+        &self,
+        archive: &ThreadArchive,
+        target_thread_id: ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Thread, HarnessError> {
+        self.state
+            .import_thread_as(archive, target_thread_id, authority)
+            .await
+    }
+
     /// Changes or clears the durable operator-authored Thread name.
     pub async fn set_thread_name(
         &self,
@@ -439,12 +496,33 @@ impl HarnessRuntime {
         self.state.set_thread_name(thread_id, name).await
     }
 
+    /// Changes a Thread name inside the trusted authority's tenant boundary.
+    pub async fn set_thread_name_as(
+        &self,
+        thread_id: &ThreadId,
+        name: Option<String>,
+        authority: &AuthorityContext,
+    ) -> Result<StoredEvent, HarnessError> {
+        self.state
+            .set_thread_name_as(thread_id, name, authority)
+            .await
+    }
+
     /// Returns journal pressure before one Thread reaches its finite boundary.
     pub async fn thread_capacity(
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<StateCapacity>, HarnessError> {
         self.state.thread_capacity(thread_id).await
+    }
+
+    /// Returns capacity only inside the trusted authority's tenant boundary.
+    pub async fn thread_capacity_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<StateCapacity>, HarnessError> {
+        self.state.thread_capacity_as(thread_id, authority).await
     }
 
     /// Whether the configured State store supports recent-Thread navigation.
@@ -462,6 +540,18 @@ impl HarnessRuntime {
         self.state.list_threads(before_sequence, limit).await
     }
 
+    /// Lists only Threads inside the trusted authority's tenant boundary.
+    pub async fn list_threads_as(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<crate::ThreadSummaryPage, HarnessError> {
+        self.state
+            .list_threads_as(before_sequence, limit, authority)
+            .await
+    }
+
     /// Prepares a bounded, digest-bound source delta for an optional Thread handoff.
     ///
     /// This read-only operation does not synthesize or persist a summary. The
@@ -473,12 +563,35 @@ impl HarnessRuntime {
         target_thread_id: &ThreadId,
         config: &crate::ThreadHandoffConfig,
     ) -> Result<Option<crate::ThreadHandoffRequest>, HarnessError> {
-        let source = self.load_thread(source_thread_id).await?.ok_or_else(|| {
-            HarnessError::State(format!("thread {source_thread_id} does not exist"))
-        })?;
-        let target = self.load_thread(target_thread_id).await?.ok_or_else(|| {
-            HarnessError::State(format!("thread {target_thread_id} does not exist"))
-        })?;
+        self.prepare_thread_handoff_as(
+            source_thread_id,
+            target_thread_id,
+            config,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Prepares a Thread handoff inside the trusted authority's tenant boundary.
+    pub async fn prepare_thread_handoff_as(
+        &self,
+        source_thread_id: &ThreadId,
+        target_thread_id: &ThreadId,
+        config: &crate::ThreadHandoffConfig,
+        authority: &AuthorityContext,
+    ) -> Result<Option<crate::ThreadHandoffRequest>, HarnessError> {
+        let source = self
+            .load_thread_as(source_thread_id, authority)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::State(format!("thread {source_thread_id} does not exist"))
+            })?;
+        let target = self
+            .load_thread_as(target_thread_id, authority)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::State(format!("thread {target_thread_id} does not exist"))
+            })?;
         crate::ThreadHandoffRequest::prepare(&source, &target, config)
     }
 
@@ -493,9 +606,22 @@ impl HarnessRuntime {
         content: impl Into<String>,
         submitted_by: ActorIdentity,
     ) -> Result<SteeringReceipt, HarnessError> {
+        let authority = AuthorityContext::new(submitted_by, None)?;
+        self.steer_turn_as(thread_id, expected_turn_id, content, &authority)
+            .await
+    }
+
+    /// Queues steering inside the trusted authority's tenant boundary.
+    pub async fn steer_turn_as(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
+        content: impl Into<String>,
+        authority: &AuthorityContext,
+    ) -> Result<SteeringReceipt, HarnessError> {
         let content = content.into();
         validate_steering(&content)?;
-        submitted_by.validate_current_state("steering actor")?;
+        authority.validate_current("steering authority")?;
         let control = self.turn_control(thread_id)?;
         let mut control = control.lock().await;
         if control.turn_id != *expected_turn_id {
@@ -523,7 +649,7 @@ impl HarnessRuntime {
         let steering_id = SteeringId::generate();
         let queued = Item::new(ItemKind::SteeringQueued {
             steering_id: steering_id.clone(),
-            submitted_by,
+            submitted_by: authority.actor().clone(),
             content: content.clone(),
         });
         let turn = Turn {
@@ -532,7 +658,7 @@ impl HarnessRuntime {
             status: TurnStatus::Running,
             items: Vec::new(),
         };
-        self.state.append_item(&turn, queued).await?;
+        self.state.append_item_as(&turn, queued, authority).await?;
         control.pending_steering_bytes += content.len();
         control.pending_steering.push_back(PendingSteering {
             steering_id: steering_id.clone(),
@@ -555,25 +681,39 @@ impl HarnessRuntime {
         thread_id: &ThreadId,
         expected_turn_id: &TurnId,
     ) -> Result<Option<Thread>, HarnessError> {
+        self.recover_thread_as(
+            thread_id,
+            expected_turn_id,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Recovers unfinished execution inside the trusted tenant boundary.
+    pub async fn recover_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<Thread>, HarnessError> {
         let recovered = self
             .state
-            .recover_thread(thread_id, expected_turn_id)
+            .recover_thread_as(thread_id, expected_turn_id, authority)
             .await?;
-        if let Some(thread) = &recovered {
-            if let Some(turn) = thread
+        if let Some(thread) = &recovered
+            && let Some(turn) = thread
                 .turns
                 .iter()
                 .find(|turn| &turn.id == expected_turn_id)
                 .filter(|turn| turn.status == TurnStatus::Interrupted)
-            {
-                self.approvals
-                    .abandon_turn(
-                        thread_id,
-                        &turn.id,
-                        "originating Turn was interrupted before approval settlement",
-                    )
-                    .await?;
-            }
+        {
+            self.approvals
+                .abandon_turn(
+                    thread_id,
+                    &turn.id,
+                    "originating Turn was interrupted before approval settlement",
+                )
+                .await?;
         }
         Ok(recovered)
     }
@@ -594,6 +734,15 @@ impl HarnessRuntime {
         self.state.events(thread_id).await
     }
 
+    /// Returns events only inside the trusted authority's tenant boundary.
+    pub async fn events_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Vec<crate::StoredEvent>, HarnessError> {
+        self.state.events_as(thread_id, authority).await
+    }
+
     /// Returns a bounded authoritative event page after one durable sequence.
     pub async fn events_page(
         &self,
@@ -603,6 +752,19 @@ impl HarnessRuntime {
     ) -> Result<Vec<crate::StoredEvent>, HarnessError> {
         self.state
             .events_page(thread_id, after_sequence, limit)
+            .await
+    }
+
+    /// Returns an event page inside the trusted authority's tenant boundary.
+    pub async fn events_page_as(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<Vec<crate::StoredEvent>, HarnessError> {
+        self.state
+            .events_page_as(thread_id, after_sequence, limit, authority)
             .await
     }
 
@@ -675,6 +837,10 @@ impl HarnessRuntime {
         let memory_scope = options.validated_memory_scope()?;
         validate_turn_context_inputs(&options.context)?;
         let deadline = deadline(options.timeout)?;
+        let existing = self
+            .load_thread_as(thread_id, &options.authority)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
         let _active = self.claim_thread(thread_id)?;
         let (
             mut turn,
@@ -686,12 +852,9 @@ impl HarnessRuntime {
         ) = match entry {
             TurnEntry::Start(prompt) => {
                 validate_prompt(&prompt)?;
-                let existing = self.load_thread(thread_id).await?.ok_or_else(|| {
-                    HarnessError::State(format!("thread {thread_id} does not exist"))
-                })?;
                 let capacity = self
                     .state
-                    .thread_capacity(thread_id)
+                    .thread_capacity_as(thread_id, &options.authority)
                     .await?
                     .ok_or_else(|| {
                         HarnessError::State(format!("thread {thread_id} does not exist"))
@@ -699,8 +862,11 @@ impl HarnessRuntime {
                 require_runtime_capacity(&capacity)?;
                 let conversation = self.context.compile_conversation(&existing)?;
 
-                let mut turn = self.state.start_turn(thread_id).await?;
-                let turn_control = self.register_turn_control(&turn)?;
+                let mut turn = self
+                    .state
+                    .start_turn_as(thread_id, &options.authority)
+                    .await?;
+                let turn_control = self.register_turn_control(&turn, options.authority.clone())?;
                 self.record(
                     &mut turn,
                     ItemKind::UserMessage {
@@ -838,10 +1004,7 @@ impl HarnessRuntime {
                 )
             }
             TurnEntry::ResumeApproval(turn_id) => {
-                let thread = self.load_thread(thread_id).await?.ok_or_else(|| {
-                    HarnessError::State(format!("thread {thread_id} does not exist"))
-                })?;
-                let turn = thread
+                let turn = existing
                     .turns
                     .iter()
                     .find(|turn| turn.id == turn_id && turn.status == TurnStatus::Running)
@@ -850,7 +1013,7 @@ impl HarnessRuntime {
                             "turn {turn_id} is not the running turn in thread {thread_id}"
                         ))
                     })?;
-                let turn_control = self.register_turn_control(turn)?;
+                let turn_control = self.register_turn_control(turn, options.authority.clone())?;
                 let (turn, conversation, context, step, call_ids) = self
                     .prepare_approval_resume(thread_id, &turn_id, &options, deadline)
                     .await?;
@@ -1005,7 +1168,9 @@ impl HarnessRuntime {
                     if retry_candidate {
                         continue;
                     }
-                    self.state.finish_turn(&turn, TurnStatus::Completed).await?;
+                    self.state
+                        .finish_turn_as(&turn, TurnStatus::Completed, &options.authority)
+                        .await?;
                     turn.status = TurnStatus::Completed;
                     return Ok(TurnOutcome {
                         turn,
@@ -2090,7 +2255,11 @@ impl HarnessRuntime {
         })
     }
 
-    fn register_turn_control(&self, turn: &Turn) -> Result<TurnControlGuard<'_>, HarnessError> {
+    fn register_turn_control(
+        &self,
+        turn: &Turn,
+        authority: AuthorityContext,
+    ) -> Result<TurnControlGuard<'_>, HarnessError> {
         let pending_steering = pending_steering_from_items(&turn.items)?;
         let pending_steering_bytes =
             pending_steering
@@ -2109,6 +2278,7 @@ impl HarnessRuntime {
         }
         let control = Arc::new(tokio::sync::Mutex::new(ActiveTurnControl {
             turn_id: turn.id.clone(),
+            authority,
             accepting_steering: true,
             pending_steering,
             pending_steering_bytes,
@@ -2201,6 +2371,7 @@ impl HarnessRuntime {
                         }),
                         is_error: true,
                     },
+                    &control.authority,
                 )
                 .await
             {
@@ -2235,12 +2406,17 @@ impl HarnessRuntime {
             return Ok(true);
         }
         if let Some(continuation) = continuation
-            && let Err(error) = self.record_unlocked(turn, continuation).await
+            && let Err(error) = self
+                .record_unlocked(turn, continuation, &control.authority)
+                .await
         {
             control.accepting_steering = false;
             return Err(error);
         }
-        if let Err(error) = self.record_unlocked(turn, decision).await {
+        if let Err(error) = self
+            .record_unlocked(turn, decision, &control.authority)
+            .await
+        {
             control.accepting_steering = false;
             return Err(error);
         }
@@ -2267,13 +2443,18 @@ impl HarnessRuntime {
             return Ok(true);
         }
         if let Some(continuation) = continuation
-            && let Err(error) = self.record_unlocked(turn, continuation).await
+            && let Err(error) = self
+                .record_unlocked(turn, continuation, &control.authority)
+                .await
         {
             control.accepting_steering = false;
             return Err(error);
         }
         let calls = decisions.into_iter().map(Item::new).collect();
-        if let Err(error) = self.record_tool_calls_unlocked(turn, calls).await {
+        if let Err(error) = self
+            .record_tool_calls_unlocked(turn, calls, &control.authority)
+            .await
+        {
             control.accepting_steering = false;
             return Err(error);
         }
@@ -2300,6 +2481,7 @@ impl HarnessRuntime {
                     steering_id: steering.steering_id,
                     content: steering.content,
                 },
+                &control.authority,
             )
             .await?;
             let _ = control.pending_steering.pop_front();
@@ -2307,7 +2489,7 @@ impl HarnessRuntime {
         }
         let thread = self
             .state
-            .load_thread(&turn.thread_id)
+            .load_thread_as(&turn.thread_id, &control.authority)
             .await?
             .ok_or_else(|| HarnessError::State(format!("thread {} disappeared", turn.thread_id)))?;
         *turn = thread
@@ -2322,21 +2504,34 @@ impl HarnessRuntime {
         let control = self.turn_control(&turn.thread_id)?;
         let mut control = control.lock().await;
         require_control_turn(&control, turn)?;
-        let result = self.record_unlocked(turn, kind).await;
+        let result = self.record_unlocked(turn, kind, &control.authority).await;
         if result.is_err() {
             control.accepting_steering = false;
         }
         result
     }
 
-    async fn record_unlocked(&self, turn: &mut Turn, kind: ItemKind) -> Result<(), HarnessError> {
+    async fn record_unlocked(
+        &self,
+        turn: &mut Turn,
+        kind: ItemKind,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
         let item = Item::new(kind);
-        match self.state.append_item(turn, item.clone()).await {
+        match self
+            .state
+            .append_item_as(turn, item.clone(), authority)
+            .await
+        {
             Ok(_) => {
                 turn.items.push(item);
                 Ok(())
             }
-            Err(record_error) => match self.state.finish_turn(turn, TurnStatus::Failed).await {
+            Err(record_error) => match self
+                .state
+                .finish_turn_as(turn, TurnStatus::Failed, authority)
+                .await
+            {
                 Ok(_) => {
                     turn.status = TurnStatus::Failed;
                     Err(record_error)
@@ -2352,13 +2547,22 @@ impl HarnessRuntime {
         &self,
         turn: &mut Turn,
         calls: Vec<Item>,
+        authority: &AuthorityContext,
     ) -> Result<(), HarnessError> {
-        match self.state.append_tool_calls(turn, calls.clone()).await {
+        match self
+            .state
+            .append_tool_calls_as(turn, calls.clone(), authority)
+            .await
+        {
             Ok(_) => {
                 turn.items.extend(calls);
                 Ok(())
             }
-            Err(record_error) => match self.state.finish_turn(turn, TurnStatus::Failed).await {
+            Err(record_error) => match self
+                .state
+                .finish_turn_as(turn, TurnStatus::Failed, authority)
+                .await
+            {
                 Ok(_) => {
                     turn.status = TurnStatus::Failed;
                     Err(record_error)
@@ -2402,10 +2606,18 @@ impl HarnessRuntime {
             ),
         };
         let settlement_item = Item::new(item);
-        match self.state.append_item(turn, settlement_item.clone()).await {
+        match self
+            .state
+            .append_item_as(turn, settlement_item.clone(), &control.authority)
+            .await
+        {
             Ok(_) => turn.items.push(settlement_item),
             Err(record_error) => {
-                return match self.state.finish_turn(turn, status.clone()).await {
+                return match self
+                    .state
+                    .finish_turn_as(turn, status.clone(), &control.authority)
+                    .await
+                {
                     Ok(_) => {
                         turn.status = status;
                         Ok(())
@@ -2416,7 +2628,9 @@ impl HarnessRuntime {
                 };
             }
         }
-        self.state.finish_turn(turn, status.clone()).await?;
+        self.state
+            .finish_turn_as(turn, status.clone(), &control.authority)
+            .await?;
         turn.status = status;
         Ok(())
     }
@@ -5446,7 +5660,7 @@ mod tests {
             }),
             StateEngine::new(Arc::new(MemoryEventStore::new())),
         );
-        let thread = runtime.create_thread().await.expect("thread");
+        let thread = runtime.create_thread_as(&authority).await.expect("thread");
         runtime
             .run_turn_with_options(
                 &thread.id,
@@ -5477,26 +5691,27 @@ mod tests {
     #[tokio::test]
     async fn tenant_scoped_approval_fails_before_request_or_tool_execution() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-42".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("scoped authority");
         let runtime = HarnessRuntime::new(
             Arc::new(EchoModel),
             registry(calls.clone()),
             Arc::new(AskPolicy),
             StateEngine::new(Arc::new(MemoryEventStore::new())),
         );
-        let thread = runtime.create_thread().await.expect("thread");
+        let thread = runtime.create_thread_as(&authority).await.expect("thread");
         let error = runtime
             .run_turn_with_options(
                 &thread.id,
                 "protected",
                 TurnExecutionOptions {
-                    authority: AuthorityContext::new(
-                        ActorIdentity::Authenticated {
-                            authority: "enterprise-identity".to_owned(),
-                            subject: "operator-42".to_owned(),
-                        },
-                        Some("tenant-a".to_owned()),
-                    )
-                    .expect("scoped authority"),
+                    authority,
                     ..TurnExecutionOptions::default()
                 },
             )
@@ -9638,7 +9853,7 @@ mod tests {
             .await
             .expect("start turn");
         let _turn_control = runtime
-            .register_turn_control(&turn)
+            .register_turn_control(&turn, AuthorityContext::local_process())
             .expect("register Turn control");
         runtime
             .steer_turn(

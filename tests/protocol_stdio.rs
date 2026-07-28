@@ -160,7 +160,7 @@ fn state_migration_cli_creates_a_no_clobber_backup() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(backup.is_file());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("State schema 1 -> 11"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("State schema 1 -> 12"));
 
     let second = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("state-migrate")

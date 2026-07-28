@@ -24,16 +24,16 @@ use tokio::{
 };
 
 use crate::{
-    Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemId, ItemKind,
-    NewStreamEvent, PendingEvent, StateEvent, StoredEvent, Thread, ThreadId, ThreadImportOrigin,
-    ThreadLineage, Turn, TurnId, TurnStatus,
+    AuthorityContext, Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemId,
+    ItemKind, NewStreamEvent, PendingEvent, StateEvent, StoredEvent, Thread, ThreadId,
+    ThreadImportOrigin, ThreadLineage, Turn, TurnId, TurnStatus,
     json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
     kernel::validate_capability_name,
     sqlite::{bounded_optional_text, bounded_text},
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 11;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 12;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -62,9 +62,9 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
 /// Current portable Thread archive format.
-pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 1;
+pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 2;
 /// Maximum accepted encoded Thread archive.
 pub const MAX_THREAD_ARCHIVE_BYTES: usize = 75_497_472;
 const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
@@ -176,6 +176,9 @@ pub struct StateCapacity {
 pub struct ThreadSummary {
     /// Opaque authoritative Thread identity.
     pub thread_id: ThreadId,
+    /// Immutable tenant boundary for this Thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     /// Optional operator-authored display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -369,6 +372,7 @@ pub trait EventStore: Send + Sync {
     /// Returns latest-per-Thread summaries before one exclusive global cursor.
     fn thread_summaries_page(
         &self,
+        _tenant_id: Option<String>,
         _before_sequence: Option<u64>,
         _limit: usize,
     ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
@@ -376,6 +380,42 @@ pub trait EventStore: Send + Sync {
             Err(HarnessError::State(
                 "Event Store does not support Thread listing".to_owned(),
             ))
+        })
+    }
+
+    /// Returns whether one Thread exists inside the exact tenant boundary.
+    ///
+    /// Implementations may override this with a disposable index. The default
+    /// reads only the creation event and treats malformed storage as an error.
+    fn thread_accessible<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        tenant_id: Option<String>,
+    ) -> HarnessFuture<'a, bool> {
+        Box::pin(async move {
+            let events = self
+                .events_page(
+                    thread_id,
+                    0,
+                    1,
+                    u64::try_from(MAX_STATE_EVENT_BYTES)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(STATE_EVENT_RECOVERY_OVERHEAD_BYTES),
+                )
+                .await?;
+            match events.first() {
+                None => Ok(false),
+                Some(StoredEvent {
+                    event:
+                        StateEvent::ThreadCreated {
+                            tenant_id: owner, ..
+                        },
+                    ..
+                }) => Ok(owner == &tenant_id),
+                Some(_) => Err(HarnessError::State(
+                    "Thread stream does not begin with creation".to_owned(),
+                )),
+            }
         })
     }
 
@@ -408,6 +448,7 @@ struct MemoryStoreData {
     events: Vec<StoredEvent>,
     stream_versions: BTreeMap<ThreadId, u64>,
     stream_recovery_bytes: BTreeMap<ThreadId, u64>,
+    stream_tenants: BTreeMap<ThreadId, Option<String>>,
     stream_names: BTreeMap<ThreadId, String>,
     stream_lineages: BTreeMap<ThreadId, ThreadLineage>,
     snapshots: BTreeMap<ThreadId, StateSnapshot>,
@@ -463,6 +504,10 @@ impl EventStore for MemoryEventStore {
                 StateEvent::ThreadForked { lineage } => Some(lineage.clone()),
                 _ => None,
             };
+            let tenant_change = match &pending.event {
+                StateEvent::ThreadCreated { tenant_id, .. } => Some(tenant_id.clone()),
+                _ => None,
+            };
             let stored = StoredEvent {
                 schema_version: STATE_EVENT_SCHEMA_VERSION,
                 sequence: u64::try_from(data.events.len() + 1).unwrap_or(u64::MAX),
@@ -475,6 +520,10 @@ impl EventStore for MemoryEventStore {
                 .insert(pending.thread_id.clone(), next_stream_version);
             data.stream_recovery_bytes
                 .insert(pending.thread_id.clone(), next_recovery_bytes);
+            if let Some(tenant_id) = tenant_change {
+                data.stream_tenants
+                    .insert(pending.thread_id.clone(), tenant_id);
+            }
             if let Some(name) = name_change {
                 match name {
                     Some(name) => {
@@ -556,6 +605,8 @@ impl EventStore for MemoryEventStore {
                 .insert(thread_id.clone(), stream_version);
             data.stream_recovery_bytes
                 .insert(thread_id.clone(), recovery_bytes);
+            data.stream_tenants
+                .insert(thread_id.clone(), final_stream_tenant(&stored)?);
             if let Some(name) = final_stream_name(&stored) {
                 data.stream_names.insert(thread_id.clone(), name);
             }
@@ -610,6 +661,7 @@ impl EventStore for MemoryEventStore {
 
     fn thread_summaries_page(
         &self,
+        tenant_id: Option<String>,
         before_sequence: Option<u64>,
         limit: usize,
     ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
@@ -621,6 +673,7 @@ impl EventStore for MemoryEventStore {
             for event in data.events.iter().rev() {
                 if !seen.insert(event.thread_id.clone())
                     || before_sequence.is_some_and(|before| event.sequence >= before)
+                    || data.stream_tenants.get(&event.thread_id) != Some(&tenant_id)
                 {
                     continue;
                 }
@@ -633,6 +686,7 @@ impl EventStore for MemoryEventStore {
                     })?;
                 page.push(ThreadSummary {
                     thread_id: event.thread_id.clone(),
+                    tenant_id: tenant_id.clone(),
                     name: data.stream_names.get(&event.thread_id).cloned(),
                     lineage: data.stream_lineages.get(&event.thread_id).cloned(),
                     last_sequence: event.sequence,
@@ -644,6 +698,16 @@ impl EventStore for MemoryEventStore {
                 }
             }
             Ok(page)
+        })
+    }
+
+    fn thread_accessible<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        tenant_id: Option<String>,
+    ) -> HarnessFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(self.data.lock().await.stream_tenants.get(thread_id) == Some(&tenant_id))
         })
     }
 
@@ -707,7 +771,8 @@ impl SqliteEventStore {
                     CREATE TABLE IF NOT EXISTS streams (
                         thread_id TEXT PRIMARY KEY,
                         version   INTEGER NOT NULL CHECK(version >= 0),
-                        name      TEXT
+                        name      TEXT,
+                        tenant_id TEXT
                     );
                     CREATE TABLE IF NOT EXISTS stream_recovery (
                         thread_id      TEXT PRIMARY KEY,
@@ -737,6 +802,7 @@ impl SqliteEventStore {
                 .execute_batch(&schema)
                 .map_err(|error| HarnessError::State(error.to_string()))?;
             migration::ensure_stream_name_column_for_bootstrap(&connection)?;
+            migration::ensure_stream_tenant_column_for_bootstrap(&connection)?;
             connection
                 .execute_batch(&migration::metadata_schema_sql())
                 .map_err(|error| HarnessError::State(error.to_string()))?;
@@ -904,7 +970,7 @@ impl EventStore for SqliteEventStore {
                     .map_err(|_| HarnessError::State("negative SQLite sequence".to_owned()))?;
                 transaction
                     .execute(
-                        "INSERT INTO streams (thread_id, version) VALUES (?1, ?2)
+                        "INSERT INTO streams (thread_id, version, tenant_id) VALUES (?1, ?2, ?3)
                          ON CONFLICT(thread_id) DO UPDATE SET version = excluded.version",
                         params![
                             pending.thread_id.as_str(),
@@ -912,7 +978,11 @@ impl EventStore for SqliteEventStore {
                                 HarnessError::State(
                                     "stream version exceeds SQLite INTEGER".to_owned(),
                                 )
-                            })?
+                            })?,
+                            match &pending.event {
+                                StateEvent::ThreadCreated { tenant_id, .. } => tenant_id.as_deref(),
+                                _ => None,
+                            }
                         ],
                     )
                     .map_err(|error| HarnessError::State(error.to_string()))?;
@@ -978,6 +1048,7 @@ impl EventStore for SqliteEventStore {
                     HarnessError::State("stream recovery charge overflow".to_owned())
                 })
             })?;
+            let tenant_id = final_new_stream_tenant(&events)?;
             let prepared = events
                 .into_iter()
                 .zip(encoded)
@@ -1020,8 +1091,9 @@ impl EventStore for SqliteEventStore {
                 })?;
                 transaction
                     .execute(
-                        "INSERT INTO streams (thread_id, version) VALUES (?1, ?2)",
-                        params![thread_id.as_str(), stream_version_sql],
+                        "INSERT INTO streams (thread_id, version, tenant_id)
+                         VALUES (?1, ?2, ?3)",
+                        params![thread_id.as_str(), stream_version_sql, tenant_id.as_deref()],
                     )
                     .map_err(|error| HarnessError::State(error.to_string()))?;
 
@@ -1171,6 +1243,7 @@ impl EventStore for SqliteEventStore {
 
     fn thread_summaries_page(
         &self,
+        tenant_id: Option<String>,
         before_sequence: Option<u64>,
         limit: usize,
     ) -> HarnessFuture<'_, Vec<ThreadSummary>> {
@@ -1207,8 +1280,9 @@ impl EventStore for SqliteEventStore {
                                ON latest.thread_id = events.thread_id
                               AND latest.last_sequence = events.sequence
                              WHERE events.sequence < ?1
+                               AND streams.tenant_id IS ?2
                              ORDER BY events.sequence DESC
-                             LIMIT ?2
+                             LIMIT ?3
                          )
                          SELECT recent.thread_id_bytes,
                                 recent.thread_id,
@@ -1237,7 +1311,7 @@ impl EventStore for SqliteEventStore {
                     )
                     .map_err(|error| HarnessError::State(error.to_string()))?;
                 let rows = statement
-                    .query_map(params![before_sequence, limit], |row| {
+                    .query_map(params![before_sequence, tenant_id, limit], |row| {
                         Ok((
                             bounded_text(row, 0, 1, 256, "State thread identity")?,
                             row.get::<_, i64>(2)?,
@@ -1317,6 +1391,7 @@ impl EventStore for SqliteEventStore {
                     };
                     page.push(ThreadSummary {
                         thread_id: summary_thread_id,
+                        tenant_id: tenant_id.clone(),
                         name,
                         lineage,
                         last_sequence: u64::try_from(last_sequence).map_err(|_| {
@@ -1331,6 +1406,29 @@ impl EventStore for SqliteEventStore {
                     });
                 }
                 Ok(page)
+            })
+            .await
+        })
+    }
+
+    fn thread_accessible<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        tenant_id: Option<String>,
+    ) -> HarnessFuture<'a, bool> {
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            self.with_connection(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT 1 FROM streams
+                         WHERE thread_id = ?1 AND tenant_id IS ?2",
+                        params![thread_id.as_str(), tenant_id],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map(|row| row.is_some())
+                    .map_err(|error| HarnessError::State(error.to_string()))
             })
             .await
         })
@@ -1596,13 +1694,24 @@ impl StateEngine {
 
     /// Creates and persists a new Thread stream.
     pub async fn create_thread(&self) -> Result<Thread, HarnessError> {
-        let thread = Thread::new();
+        self.create_thread_as(&AuthorityContext::local_process())
+            .await
+    }
+
+    /// Creates a Thread owned by the trusted authority's exact tenant boundary.
+    pub async fn create_thread_as(
+        &self,
+        authority: &AuthorityContext,
+    ) -> Result<Thread, HarnessError> {
+        authority.validate_current("Thread creation authority")?;
+        let thread = Thread::new_in_tenant(authority.tenant_id().map(str::to_owned));
         self.commit(
             thread.id.clone(),
             0,
             0,
             StateEvent::ThreadCreated {
                 created_at_ms: thread.created_at_ms,
+                tenant_id: authority.tenant_id().map(str::to_owned),
             },
         )
         .await?;
@@ -1633,6 +1742,23 @@ impl StateEngine {
         child_thread_id: ThreadId,
         through_turn_id: Option<&TurnId>,
     ) -> Result<Thread, HarnessError> {
+        self.fork_thread_as(
+            &AuthorityContext::local_process(),
+            parent_thread_id,
+            child_thread_id,
+            through_turn_id,
+        )
+        .await
+    }
+
+    /// Forks a Thread inside the trusted authority's exact tenant boundary.
+    pub async fn fork_thread_as(
+        &self,
+        authority: &AuthorityContext,
+        parent_thread_id: &ThreadId,
+        child_thread_id: ThreadId,
+        through_turn_id: Option<&TurnId>,
+    ) -> Result<Thread, HarnessError> {
         validate_state_id("parent thread", parent_thread_id.as_str())?;
         validate_state_id("child thread", child_thread_id.as_str())?;
         if parent_thread_id == &child_thread_id {
@@ -1646,11 +1772,14 @@ impl StateEngine {
             ));
         }
 
+        self.require_thread_access(parent_thread_id, authority)
+            .await?;
         let checked = self.checked_events(parent_thread_id).await?;
         let parent = project_events(&checked.events)?.ok_or_else(|| {
             HarnessError::State(format!("thread {parent_thread_id} does not exist"))
         })?;
-        let existing_child = self.load_thread(&child_thread_id).await?;
+        validate_thread_authority(&parent, authority)?;
+        let existing_child = self.load_thread_as(&child_thread_id, authority).await?;
         let boundary = match (&existing_child, through_turn_id) {
             (Some(existing), None) => {
                 let lineage = existing.lineage.as_ref().ok_or_else(|| {
@@ -1711,6 +1840,7 @@ impl StateEngine {
             recorded_at_ms,
             event: StateEvent::ThreadCreated {
                 created_at_ms: recorded_at_ms,
+                tenant_id: authority.tenant_id().map(str::to_owned),
             },
         });
         new_events.push(NewStreamEvent {
@@ -1753,11 +1883,14 @@ impl StateEngine {
                 expected: 0,
                 ..
             }) if thread_id == child_thread_id => {
-                let existing = self.load_thread(&child_thread_id).await?.ok_or_else(|| {
-                    HarnessError::State(
-                        "fork child appeared concurrently but cannot be loaded".to_owned(),
-                    )
-                })?;
+                let existing = self
+                    .load_thread_as(&child_thread_id, authority)
+                    .await?
+                    .ok_or_else(|| {
+                        HarnessError::State(
+                            "fork child appeared concurrently but cannot be loaded".to_owned(),
+                        )
+                    })?;
                 validate_existing_fork(&existing, &lineage, &inherited.turns)?;
                 return Ok(existing);
             }
@@ -1780,8 +1913,22 @@ impl StateEngine {
 
     /// Loads and validates the projected Thread, returning `None` when absent.
     pub async fn load_thread(&self, thread_id: &ThreadId) -> Result<Option<Thread>, HarnessError> {
+        self.load_thread_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Loads a Thread only inside the trusted authority's tenant boundary.
+    pub async fn load_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<Thread>, HarnessError> {
+        if !self.thread_accessible(thread_id, authority).await? {
+            return Ok(None);
+        }
         let loaded = self.load_projection(thread_id).await?;
         if let Some(thread) = &loaded.thread {
+            validate_thread_authority(thread, authority)?;
             self.cache_head(
                 thread_id.clone(),
                 stream_head_from_parts(
@@ -1804,7 +1951,19 @@ impl StateEngine {
         thread_id: &ThreadId,
         name: Option<String>,
     ) -> Result<StoredEvent, HarnessError> {
+        self.set_thread_name_as(thread_id, name, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Changes a Thread name inside the trusted authority's tenant boundary.
+    pub async fn set_thread_name_as(
+        &self,
+        thread_id: &ThreadId,
+        name: Option<String>,
+        authority: &AuthorityContext,
+    ) -> Result<StoredEvent, HarnessError> {
         validate_thread_name(name.as_deref())?;
+        self.require_thread_access(thread_id, authority).await?;
         let head = self.require_stream_head(thread_id).await?;
         self.commit(
             thread_id.clone(),
@@ -1820,11 +1979,25 @@ impl StateEngine {
         &self,
         thread_id: &ThreadId,
     ) -> Result<Option<StateCapacity>, HarnessError> {
+        self.thread_capacity_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Returns capacity only inside the trusted authority's tenant boundary.
+    pub async fn thread_capacity_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<StateCapacity>, HarnessError> {
+        if !self.thread_accessible(thread_id, authority).await? {
+            return Ok(None);
+        }
         let loaded = self.load_projection(thread_id).await?;
         let Some(thread) = loaded.thread else {
             self.heads.lock().await.remove(thread_id);
             return Ok(None);
         };
+        validate_thread_authority(&thread, authority)?;
         self.cache_head(
             thread_id.clone(),
             stream_head_from_parts(
@@ -1853,6 +2026,18 @@ impl StateEngine {
         before_sequence: Option<u64>,
         limit: usize,
     ) -> Result<ThreadSummaryPage, HarnessError> {
+        self.list_threads_as(before_sequence, limit, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Lists only Threads inside the trusted authority's tenant boundary.
+    pub async fn list_threads_as(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<ThreadSummaryPage, HarnessError> {
+        authority.validate_current("Thread listing authority")?;
         if !(1..=MAX_THREAD_SUMMARY_PAGE).contains(&limit) {
             return Err(HarnessError::State(format!(
                 "Thread page limit must be 1-{MAX_THREAD_SUMMARY_PAGE}"
@@ -1868,8 +2053,20 @@ impl StateEngine {
             .ok_or_else(|| HarnessError::State("Thread page limit overflow".to_owned()))?;
         let mut threads = self
             .store
-            .thread_summaries_page(before_sequence, fetch_limit)
+            .thread_summaries_page(
+                authority.tenant_id().map(str::to_owned),
+                before_sequence,
+                fetch_limit,
+            )
             .await?;
+        if threads
+            .iter()
+            .any(|thread| thread.tenant_id.as_deref() != authority.tenant_id())
+        {
+            return Err(HarnessError::State(
+                "Event Store returned a Thread outside the requested tenant boundary".to_owned(),
+            ));
+        }
         validate_thread_summaries(&threads, before_sequence, fetch_limit)?;
         let has_more = threads.len() > limit;
         if has_more {
@@ -1887,14 +2084,37 @@ impl StateEngine {
 
     /// Returns the authoritative ordered events for a Thread.
     pub async fn events(&self, thread_id: &ThreadId) -> Result<Vec<StoredEvent>, HarnessError> {
+        self.events_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Returns events only inside the trusted authority's tenant boundary.
+    pub async fn events_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Vec<StoredEvent>, HarnessError> {
+        self.require_thread_access(thread_id, authority).await?;
         Ok(self.checked_events(thread_id).await?.events)
     }
 
     /// Exports one complete terminal Thread journal with an integrity digest.
     pub async fn export_thread(&self, thread_id: &ThreadId) -> Result<ThreadArchive, HarnessError> {
+        self.export_thread_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Exports a Thread only inside the trusted authority's tenant boundary.
+    pub async fn export_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<ThreadArchive, HarnessError> {
+        self.require_thread_access(thread_id, authority).await?;
         let checked = self.checked_events(thread_id).await?;
         let thread = project_events(&checked.events)?
             .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        validate_thread_authority(&thread, authority)?;
         if thread
             .turns
             .iter()
@@ -1931,6 +2151,25 @@ impl StateEngine {
         archive: &ThreadArchive,
         target_thread_id: ThreadId,
     ) -> Result<Thread, HarnessError> {
+        self.import_thread_as(
+            archive,
+            target_thread_id,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Imports an archive into the trusted authority's tenant boundary.
+    ///
+    /// Source ownership remains archive evidence only and never grants target
+    /// access. The new local Thread is always rebound to `authority`.
+    pub async fn import_thread_as(
+        &self,
+        archive: &ThreadArchive,
+        target_thread_id: ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Thread, HarnessError> {
+        authority.validate_current("Thread import authority")?;
         validate_state_id("target thread", target_thread_id.as_str())?;
         if !self.store.supports_atomic_stream_creation() {
             return Err(HarnessError::State(
@@ -1945,7 +2184,7 @@ impl StateEngine {
             source_events_sha256: archive.source_events_sha256.clone(),
             source_lineage: source.lineage.clone(),
         };
-        if let Some(existing) = self.load_thread(&target_thread_id).await? {
+        if let Some(existing) = self.load_thread_as(&target_thread_id, authority).await? {
             validate_existing_import(&existing, &origin, &source.turns)?;
             return Ok(existing);
         }
@@ -1958,6 +2197,7 @@ impl StateEngine {
             recorded_at_ms,
             event: StateEvent::ThreadCreated {
                 created_at_ms: recorded_at_ms,
+                tenant_id: authority.tenant_id().map(str::to_owned),
             },
         });
         new_events.push(NewStreamEvent {
@@ -2001,11 +2241,14 @@ impl StateEngine {
                 expected: 0,
                 ..
             }) if thread_id == target_thread_id => {
-                let existing = self.load_thread(&target_thread_id).await?.ok_or_else(|| {
-                    HarnessError::State(
-                        "import target appeared concurrently but cannot be loaded".to_owned(),
-                    )
-                })?;
+                let existing = self
+                    .load_thread_as(&target_thread_id, authority)
+                    .await?
+                    .ok_or_else(|| {
+                        HarnessError::State(
+                            "import target appeared concurrently but cannot be loaded".to_owned(),
+                        )
+                    })?;
                 validate_existing_import(&existing, &origin, &source.turns)?;
                 return Ok(existing);
             }
@@ -2033,8 +2276,26 @@ impl StateEngine {
         after_sequence: u64,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, HarnessError> {
+        self.events_page_as(
+            thread_id,
+            after_sequence,
+            limit,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Returns a bounded event page inside the exact tenant boundary.
+    pub async fn events_page_as(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<Vec<StoredEvent>, HarnessError> {
         validate_state_id("thread", thread_id.as_str())?;
         validate_event_page_limit(limit)?;
+        self.require_thread_access(thread_id, authority).await?;
         let events = self
             .store
             .events_page(
@@ -2059,6 +2320,24 @@ impl StateEngine {
     /// Snapshot creation is an explicit maintenance operation. It never deletes
     /// journal events and remains safe while another writer appends a newer tail.
     pub async fn create_snapshot(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<StateSnapshot, HarnessError> {
+        self.create_snapshot_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Creates a snapshot inside the trusted authority's tenant boundary.
+    pub async fn create_snapshot_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<StateSnapshot, HarnessError> {
+        self.require_thread_access(thread_id, authority).await?;
+        self.create_snapshot_unchecked(thread_id).await
+    }
+
+    async fn create_snapshot_unchecked(
         &self,
         thread_id: &ThreadId,
     ) -> Result<StateSnapshot, HarnessError> {
@@ -2095,6 +2374,17 @@ impl StateEngine {
 
     /// Starts a Turn when no other Turn is running in the Thread.
     pub async fn start_turn(&self, thread_id: &ThreadId) -> Result<Turn, HarnessError> {
+        self.start_turn_as(thread_id, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Starts a Turn inside the trusted authority's tenant boundary.
+    pub async fn start_turn_as(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<Turn, HarnessError> {
+        self.require_thread_access(thread_id, authority).await?;
         let mut head = self.require_stream_head(thread_id).await?;
         if head.running_turn.is_some() {
             head = self.refresh_stream_head(thread_id).await?;
@@ -2120,13 +2410,29 @@ impl StateEngine {
 
     /// Appends an Item after validating that its Turn is still running.
     pub async fn append_item(&self, turn: &Turn, item: Item) -> Result<StoredEvent, HarnessError> {
+        self.append_item_as(turn, item, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Appends an Item inside the trusted authority's tenant boundary.
+    pub async fn append_item_as(
+        &self,
+        turn: &Turn,
+        item: Item,
+        authority: &AuthorityContext,
+    ) -> Result<StoredEvent, HarnessError> {
+        self.require_thread_access(&turn.thread_id, authority)
+            .await?;
         if matches!(
             item.kind,
             ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. }
         ) {
-            let thread = self.load_thread(&turn.thread_id).await?.ok_or_else(|| {
-                HarnessError::State(format!("thread {} does not exist", turn.thread_id))
-            })?;
+            let thread = self
+                .load_thread_as(&turn.thread_id, authority)
+                .await?
+                .ok_or_else(|| {
+                    HarnessError::State(format!("thread {} does not exist", turn.thread_id))
+                })?;
             validate_steering_append(&thread, &turn.id, &item)?;
         }
         let mut head = self.require_stream_head(&turn.thread_id).await?;
@@ -2147,11 +2453,14 @@ impl StateEngine {
     }
 
     /// Atomically appends one same-response Tool-call batch.
-    pub(crate) async fn append_tool_calls(
+    pub(crate) async fn append_tool_calls_as(
         &self,
         turn: &Turn,
         calls: Vec<Item>,
+        authority: &AuthorityContext,
     ) -> Result<StoredEvent, HarnessError> {
+        self.require_thread_access(&turn.thread_id, authority)
+            .await?;
         let mut head = self.require_stream_head(&turn.thread_id).await?;
         if require_running_head(&head, &turn.id).is_err() {
             head = self.refresh_stream_head(&turn.thread_id).await?;
@@ -2175,15 +2484,31 @@ impl StateEngine {
         turn: &Turn,
         status: TurnStatus,
     ) -> Result<StoredEvent, HarnessError> {
+        self.finish_turn_as(turn, status, &AuthorityContext::local_process())
+            .await
+    }
+
+    /// Settles a Turn inside the trusted authority's tenant boundary.
+    pub async fn finish_turn_as(
+        &self,
+        turn: &Turn,
+        status: TurnStatus,
+        authority: &AuthorityContext,
+    ) -> Result<StoredEvent, HarnessError> {
+        self.require_thread_access(&turn.thread_id, authority)
+            .await?;
         if status == TurnStatus::Running {
             return Err(HarnessError::State(
                 "cannot finish a turn with running status".to_owned(),
             ));
         }
         if status == TurnStatus::Completed {
-            let thread = self.load_thread(&turn.thread_id).await?.ok_or_else(|| {
-                HarnessError::State(format!("thread {} does not exist", turn.thread_id))
-            })?;
+            let thread = self
+                .load_thread_as(&turn.thread_id, authority)
+                .await?
+                .ok_or_else(|| {
+                    HarnessError::State(format!("thread {} does not exist", turn.thread_id))
+                })?;
             let projected = thread
                 .turns
                 .iter()
@@ -2237,7 +2562,22 @@ impl StateEngine {
         thread_id: &ThreadId,
         expected_turn_id: &TurnId,
     ) -> Result<Option<Thread>, HarnessError> {
-        let Some(thread) = self.load_thread(thread_id).await? else {
+        self.recover_thread_as(
+            thread_id,
+            expected_turn_id,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Recovers one exact Turn inside the trusted tenant boundary.
+    pub async fn recover_thread_as(
+        &self,
+        thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<Thread>, HarnessError> {
+        let Some(thread) = self.load_thread_as(thread_id, authority).await? else {
             return Ok(None);
         };
         let expected = thread
@@ -2269,8 +2609,9 @@ impl StateEngine {
                 "thread {thread_id} is not awaiting takeover of Turn {expected_turn_id}"
             )));
         }
-        self.finish_turn(expected, TurnStatus::Interrupted).await?;
-        self.load_thread(thread_id).await
+        self.finish_turn_as(expected, TurnStatus::Interrupted, authority)
+            .await?;
+        self.load_thread_as(thread_id, authority).await
     }
 
     /// Persists a checkpoint targeting the current Thread sequence.
@@ -2280,7 +2621,25 @@ impl StateEngine {
         turn_id: Option<TurnId>,
         label: Option<String>,
     ) -> Result<Checkpoint, HarnessError> {
+        self.create_checkpoint_as(
+            thread_id,
+            turn_id,
+            label,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Persists a checkpoint inside the trusted tenant boundary.
+    pub async fn create_checkpoint_as(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: Option<TurnId>,
+        label: Option<String>,
+        authority: &AuthorityContext,
+    ) -> Result<Checkpoint, HarnessError> {
         validate_checkpoint_label(label.as_deref())?;
+        self.require_thread_access(thread_id, authority).await?;
         let mut head = self.require_stream_head(thread_id).await?;
         if let Some(turn_id) = &turn_id
             && !head.turns.contains(turn_id)
@@ -2317,6 +2676,32 @@ impl StateEngine {
             return Ok(head);
         }
         self.refresh_stream_head(thread_id).await
+    }
+
+    async fn thread_accessible(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<bool, HarnessError> {
+        validate_state_id("thread", thread_id.as_str())?;
+        authority.validate_current("Thread access authority")?;
+        self.store
+            .thread_accessible(thread_id, authority.tenant_id().map(str::to_owned))
+            .await
+    }
+
+    async fn require_thread_access(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
+        if self.thread_accessible(thread_id, authority).await? {
+            Ok(())
+        } else {
+            Err(HarnessError::State(format!(
+                "thread {thread_id} does not exist"
+            )))
+        }
     }
 
     async fn refresh_stream_head(&self, thread_id: &ThreadId) -> Result<StreamHead, HarnessError> {
@@ -2657,7 +3042,7 @@ impl StateEngine {
                 snapshot.stream_version,
             ));
         }
-        let snapshot = self.create_snapshot(thread_id).await?;
+        let snapshot = self.create_snapshot_unchecked(thread_id).await?;
         Ok(SnapshotMaintenanceOutcome::Created(snapshot.stream_version))
     }
 
@@ -3108,14 +3493,22 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
     for stored in events {
         validate_stored_schema(stored)?;
         match &stored.event {
-            StateEvent::ThreadCreated { created_at_ms } => {
+            StateEvent::ThreadCreated {
+                created_at_ms,
+                tenant_id,
+            } => {
                 if thread.is_some() {
                     return Err(HarnessError::State(
                         "thread has multiple creation events".to_owned(),
                     ));
                 }
+                if let Some(tenant_id) = tenant_id {
+                    AuthorityContext::validate_tenant(tenant_id)
+                        .map_err(|error| HarnessError::State(error.to_string()))?;
+                }
                 *thread = Some(Thread {
                     id: stored.thread_id.clone(),
+                    tenant_id: tenant_id.clone(),
                     name: None,
                     lineage: None,
                     import_origin: None,
@@ -3272,6 +3665,20 @@ fn projection_thread(thread: &mut Option<Thread>) -> Result<&mut Thread, Harness
         .ok_or_else(|| HarnessError::State("event precedes thread creation".to_owned()))
 }
 
+fn validate_thread_authority(
+    thread: &Thread,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    authority.validate_current("Thread access authority")?;
+    if thread.tenant_id() == authority.tenant_id() {
+        Ok(())
+    } else {
+        Err(HarnessError::State(
+            "Event Store tenant projection differs from authoritative Thread creation".to_owned(),
+        ))
+    }
+}
+
 fn validate_stream_version(actual: u64, pending: &PendingEvent) -> Result<(), HarnessError> {
     if actual == pending.expected_stream_version {
         Ok(())
@@ -3381,6 +3788,7 @@ fn validate_projected_thread(
 
     let mut recovery_bytes = encode_state_event(&StateEvent::ThreadCreated {
         created_at_ms: thread.created_at_ms,
+        tenant_id: thread.tenant_id().map(str::to_owned),
     })?
     .recovery_bytes;
     if let Some(lineage) = &thread.lineage {
@@ -3725,9 +4133,32 @@ fn final_stream_lineage(events: &[StoredEvent]) -> Option<ThreadLineage> {
     })
 }
 
+fn final_stream_tenant(events: &[StoredEvent]) -> Result<Option<String>, HarnessError> {
+    match events.first().map(|stored| &stored.event) {
+        Some(StateEvent::ThreadCreated { tenant_id, .. }) => Ok(tenant_id.clone()),
+        _ => Err(HarnessError::State(
+            "Thread stream does not begin with creation".to_owned(),
+        )),
+    }
+}
+
+fn final_new_stream_tenant(events: &[NewStreamEvent]) -> Result<Option<String>, HarnessError> {
+    match events.first().map(|new| &new.event) {
+        Some(StateEvent::ThreadCreated { tenant_id, .. }) => Ok(tenant_id.clone()),
+        _ => Err(HarnessError::State(
+            "Thread stream does not begin with creation".to_owned(),
+        )),
+    }
+}
+
 fn validate_state_event(event: &StateEvent) -> Result<(), HarnessError> {
     match event {
-        StateEvent::ThreadCreated { .. } => {}
+        StateEvent::ThreadCreated { tenant_id, .. } => {
+            if let Some(tenant_id) = tenant_id {
+                AuthorityContext::validate_tenant(tenant_id)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+            }
+        }
         StateEvent::ThreadNamed { name } => validate_thread_name(name.as_deref())?,
         StateEvent::ThreadForked { lineage } => validate_thread_lineage(lineage)?,
         StateEvent::ThreadImported { origin } => validate_thread_import_origin(origin)?,
@@ -4011,6 +4442,11 @@ fn validate_state_event_schema(
     schema_version: u32,
 ) -> Result<(), HarnessError> {
     match event {
+        StateEvent::ThreadCreated {
+            tenant_id: Some(_), ..
+        } if schema_version < 12 => Err(HarnessError::State(format!(
+            "schema-{schema_version} cannot contain a Thread tenant"
+        ))),
         StateEvent::ThreadNamed { .. } if schema_version < 8 => Err(HarnessError::State(format!(
             "schema-{schema_version} cannot contain a Thread name"
         ))),
@@ -4648,7 +5084,7 @@ mod tests {
         SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
     };
     use crate::{
-        ActorIdentity, CapabilityOrigin, EventId, HarnessError, HarnessFuture,
+        ActorIdentity, AuthorityContext, CapabilityOrigin, EventId, HarnessError, HarnessFuture,
         InvocationContextEvidence, Item, ItemKind, ModelContinuation, NewStreamEvent, PendingEvent,
         StateEvent, SteeringId, StoredEvent, ThreadId, ThreadImportOrigin, ThreadLineage,
         ToolCallBatch, ToolCallBatchId, TurnId, TurnStatus, kernel::now_ms,
@@ -4831,6 +5267,7 @@ mod tests {
             recorded_at_ms: now_ms(),
             event: StateEvent::ThreadCreated {
                 created_at_ms: now_ms(),
+                tenant_id: None,
             },
         };
 
@@ -4916,6 +5353,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             })
             .await
@@ -4947,6 +5385,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             })
             .await
@@ -5023,6 +5462,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             })
             .await
@@ -5056,7 +5496,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         state
-            .append_tool_calls(&turn, calls.clone())
+            .append_tool_calls_as(
+                &turn,
+                calls.clone(),
+                &crate::AuthorityContext::local_process(),
+            )
             .await
             .expect("append atomic batch");
         let projected = state
@@ -5102,7 +5546,7 @@ mod tests {
             }),
         ];
         let error = state
-            .append_tool_calls(&turn, malformed)
+            .append_tool_calls_as(&turn, malformed, &crate::AuthorityContext::local_process())
             .await
             .expect_err("reject inconsistent positions");
         assert!(error.to_string().contains("inconsistent"));
@@ -5228,6 +5672,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             })
             .collect();
@@ -5654,6 +6099,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_tenant_ownership_fences_reads_mutations_and_reopen() {
+        let tenant_a = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "operator-a".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant A authority");
+        let tenant_b = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "operator-b".to_owned(),
+            },
+            Some("tenant-b".to_owned()),
+        )
+        .expect("tenant B authority");
+
+        let memory = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        assert_tenant_fencing(&memory, &tenant_a, &tenant_b).await;
+
+        let path = temp_database_path();
+        let sqlite = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open database"),
+        ));
+        let tenant_a_thread = assert_tenant_fencing(&sqlite, &tenant_a, &tenant_b).await;
+        drop(sqlite);
+
+        let reopened = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen tenant database"),
+        ));
+        assert!(
+            reopened
+                .load_thread_as(&tenant_a_thread, &tenant_a)
+                .await
+                .expect("tenant A reopen read")
+                .is_some()
+        );
+        assert_eq!(
+            reopened
+                .load_thread_as(&tenant_a_thread, &tenant_b)
+                .await
+                .expect("tenant B denied reopen read"),
+            None
+        );
+        remove_database_files(&path);
+    }
+
+    async fn assert_tenant_fencing(
+        state: &StateEngine,
+        tenant_a: &AuthorityContext,
+        tenant_b: &AuthorityContext,
+    ) -> ThreadId {
+        let thread_a = state
+            .create_thread_as(tenant_a)
+            .await
+            .expect("create tenant A Thread");
+        let thread_b = state
+            .create_thread_as(tenant_b)
+            .await
+            .expect("create tenant B Thread");
+        assert_eq!(thread_a.tenant_id(), Some("tenant-a"));
+        assert_eq!(thread_b.tenant_id(), Some("tenant-b"));
+        assert_eq!(
+            state
+                .load_thread_as(&thread_a.id, tenant_b)
+                .await
+                .expect("cross-tenant read is hidden"),
+            None
+        );
+        assert!(
+            state
+                .set_thread_name_as(&thread_a.id, Some("forbidden".to_owned()), tenant_b)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .events_page_as(&thread_a.id, 0, 1, tenant_b)
+                .await
+                .is_err()
+        );
+
+        let page_a = state
+            .list_threads_as(None, 64, tenant_a)
+            .await
+            .expect("list tenant A");
+        assert_eq!(page_a.threads.len(), 1);
+        assert_eq!(page_a.threads[0].thread_id, thread_a.id);
+        assert_eq!(page_a.threads[0].tenant_id.as_deref(), Some("tenant-a"));
+        let page_b = state
+            .list_threads_as(None, 64, tenant_b)
+            .await
+            .expect("list tenant B");
+        assert_eq!(page_b.threads.len(), 1);
+        assert_eq!(page_b.threads[0].thread_id, thread_b.id);
+
+        let turn = state
+            .start_turn_as(&thread_a.id, tenant_a)
+            .await
+            .expect("start tenant A Turn");
+        assert!(
+            state
+                .finish_turn_as(&turn, TurnStatus::Completed, tenant_b)
+                .await
+                .is_err()
+        );
+        state
+            .finish_turn_as(&turn, TurnStatus::Completed, tenant_a)
+            .await
+            .expect("finish tenant A Turn");
+
+        let child = state
+            .fork_thread_as(tenant_a, &thread_a.id, ThreadId::generate(), Some(&turn.id))
+            .await
+            .expect("fork inside tenant A");
+        assert_eq!(child.tenant_id(), Some("tenant-a"));
+        assert_eq!(
+            state
+                .load_thread_as(&child.id, tenant_b)
+                .await
+                .expect("cross-tenant child read hidden"),
+            None
+        );
+        assert!(
+            state
+                .export_thread_as(&thread_a.id, tenant_b)
+                .await
+                .is_err()
+        );
+        let archive = state
+            .export_thread_as(&thread_a.id, tenant_a)
+            .await
+            .expect("export inside tenant A");
+        let imported = state
+            .import_thread_as(&archive, ThreadId::generate(), tenant_b)
+            .await
+            .expect("import rebinds archive into tenant B");
+        assert_eq!(imported.tenant_id(), Some("tenant-b"));
+        assert_eq!(
+            state
+                .load_thread_as(&imported.id, tenant_a)
+                .await
+                .expect("source tenant cannot read imported copy"),
+            None
+        );
+        thread_a.id
+    }
+
+    #[tokio::test]
     async fn thread_fork_is_terminal_idempotent_and_independent_across_stores() {
         assert_thread_fork(StateEngine::new(Arc::new(MemoryEventStore::new()))).await;
 
@@ -5722,6 +6319,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             },
             NewStreamEvent {
@@ -5797,6 +6395,45 @@ mod tests {
             error
                 .to_string()
                 .contains("Thread names do not match authoritative events")
+        );
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_thread_tenant_projection_drift() {
+        let path = temp_database_path();
+        let store = Arc::new(SqliteEventStore::open(&path).await.expect("open database"));
+        let state = StateEngine::new(store.clone());
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "operator".to_owned(),
+            },
+            Some("tenant-authoritative".to_owned()),
+        )
+        .expect("tenant authority");
+        let thread = state
+            .create_thread_as(&authority)
+            .await
+            .expect("create tenant Thread");
+        drop(state);
+        drop(store);
+
+        rusqlite::Connection::open(&path)
+            .expect("open raw database")
+            .execute(
+                "UPDATE streams SET tenant_id = 'tenant-drifted' WHERE thread_id = ?1",
+                [thread.id.as_str()],
+            )
+            .expect("tamper tenant projection");
+        let error = SqliteEventStore::open(&path)
+            .await
+            .err()
+            .expect("tenant projection drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Thread tenants do not match authoritative creation events")
         );
         remove_database_files(&path);
     }
@@ -6020,6 +6657,17 @@ mod tests {
         let decoded = super::decode_thread_archive(&encoded).expect("decode archive");
         assert_eq!(decoded, archive);
 
+        let mut legacy = serde_json::to_value(&archive).expect("legacy archive value");
+        legacy["format_version"] = json!(1);
+        assert!(
+            super::decode_thread_archive(
+                &serde_json::to_vec(&legacy).expect("encode legacy archive")
+            )
+            .expect_err("legacy archive format")
+            .to_string()
+            .contains("unsupported Thread archive format")
+        );
+
         let mut unknown = serde_json::to_value(&archive).expect("archive value");
         unknown
             .as_object_mut()
@@ -6183,6 +6831,7 @@ mod tests {
                 recorded_at_ms: now_ms(),
                 event: StateEvent::ThreadCreated {
                     created_at_ms: now_ms(),
+                    tenant_id: None,
                 },
             })
             .await
@@ -6400,6 +7049,26 @@ mod tests {
         let encoded = serde_json::to_string(&event).expect("serialize");
         let decoded: StateEvent = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn thread_tenant_evidence_requires_schema_twelve() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            event_id: EventId::from_static("tenant-event"),
+            thread_id: ThreadId::from_static("tenant-thread"),
+            recorded_at_ms: 1,
+            event: StateEvent::ThreadCreated {
+                created_at_ms: 1,
+                tenant_id: Some("tenant-a".to_owned()),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-12 tenant evidence");
+        stored.schema_version = 11;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-11 cannot claim tenant ownership");
+        assert!(error.to_string().contains("schema-11"));
     }
 
     #[test]

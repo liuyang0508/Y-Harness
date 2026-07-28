@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v19 projections.
+//! Product TUI state derived exclusively from Protocol v20 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -1078,7 +1078,7 @@ impl App {
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v19.".to_owned(),
+                content: "Keep clients behind Protocol v20.".to_owned(),
             }));
         thread.name = Some("Harness design".to_owned());
         let lineage = y_harness::ThreadLineage {
@@ -1091,6 +1091,7 @@ impl App {
         thread.turns.push(turn);
         let session = ThreadSummary {
             thread_id: thread.id.clone(),
+            tenant_id: None,
             name: Some("Harness design".to_owned()),
             lineage: Some(lineage),
             last_sequence: 8,

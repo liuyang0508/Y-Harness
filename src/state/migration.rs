@@ -17,7 +17,7 @@ use super::{
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SqliteEventStore,
     configure_sqlite_busy_timeout, configure_sqlite_session, validate_thread_name,
 };
-use crate::{EventId, HarnessError, sqlite::bounded_text};
+use crate::{AuthorityContext, EventId, HarnessError, sqlite::bounded_text};
 
 const FIRST_STATE_EVENT_SCHEMA_VERSION: u32 = 1;
 const FIRST_METADATA_STATE_EVENT_SCHEMA_VERSION: u32 = 2;
@@ -125,6 +125,7 @@ pub(super) fn validate_or_bootstrap_store(connection: &Connection) -> Result<(),
             validate_event_schema_set(connection, STATE_EVENT_SCHEMA_VERSION)?;
             validate_auxiliary_state(connection)?;
             validate_stream_name_projection(connection)?;
+            validate_stream_tenant_projection(connection)?;
         }
         Some((event_schema, snapshot_schema))
             if (FIRST_METADATA_STATE_EVENT_SCHEMA_VERSION..STATE_EVENT_SCHEMA_VERSION)
@@ -158,6 +159,21 @@ pub(super) fn ensure_stream_name_column_for_bootstrap(
     }
     connection
         .execute("ALTER TABLE streams ADD COLUMN name TEXT", [])
+        .map_err(|error| HarnessError::State(error.to_string()))?;
+    Ok(())
+}
+
+pub(super) fn ensure_stream_tenant_column_for_bootstrap(
+    connection: &Connection,
+) -> Result<(), HarnessError> {
+    if column_exists(connection, "streams", "tenant_id")? {
+        return Ok(());
+    }
+    if !legacy_auxiliary_state_is_empty(connection)? {
+        return Err(migration_required());
+    }
+    connection
+        .execute("ALTER TABLE streams ADD COLUMN tenant_id TEXT", [])
         .map_err(|error| HarnessError::State(error.to_string()))?;
     Ok(())
 }
@@ -198,6 +214,7 @@ fn migrate_sync(
     if source.event_schema == STATE_EVENT_SCHEMA_VERSION {
         validate_event_schema_set(&connection, STATE_EVENT_SCHEMA_VERSION)?;
         validate_stream_name_projection(&connection)?;
+        validate_stream_tenant_projection(&connection)?;
         return Ok(StateMigrationReport {
             status: StateMigrationStatus::AlreadyCurrent,
             from_event_schema: STATE_EVENT_SCHEMA_VERSION,
@@ -243,6 +260,11 @@ fn migrate_sync(
     if source.event_schema < 8 {
         transaction
             .execute("ALTER TABLE streams ADD COLUMN name TEXT", [])
+            .map_err(|error| HarnessError::State(error.to_string()))?;
+    }
+    if source.event_schema < 12 {
+        transaction
+            .execute("ALTER TABLE streams ADD COLUMN tenant_id TEXT", [])
             .map_err(|error| HarnessError::State(error.to_string()))?;
     }
     transaction
@@ -294,6 +316,7 @@ fn migrate_sync(
             .map_err(|error| HarnessError::State(error.to_string()))?;
     }
     validate_stream_name_projection(&transaction)?;
+    validate_stream_tenant_projection(&transaction)?;
     if stop == MigrationStop::BeforeCommit {
         return Err(injected_stop("before commit"));
     }
@@ -679,8 +702,7 @@ fn validate_stream_name_projection(connection: &Connection) -> Result<(), Harnes
     }
     let invalid_name = connection
         .query_row(
-            &format!(
-                "
+            "
                 WITH ranked_names AS (
                     SELECT thread_id,
                            json_extract(event_json, '$.name') AS name,
@@ -688,7 +710,7 @@ fn validate_stream_name_projection(connection: &Connection) -> Result<(), Harnes
                                PARTITION BY thread_id ORDER BY sequence DESC
                            ) AS rank
                     FROM events
-                    WHERE schema_version >= {STATE_EVENT_SCHEMA_VERSION}
+                    WHERE schema_version >= 8
                       AND json_extract(event_json, '$.type') = 'thread_named'
                 )
                 SELECT 1
@@ -698,8 +720,7 @@ fn validate_stream_name_projection(connection: &Connection) -> Result<(), Harnes
                  AND expected.rank = 1
                 WHERE NOT (stream.name IS expected.name)
                 LIMIT 1
-                "
-            ),
+                ",
             [],
             |_| Ok(()),
         )
@@ -709,6 +730,59 @@ fn validate_stream_name_projection(connection: &Connection) -> Result<(), Harnes
     if invalid_name {
         return Err(HarnessError::State(
             "SQLite State Thread names do not match authoritative events".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_tenant_projection(connection: &Connection) -> Result<(), HarnessError> {
+    if !column_exists(connection, "streams", "tenant_id")? {
+        return Err(HarnessError::State(
+            "SQLite State store is partial: streams.tenant_id is missing".to_owned(),
+        ));
+    }
+    let mut tenants = connection
+        .prepare(
+            "SELECT length(CAST(tenant_id AS BLOB)), tenant_id
+             FROM streams
+             WHERE tenant_id IS NOT NULL",
+        )
+        .map_err(|error| HarnessError::State(error.to_string()))?;
+    let rows = tenants
+        .query_map([], |row| {
+            bounded_text(row, 0, 1, 128, "Thread tenant identity")
+        })
+        .map_err(|error| HarnessError::State(error.to_string()))?;
+    for tenant_id in rows {
+        AuthorityContext::validate_tenant(
+            &tenant_id.map_err(|error| HarnessError::State(error.to_string()))?,
+        )
+        .map_err(|error| HarnessError::State(error.to_string()))?;
+    }
+    let invalid_tenant = connection
+        .query_row(
+            "
+            WITH creation AS (
+                SELECT thread_id, json_extract(event_json, '$.tenant_id') AS tenant_id
+                FROM events
+                WHERE json_extract(event_json, '$.type') = 'thread_created'
+            )
+            SELECT 1
+            FROM streams AS stream
+            LEFT JOIN creation ON creation.thread_id = stream.thread_id
+            WHERE creation.thread_id IS NULL
+               OR NOT (stream.tenant_id IS creation.tenant_id)
+            LIMIT 1
+            ",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| HarnessError::State(error.to_string()))?
+        .is_some();
+    if invalid_tenant {
+        return Err(HarnessError::State(
+            "SQLite State Thread tenants do not match authoritative creation events".to_owned(),
         ));
     }
     Ok(())
@@ -799,6 +873,7 @@ fn legacy_snapshot_schema(event_schema: u32) -> Option<u32> {
         8 => Some(8),
         9 => Some(9),
         10 => Some(10),
+        11 => Some(11),
         _ => None,
     }
 }
@@ -1047,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn migration_advances_metadata_schemas_without_rewriting_history() {
         for legacy_schema in [
-            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32,
+            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32,
         ] {
             let source = fixture_path(&format!("source-v{legacy_schema}"));
             let backup = fixture_path(&format!("backup-v{legacy_schema}"));
@@ -1069,6 +1144,20 @@ mod tests {
 
             let migrated = Connection::open(&source).expect("inspect migrated store");
             assert!(super::column_exists(&migrated, "streams", "name").expect("name column"));
+            assert!(
+                super::column_exists(&migrated, "streams", "tenant_id").expect("tenant column")
+            );
+            let tenant_id: Option<String> = migrated
+                .query_row(
+                    "SELECT tenant_id FROM streams WHERE thread_id = 'thread-v1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("legacy Thread tenant");
+            assert_eq!(
+                tenant_id, None,
+                "migration must preserve legacy Threads as unscoped"
+            );
             let snapshots: i64 = migrated
                 .query_row("SELECT COUNT(*) FROM state_snapshots", [], |row| row.get(0))
                 .expect("snapshot count");
@@ -1135,7 +1224,9 @@ mod tests {
 
     #[test]
     fn metadata_migration_restarts_after_every_phase() {
-        for legacy_schema in [2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32] {
+        for legacy_schema in [
+            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32,
+        ] {
             for phase in ["after_preflight", "after_backup", "before_commit"] {
                 let source = fixture_path(&format!("v{legacy_schema}-{phase}"));
                 let backup = fixture_path(&format!("v{legacy_schema}-{phase}-backup"));
@@ -1197,7 +1288,10 @@ mod tests {
             expected_stream_version: 0,
             expected_stream_recovery_bytes: 0,
             recorded_at_ms: crate::kernel::now_ms(),
-            event: crate::StateEvent::ThreadCreated { created_at_ms: 1 },
+            event: crate::StateEvent::ThreadCreated {
+                created_at_ms: 1,
+                tenant_id: None,
+            },
         };
         store.append(pending).await.expect("append current event");
         drop(store);

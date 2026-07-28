@@ -169,7 +169,7 @@ fn print_help() {
            --engine <path>  Engine executable; defaults to $YH_BIN or `yh`\n  \
            --thread <id>    attach to an existing authoritative Thread\n\n\
          With no mode, y-harness.json is used when present; otherwise demo mode.\n\
-         The TUI is an optional Protocol v19 client and owns no Engine state."
+         The TUI is an optional Protocol v20 client and owns no Engine state."
     );
 }
 
