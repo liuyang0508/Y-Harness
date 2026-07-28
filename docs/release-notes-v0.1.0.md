@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v23 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v24 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -45,8 +45,14 @@ user-level reference data.
 Schema 12 adds durable optional Thread tenant ownership with validated
 Memory/SQLite projections and exact State access fencing. Schema-1 through
 schema-11 Threads migrate as unscoped rather than receiving inferred
-ownership. Forks inherit the trusted tenant; format-2 archive imports rebind a
-new target to the importing tenant.
+ownership. Forks inherit the trusted tenant; format-3 archive imports rebind
+unbound history to the importing tenant.
+Schema 13 adds a single immutable, content-free per-Turn execution binding
+with exact configuration/environment digests, revision, actor, and tenant.
+Runtime excludes it from Model Context, validates it across SQLite
+snapshot/reopen, and requires an exact match on approval restart. Thread
+archive format 3 preserves this evidence and refuses cross-tenant rebinding of
+bound history.
 Protocol 19 adds permissioned recovery of one exact abandoned Turn without
 automatic replay. The embedded Runtime also carries a validated per-Turn
 Authority Context from a trusted host or protocol authorizer into Memory scope,
@@ -64,11 +70,15 @@ Provider. Exact tenant/reference environment mappings have no global fallback;
 legacy Secret Providers and shared MCP sessions fail closed for tenant-scoped
 operations. Reference-service tenant credential configuration and
 tenant-partitioned MCP sessions remain explicit open work.
+Protocol 24 advertises State/snapshot schema 13; Thread archive format 3
+advances independently, and remote clients cannot author trusted execution
+bindings.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v23. Format/store schema 1 pins immutable component snapshots and a
+Protocol v24. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
-bounded rollback, and execution-time inventory/revision binding. The embedding
+bounded rollback, and execution-time inventory/revision binding. Its proof
+converts into the generic Engine Turn binding. The embedding
 control service remains responsible for role authorization and component
 locking; no business workflow is added to the Agent Loop.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only

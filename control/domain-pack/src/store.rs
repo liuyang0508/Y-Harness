@@ -12,7 +12,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task};
-use y_harness::{ActorIdentity, AuthorityContext};
+use y_harness::{ActorIdentity, AuthorityContext, ExecutionBinding};
 
 use crate::{
     DomainPackComponentKind, DomainPackReleaseId, DomainPackSnapshot, VerifiedDomainPack,
@@ -221,6 +221,25 @@ impl DomainPackExecutionBinding {
     #[must_use]
     pub fn inventory_sha256(&self) -> &str {
         &self.inventory_sha256
+    }
+
+    /// Converts this governed proof into Engine-owned durable Turn evidence.
+    pub fn to_execution_binding(&self) -> Result<ExecutionBinding, DomainPackError> {
+        ExecutionBinding::new(
+            "domain-pack",
+            self.snapshot.release.name.clone(),
+            self.snapshot.release.version.to_string(),
+            self.snapshot.content_sha256.clone(),
+            self.inventory_sha256.clone(),
+            self.activation_revision,
+            self.tenant_id.clone(),
+        )
+        .map_err(|_| {
+            DomainPackError::Invalid(
+                "governed Domain Pack cannot be represented as an Engine execution binding"
+                    .to_owned(),
+            )
+        })
     }
 }
 
@@ -1918,6 +1937,25 @@ mod tests {
             binding.inventory_sha256(),
             first_verified.inventory_sha256()
         );
+        let engine_binding = binding
+            .to_execution_binding()
+            .expect("convert governed binding");
+        assert_eq!(engine_binding.issuer(), "domain-pack");
+        assert_eq!(engine_binding.name(), first_snapshot.release.name);
+        assert_eq!(
+            engine_binding.version(),
+            first_snapshot.release.version.to_string()
+        );
+        assert_eq!(
+            engine_binding.configuration_sha256(),
+            first_snapshot.content_sha256
+        );
+        assert_eq!(
+            engine_binding.environment_sha256(),
+            first_verified.inventory_sha256()
+        );
+        assert_eq!(engine_binding.revision(), 1);
+        assert_eq!(engine_binding.tenant_id(), Some("tenant-a"));
 
         let mut drifted_inventory = first_snapshot.components.clone();
         drifted_inventory.push(DomainPackComponentPin {

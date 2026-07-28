@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v23 projections.
+//! Product TUI state derived exclusively from Protocol v24 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -1078,7 +1078,7 @@ impl App {
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v23.".to_owned(),
+                content: "Keep clients behind Protocol v24.".to_owned(),
             }));
         thread.name = Some("Harness design".to_owned());
         let lineage = y_harness::ThreadLineage {
@@ -1205,6 +1205,12 @@ fn describe_event(event: &StoredEvent) -> String {
         }
         StateEvent::ItemAppended { item, .. } => match &item.kind {
             ItemKind::UserMessage { .. } => "User message".to_owned(),
+            ItemKind::ExecutionBinding { binding, .. } => format!(
+                "Execution bound · {}@{} · revision {}",
+                binding.name(),
+                binding.version(),
+                binding.revision()
+            ),
             ItemKind::SteeringQueued { .. } => "Steering queued".to_owned(),
             ItemKind::SteeringApplied { .. } => "Steering applied".to_owned(),
             ItemKind::AssistantMessage { model_id, .. } => {

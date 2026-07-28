@@ -874,6 +874,7 @@ fn legacy_snapshot_schema(event_schema: u32) -> Option<u32> {
         9 => Some(9),
         10 => Some(10),
         11 => Some(11),
+        12 => Some(12),
         _ => None,
     }
 }

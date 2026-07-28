@@ -70,11 +70,16 @@ execution. `DomainPackStore::bind` therefore checks, in one store read:
 4. the complete inventory digest still equals the activated digest.
 
 Only then does it return a constructor-only `DomainPackExecutionBinding`.
-An embedding host retains this binding while assembling and running the
-corresponding immutable component set. The binding is in-process evidence, not
-a remote bearer token or a substitute for the host's extension and activation
-fencing. A later activation does not mutate an already issued binding; the host
-decides whether an in-flight execution may finish its pinned release.
+`to_execution_binding` converts that proof into the generic Engine
+`ExecutionBinding`: snapshot digest becomes configuration identity, complete
+inventory digest becomes environment identity, and activation revision and
+tenant remain exact. An embedding host supplies it through
+`TurnExecutionOptions`; State schema 13 records it once, keeps it out of Model
+Context, and requires the same value for approval continuation. The binding is
+not a remote bearer token or a substitute for the host's extension and
+activation fencing. A later activation does not mutate an already issued
+binding; the host decides whether an in-flight execution may finish its pinned
+release.
 
 ## Storage
 
@@ -95,7 +100,7 @@ install, evaluate, approve, activate, deactivate, rollback, and bind action
 through its Policy boundary. It must also produce truthful component
 inventories and keep installed components immutable for the binding lifetime.
 
-The current package is a Rust library, not a Protocol v23 command, CLI, remote
+The current package is a Rust library, not a Protocol v24 command, CLI, remote
 control-plane service, registry, or automatic config mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, Workflow
 timers, Human Handoff, or domain-specific Evaluation content.
@@ -103,3 +108,6 @@ timers, Human Handoff, or domain-specific Evaluation content.
 Task `Artifact` reference metadata is a separate boundary. It inherits the
 tenant of its durable Task Graph, but Y-Harness does not yet store or authorize
 the external blob named by the `uri`.
+
+Turn execution binding is implemented; durable Task-attempt binding remains a
+separate Task Graph schema change and is not claimed here.

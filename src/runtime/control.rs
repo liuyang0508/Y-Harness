@@ -5,8 +5,8 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::{
-    ActorIdentity, AuthorityContext, CancellationToken, ExecutionPhase, HarnessError, MemoryScope,
-    ModelEventSink, TurnContextInput, isolation::isolate_future,
+    ActorIdentity, AuthorityContext, CancellationToken, ExecutionBinding, ExecutionPhase,
+    HarnessError, MemoryScope, ModelEventSink, TurnContextInput, isolation::isolate_future,
 };
 
 /// Caller-controlled isolation, cancellation, and deadline for one Turn.
@@ -21,6 +21,11 @@ pub struct TurnExecutionOptions {
     pub memory_scope: MemoryScope,
     /// Bounded non-authoritative reference context supplied for this Turn.
     pub context: Vec<TurnContextInput>,
+    /// Optional immutable deployment and environment evidence.
+    ///
+    /// Embedding hosts must obtain this from a governed control plane. Remote
+    /// Protocol clients cannot author this field.
+    pub execution_binding: Option<ExecutionBinding>,
     /// Optional total deadline for external Context, Model, Policy, and Tool work.
     ///
     /// State settlement may continue after this duration so the journal always
@@ -33,6 +38,21 @@ pub struct TurnExecutionOptions {
 }
 
 impl TurnExecutionOptions {
+    pub(super) fn validated_execution_binding(
+        &self,
+    ) -> Result<Option<ExecutionBinding>, HarnessError> {
+        let Some(binding) = &self.execution_binding else {
+            return Ok(None);
+        };
+        binding.validate()?;
+        if binding.tenant_id() != self.authority.tenant_id() {
+            return Err(HarnessError::InvalidConfiguration(
+                "execution binding tenant does not match the trusted Turn authority".to_owned(),
+            ));
+        }
+        Ok(Some(binding.clone()))
+    }
+
     pub(super) fn validated_memory_scope(&self) -> Result<MemoryScope, HarnessError> {
         self.authority.validate_current("Turn authority")?;
         let mut scope = self.memory_scope.clone();

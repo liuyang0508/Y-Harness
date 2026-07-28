@@ -162,6 +162,7 @@ impl EvaluationTarget for HarnessRuntime {
                     authority: crate::AuthorityContext::local_process(),
                     memory_scope: case.memory_scope,
                     context: Vec::new(),
+                    execution_binding: None,
                     timeout: None,
                     cancellation,
                     model_event_sink: None,

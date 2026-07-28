@@ -24,6 +24,27 @@ pub const MAX_MODEL_PROVIDER_RETRY_AFTER_MS: u64 = 86_400_000;
 /// Maximum Tool calls accepted from one Model response.
 pub const MAX_TOOL_CALLS_PER_BATCH: usize = 64;
 
+fn validate_portable_coordinate(kind: &str, value: &str) -> Result<(), HarnessError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':' | b'+')
+        });
+    if !valid {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "{kind} must be 1-128 portable ASCII bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Boxed asynchronous result used by object-safe capability contracts.
 pub type HarnessFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HarnessError>> + Send + 'a>>;
 
@@ -238,6 +259,112 @@ pub struct InvocationContextEvidence {
     pub serialized_bytes: usize,
 }
 
+/// Immutable content-free deployment evidence bound to one execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBinding {
+    issuer: String,
+    name: String,
+    version: String,
+    configuration_sha256: String,
+    environment_sha256: String,
+    revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+}
+
+impl ExecutionBinding {
+    /// Creates and validates one exact execution binding.
+    pub fn new(
+        issuer: impl Into<String>,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        configuration_sha256: impl Into<String>,
+        environment_sha256: impl Into<String>,
+        revision: u64,
+        tenant_id: Option<String>,
+    ) -> Result<Self, HarnessError> {
+        let binding = Self {
+            issuer: issuer.into(),
+            name: name.into(),
+            version: version.into(),
+            configuration_sha256: configuration_sha256.into(),
+            environment_sha256: environment_sha256.into(),
+            revision,
+            tenant_id,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    /// Returns the stable binding issuer.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Returns the stable deployment identity.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the exact issuer-owned version coordinate.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns the digest of immutable deployment configuration.
+    #[must_use]
+    pub fn configuration_sha256(&self) -> &str {
+        &self.configuration_sha256
+    }
+
+    /// Returns the digest of the complete verified execution environment.
+    #[must_use]
+    pub fn environment_sha256(&self) -> &str {
+        &self.environment_sha256
+    }
+
+    /// Returns the issuer's optimistic activation or release revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the immutable tenant boundary.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HarnessError> {
+        crate::kernel::validate_capability_name("execution binding issuer", &self.issuer)?;
+        validate_portable_coordinate("execution binding name", &self.name)?;
+        validate_portable_coordinate("execution binding version", &self.version)?;
+        if !is_lower_sha256(&self.configuration_sha256)
+            || !is_lower_sha256(&self.environment_sha256)
+            || self.revision == 0
+        {
+            return Err(HarnessError::InvalidConfiguration(
+                "execution binding requires two lowercase SHA-256 digests and a non-zero revision"
+                    .to_owned(),
+            ));
+        }
+        AuthorityContext::new(ActorIdentity::LocalProcess, self.tenant_id.clone())?;
+        let encoded = serde_json::to_vec(self).map_err(|_| {
+            HarnessError::InvalidConfiguration("execution binding cannot be encoded".to_owned())
+        })?;
+        if encoded.len() > 2_048 {
+            return Err(HarnessError::InvalidConfiguration(
+                "execution binding exceeds 2048 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Runtime item payloads recorded in ordered state.
@@ -246,6 +373,13 @@ pub enum ItemKind {
     UserMessage {
         /// Message text.
         content: String,
+    },
+    /// Content-free immutable deployment evidence for this Turn.
+    ExecutionBinding {
+        /// Authenticated actor that attached the trusted host binding.
+        bound_by: ActorIdentity,
+        /// Exact issuer-provided deployment and environment coordinate.
+        binding: ExecutionBinding,
     },
     /// Durable external input accepted for a running Turn but not yet exposed
     /// to the Model.
@@ -1484,11 +1618,60 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ActorIdentity, AuthorityContext, HarnessError, MAX_MODEL_CONTINUATION_BYTES,
-        MAX_MODEL_CONTINUATION_ITEMS, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
-        MAX_MODEL_PROVIDER_RETRY_AFTER_MS, ModelContinuation, ModelProviderFailure,
-        ModelProviderFailureKind, ModelRequest, ModelUsage, ThreadId, TurnId,
+        ActorIdentity, AuthorityContext, ExecutionBinding, HarnessError,
+        MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS,
+        MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
+        ModelContinuation, ModelProviderFailure, ModelProviderFailureKind, ModelRequest,
+        ModelUsage, ThreadId, TurnId,
     };
+
+    #[test]
+    fn execution_binding_is_bounded_canonical_and_rejects_unknown_fields() {
+        let binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.2.3+build.4",
+            "a".repeat(64),
+            "b".repeat(64),
+            7,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("valid binding");
+        assert_eq!(binding.revision(), 7);
+        assert_eq!(binding.tenant_id(), Some("tenant-a"));
+
+        assert!(
+            ExecutionBinding::new(
+                "Domain Pack",
+                "course-assistant",
+                "1.0.0",
+                "a".repeat(64),
+                "b".repeat(64),
+                1,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutionBinding::new(
+                "domain-pack",
+                "../course",
+                "1.0.0",
+                "A".repeat(64),
+                "b".repeat(64),
+                0,
+                None,
+            )
+            .is_err()
+        );
+
+        let mut encoded = serde_json::to_value(binding).expect("encode");
+        encoded
+            .as_object_mut()
+            .expect("object")
+            .insert("ignored".to_owned(), json!(true));
+        assert!(serde_json::from_value::<ExecutionBinding>(encoded).is_err());
+    }
 
     #[test]
     fn model_provider_failure_is_typed_bounded_evidence() {

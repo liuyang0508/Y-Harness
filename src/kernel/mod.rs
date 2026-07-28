@@ -19,8 +19,8 @@ pub(crate) use registry::{
 pub(crate) use types::now_ms;
 pub use types::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
-    AuthorityContext, Checkpoint, CheckpointId, EventId, ExecutionPhase, HarnessError,
-    HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
+    AuthorityContext, Checkpoint, CheckpointId, EventId, ExecutionBinding, ExecutionPhase,
+    HarnessError, HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
     MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
     MAX_TOOL_CALLS_PER_BATCH, MemoryContextRecordStatus, ModelContinuation, ModelOutput,
     ModelProviderFailure, ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStreamEvent,

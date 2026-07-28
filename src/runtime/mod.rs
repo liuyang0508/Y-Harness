@@ -835,6 +835,7 @@ impl HarnessRuntime {
         options: TurnExecutionOptions,
     ) -> Result<TurnOutcome, HarnessError> {
         self.models.validate()?;
+        let execution_binding = options.validated_execution_binding()?;
         let memory_scope = options.validated_memory_scope()?;
         validate_turn_context_inputs(&options.context)?;
         let deadline = deadline(options.timeout)?;
@@ -875,6 +876,16 @@ impl HarnessRuntime {
                     },
                 )
                 .await?;
+                if let Some(binding) = execution_binding {
+                    self.record(
+                        &mut turn,
+                        ItemKind::ExecutionBinding {
+                            bound_by: options.authority.actor().clone(),
+                            binding,
+                        },
+                    )
+                    .await?;
+                }
                 self.record(
                     &mut turn,
                     ItemKind::ConversationContext {
@@ -1366,6 +1377,7 @@ impl HarnessRuntime {
                 "thread projection contains multiple running turns".to_owned(),
             ));
         }
+        require_execution_binding(&turn, options.execution_binding.as_ref())?;
         let evidence = approval_resume_evidence(&turn, options.authority.actor())?;
         if !self
             .models
@@ -2650,6 +2662,31 @@ struct ApprovalResumeEvidence {
     current_batch_index: usize,
     consumed_steps: usize,
     tool_call_ids: BTreeSet<String>,
+}
+
+fn require_execution_binding(
+    turn: &Turn,
+    expected: Option<&crate::ExecutionBinding>,
+) -> Result<(), HarnessError> {
+    let mut recorded = turn.items.iter().filter_map(|item| {
+        if let ItemKind::ExecutionBinding { binding, .. } = &item.kind {
+            Some(binding)
+        } else {
+            None
+        }
+    });
+    let actual = recorded.next();
+    if recorded.next().is_some() {
+        return Err(HarnessError::State(
+            "Turn contains multiple execution bindings".to_owned(),
+        ));
+    }
+    if actual == expected {
+        return Ok(());
+    }
+    Err(HarnessError::State(
+        "approval continuation execution binding does not match the recorded Turn".to_owned(),
+    ))
 }
 
 fn approval_resume_evidence(
@@ -3984,15 +4021,16 @@ mod tests {
         CapabilityOrigin, ContextEngine, ContextSource, ConversationCompactionConfig,
         ConversationCompactionRequest, ConversationCompactionResponse, ConversationCompactor,
         ConversationCompactorDescriptor, ConversationCompactorRegistry, ConversationContextConfig,
-        EventId, EventStore, ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler,
-        ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
-        MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
-        MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
-        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
-        ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
-        ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, Observability,
-        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox,
-        SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
+        EventId, EventStore, ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture,
+        InboxApprovalHandler, ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox,
+        MemoryContextConfig, MemoryContextPack, MemoryContextRecordStatus, MemoryEventStore,
+        MemoryFailureMode, MemoryOperation, MemoryProvider, MemoryProviderDescriptor,
+        MemoryReference, MemoryRegistry, MemorySearchRequest, MemorySearchResponse, MemoryView,
+        ModelContinuation, ModelEventSink, ModelOutput, ModelProviderFailure,
+        ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+        ModelStreamEvent, ModelToolCall, ModelUsage, Observability, ObservationOutcome,
+        PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox, SqliteEventStore,
+        StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
         ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution, ToolContext,
         ToolDescriptor, ToolRegistry, TraceCollector, TurnContextInput, TurnStatus, TurnStopReason,
         VerificationOutcome, VerificationRegistry, VerificationRequest, Verifier,
@@ -7153,10 +7191,21 @@ mod tests {
             reference: "thread:source/turn:terminal".to_owned(),
             text: "exact resumable handoff".to_owned(),
         };
+        let execution_binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            None,
+        )
+        .expect("execution binding");
         let first_worker = {
             let runtime = first.clone();
             let thread_id = thread.id.clone();
             let turn_context = turn_context.clone();
+            let execution_binding = execution_binding.clone();
             tokio::spawn(async move {
                 runtime
                     .run_turn_with_options(
@@ -7164,6 +7213,7 @@ mod tests {
                         "resume me",
                         TurnExecutionOptions {
                             context: vec![turn_context],
+                            execution_binding: Some(execution_binding),
                             ..TurnExecutionOptions::default()
                         },
                     )
@@ -7210,6 +7260,49 @@ mod tests {
             .await
             .expect("independent settlement");
 
+        let binding_error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .await
+        .expect_err("missing execution binding must fail closed");
+        assert!(binding_error.to_string().contains("execution binding"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let substituted_binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.1",
+            "c".repeat(64),
+            "b".repeat(64),
+            2,
+            None,
+        )
+        .expect("substituted binding");
+        let substitution_error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                execution_binding: Some(substituted_binding),
+                ..TurnExecutionOptions::default()
+            },
+        )
+        .await
+        .expect_err("substituted execution binding must fail closed");
+        assert!(substitution_error.to_string().contains("execution binding"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
         let actor_error = HarnessRuntime::new(
             Arc::new(EchoModel),
             registry(calls.clone()),
@@ -7230,6 +7323,7 @@ mod tests {
                 )
                 .expect("different authority"),
                 context: vec![turn_context.clone()],
+                execution_binding: Some(execution_binding.clone()),
                 ..TurnExecutionOptions::default()
             },
         )
@@ -7245,7 +7339,14 @@ mod tests {
             state.clone(),
         )
         .with_approval_handler(handler.clone())
-        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                execution_binding: Some(execution_binding.clone()),
+                ..TurnExecutionOptions::default()
+            },
+        )
         .await
         .expect_err("missing invocation context must fail closed");
         assert!(context_error.to_string().contains("Model request changed"));
@@ -7273,6 +7374,7 @@ mod tests {
                 &turn_id,
                 TurnExecutionOptions {
                     context: vec![turn_context.clone()],
+                    execution_binding: Some(execution_binding.clone()),
                     ..TurnExecutionOptions::default()
                 },
             )
@@ -7303,6 +7405,7 @@ mod tests {
             &turn_id,
             TurnExecutionOptions {
                 context: vec![turn_context],
+                execution_binding: Some(execution_binding),
                 ..TurnExecutionOptions::default()
             },
         )
@@ -9555,6 +9658,157 @@ mod tests {
                 ..
             } if included_turns.len() == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn execution_binding_is_tenant_fenced_durable_and_model_invisible() {
+        let path = sqlite_test_path("execution-binding");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "executor".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
+        let binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            9,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("execution binding");
+        let thread_id;
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path).await.expect("open database"),
+            ));
+            let runtime = HarnessRuntime::new(
+                Arc::new(RecordingHistoryModel {
+                    requests: requests.clone(),
+                }),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                state.clone(),
+            );
+            let thread = runtime
+                .create_thread_as(&authority)
+                .await
+                .expect("create tenant Thread");
+            thread_id = thread.id.clone();
+            let outcome = runtime
+                .run_turn_with_options(
+                    &thread.id,
+                    "execute governed release",
+                    TurnExecutionOptions {
+                        authority: authority.clone(),
+                        execution_binding: Some(binding.clone()),
+                        ..TurnExecutionOptions::default()
+                    },
+                )
+                .await
+                .expect("bound Turn");
+            assert!(outcome.turn.items.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::ExecutionBinding {
+                        bound_by,
+                        binding: recorded,
+                    } if bound_by == authority.actor() && recorded == &binding
+                )
+            }));
+            assert!(
+                !requests
+                    .lock()
+                    .expect("recorded request")
+                    .iter()
+                    .flat_map(|request| &request.items)
+                    .any(|item| matches!(item.kind, ItemKind::ExecutionBinding { .. }))
+            );
+            state
+                .create_snapshot_as(&thread.id, &authority)
+                .await
+                .expect("create snapshot");
+        }
+        let reopened = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen database"),
+        ));
+        let projected = reopened
+            .load_thread_as(&thread_id, &authority)
+            .await
+            .expect("load tenant Thread")
+            .expect("Thread");
+        assert!(projected.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::ExecutionBinding {
+                    bound_by,
+                    binding: recorded,
+                } if bound_by == authority.actor() && recorded == &binding
+            )
+        }));
+        remove_sqlite_files(&path);
+    }
+
+    #[tokio::test]
+    async fn execution_binding_tenant_mismatch_fails_before_turn_creation() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "executor".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime
+            .create_thread_as(&authority)
+            .await
+            .expect("create tenant Thread");
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "reject mismatched binding",
+                TurnExecutionOptions {
+                    authority: authority.clone(),
+                    execution_binding: Some(
+                        ExecutionBinding::new(
+                            "domain-pack",
+                            "course-assistant",
+                            "1.0.0",
+                            "a".repeat(64),
+                            "b".repeat(64),
+                            1,
+                            Some("tenant-b".to_owned()),
+                        )
+                        .expect("valid other-tenant binding"),
+                    ),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("tenant mismatch");
+        assert!(error.to_string().contains("tenant does not match"));
+        assert!(
+            runtime
+                .load_thread_as(&thread.id, &authority)
+                .await
+                .expect("load")
+                .expect("Thread")
+                .turns
+                .is_empty()
+        );
     }
 
     #[tokio::test]

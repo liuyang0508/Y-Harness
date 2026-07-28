@@ -35,7 +35,7 @@ reason to duplicate Runtime or State.
 
 | Existing primitive | It does not yet prove |
 |---|---|
-| optional immutable Domain Pack snapshots plus tenant-fenced promotion, activation, rollback, and execution binding | Engine service/API exposure, role authorization, canary rollout, or multi-node control-plane HA |
+| optional immutable Domain Pack snapshots plus tenant-fenced promotion, activation, rollback, and schema-13 Turn execution binding | remote control-plane exposure, Task-attempt binding, role authorization, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API plus exact embedded tenant/reference adapter | reference-service tenant credential maps or a general Secret-manager backend |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
@@ -93,7 +93,15 @@ SQLite CAS for activation, deactivation, and bounded rollback. A
 constructor-only execution binding is issued only when the approved active
 release, full inventory digest, activation revision, and tenant still agree.
 
-This remains deliberately outside Core and the v23 client protocol. The
+ADR 0122 adds a Domain-Pack-neutral Engine `ExecutionBinding`. The control
+plane converts its proof into that content-free record; Runtime persists it
+once per Turn, excludes it from Model Context, checks tenant equality, and
+requires exact evidence on approval resume. This closes the Turn side of
+ordered item 2. Task-attempt binding remains open and requires its own Task
+Graph migration.
+
+Domain Pack lifecycle remains deliberately outside Core and the v24 client
+protocol. The
 embedding control service must authenticate and authorize install, evaluation,
 approval, and activation operations, collect truthful component inventories,
 and keep the binding valid for the assembled execution. No customer-service,

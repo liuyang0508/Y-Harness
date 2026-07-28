@@ -11,16 +11,16 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"23"` | exact `Initialize` request/response |
-| State events | `12` | per-event durable envelope; reads schemas 1 through 12 |
-| State snapshots | `12` | cache body; incompatible caches are discarded |
+| Client protocol | `"24"` | exact `Initialize` request/response |
+| State events | `13` | per-event durable envelope; reads schemas 1 through 13 |
+| State snapshots | `13` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
 | Task Coordinator | `2` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
 | Thread handoff request format | `1` | canonical bounded summarizer-input envelope |
-| Thread archive format | `2` | exact bounded archive root plus digest |
+| Thread archive format | `3` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `2` | exact descriptor registration and trusted-authority resolution |
@@ -174,6 +174,15 @@ tenant-scoped calls unless a custom implementation proves session partitioning.
 Protocol v23 advertises Secret API 2; State, Approval, Task, service
 configuration, and Model Gateway coordinates are unchanged. See
 [ADR 0120](adr/0120-authority-aware-secret-resolution.md).
+The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
+`ExecutionBinding`. State schema 13 records at most one binding per Turn,
+requires its tenant to equal authoritative Thread ownership, excludes it from
+Model Context, and requires an exact match on approval resume. Thread archive
+format 3 preserves the evidence and refuses cross-tenant rebinding when any
+binding is present. Protocol v24 advertises the new State/snapshot coordinates
+but does not expose a binding-authoring command; archive format is a separate
+Rust/CLI coordinate. See
+[ADR 0122](adr/0122-durable-turn-execution-binding.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -226,6 +235,14 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `24` preserves protocol-v23 commands, framing, authority,
+permissions, and request/response ceilings. It advances advertised State event
+and snapshot coordinates to 13. Thread archive format independently advances
+to 3. The new execution binding is trusted embedded-host input and durable
+output evidence; protocol callers can observe State but cannot author that field.
+Protocol-v23 clients must fail exact initialization rather than assume
+schema-12 projections can preserve schema-13 Items.
 
 Client protocol `23` preserves protocol-v22 commands, framing, authority,
 tenant-owned State/Approval/Task projections, and Model Gateway API 7. It
@@ -381,6 +398,14 @@ Client protocol `3` added exact recovery-byte fields to the protocol-v2
 Thread-capacity result. Protocol versions remain exact rather than rolling
 field negotiation.
 
+State event schema `13` adds one immutable content-free execution binding to a
+Turn. The binding carries trusted actor, issuer/name/version, exact
+configuration and environment SHA-256 values, revision, and optional tenant.
+The tenant must equal authoritative Thread ownership, projection permits at
+most one binding, and Runtime excludes it from Model Context. Schema-13
+readers accept immutable schema-1 through schema-12 history after explicit
+migration, and the schema-13 writer emits only schema 13.
+
 State event schema `12` adds optional tenant ownership to the authoritative
 `thread_created` event. SQLite persists a nullable same-transaction
 `streams.tenant_id` lookup projection and validates it against the journal on
@@ -521,12 +546,12 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1 through 11 are supported migration sources. Populated SQLite
+State schemas 1 through 12 are supported migration sources. Populated SQLite
 stores at any of those coordinates require the explicit backup-first command
-below before a schema-12 Runtime can open them:
+below before a schema-13 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v12.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v13.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
@@ -536,16 +561,16 @@ Thread-tenant projection without inferring legacy ownership, drops disposable
 old snapshots, and advances
 event/snapshot writer metadata in one immediate transaction. Historical event
 JSON and schema labels are never rewritten. An interrupted schema-1 through
-schema-11 run can reuse its validated backup.
+schema-12 run can reuse its validated backup.
 
-The schema-12 reader/new writer decision is asymmetric:
+The schema-13 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1 through schema-11 events remain readable;
-- old reader + new writer: unsupported and fails on schema-12 metadata or
+  schema-1 through schema-12 events remain readable;
+- old reader + new writer: unsupported and fails on schema-13 metadata or
   events;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-12 event
+- downgrade: supported only by restoring the backup before any schema-13 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -587,7 +612,9 @@ schema 3 and Protocol v21 tenant fencing, plus
 [ADR 0119](adr/0119-durable-task-graph-tenant-ownership.md) for Task Graph
 schema 2 and Protocol v22 tenant fencing, plus
 [ADR 0120](adr/0120-authority-aware-secret-resolution.md) for Secret Provider
-API 2, in-process Model authority, MCP session fencing, and Protocol v23.
+API 2, in-process Model authority, MCP session fencing, and Protocol v23, plus
+[ADR 0122](adr/0122-durable-turn-execution-binding.md) for schema-13 Turn
+execution evidence, archive format 3, and Protocol v24.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -645,8 +672,8 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 12 reads
-immutable schema-1 through schema-11 history after explicit store migration.
+durable schema support windows are declared per release. State schema 13 reads
+immutable schema-1 through schema-12 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
 reads schema 1 and schema 2. Task coordination reads only schema 2 in normal
 operation; `task-migrate` alone reads schema 1 and the earlier unversioned

@@ -855,7 +855,8 @@ fn model_visible_item(item: &Item) -> Option<Item> {
         | ItemKind::ToolCall { .. }
         | ItemKind::ToolResult { .. }
         | ItemKind::VerificationResult { .. } => Some(item.clone()),
-        ItemKind::SteeringQueued { .. }
+        ItemKind::ExecutionBinding { .. }
+        | ItemKind::SteeringQueued { .. }
         | ItemKind::PolicyDecision { .. }
         | ItemKind::ApprovalRequested { .. }
         | ItemKind::ApprovalDecision { .. }

@@ -152,7 +152,7 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-12 writer, and no mutation of authoritative history or
+  current schema-13 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
 - optional 1–64-block per-Turn reference Context with pre-State count/byte/
   identity validation, fixed non-authoritative labeling, provider-specific
@@ -228,6 +228,11 @@ direction:
   Thread/Turn/Operation fencing, validated disposable Memory/SQLite lookup
   projections, unscoped legacy migration, inherited fork ownership, and
   importing-tenant archive rebind;
+- schema-13 immutable content-free Turn execution binding with exact
+  configuration/environment digests, revision, trusted actor, and tenant;
+  single-binding projection validation, Model invisibility, SQLite
+  snapshot/reopen persistence, exact approval-resume matching, and
+  archive-format-3 preservation without cross-tenant evidence rewriting;
 - Approval Inbox schema 3 immutable optional tenant ownership with exact
   Memory/SQLite list/get/settle/orphan fencing, validated lookup projection,
   attributed same-tenant separation of duty, restart continuation, and
@@ -311,11 +316,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v23 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v24 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 23
-  advertises Secret Provider API 2 and fail-closed MCP session fencing,
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 24
+  advertises schema-13 execution binding evidence while keeping binding
+  authorship embedded-only, protocol 23 advertises Secret Provider API 2 and
+  fail-closed MCP session fencing,
   protocol 22
   adds schema-2 durable Task Graph tenant ownership and the tenant-scoped
   worker lifecycle, protocol 21 adds schema-3 Approval tenant fencing, and
@@ -361,7 +368,7 @@ direction:
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v23, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v24, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;

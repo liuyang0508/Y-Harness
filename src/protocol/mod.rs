@@ -37,7 +37,7 @@ pub use task::{TaskGraphSummary, TaskRecordPage};
 use task::{TaskProtocolService, TaskWorkerAccess};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "23";
+pub const PROTOCOL_VERSION: &str = "24";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -1390,6 +1390,7 @@ impl ProtocolHandler {
                                 authority,
                                 memory_scope,
                                 context,
+                                execution_binding: None,
                                 timeout: timeout_ms.map(Duration::from_millis),
                                 cancellation,
                                 model_event_sink: Some(events),
@@ -2342,15 +2343,15 @@ mod tests {
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
         ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin, EventStore,
-        HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind,
-        LanguageModel, MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
-        ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelResponse, ModelStream,
-        ModelStreamEvent, OperationId, PendingEvent, PolicyDecision, PolicyEngine, RiskLevel,
-        SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine, StateEvent, StateSnapshot,
-        StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId,
-        TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool, ToolAuthorization, ToolCallBatch,
-        ToolCallBatchId, ToolContext, ToolDescriptor, ToolRegistry, TurnContextInput, TurnId,
-        TurnStatus, WorkspaceMode,
+        ExecutionBinding, HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item,
+        ItemId, ItemKind, LanguageModel, MemoryApprovalInbox, MemoryEventStore, MemoryScope,
+        MemoryTaskCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
+        ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
+        PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
+        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
+        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
+        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2726,7 +2727,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_three_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_four_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2734,14 +2735,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "23",
+                "protocol_version": "24",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "23",
+                "protocol_version": "24",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2750,7 +2751,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "23",
+                "protocol_version": "24",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2772,7 +2773,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "23",
+                "protocol_version": "24",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2780,6 +2781,35 @@ mod tests {
                         "operation_id": "operation-fixture",
                         "accepted": true
                     }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemKind::ExecutionBinding {
+                bound_by: crate::ActorIdentity::LocalProcess,
+                binding: ExecutionBinding::new(
+                    "domain-pack",
+                    "course-assistant",
+                    "1.0.0",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    7,
+                    Some("tenant-a".to_owned()),
+                )
+                .expect("execution binding"),
+            })
+            .expect("encode schema-13 execution binding evidence"),
+            json!({
+                "type": "execution_binding",
+                "bound_by": {"kind": "local_process"},
+                "binding": {
+                    "issuer": "domain-pack",
+                    "name": "course-assistant",
+                    "version": "1.0.0",
+                    "configuration_sha256": "a".repeat(64),
+                    "environment_sha256": "b".repeat(64),
+                    "revision": 7,
+                    "tenant_id": "tenant-a"
                 }
             })
         );
@@ -3001,6 +3031,25 @@ mod tests {
         assert_eq!(
             turn_context["context"][0]["reference"],
             "thread:source/turn:terminal"
+        );
+        let mut untrusted_binding = turn_context.clone();
+        untrusted_binding
+            .as_object_mut()
+            .expect("StartTurn object")
+            .insert(
+                "execution_binding".to_owned(),
+                json!({
+                    "issuer": "domain-pack",
+                    "name": "course-assistant",
+                    "version": "1.0.0",
+                    "configuration_sha256": "a".repeat(64),
+                    "environment_sha256": "b".repeat(64),
+                    "revision": 7
+                }),
+            );
+        assert!(
+            serde_json::from_value::<ProtocolCommand>(untrusted_binding).is_err(),
+            "Protocol clients cannot author trusted execution bindings"
         );
 
         let commands = [

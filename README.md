@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v23 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v24 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v23 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v24 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -190,7 +190,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v23 specification](docs/protocol.md).
+[client protocol v24 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -348,16 +348,16 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-12 writer
+introduced bounded content-free evidence, and the current schema-13 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1 through schema-11 SQLite
+Populated schema-1 through schema-12 SQLite
 databases require an offline, backup-first migration before the current
 Runtime opens them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v12.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v13.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -436,8 +436,10 @@ yh thread import <archive> <target-thread-id> [config]
 
 Export never overwrites its destination, import rejects altered or oversized
 archives before mutation, and a running Turn is not exportable. The current
-archive root is format 2 so older readers cannot silently discard schema-12
-tenant ownership. See
+archive root is format 3 so older readers cannot silently discard schema-13
+execution-binding evidence. A tenant-bound execution history can be imported
+only into the same tenant; unbound histories retain the existing explicit
+target-tenant rebind behavior. See
 [ADR 0095](docs/adr/0095-portable-integrity-bound-thread-archives.md).
 
 State schema 11 adds optional per-Turn reference Context without adding another
@@ -459,6 +461,14 @@ target to the importing tenant. Legacy Threads migrate as unscoped rather than
 receiving inferred ownership. Task ownership is independently bound by Task
 Graph schema 2 rather than inferred from a Thread. See
 [ADR 0117](docs/adr/0117-durable-thread-tenant-ownership.md).
+
+State schema 13 adds one immutable, content-free `ExecutionBinding` Item to a
+Turn. A trusted embedding host may pin an issuer, deployment name/version,
+configuration digest, complete environment digest, activation revision, and
+exact tenant before execution. Runtime records it once, excludes it from Model
+Context, preserves it through SQLite snapshots and archives, and requires an
+exact match on approval restart. Protocol clients cannot author this trusted
+field. See [ADR 0122](docs/adr/0122-durable-turn-execution-binding.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
 longest identical Turn prefix and selects a bounded newest source-only delta.
@@ -560,8 +570,11 @@ digest, and activation revision so extension drift fails closed. Domain
 behavior does not enter the Agent Loop, and the current Engine service does not
 implicitly activate Packs. An embedding control service must authorize each
 control-plane action and retain the returned binding while assembling an
-execution. See the [Domain Pack governance guide](docs/domain-pack-governance.md)
-and [ADR 0121](docs/adr/0121-domain-pack-control-plane.md).
+execution. The returned Domain Pack proof converts directly into the generic
+Engine binding; the Engine remains unaware of Domain Pack lifecycle rules.
+See the [Domain Pack governance guide](docs/domain-pack-governance.md),
+[ADR 0121](docs/adr/0121-domain-pack-control-plane.md), and
+[ADR 0122](docs/adr/0122-durable-turn-execution-binding.md).
 
 Completion verifiers are registered through a typed, collision-safe registry.
 All must pass before an assistant candidate completes the Turn. Retryable
@@ -715,7 +728,7 @@ immutable optional tenant envelope and duplicates that owner in the SQLite
 lookup key; reads validate both representations before returning data.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v23 preserves Protocol v22's 2 MiB request and 16 MiB
+protocol. Protocol v24 preserves Protocol v23's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -734,7 +747,10 @@ Approval tenant ownership and tenant-scoped Approval capabilities. Protocol
 22 adds schema-2 durable Task Graph ownership, tenant-partitioned Graph
 identity, and the complete tenant-scoped worker lifecycle. Protocol 23 adds
 Secret Provider API 2 with trusted-authority credential resolution and
-fail-closed shared MCP session fencing. Steering
+fail-closed shared MCP session fencing. Protocol 24 advertises State and
+snapshot schema 13 for durable Turn execution bindings; Thread archive format
+3 advances independently. Remote protocol callers still cannot author
+bindings. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -833,7 +849,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v23. The Sessions panel shows direct fork ancestry from
+through Protocol v24. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

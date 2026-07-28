@@ -1,10 +1,10 @@
-# Client protocol v23
+# Client protocol v24
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"23"` is exact. Every request carries that value, and a peer
+Protocol version `"24"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "23",
+  "protocol_version": "24",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "23",
+  "protocol_version": "24",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "23",
+  "protocol_version": "24",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "23",
+  "protocol_version": "24",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "23",
+  "protocol_version": "24",
   "body": {
     "status": "success",
     "result": {
@@ -134,8 +134,8 @@ The result type is `initialized`:
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 12,
-        "state_snapshot_schema": 12,
+        "state_event_schema": 13,
+        "state_snapshot_schema": 13,
         "approval_inbox_schema": 3,
         "task_graph_schema": 2,
         "memory_api": 1,
@@ -804,6 +804,29 @@ authority, never from a command field. Forks inherit the caller tenant; an
 archive import binds the new target to the importing tenant. SQLite's nullable
 tenant column is only a validated lookup projection of this event.
 
+State event schema 13 adds one content-free execution binding to a Turn:
+
+```json
+{
+  "type": "execution_binding",
+  "bound_by": { "kind": "local_process" },
+  "binding": {
+    "issuer": "domain-pack",
+    "name": "course-assistant",
+    "version": "1.0.0",
+    "configuration_sha256": "lowercase-64-character-sha256",
+    "environment_sha256": "lowercase-64-character-sha256",
+    "revision": 7,
+    "tenant_id": "tenant-a"
+  }
+}
+```
+
+Only a trusted embedded host can supply this input through
+`TurnExecutionOptions`; `start_turn` has no binding field. State permits at
+most one binding, requires its tenant to equal the Thread tenant, excludes it
+from Model Context, and preserves it as observable audit evidence.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -818,7 +841,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v23 value |
+| Boundary | Protocol v24 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -851,7 +874,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"23"` |
+| `unsupported_version` | Request protocol is not exactly `"24"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -870,7 +893,8 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-12 Thread-tenant evidence, schema-11 invocation-context evidence,
+schema-13 execution-binding evidence, schema-12 Thread-tenant evidence,
+schema-11 invocation-context evidence,
 schema-10 Thread-import evidence,
 schema-9 Thread-fork evidence, schema-8
 Thread-name evidence, schema-7 Tool-call batch evidence, schema-6

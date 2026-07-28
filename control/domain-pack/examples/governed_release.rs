@@ -61,13 +61,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let binding = store
         .bind(verified, activation.revision, &authority("executor")?)
         .await?;
+    let engine_binding = binding.to_execution_binding()?;
 
     println!(
-        "bound {}@{} for tenant {} at activation revision {}",
-        binding.snapshot().release.name,
-        binding.snapshot().release.version,
-        binding.tenant_id().unwrap_or("unscoped"),
-        binding.activation_revision()
+        "bound {}:{}@{} for tenant {} at activation revision {}",
+        engine_binding.issuer(),
+        engine_binding.name(),
+        engine_binding.version(),
+        engine_binding.tenant_id().unwrap_or("unscoped"),
+        engine_binding.revision()
     );
     Ok(())
 }

@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 12;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 13;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -62,9 +62,9 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 13;
 /// Current portable Thread archive format.
-pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 2;
+pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 3;
 /// Maximum accepted encoded Thread archive.
 pub const MAX_THREAD_ARCHIVE_BYTES: usize = 75_497_472;
 const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
@@ -2177,6 +2177,7 @@ impl StateEngine {
             ));
         }
         let source = validate_thread_archive(archive)?;
+        validate_import_execution_bindings(&source, authority)?;
         let origin = ThreadImportOrigin {
             source_thread_id: archive.source_thread_id.clone(),
             source_stream_version: archive.source_stream_version,
@@ -2425,7 +2426,9 @@ impl StateEngine {
             .await?;
         if matches!(
             item.kind,
-            ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. }
+            ItemKind::ExecutionBinding { .. }
+                | ItemKind::SteeringQueued { .. }
+                | ItemKind::SteeringApplied { .. }
         ) {
             let thread = self
                 .load_thread_as(&turn.thread_id, authority)
@@ -2433,7 +2436,17 @@ impl StateEngine {
                 .ok_or_else(|| {
                     HarnessError::State(format!("thread {} does not exist", turn.thread_id))
                 })?;
-            validate_steering_append(&thread, &turn.id, &item)?;
+            match &item.kind {
+                ItemKind::ExecutionBinding { bound_by, binding } => {
+                    validate_execution_binding_append(
+                        &thread, &turn.id, bound_by, binding, authority,
+                    )?;
+                }
+                ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
+                    validate_steering_append(&thread, &turn.id, &item)?;
+                }
+                _ => {}
+            }
         }
         let mut head = self.require_stream_head(&turn.thread_id).await?;
         if require_running_head(&head, &turn.id).is_err() {
@@ -3288,6 +3301,30 @@ fn validate_existing_import(
     Ok(())
 }
 
+fn validate_import_execution_bindings(
+    source: &Thread,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    if source
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| {
+            if let ItemKind::ExecutionBinding { binding, .. } = &item.kind {
+                Some(binding)
+            } else {
+                None
+            }
+        })
+        .any(|binding| binding.tenant_id() != authority.tenant_id())
+    {
+        return Err(HarnessError::State(
+            "cannot rebind a Thread archive containing tenant-bound execution evidence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_thread_archive(archive: &ThreadArchive) -> Result<Thread, HarnessError> {
     if archive.format_version != THREAD_ARCHIVE_FORMAT_VERSION {
         return Err(HarnessError::State(format!(
@@ -3627,6 +3664,7 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
         }
     }
     if let Some(thread) = thread {
+        validate_execution_binding_projection(thread)?;
         validate_steering_projection(thread)?;
         validate_tool_call_batch_projection(thread)?;
     }
@@ -3949,6 +3987,7 @@ fn validate_projected_thread(
     }
     validate_steering_projection(thread)?;
     validate_tool_call_batch_projection(thread)?;
+    validate_execution_binding_projection(thread)?;
 
     let mut checkpoint_ids = BTreeSet::new();
     for checkpoint in &thread.checkpoints {
@@ -4280,6 +4319,12 @@ fn validate_thread_name(name: Option<&str>) -> Result<(), HarnessError> {
 
 fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
     match &item.kind {
+        crate::ItemKind::ExecutionBinding { bound_by, binding } => {
+            bound_by.validate_current_state("State execution binding actor")?;
+            binding
+                .validate()
+                .map_err(|error| HarnessError::State(error.to_string()))?;
+        }
         crate::ItemKind::SteeringQueued {
             steering_id,
             submitted_by,
@@ -4487,6 +4532,13 @@ fn validate_state_event_schema(
 
 fn validate_state_item_schema(kind: &ItemKind, schema_version: u32) -> Result<(), HarnessError> {
     match kind {
+        ItemKind::ExecutionBinding { .. } => {
+            if schema_version < 13 {
+                return Err(HarnessError::State(format!(
+                    "schema-{schema_version} cannot contain execution binding evidence"
+                )));
+            }
+        }
         ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
             if schema_version < 6 {
                 return Err(HarnessError::State(format!(
@@ -4548,6 +4600,72 @@ fn validate_steering_content(content: &str) -> Result<(), HarnessError> {
     if content.trim().is_empty() || content.len() > MAX_STEERING_CONTENT_BYTES {
         return Err(HarnessError::State(format!(
             "steering content must be 1-{MAX_STEERING_CONTENT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_execution_binding_projection(thread: &Thread) -> Result<(), HarnessError> {
+    for turn in &thread.turns {
+        let mut bindings = turn.items.iter().filter_map(|item| {
+            if let ItemKind::ExecutionBinding { binding, .. } = &item.kind {
+                Some(binding)
+            } else {
+                None
+            }
+        });
+        let Some(binding) = bindings.next() else {
+            continue;
+        };
+        if bindings.next().is_some() {
+            return Err(HarnessError::State(format!(
+                "turn {} contains multiple execution bindings",
+                turn.id
+            )));
+        }
+        if binding.tenant_id() != thread.tenant_id() {
+            return Err(HarnessError::State(format!(
+                "turn {} execution binding tenant differs from its Thread",
+                turn.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_binding_append(
+    thread: &Thread,
+    turn_id: &TurnId,
+    bound_by: &crate::ActorIdentity,
+    binding: &crate::ExecutionBinding,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    let turn = thread
+        .turns
+        .iter()
+        .find(|turn| &turn.id == turn_id)
+        .ok_or_else(|| {
+            HarnessError::State(format!(
+                "execution binding references unknown turn {turn_id}"
+            ))
+        })?;
+    if turn
+        .items
+        .iter()
+        .any(|item| matches!(item.kind, ItemKind::ExecutionBinding { .. }))
+    {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} already has an execution binding"
+        )));
+    }
+    if bound_by != authority.actor() {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} execution binding actor differs from its trusted authority"
+        )));
+    }
+    if binding.tenant_id() != thread.tenant_id() {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} execution binding tenant differs from its Thread"
         )));
     }
     Ok(())
@@ -6251,6 +6369,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_binding_is_single_tenant_exact_and_archive_rebind_safe() {
+        let tenant_a = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "operator-a".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant A authority");
+        let tenant_b = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "operator-b".to_owned(),
+            },
+            Some("tenant-b".to_owned()),
+        )
+        .expect("tenant B authority");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state
+            .create_thread_as(&tenant_a)
+            .await
+            .expect("create Thread");
+        let turn = state
+            .start_turn_as(&thread.id, &tenant_a)
+            .await
+            .expect("start Turn");
+        let tenant_b_binding = crate::ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            Some("tenant-b".to_owned()),
+        )
+        .expect("tenant B binding");
+        assert!(
+            state
+                .append_item_as(
+                    &turn,
+                    Item::new(ItemKind::ExecutionBinding {
+                        bound_by: tenant_a.actor().clone(),
+                        binding: tenant_b_binding,
+                    }),
+                    &tenant_a,
+                )
+                .await
+                .expect_err("mismatched tenant")
+                .to_string()
+                .contains("tenant differs")
+        );
+
+        let binding = crate::ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant A binding");
+        assert!(
+            state
+                .append_item_as(
+                    &turn,
+                    Item::new(ItemKind::ExecutionBinding {
+                        bound_by: ActorIdentity::LocalProcess,
+                        binding: binding.clone(),
+                    }),
+                    &tenant_a,
+                )
+                .await
+                .expect_err("forged actor")
+                .to_string()
+                .contains("actor differs")
+        );
+        state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::ExecutionBinding {
+                    bound_by: tenant_a.actor().clone(),
+                    binding: binding.clone(),
+                }),
+                &tenant_a,
+            )
+            .await
+            .expect("append binding");
+        assert!(
+            state
+                .append_item_as(
+                    &turn,
+                    Item::new(ItemKind::ExecutionBinding {
+                        bound_by: tenant_a.actor().clone(),
+                        binding,
+                    }),
+                    &tenant_a,
+                )
+                .await
+                .expect_err("duplicate binding")
+                .to_string()
+                .contains("already has")
+        );
+        state
+            .finish_turn_as(&turn, TurnStatus::Completed, &tenant_a)
+            .await
+            .expect("finish Turn");
+        let archive = state
+            .export_thread_as(&thread.id, &tenant_a)
+            .await
+            .expect("export archive");
+        let imported = state
+            .import_thread_as(&archive, ThreadId::generate(), &tenant_a)
+            .await
+            .expect("same-tenant import");
+        assert_eq!(imported.tenant_id(), Some("tenant-a"));
+        let error = state
+            .import_thread_as(&archive, ThreadId::generate(), &tenant_b)
+            .await
+            .expect_err("bound archive cannot change tenant");
+        assert!(error.to_string().contains("cannot rebind"));
+    }
+
+    #[tokio::test]
     async fn thread_fork_is_terminal_idempotent_and_independent_across_stores() {
         assert_thread_fork(StateEngine::new(Arc::new(MemoryEventStore::new()))).await;
 
@@ -7069,6 +7311,38 @@ mod tests {
         let error = super::validate_stored_event(&stored)
             .expect_err("schema-11 cannot claim tenant ownership");
         assert!(error.to_string().contains("schema-11"));
+    }
+
+    #[test]
+    fn execution_binding_evidence_requires_schema_thirteen() {
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 3,
+            event_id: EventId::from_static("event-execution-binding"),
+            thread_id: ThreadId::from_static("thread-execution-binding"),
+            recorded_at_ms: 1,
+            event: StateEvent::ItemAppended {
+                turn_id: TurnId::from_static("turn-execution-binding"),
+                item: Item::new(ItemKind::ExecutionBinding {
+                    bound_by: ActorIdentity::LocalProcess,
+                    binding: crate::ExecutionBinding::new(
+                        "domain-pack",
+                        "course-assistant",
+                        "1.0.0",
+                        "a".repeat(64),
+                        "b".repeat(64),
+                        1,
+                        None,
+                    )
+                    .expect("binding"),
+                }),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-13 execution binding evidence");
+        stored.schema_version = 12;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-12 cannot claim execution binding evidence");
+        assert!(error.to_string().contains("schema-12"));
     }
 
     #[test]
