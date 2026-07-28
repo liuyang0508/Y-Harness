@@ -228,7 +228,9 @@ direction:
   JSON bodies and session IDs, and explicit rejection of SSE or
   expired-session request replay;
 - atomic namespaced MCP catalog registration into the ordinary Tool registry,
-  preserving external origin and all Policy/approval/State boundaries;
+  preserving external origin and all Policy/approval/State boundaries, with
+  cooperative in-flight cancellation and bounded session settlement before a
+  cancelled or timed-out Turn becomes terminal;
 - a first-party Agent Memory Hub adapter for search, bounded read, governed
   write, resume brief, and health;
 - an isolated real-process integration test covering MCP negotiation, tool
@@ -433,14 +435,20 @@ an uncertain write.
 ## Cancellation and deadline boundary
 
 The runtime checks one shared cancellation signal and absolute deadline while
-awaiting Context, Model, Policy, and Tool capabilities. It then records the
-reason and active phase before settling the Turn. State append and terminal
-settlement are deliberately outside interruptible waits.
+awaiting Context, Model, Policy, and Tool capabilities. A Tool receives a
+per-call stop signal derived from both controls. Tools default to no cleanup
+grace; an implementation may declare a registration-time-frozen grace of at
+most ten seconds. The runtime waits only that bounded interval before recording
+the reason and active phase. State append and terminal settlement are
+deliberately outside interruptible waits.
 
 Cancellation is not rollback. In particular, a Tool stop may occur after an
 external side effect started. The runtime neither reports that as an ordinary
 Tool error nor retries it. A Tool can observe the shared cancellation token to
-perform capability-specific cleanup.
+perform capability-specific cleanup. MCP adapters reserve the bounded grace,
+discard and settle the affected built-in session, and reconnect only for a
+later explicit call. A cleanup failure remains a failure rather than being
+relabeled successful cancellation.
 
 Worker-loss continuation is narrower than generic recovery. An embedded host
 that has independently proven exclusive Thread ownership may resume only when

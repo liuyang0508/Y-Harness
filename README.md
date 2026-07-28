@@ -796,6 +796,16 @@ whole catalog. Calls then follow the ordinary model proposal, Policy/approval,
 Tool execution, State evidence, cancellation, and Verification path rather than
 receiving a transport-specific bypass.
 
+MCP Tool calls observe a per-call Runtime stop signal for both explicit
+cancellation and Turn deadline expiry. MCP adapters reserve a
+registration-time-frozen cleanup grace capped at ten seconds. The built-in
+stdio and HTTPS transports remove and boundedly close the affected persistent
+session before the Turn becomes terminal; cleanup failure is reported as a
+failure, not successful cancellation. The stdio boundary also waits for its
+bounded child/process-group settlement. Cancellation never claims rollback and
+never triggers an automatic Tool retry; only a later explicit call may create a
+new session.
+
 The optional `https-mcp` feature adds an authenticated remote transport for
 the bounded stateless JSON-response subset of MCP Streamable HTTP. It requires
 an exact HTTPS URL and environment-backed Secret reference, disables redirects,
@@ -805,7 +815,8 @@ timeouts. A project-contained exclusive CA bundle is supported. SSE, OAuth,
 arbitrary headers, and stateful remote sessions are explicitly not claimed.
 The operator install and release binary include this feature; library hosts may
 exclude it. See
-[ADR 0103](docs/adr/0103-bounded-authenticated-https-mcp-json-transport.md).
+[ADR 0103](docs/adr/0103-bounded-authenticated-https-mcp-json-transport.md) and
+[ADR 0115](docs/adr/0115-bounded-mcp-tool-cancellation-settlement.md).
 
 Reference-service stdio and `https_mcp_servers` entries are explicitly
 activatable. A disabled entry

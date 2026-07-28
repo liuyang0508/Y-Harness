@@ -6,6 +6,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -17,6 +18,8 @@ use super::{
 
 const MAX_STREAM_DELTA_BYTES: usize = 4_096;
 const MAX_STREAM_BYTES: usize = 1_048_576;
+/// Largest cleanup grace a Tool may reserve after cancellation or deadline.
+pub const MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Synchronous non-blocking sink for provisional model events.
 ///
@@ -282,6 +285,14 @@ pub trait Tool: Send + Sync {
     /// than memory safety, idempotency, or provider parallel-call support.
     fn batch_execution(&self) -> crate::ToolBatchExecution {
         crate::ToolBatchExecution::Sequential
+    }
+
+    /// Returns bounded time needed to settle after execution is stopped.
+    ///
+    /// The default requests no grace. Implementations that opt in must observe
+    /// [`ToolContext::cancellation`] and finish within the returned duration.
+    fn cancellation_settlement_timeout(&self) -> Duration {
+        Duration::ZERO
     }
 
     /// Executes one authorized call.

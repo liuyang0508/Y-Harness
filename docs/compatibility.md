@@ -110,6 +110,19 @@ Turn stop evidence. See
 The defaulted `max_parallel_tool_calls` field is bounded to 1–64, and JSON
 Tools may explicitly opt into `parallel_safe`; absent declarations remain
 sequential.
+The public pre-1.0 `Tool` trait adds the defaulted
+`cancellation_settlement_timeout` method, and `RegisteredTool` exposes its
+registration-time-frozen value. Existing `Tool` implementations require no
+method addition; external `RegisteredTool` struct literals must add the field.
+The limit is ten seconds and the default is zero. `ToolContext::cancellation`
+is now a per-call signal derived from both Turn cancellation and deadline, and
+is closed when that Tool Future settles; implementations must not treat its
+identity as a Turn-global token. `McpClient` likewise adds the defaulted
+`call_tool_with_cancellation` method; existing implementations remain
+source-compatible, while stateful implementations should override it for
+session cleanup. These changes do not alter State, Client Protocol, service
+configuration, or MCP wire coordinates. See
+[ADR 0115](adr/0115-bounded-mcp-tool-cancellation-settlement.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an

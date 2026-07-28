@@ -16,7 +16,9 @@ use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
 use crate::verification::validate_outcome;
 pub use control::TurnExecutionOptions;
-use control::{controlled, controlled_with_settlement_cancellation, deadline};
+use control::{
+    controlled, controlled_with_settlement_cancellation, controlled_with_settlement_grace, deadline,
+};
 pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngine};
 
 pub use crate::kernel::{LanguageModel, Tool};
@@ -146,6 +148,12 @@ struct ToolCallSettlement {
     call_id: String,
     output: Value,
     is_error: bool,
+}
+
+struct ToolCapabilityInvocation {
+    tool: Arc<dyn Tool>,
+    cancellation_settlement_timeout: Duration,
+    call: ModelToolCall,
 }
 
 struct ActiveTurnControl {
@@ -1368,11 +1376,14 @@ impl HarnessRuntime {
             input,
         };
         match invoke_tool_capability(
-            registered.tool.clone(),
+            ToolCapabilityInvocation {
+                tool: registered.tool.clone(),
+                cancellation_settlement_timeout: registered.cancellation_settlement_timeout,
+                call,
+            },
             self.observability.clone(),
             turn.thread_id.clone(),
             turn.id.clone(),
-            call,
             options.cancellation.clone(),
             deadline,
         )
@@ -1479,11 +1490,18 @@ impl HarnessRuntime {
                 self.settle_error(turn, &error).await?;
                 return Err(error);
             };
-            jobs.push((index, call, registered.tool.clone()));
+            jobs.push((
+                index,
+                ToolCapabilityInvocation {
+                    tool: registered.tool.clone(),
+                    cancellation_settlement_timeout: registered.cancellation_settlement_timeout,
+                    call,
+                },
+            ));
         }
         let semaphore = Arc::new(Semaphore::new(self.max_parallel_tool_calls));
         let mut tasks = JoinSet::new();
-        for (index, call, tool) in jobs {
+        for (index, invocation) in jobs {
             let semaphore = semaphore.clone();
             let observability = self.observability.clone();
             let thread_id = turn.thread_id.clone();
@@ -1493,11 +1511,10 @@ impl HarnessRuntime {
                 let result = match semaphore.acquire_owned().await {
                     Ok(permit) => {
                         let result = invoke_tool_capability(
-                            tool,
+                            invocation,
                             observability,
                             thread_id,
                             turn_id,
-                            call,
                             cancellation,
                             deadline,
                         )
@@ -3539,29 +3556,39 @@ fn invocation_context_record(
 }
 
 async fn invoke_tool_capability(
-    tool: Arc<dyn Tool>,
+    invocation: ToolCapabilityInvocation,
     observability: Observability,
     thread_id: ThreadId,
     turn_id: TurnId,
-    call: ModelToolCall,
     cancellation: crate::CancellationToken,
     deadline: Option<Instant>,
 ) -> Result<ToolCallSettlement, HarnessError> {
+    let ToolCapabilityInvocation {
+        tool,
+        cancellation_settlement_timeout,
+        call,
+    } = invocation;
     let ModelToolCall {
         call_id,
         name,
         input,
     } = call;
+    let capability_cancellation = crate::CancellationToken::new();
     let context = ToolContext {
         thread_id: thread_id.clone(),
         turn_id: turn_id.clone(),
         call_id: call_id.clone(),
-        cancellation: cancellation.clone(),
+        cancellation: capability_cancellation.clone(),
     };
     let started = Instant::now();
-    let result = controlled(&cancellation, deadline, ExecutionPhase::Tool, || {
-        tool.execute(input, context)
-    })
+    let result = controlled_with_settlement_grace(
+        &cancellation,
+        capability_cancellation,
+        deadline,
+        ExecutionPhase::Tool,
+        cancellation_settlement_timeout,
+        || tool.execute(input, context),
+    )
     .await;
     observability.emit(&PhaseObservation {
         thread_id,

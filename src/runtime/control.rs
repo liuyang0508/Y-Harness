@@ -1,8 +1,8 @@
 //! Turn execution options and bounded external-operation waits.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::{
     ApprovalActor, CancellationToken, ExecutionPhase, HarnessError, MemoryScope, ModelEventSink,
@@ -66,7 +66,15 @@ pub(super) async fn controlled<F, T>(
 where
     F: Future<Output = Result<T, HarnessError>>,
 {
-    controlled_inner(cancellation, deadline, phase, operation, None).await
+    controlled_inner(
+        cancellation,
+        deadline,
+        phase,
+        operation,
+        None,
+        Duration::ZERO,
+    )
+    .await
 }
 
 pub(super) async fn controlled_with_settlement_cancellation<F, T>(
@@ -85,6 +93,29 @@ where
         phase,
         operation,
         Some(settlement_cancellation),
+        Duration::ZERO,
+    )
+    .await
+}
+
+pub(super) async fn controlled_with_settlement_grace<F, T>(
+    cancellation: &CancellationToken,
+    settlement_cancellation: CancellationToken,
+    deadline: Option<Instant>,
+    phase: ExecutionPhase,
+    settlement_timeout: Duration,
+    operation: impl FnOnce() -> F,
+) -> Result<T, HarnessError>
+where
+    F: Future<Output = Result<T, HarnessError>>,
+{
+    controlled_inner(
+        cancellation,
+        deadline,
+        phase,
+        operation,
+        Some(settlement_cancellation),
+        settlement_timeout,
     )
     .await
 }
@@ -95,29 +126,71 @@ async fn controlled_inner<F, T>(
     phase: ExecutionPhase,
     operation: impl FnOnce() -> F,
     settlement_cancellation: Option<CancellationToken>,
+    settlement_timeout: Duration,
 ) -> Result<T, HarnessError>
 where
     F: Future<Output = Result<T, HarnessError>>,
 {
+    let settlement_signal = settlement_cancellation.clone();
     let operation = isolate_future(operation, settlement_cancellation)
         .map_err(|()| HarnessError::CapabilityPanicked { phase })?;
     tokio::pin!(operation);
-    match deadline {
+    let control = match deadline {
         Some(deadline) => {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(HarnessError::Cancelled { phase }),
                 () = sleep_until(deadline) => Err(HarnessError::TimedOut { phase }),
-                result = &mut operation => settle_panic(result, phase),
+                result = &mut operation => Ok(result),
             }
         }
         None => {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(HarnessError::Cancelled { phase }),
-                result = &mut operation => settle_panic(result, phase),
+                result = &mut operation => Ok(result),
             }
         }
+    };
+    match control {
+        Ok(settlement) => settle_panic(settlement, phase),
+        Err(control_error) => {
+            settle_after_control(
+                operation.as_mut(),
+                settlement_signal.as_ref(),
+                settlement_timeout,
+                control_error,
+                phase,
+            )
+            .await
+        }
+    }
+}
+
+async fn settle_after_control<O, T>(
+    mut operation: Pin<&mut O>,
+    settlement_cancellation: Option<&CancellationToken>,
+    settlement_timeout: Duration,
+    control_error: HarnessError,
+    phase: ExecutionPhase,
+) -> Result<T, HarnessError>
+where
+    O: Future<Output = Result<Result<T, HarnessError>, ()>>,
+{
+    if let Some(cancellation) = settlement_cancellation {
+        cancellation.cancel();
+    }
+    if settlement_timeout.is_zero() {
+        return Err(control_error);
+    }
+    match timeout(settlement_timeout, operation.as_mut()).await {
+        Ok(settlement) => match settle_panic(settlement, phase) {
+            Err(HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. }) | Ok(_) => {
+                Err(control_error)
+            }
+            Err(error) => Err(error),
+        },
+        Err(_) => Err(control_error),
     }
 }
 
@@ -141,7 +214,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{controlled, controlled_with_settlement_cancellation, deadline};
+    use super::{
+        controlled, controlled_with_settlement_cancellation, controlled_with_settlement_grace,
+        deadline,
+    };
     use crate::{CancellationToken, ExecutionPhase, HarnessError};
 
     struct PanickingFuture;
@@ -252,6 +328,33 @@ mod tests {
             })
         );
         assert!(dropped_after_cancellation.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn settlement_grace_waits_and_preserves_cleanup_failure() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let settlement_cancellation = CancellationToken::new();
+        let provider_cancellation = settlement_cancellation.clone();
+        let settled = Arc::new(AtomicBool::new(false));
+        let did_settle = settled.clone();
+
+        let result = controlled_with_settlement_grace(
+            &cancellation,
+            settlement_cancellation,
+            None,
+            ExecutionPhase::Tool,
+            Duration::from_millis(100),
+            || async move {
+                provider_cancellation.cancelled().await;
+                did_settle.store(true, Ordering::SeqCst);
+                Err::<(), _>(HarnessError::Mcp("cleanup failed".to_owned()))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(HarnessError::Mcp("cleanup failed".to_owned())));
+        assert!(settled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

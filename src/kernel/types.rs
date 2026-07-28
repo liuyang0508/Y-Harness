@@ -643,7 +643,7 @@ pub struct ToolContext {
     pub turn_id: TurnId,
     /// Tool-call correlation ID.
     pub call_id: String,
-    /// Cooperative stop signal shared with the owning Turn.
+    /// Per-call stop signal derived from owning Turn cancellation and deadline.
     pub cancellation: CancellationToken,
 }
 

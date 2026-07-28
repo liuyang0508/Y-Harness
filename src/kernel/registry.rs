@@ -99,6 +99,8 @@ pub struct RegisteredTool {
     pub origin: CapabilityOrigin,
     /// Frozen same-response scheduling guarantee.
     pub batch_execution: crate::ToolBatchExecution,
+    /// Frozen cleanup grace after cancellation or deadline.
+    pub cancellation_settlement_timeout: std::time::Duration,
     /// Executable implementation.
     pub tool: Arc<dyn Tool>,
 }
@@ -140,6 +142,16 @@ impl ToolRegistry {
             validate_descriptor(&descriptor)?;
             let batch_execution =
                 capture_capability_metadata("tool batch execution", || tool.batch_execution())?;
+            let cancellation_settlement_timeout =
+                capture_capability_metadata("tool cancellation settlement timeout", || {
+                    tool.cancellation_settlement_timeout()
+                })?;
+            if cancellation_settlement_timeout > crate::MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT {
+                return Err(HarnessError::InvalidCapability(format!(
+                    "tool cancellation settlement timeout exceeds {} seconds",
+                    crate::MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT.as_secs()
+                )));
+            }
             if self.tools.contains_key(&descriptor.name) || staged.contains_key(&descriptor.name) {
                 return Err(HarnessError::DuplicateCapability(descriptor.name));
             }
@@ -174,6 +186,7 @@ impl ToolRegistry {
                     descriptor,
                     origin,
                     batch_execution,
+                    cancellation_settlement_timeout,
                     tool,
                 },
             );
@@ -316,14 +329,14 @@ pub(crate) fn validate_model_id(id: &str) -> Result<(), HarnessError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use serde_json::{Value, json};
 
     use super::{CapabilityOrigin, ModelRegistry, ToolRegistry};
     use crate::{
-        HarnessError, HarnessFuture, LanguageModel, ModelOutput, ModelRequest, Tool,
-        ToolBatchExecution, ToolContext, ToolDescriptor,
+        HarnessError, HarnessFuture, LanguageModel, MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT,
+        ModelOutput, ModelRequest, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
     };
 
     struct TestModel(&'static str);
@@ -338,6 +351,10 @@ mod tests {
     struct PanickingTool;
     struct ParallelTool;
     struct PanickingBatchExecutionTool;
+    struct SettlementTool {
+        name: &'static str,
+        timeout: Option<Duration>,
+    }
 
     impl LanguageModel for TestModel {
         fn id(&self) -> &str {
@@ -427,6 +444,25 @@ mod tests {
         }
     }
 
+    impl Tool for SettlementTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: self.name.to_owned(),
+                description: "settlement test tool".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn cancellation_settlement_timeout(&self) -> Duration {
+            self.timeout
+                .unwrap_or_else(|| panic!("sensitive settlement timeout panic"))
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move { Ok(input) })
+        }
+    }
+
     #[test]
     fn model_registry_validates_identity_and_rejects_replacement() {
         let mut registry = ModelRegistry::new();
@@ -505,6 +541,53 @@ mod tests {
         assert!(matches!(error, HarnessError::InvalidCapability(_)));
         assert!(!error.to_string().contains("sensitive"));
         assert!(registry.get("panic-batch-execution").is_none());
+    }
+
+    #[test]
+    fn tool_cancellation_settlement_timeout_is_frozen_bounded_and_panic_isolated() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SettlementTool {
+                    name: "settlement",
+                    timeout: Some(Duration::from_secs(2)),
+                }),
+            )
+            .expect("bounded settlement Tool");
+        assert_eq!(
+            registry
+                .get("settlement")
+                .map(|tool| tool.cancellation_settlement_timeout),
+            Some(Duration::from_secs(2))
+        );
+
+        let over_limit = registry
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SettlementTool {
+                    name: "over-limit",
+                    timeout: Some(
+                        MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT + Duration::from_nanos(1),
+                    ),
+                }),
+            )
+            .expect_err("unbounded settlement timeout");
+        assert!(matches!(over_limit, HarnessError::InvalidCapability(_)));
+        assert!(registry.get("over-limit").is_none());
+
+        let panic = registry
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SettlementTool {
+                    name: "panic-settlement",
+                    timeout: None,
+                }),
+            )
+            .expect_err("settlement timeout panic");
+        assert!(matches!(panic, HarnessError::InvalidCapability(_)));
+        assert!(!panic.to_string().contains("sensitive"));
+        assert!(registry.get("panic-settlement").is_none());
     }
 
     #[test]

@@ -201,6 +201,15 @@ internals or read Engine storage directly.
 - MCP discovery never mutates Tool registration incrementally. The complete
   namespaced catalog is validated for portable names, schemas, collisions, and
   metadata panics before one atomic registry commit.
+- Tool cleanup grace defaults to zero, is frozen at registration, and cannot
+  exceed ten seconds. Cancellation and the Turn deadline cancel a per-call Tool
+  signal before the Runtime waits that grace. A cleanup error must not be
+  relabeled as successful cancellation or timeout.
+- MCP Tool execution must use the cancellation-aware client entry. Built-in
+  stateful transports remove and boundedly close an affected session before
+  returning cancellation; they never retry an ambiguous Tool call. A queued
+  call cancelled before acquiring the session must return without disturbing
+  unrelated in-flight work.
 - Remote MCP must reuse the same provider-neutral client and Tool/Memory
   registration path. The shipped HTTPS adapter accepts only exact
   credential-free HTTPS URLs, resolves a configured Secret for each request,

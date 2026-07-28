@@ -30,8 +30,9 @@ use tokio::{
 };
 
 use crate::{
-    CapabilityOrigin, ExecutionPhase, HarnessError, HarnessFuture, NetworkAccess,
-    ProcessBrokerDescriptor, ProcessIsolation, Tool, ToolContext, ToolDescriptor, ToolRegistry,
+    CapabilityOrigin, ExecutionPhase, HarnessError, HarnessFuture,
+    MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, NetworkAccess, ProcessBrokerDescriptor,
+    ProcessIsolation, Tool, ToolContext, ToolDescriptor, ToolRegistry,
     execution::{ChildProcessGroup, MacOsSeatbeltPolicy, configure_process_group},
     kernel::{validate_capability_name, validate_capability_origin, validate_registry_growth},
 };
@@ -52,6 +53,7 @@ const MAX_MCP_CURSOR_BYTES: usize = 4_096;
 const MAX_MCP_TIMEOUT: Duration = Duration::from_secs(86_400);
 const MAX_MCP_PROCESS_CONCURRENCY: usize = 4_096;
 const MCP_CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const MCP_SESSION_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(9);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Provider-neutral view of an MCP tool declaration.
@@ -70,6 +72,27 @@ pub trait McpClient: Send + Sync {
     fn list_tools<'a>(&'a self) -> HarnessFuture<'a, Vec<McpToolDescriptor>>;
     /// Calls one tool with JSON-object arguments.
     fn call_tool<'a>(&'a self, name: &'a str, arguments: Value) -> HarnessFuture<'a, Value>;
+    /// Calls one tool while observing the owning Turn's cooperative stop signal.
+    ///
+    /// The default drops the in-flight call Future when cancellation wins.
+    /// Stateful transports should override this method to invalidate the
+    /// affected session before returning.
+    fn call_tool_with_cancellation<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Value,
+        cancellation: crate::CancellationToken,
+    ) -> HarnessFuture<'a, Value> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                }),
+                result = self.call_tool(name, arguments) => result,
+            }
+        })
+    }
 }
 
 struct McpToolAdapter {
@@ -83,14 +106,15 @@ impl Tool for McpToolAdapter {
         self.descriptor.clone()
     }
 
+    fn cancellation_settlement_timeout(&self) -> Duration {
+        MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT
+    }
+
     fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value> {
         Box::pin(async move {
-            if context.cancellation.is_cancelled() {
-                return Err(HarnessError::Cancelled {
-                    phase: ExecutionPhase::Tool,
-                });
-            }
-            self.client.call_tool(&self.remote_name, input).await
+            self.client
+                .call_tool_with_cancellation(&self.remote_name, input, context.cancellation)
+                .await
         })
     }
 }
@@ -583,6 +607,33 @@ impl StdioMcpClient {
         }
     }
 
+    async fn call_tool_in_session(
+        &self,
+        session: &mut Option<RunningService<RoleClient, ()>>,
+        name: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<Value, HarnessError> {
+        let service = self.ensure_connected(session).await?;
+        let result = timeout(
+            self.config.request_timeout,
+            service
+                .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)),
+        )
+        .await;
+        let result = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Self::invalidate(session);
+                return Err(HarnessError::Mcp(format!("MCP tool {name} failed")));
+            }
+            Err(_) => {
+                Self::invalidate(session);
+                return Err(HarnessError::Mcp(format!("MCP tool {name} timed out")));
+            }
+        };
+        tool_result_value(name, result)
+    }
+
     /// Gracefully closes the active MCP session within the configured timeout.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         let service = self.session.lock().await.take();
@@ -619,54 +670,97 @@ impl McpClient for StdioMcpClient {
 
     fn call_tool<'a>(&'a self, name: &'a str, arguments: Value) -> HarnessFuture<'a, Value> {
         Box::pin(async move {
-            validate_mcp_tool_name(name)?;
-            crate::json::validate_value_shape(&arguments).map_err(|_| {
-                HarnessError::Mcp(
-                    "MCP tool arguments exceed the supported JSON depth or node count".to_owned(),
-                )
-            })?;
-            let arguments = match arguments {
-                Value::Object(arguments) => {
-                    crate::json::bounded_serialized_size(&arguments, MAX_MCP_TOOL_ARGUMENT_BYTES)
-                        .map_err(|error| match error {
-                        crate::json::BoundedJsonError::LimitExceeded => HarnessError::Mcp(format!(
-                            "MCP tool arguments exceed {MAX_MCP_TOOL_ARGUMENT_BYTES} bytes"
-                        )),
-                        crate::json::BoundedJsonError::CannotEncode => {
-                            HarnessError::Mcp("cannot encode MCP tool arguments".to_owned())
-                        }
-                    })?;
-                    arguments
-                }
-                _ => {
-                    return Err(HarnessError::Mcp(
-                        "MCP tool arguments must be a JSON object".to_owned(),
-                    ));
-                }
-            };
+            let arguments =
+                validated_mcp_tool_arguments(name, arguments, MAX_MCP_TOOL_ARGUMENT_BYTES)?;
             let mut session = self.session.lock().await;
-            let service = self.ensure_connected(&mut session).await?;
-            let result = timeout(
-                self.config.request_timeout,
-                service.call_tool(
-                    CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
-                ),
-            )
-            .await;
-            let result = match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    Self::invalidate(&mut session);
-                    return Err(HarnessError::Mcp(format!("MCP tool {name} failed")));
-                }
-                Err(_) => {
-                    Self::invalidate(&mut session);
-                    return Err(HarnessError::Mcp(format!("MCP tool {name} timed out")));
-                }
-            };
-            tool_result_value(name, result)
+            self.call_tool_in_session(&mut session, name, arguments)
+                .await
         })
     }
+
+    fn call_tool_with_cancellation<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Value,
+        cancellation: crate::CancellationToken,
+    ) -> HarnessFuture<'a, Value> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                });
+            }
+            let arguments =
+                validated_mcp_tool_arguments(name, arguments, MAX_MCP_TOOL_ARGUMENT_BYTES)?;
+            let mut session = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                }),
+                session = self.session.lock() => session,
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                result = self.call_tool_in_session(&mut session, name, arguments) => return result,
+            };
+            settle_cancelled_session(&mut session, "stdio").await?;
+            Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Tool,
+            })
+        })
+    }
+}
+
+pub(super) async fn settle_cancelled_session(
+    session: &mut Option<RunningService<RoleClient, ()>>,
+    transport: &str,
+) -> Result<(), HarnessError> {
+    let Some(mut service) = session.take() else {
+        return Ok(());
+    };
+    match service
+        .close_with_timeout(MCP_SESSION_CANCELLATION_TIMEOUT)
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(HarnessError::Mcp(format!(
+            "{transport} MCP session cancellation did not settle within {} seconds",
+            MCP_SESSION_CANCELLATION_TIMEOUT.as_secs()
+        ))),
+        Err(_) => Err(HarnessError::Mcp(format!(
+            "{transport} MCP session cancellation failed"
+        ))),
+    }
+}
+
+pub(super) fn validated_mcp_tool_arguments(
+    name: &str,
+    arguments: Value,
+    maximum_bytes: usize,
+) -> Result<serde_json::Map<String, Value>, HarnessError> {
+    validate_mcp_tool_name(name)?;
+    crate::json::validate_value_shape(&arguments).map_err(|_| {
+        HarnessError::Mcp(
+            "MCP tool arguments exceed the supported JSON depth or node count".to_owned(),
+        )
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(HarnessError::Mcp(
+            "MCP tool arguments must be a JSON object".to_owned(),
+        ));
+    };
+    crate::json::bounded_serialized_size(&arguments, maximum_bytes).map_err(
+        |error| match error {
+            crate::json::BoundedJsonError::LimitExceeded => {
+                HarnessError::Mcp(format!("MCP tool arguments exceed {maximum_bytes} bytes"))
+            }
+            crate::json::BoundedJsonError::CannotEncode => {
+                HarnessError::Mcp("cannot encode MCP tool arguments".to_owned())
+            }
+        },
+    )?;
+    Ok(arguments)
 }
 
 pub(super) async fn list_tools_bounded(
@@ -900,14 +994,21 @@ pub fn mcp_client(client: impl McpClient + 'static) -> Arc<dyn McpClient> {
 mod tests {
     use std::{
         collections::BTreeMap,
+        future::pending,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
     use rmcp::model::{CallToolResult, ContentBlock};
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Notify,
+    };
 
     use super::{
         BoundedLineReader, MAX_MCP_PROCESS_CONCURRENCY, McpClient, McpToolDescriptor,
@@ -915,8 +1016,9 @@ mod tests {
         register_selected_mcp_tools, tool_result_value,
     };
     use crate::{
-        AllowListPolicy, CapabilityOrigin, HarnessError, HarnessFuture, HarnessRuntime,
-        LanguageModel, MemoryEventStore, ModelOutput, ModelRequest, StateEngine, ToolRegistry,
+        AllowListPolicy, CancellationToken, CapabilityOrigin, ExecutionPhase, HarnessError,
+        HarnessFuture, HarnessRuntime, ItemKind, LanguageModel, MemoryEventStore, ModelOutput,
+        ModelRequest, StateEngine, ToolRegistry, TurnExecutionOptions, TurnStatus, TurnStopReason,
     };
 
     struct FakeMcpClient {
@@ -936,6 +1038,49 @@ mod tests {
                     .map_err(|_| HarnessError::Mcp("call recorder poisoned".to_owned()))?
                     .push(name.to_owned());
                 Ok(arguments)
+            })
+        }
+    }
+
+    struct PendingMcpClient {
+        entered: Arc<Notify>,
+        settled: Arc<AtomicBool>,
+    }
+
+    impl McpClient for PendingMcpClient {
+        fn list_tools<'a>(&'a self) -> HarnessFuture<'a, Vec<McpToolDescriptor>> {
+            Box::pin(async {
+                Ok(vec![McpToolDescriptor {
+                    name: "echo".to_owned(),
+                    description: Some("Never returns".to_owned()),
+                    input_schema: json!({"type": "object"}),
+                }])
+            })
+        }
+
+        fn call_tool<'a>(&'a self, _name: &'a str, _arguments: Value) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                pending().await
+            })
+        }
+
+        fn call_tool_with_cancellation<'a>(
+            &'a self,
+            name: &'a str,
+            arguments: Value,
+            cancellation: CancellationToken,
+        ) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    result = self.call_tool(name, arguments) => return result,
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.settled.store(true, Ordering::SeqCst);
+                Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                })
             })
         }
     }
@@ -1228,6 +1373,135 @@ mod tests {
             Err(HarnessError::InvalidCapability(_))
         ));
         assert!(empty.descriptors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_cancellation_stops_an_in_flight_mcp_tool() {
+        let entered = Arc::new(Notify::new());
+        let settled = Arc::new(AtomicBool::new(false));
+        let client: Arc<dyn McpClient> = Arc::new(PendingMcpClient {
+            entered: entered.clone(),
+            settled: settled.clone(),
+        });
+        let mut tools = ToolRegistry::new();
+        register_mcp_tools(
+            &mut tools,
+            CapabilityOrigin::External {
+                id: "mcp/pending".to_owned(),
+            },
+            "demo",
+            client,
+        )
+        .await
+        .expect("register pending MCP tool");
+
+        let runtime = HarnessRuntime::new(
+            Arc::new(McpCallingModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("demo.echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+        let cancellation = CancellationToken::new();
+        let cancel_from_task = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            entered.notified().await;
+            cancel_from_task.cancel();
+        });
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "cancel MCP",
+                TurnExecutionOptions {
+                    cancellation,
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("MCP-backed Turn should be cancelled");
+        canceller.await.expect("canceller");
+        assert!(settled.load(Ordering::SeqCst));
+
+        assert_eq!(
+            error,
+            HarnessError::Cancelled {
+                phase: ExecutionPhase::Tool
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Cancelled);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::Cancelled,
+                phase: ExecutionPhase::Tool,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn turn_deadline_settles_an_in_flight_mcp_tool_before_timeout() {
+        let settled = Arc::new(AtomicBool::new(false));
+        let client: Arc<dyn McpClient> = Arc::new(PendingMcpClient {
+            entered: Arc::new(Notify::new()),
+            settled: settled.clone(),
+        });
+        let mut tools = ToolRegistry::new();
+        register_mcp_tools(
+            &mut tools,
+            CapabilityOrigin::External {
+                id: "mcp/pending".to_owned(),
+            },
+            "demo",
+            client,
+        )
+        .await
+        .expect("register pending MCP tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(McpCallingModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("demo.echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "time out MCP",
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("MCP-backed Turn should time out");
+
+        assert!(settled.load(Ordering::SeqCst));
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Tool
+            }
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(matches!(
+            projected.turns[0].items.last().map(|item| &item.kind),
+            Some(ItemKind::TurnStopped {
+                reason: TurnStopReason::TimedOut,
+                phase: ExecutionPhase::Tool,
+            })
+        ));
     }
 
     #[tokio::test]

@@ -5,7 +5,9 @@ mod control;
 mod registry;
 mod types;
 
-pub use capability::{LanguageModel, ModelEventSink, ModelStream, Tool};
+pub use capability::{
+    LanguageModel, MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, ModelEventSink, ModelStream, Tool,
+};
 pub use control::CancellationToken;
 pub use registry::{
     CapabilityOrigin, ModelRegistry, RegisteredModel, RegisteredTool, ToolRegistry,

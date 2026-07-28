@@ -8,13 +8,16 @@ use std::{
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use y_harness::{McpClient, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority};
+use y_harness::{
+    CancellationToken, ExecutionPhase, HarnessError, McpClient, StdioMcpClient, StdioMcpConfig,
+    StdioMcpLaunchAuthority,
+};
 
 fn fixture_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_yh-fault-fixture"))
 }
 
-fn temp_fixture() -> (PathBuf, PathBuf) {
+fn temp_fixture(case: &str) -> (PathBuf, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -26,8 +29,8 @@ fn temp_fixture() -> (PathBuf, PathBuf) {
     let journal_path = directory.join("journal.jsonl");
     let spec = json!({
         "format_version": 1,
-        "fixture_id": "cf-tool-uncertain-001",
-        "case": "crash_after_first_effect",
+        "fixture_id": format!("cf-tool-{case}-001"),
+        "case": case,
         "expected_fixture_executable_sha256": sha256_file(&fixture_binary()),
         "journal": journal_path,
         "operation_id": "effect-001",
@@ -80,7 +83,7 @@ fn client(spec_path: &Path, current_dir: &Path) -> StdioMcpClient {
 
 #[tokio::test]
 async fn real_mcp_crash_is_durable_and_never_implicitly_retried() {
-    let (directory, spec_path) = temp_fixture();
+    let (directory, spec_path) = temp_fixture("crash_after_first_effect");
     let prepared = run_fixture("prepare", &spec_path);
     assert_eq!(prepared["format_version"], 1);
     let repeated_prepare = Command::new(fixture_binary())
@@ -126,6 +129,63 @@ async fn real_mcp_crash_is_durable_and_never_implicitly_retried() {
     assert_eq!(duplicated["effect_count"], 2);
     assert_eq!(duplicated["oracle"]["passed"], false);
     assert_eq!(duplicated["oracle"]["classification"], "duplicate_effect");
+
+    fs::remove_dir_all(&directory).expect("remove isolated fixture directory");
+}
+
+#[tokio::test]
+async fn cancelling_a_live_stdio_mcp_call_invalidates_its_session() {
+    let (directory, spec_path) = temp_fixture("hold_after_first_effect");
+    run_fixture("prepare", &spec_path);
+    let client = client(&spec_path, &directory);
+    client.list_tools().await.expect("fixture tool catalog");
+    let arguments = json!({
+        "operation_id": "effect-001",
+        "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    let cancellation = CancellationToken::new();
+    let cancel_from_thread = cancellation.clone();
+    let journal_path = directory.join("journal.jsonl");
+    let canceller = std::thread::spawn(move || {
+        for _ in 0..500 {
+            let committed = fs::read_to_string(&journal_path)
+                .is_ok_and(|journal| journal.contains("\"type\":\"effect_committed\""));
+            if committed {
+                cancel_from_thread.cancel();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cancel_from_thread.cancel();
+        false
+    });
+
+    let error = client
+        .call_tool_with_cancellation("commit_effect", arguments.clone(), cancellation)
+        .await
+        .expect_err("live MCP call should be cancelled");
+    assert_eq!(
+        error,
+        HarnessError::Cancelled {
+            phase: ExecutionPhase::Tool
+        }
+    );
+    assert!(canceller.join().expect("canceller"));
+
+    let after_cancel = run_fixture("inspect", &spec_path);
+    assert_eq!(after_cancel["invocation_count"], 1);
+    assert_eq!(after_cancel["effect_count"], 1);
+    assert_eq!(
+        after_cancel["oracle"]["classification"],
+        "uncertain_effect_not_replayed"
+    );
+
+    let second = client
+        .call_tool("commit_effect", arguments)
+        .await
+        .expect("an explicit second call reconnects");
+    assert_eq!(second["effect_ordinal"], 2);
+    client.shutdown().await.expect("fixture shutdown");
 
     fs::remove_dir_all(&directory).expect("remove isolated fixture directory");
 }

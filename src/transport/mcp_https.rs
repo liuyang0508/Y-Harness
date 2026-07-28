@@ -36,10 +36,12 @@ use tokio::{sync::Mutex, time::timeout};
 use zeroize::Zeroizing;
 
 use super::mcp::{
-    McpClient, McpToolDescriptor, list_tools_bounded, tool_result_value, validate_mcp_tool_name,
+    McpClient, McpToolDescriptor, list_tools_bounded, settle_cancelled_session, tool_result_value,
+    validated_mcp_tool_arguments,
 };
 use crate::{
-    HarnessError, HarnessFuture, SecretProvider, SecretReference, SecretRequest, ThreadId, TurnId,
+    CancellationToken, ExecutionPhase, HarnessError, HarnessFuture, SecretProvider,
+    SecretReference, SecretRequest, ThreadId, TurnId,
 };
 
 const MAX_HTTPS_MCP_URL_BYTES: usize = 8_192;
@@ -233,6 +235,35 @@ impl HttpsJsonMcpClient {
         }
     }
 
+    async fn call_tool_in_session(
+        &self,
+        session: &mut Option<RunningService<RoleClient, ()>>,
+        name: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<Value, HarnessError> {
+        let service = self.ensure_connected(session).await?;
+        let result = timeout(
+            self.config.request_timeout,
+            service
+                .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)),
+        )
+        .await;
+        let result = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Self::invalidate(session);
+                return Err(HarnessError::Mcp(format!("HTTPS MCP tool {name} failed")));
+            }
+            Err(_) => {
+                Self::invalidate(session);
+                return Err(HarnessError::Mcp(format!(
+                    "HTTPS MCP tool {name} timed out"
+                )));
+            }
+        };
+        tool_result_value(name, result)
+    }
+
     /// Gracefully closes the active remote session.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         let service = self.session.lock().await.take();
@@ -270,57 +301,44 @@ impl McpClient for HttpsJsonMcpClient {
 
     fn call_tool<'a>(&'a self, name: &'a str, arguments: Value) -> HarnessFuture<'a, Value> {
         Box::pin(async move {
-            validate_mcp_tool_name(name)?;
-            crate::json::validate_value_shape(&arguments).map_err(|_| {
-                HarnessError::Mcp(
-                    "MCP tool arguments exceed the supported JSON depth or node count".to_owned(),
-                )
-            })?;
-            let arguments = match arguments {
-                Value::Object(arguments) => {
-                    crate::json::bounded_serialized_size(
-                        &arguments,
-                        MAX_HTTPS_MCP_TOOL_ARGUMENT_BYTES,
-                    )
-                    .map_err(|error| match error {
-                        crate::json::BoundedJsonError::LimitExceeded => HarnessError::Mcp(format!(
-                            "MCP tool arguments exceed {MAX_HTTPS_MCP_TOOL_ARGUMENT_BYTES} bytes"
-                        )),
-                        crate::json::BoundedJsonError::CannotEncode => {
-                            HarnessError::Mcp("cannot encode MCP tool arguments".to_owned())
-                        }
-                    })?;
-                    arguments
-                }
-                _ => {
-                    return Err(HarnessError::Mcp(
-                        "MCP tool arguments must be a JSON object".to_owned(),
-                    ));
-                }
-            };
+            let arguments =
+                validated_mcp_tool_arguments(name, arguments, MAX_HTTPS_MCP_TOOL_ARGUMENT_BYTES)?;
             let mut session = self.session.lock().await;
-            let service = self.ensure_connected(&mut session).await?;
-            let result = timeout(
-                self.config.request_timeout,
-                service.call_tool(
-                    CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
-                ),
-            )
-            .await;
-            let result = match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    Self::invalidate(&mut session);
-                    return Err(HarnessError::Mcp(format!("HTTPS MCP tool {name} failed")));
-                }
-                Err(_) => {
-                    Self::invalidate(&mut session);
-                    return Err(HarnessError::Mcp(format!(
-                        "HTTPS MCP tool {name} timed out"
-                    )));
-                }
+            self.call_tool_in_session(&mut session, name, arguments)
+                .await
+        })
+    }
+
+    fn call_tool_with_cancellation<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> HarnessFuture<'a, Value> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                });
+            }
+            let arguments =
+                validated_mcp_tool_arguments(name, arguments, MAX_HTTPS_MCP_TOOL_ARGUMENT_BYTES)?;
+            let mut session = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HarnessError::Cancelled {
+                    phase: ExecutionPhase::Tool,
+                }),
+                session = self.session.lock() => session,
             };
-            tool_result_value(name, result)
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                result = self.call_tool_in_session(&mut session, name, arguments) => return result,
+            };
+            settle_cancelled_session(&mut session, "HTTPS").await?;
+            Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Tool,
+            })
         })
     }
 }
