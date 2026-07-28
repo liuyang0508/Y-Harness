@@ -118,7 +118,13 @@ JSON-command Model, stdio MCP, SQLite restart, permissioned exact-Turn
 recovery, and a Tool-free audit Turn. State rechecks the expected Turn at the
 optimistic-commit boundary, while the report explicitly declines descendant
 cleanup, in-place continuation, reasoning-quality, and comparative claims.
-No cross-product comparative result is claimed.
+A shared-Provider Claude Code/Codex preflight also completed with the same
+requested Model identifier, prompts, effort label, timeout, empty-workspace
+class, and fixed response. Its machine verdict is `not_comparable`: Codex
+reported fallback Model metadata, the products used different protocols,
+Tools, reasoning representations, Context, and sandboxes, and identical Model
+implementation was not settled. No cross-product comparative result is
+claimed.
 
 ## Start
 

@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "experiment": "harness_control_preflight",
+  "verdict": "not_comparable",
+  "eligible_for_harness_effect_claim": false,
+  "reports": {
+    "claude_code": "claude-result.json",
+    "codex": "codex-result.json"
+  },
+  "shared_requested_controls": {
+    "provider_process": "provider.mjs",
+    "provider_executable_sha256": "ddc8c2357dd1f0a4d1a2a7ecb7d723abc8b7bc363a4c1973bf25ac2279a0408f",
+    "provider_label": "yh-shared-harness-control",
+    "model_identifier": "claude-haiku-4-5-20251001",
+    "reasoning_effort_label": "medium",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "prompt_sha256": "b2103b25500d9e500be458ce046ac18f83795f91638487c5efd0eec30dfbda72",
+    "timeout_ms": 30000,
+    "workspace_snapshot": "empty-directory-v1",
+    "expected_output": "YH-HARNESS-CONTROL-OK"
+  },
+  "established": [
+    "both released products completed against one deterministic loopback Provider process",
+    "both adapters requested the same Provider label, Model identifier, prompts, reasoning-effort label, timeout, and empty-workspace class",
+    "the fixture observed both requested prompts and returned the same deterministic output"
+  ],
+  "blocking_differences": [
+    "the products used different wire protocols: Anthropic Messages and OpenAI Responses",
+    "Codex reported that the shared Model identifier had no Model metadata and used fallback metadata",
+    "Claude Code settled the Model identifier while Codex JSONL did not settle Model or Provider identity",
+    "Claude Code exposed no Tools while Codex exposed five read-only built-in Tools",
+    "Claude Code requested enabled thinking with a 31999-token budget while Codex requested medium effort with automatic summary",
+    "Claude Code ran without a product OS sandbox while Codex requested its read-only product sandbox",
+    "the products injected different built-in Context and materialized different isolated state",
+    "only Claude Code exposed a hard monetary budget and projected price-table cost; neither adapter established a common Provider-call ceiling"
+  ],
+  "next_required_control": "Use a Provider and Model implementation natively supported and identically settled by both products, then equalize Tool, Context, sandbox, budget, and call-ceiling semantics before running a shared Tool workload; if no such coordinate exists, this product pair remains unavailable to the Harness-control track."
+}

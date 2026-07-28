@@ -28,8 +28,9 @@ contracts now exist, with one checked-in real Claude Code
 ambient-product result, one real deterministic Claude Code fixed-output
 result, one real Grok Build fixed-output result, one real Pi fixed-output
 result, one real OpenCode fixed-output result, one real Hermes fixed-output
-result, one real Codex fixed-output result, and two Codex CF-003 fault records.
-All have
+result, one real Codex fixed-output result, one shared-Provider Claude
+Code/Codex Harness-control preflight, and two Codex CF-003 fault records. All
+have
 `claim_eligible: false`: they prove bounded adapters and registered fault
 behavior, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
@@ -67,6 +68,22 @@ permit:
 
 If a product cannot accept one of these controls, the difference is recorded
 and the run cannot support a pure Harness-effect claim.
+
+The first real preflight is preserved under
+[`2026-07-28-harness-control-preflight`](../tools/benchmark-runner/evidence/2026-07-28-harness-control-preflight/).
+Released Claude Code `2.1.143` and Codex `0.145.0` used one running
+deterministic Provider fixture and requested the same Provider label, Model
+identifier, prompts, `medium` effort label, timeout, and empty-workspace class.
+Both returned the same fixed text. The result is nevertheless
+`not_comparable`: Claude used Anthropic Messages with no Tools and enabled
+thinking, while Codex used OpenAI Responses with five built-in Tools,
+automatic reasoning summary, and a read-only product sandbox. Codex also
+reported that the shared Claude Model identifier had no Model metadata and
+that fallback metadata was used; its JSONL did not settle Model or Provider
+identity. A shared string and fixture therefore did not establish an
+identically implemented Model coordinate. No shared Tool workload may be
+promoted to this track until that identity gap and the Tool, Context, sandbox,
+budget, and Provider-call-ceiling differences are equalized.
 
 ### Product-default track
 

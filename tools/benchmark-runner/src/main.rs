@@ -1251,4 +1251,174 @@ mod tests {
             "Return exactly YH-CLAUDE-ADAPTER-OK"
         );
     }
+
+    #[test]
+    fn checked_in_harness_control_preflight_rejects_false_model_and_tool_parity() {
+        let claude_spec: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-harness-control-preflight/claude-spec.json"
+        ))
+        .expect("checked-in Claude Code preflight spec");
+        let codex_spec: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-harness-control-preflight/codex-spec.json"
+        ))
+        .expect("checked-in Codex preflight spec");
+        let manifest: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-harness-control-preflight/preflight.json"
+        ))
+        .expect("checked-in Harness-control preflight");
+        let claude: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-harness-control-preflight/claude-result.json"
+        ))
+        .expect("checked-in Claude Code preflight report");
+        let codex: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-harness-control-preflight/codex-result.json"
+        ))
+        .expect("checked-in Codex preflight report");
+        let requests =
+            include_str!("../evidence/2026-07-28-harness-control-preflight/provider-request.jsonl")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("preflight Provider request")
+                })
+                .collect::<Vec<_>>();
+        let provider =
+            include_bytes!("../evidence/2026-07-28-harness-control-preflight/provider.mjs");
+
+        assert_eq!(manifest["verdict"], "not_comparable");
+        assert_eq!(manifest["eligible_for_harness_effect_claim"], false);
+        assert_eq!(
+            sha256_bytes(provider),
+            manifest["shared_requested_controls"]["provider_executable_sha256"]
+        );
+
+        for field in [
+            "benchmark_version",
+            "case_id",
+            "workspace_snapshot",
+            "profile",
+            "provider",
+            "model",
+            "reasoning_effort",
+            "system_prompt",
+            "prompt",
+            "timeout_ms",
+        ] {
+            assert_eq!(
+                claude_spec[field], codex_spec[field],
+                "shared input coordinate {field}"
+            );
+        }
+        assert_eq!(
+            codex_spec["provider_base_url"],
+            format!(
+                "{}/v1",
+                claude_spec["provider_base_url"]
+                    .as_str()
+                    .expect("Claude Provider base URL")
+            )
+        );
+        assert_eq!(
+            sha256_bytes(
+                claude_spec["system_prompt"]
+                    .as_str()
+                    .expect("Claude system prompt")
+                    .as_bytes()
+            ),
+            claude["controls"]["system_prompt_sha256"]
+        );
+        assert_eq!(
+            sha256_bytes(
+                codex_spec["prompt"]
+                    .as_str()
+                    .expect("Codex prompt")
+                    .as_bytes()
+            ),
+            codex["controls"]["prompt_sha256"]
+        );
+        assert_eq!(
+            claude_spec["expected_product_executable_sha256"],
+            claude["adapter"]["product_executable_sha256"]
+        );
+        assert_eq!(
+            codex_spec["expected_product_executable_sha256"],
+            codex["adapter"]["product_executable_sha256"]
+        );
+
+        for field in [
+            "requested_provider",
+            "requested_model",
+            "prompt_sha256",
+            "system_prompt_sha256",
+            "requested_reasoning_effort",
+            "timeout_ms",
+        ] {
+            assert_eq!(
+                claude["controls"][field], codex["controls"][field],
+                "shared requested control {field}"
+            );
+        }
+        assert_eq!(
+            claude["coordinate"]["benchmark_version"],
+            codex["coordinate"]["benchmark_version"]
+        );
+        assert_eq!(
+            claude["coordinate"]["case_id"],
+            codex["coordinate"]["case_id"]
+        );
+        assert_eq!(
+            claude["coordinate"]["workspace_snapshot"],
+            codex["coordinate"]["workspace_snapshot"]
+        );
+        assert_eq!(claude["controls"]["claim_eligible"], false);
+        assert_eq!(codex["controls"]["claim_eligible"], false);
+        assert_eq!(
+            claude["execution"]["settlement"]["raw_result"]["result"],
+            "YH-HARNESS-CONTROL-OK"
+        );
+        assert_eq!(
+            codex["execution"]["settlement"]["raw_result"][3]["item"]["text"],
+            "YH-HARNESS-CONTROL-OK"
+        );
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["protocol"], "claude_probe");
+        assert_eq!(requests[1]["protocol"], "anthropic_messages");
+        assert_eq!(requests[2]["protocol"], "openai_responses");
+        assert_eq!(requests[1]["authorization"], "x-api-key-valid");
+        assert_eq!(requests[2]["authorization"], "bearer-valid");
+        assert_eq!(requests[1]["body"]["model"], requests[2]["body"]["model"]);
+        assert_eq!(requests[1]["body"]["tool_names"], serde_json::json!([]));
+        assert_eq!(
+            requests[2]["body"]["tool_names"],
+            serde_json::json!([
+                "exec_command",
+                "write_stdin",
+                "update_plan",
+                "request_user_input",
+                "view_image"
+            ])
+        );
+        assert_eq!(
+            requests[1]["body"]["thinking"],
+            serde_json::json!({"budget_tokens": 31_999, "type": "enabled"})
+        );
+        assert_eq!(
+            requests[2]["body"]["reasoning"],
+            serde_json::json!({"effort": "medium", "summary": "auto"})
+        );
+
+        assert_eq!(
+            claude["controls"]["observed_models"],
+            serde_json::json!(["claude-haiku-4-5-20251001"])
+        );
+        assert_eq!(codex["controls"]["observed_models"], serde_json::json!([]));
+        assert_eq!(claude["controls"]["tools"], "disabled");
+        assert_eq!(codex["controls"]["tools"], "product_builtins_read_only");
+        assert!(claude["controls"]["product_sandbox"].is_null());
+        assert_eq!(codex["controls"]["product_sandbox"], "read-only");
+        assert_eq!(
+            codex["execution"]["settlement"]["raw_result"][1]["item"]["message"],
+            "Model metadata for `claude-haiku-4-5-20251001` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."
+        );
+    }
 }

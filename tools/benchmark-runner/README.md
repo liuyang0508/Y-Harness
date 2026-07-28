@@ -471,5 +471,15 @@ fixed-output record is checked in under
 [`evidence/2026-07-28-hermes-fixed-output`](evidence/2026-07-28-hermes-fixed-output).
 It remains `claim_eligible: false`; there is no comparative Hermes run.
 
+The checked-in
+[`2026-07-28-harness-control-preflight`](evidence/2026-07-28-harness-control-preflight/)
+record reuses the format-1 Claude Code and format-2 Codex adapters against one
+running deterministic Provider fixture. Its `preflight.json` verdict is
+`not_comparable`: the same requested Model identifier triggered Codex fallback
+metadata, and the actual requests retained different protocols, Tool surfaces,
+reasoning representations, and sandbox semantics. This preflight is a
+machine-checked refusal to overclaim, not an additional report format or a
+Harness-effect result.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

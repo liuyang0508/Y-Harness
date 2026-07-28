@@ -160,6 +160,9 @@ yh skill verify "$project/y-harness.json"
       和哈希锁定二进制；真实服务重启先保留 abandoned Turn 为 `running`，
       显式精确 Turn recovery 后为 `interrupted`，新 Turn 无 Tool 完成，
       独立 oracle 前后均保持一次调用/一次 effect。
+- [ ] Claude Code/Codex 共享 Provider 预检必须核对相同请求坐标与真实
+      wire sidecar；只要 Model 元数据、协议、Tool、推理、Context、沙箱、
+      预算或调用上限未对齐，机器结论必须保持 `not_comparable`。
 - [ ] 所有 released-product 适配器始终输出
       `claim_eligible: false`；单产品 conformance 不能作为效果超越证据。
 

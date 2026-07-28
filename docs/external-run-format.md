@@ -307,6 +307,19 @@ Its loopback sidecar corroborated one Responses request, exact Model and
 reasoning effort, absent automatic Skill/App instructions, and six visible
 built-in Tools. It remains non-comparative, `claim_eligible: false` evidence.
 
+A real two-product control preflight is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-harness-control-preflight`](../tools/benchmark-runner/evidence/2026-07-28-harness-control-preflight/).
+Released Claude Code `2.1.143` and Codex `0.145.0` completed against the same
+running loopback Provider process with matching requested labels, Model
+identifier, prompts, effort label, timeout, and empty-workspace class. The
+machine-readable verdict is `not_comparable`, not a new external-run format:
+the existing format-1 and format-2 reports remain `adapter_conformance` and
+`claim_eligible: false`. The sidecar preserves different wire protocols,
+reasoning representations, Tool surfaces, and sandbox behavior. Codex also
+emitted a fallback-Model-metadata event for the shared Claude identifier and
+did not settle Model or Provider identity, so same-Model parity was not
+established.
+
 The source-pinned format-7 driver is additionally tested against official tag
 [`rust-v0.145.0`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
 One real released-product CF-003 record is preserved under

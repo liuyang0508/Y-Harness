@@ -74,9 +74,9 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
 The all-feature workspace run contains 344 passing library tests plus
 2 manual size tests, 10 CLI configuration tests, 23 Engine process/service tests, 11 TUI
 unit/render tests, 2 local private-gateway TLS integration tests, 2 local
-private-MCP TLS integration tests, 51 product/Engine evidence-adapter tests, and 6
-deterministic fault-fixture tests: 449 passing plus 7 explicitly ignored
-fixtures in total. The no-default-feature workspace run contains 420 passing tests plus 3 ignored
+private-MCP TLS integration tests, 52 product/Engine evidence-adapter tests, and 6
+deterministic fault-fixture tests: 450 passing plus 7 explicitly ignored
+fixtures in total. The no-default-feature workspace run contains 421 passing tests plus 3 ignored
 manual/environment fixtures. The demo and configured PTY
 smoke gates submit real Turns, create atomic child Threads, verify parent/child
 history plus durable lineage in State, and check alternate-screen and
@@ -117,7 +117,10 @@ This completion audit is an internal contract-coverage statement, not evidence
 that Y-Harness produces better results than another Harness or product. Such a
 claim additionally requires the controlled, source-pinned protocol in
 [`competitive-benchmark.md`](competitive-benchmark.md); no comparative result
-has been produced yet.
+has been produced yet. The first shared-Provider Claude Code/Codex preflight
+completed but correctly returned `not_comparable`: the common requested Model
+identifier triggered Codex fallback metadata, and protocol, Tool, reasoning,
+sandbox, Context, and settlement controls remained unequal.
 
 “No bugs” is not a verifiable permanent state. The enforceable completion rule
 is zero known critical/high defects plus named, reproducible evidence for every
