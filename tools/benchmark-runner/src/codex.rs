@@ -2,9 +2,19 @@
 
 use super::*;
 
-const ADAPTER_VERSION: &str = "codex-exec-jsonl-v1";
+const ADAPTER_VERSION: &str = "codex-exec-jsonl-v2";
 const RUN_FORMAT_VERSION: u32 = 2;
 const MAX_EVENTS: usize = 4_096;
+const BARE_PROVIDER_ID: &str = "yh_bench";
+const PROVIDER_TOKEN_ENV: &str = "CODEX_API_KEY";
+const OWNED_BARE_ENVIRONMENT: [&str; 6] = [
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,11 +36,15 @@ pub(super) struct RunSpec {
     workspace: PathBuf,
     workspace_snapshot: String,
     profile: Profile,
+    provider: Option<String>,
+    provider_base_url: Option<String>,
     model: String,
+    reasoning_effort: String,
     system_prompt: String,
     prompt: String,
     timeout_ms: u64,
     inherit_environment: Vec<String>,
+    home: Option<PathBuf>,
     codex_home: Option<PathBuf>,
 }
 
@@ -65,26 +79,59 @@ fn validate_spec(spec: &RunSpec) -> AppResult<()> {
         spec.timeout_ms,
         &spec.inherit_environment,
     )?;
-    match (spec.profile, spec.codex_home.as_ref()) {
-        (Profile::Bare, Some(home)) if home.is_absolute() => {
+    validate_text("reasoning_effort", &spec.reasoning_effort)?;
+    match spec.profile {
+        Profile::Bare => {
+            let (Some(home), Some(codex_home)) = (spec.home.as_ref(), spec.codex_home.as_ref())
+            else {
+                return Err(
+                    "bare Codex profile requires absolute home and codex_home directories"
+                        .to_owned(),
+                );
+            };
+            if !home.is_absolute() || !codex_home.is_absolute() {
+                return Err(
+                    "bare Codex profile requires absolute home and codex_home directories"
+                        .to_owned(),
+                );
+            }
+            let provider = spec
+                .provider
+                .as_deref()
+                .ok_or_else(|| "bare Codex profile requires provider".to_owned())?;
+            validate_text("Codex provider", provider)?;
+            let provider_base_url = spec
+                .provider_base_url
+                .as_deref()
+                .ok_or_else(|| "bare Codex profile requires provider_base_url".to_owned())?;
+            validate_loopback_provider_base_url(provider_base_url)?;
             let names = spec
                 .inherit_environment
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>();
-            if !names.contains("CODEX_API_KEY") || !names.contains("CODEX_HOME") {
+            if !names.contains(PROVIDER_TOKEN_ENV) {
+                return Err("bare Codex profile requires CODEX_API_KEY inheritance".to_owned());
+            }
+            if OWNED_BARE_ENVIRONMENT.iter().any(|owned| {
+                spec.inherit_environment
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(owned))
+            }) {
+                return Err("bare Codex profile owns its state environment".to_owned());
+            }
+        }
+        Profile::Product => {
+            if spec.home.is_some()
+                || spec.codex_home.is_some()
+                || spec.provider.is_some()
+                || spec.provider_base_url.is_some()
+            {
                 return Err(
-                    "bare Codex profile requires CODEX_API_KEY and CODEX_HOME inheritance"
+                    "product Codex profile must not declare bare-profile state or routing"
                         .to_owned(),
                 );
             }
-        }
-        (Profile::Bare, _) => {
-            return Err("bare Codex profile requires an absolute codex_home".to_owned());
-        }
-        (Profile::Product, None) => {}
-        (Profile::Product, Some(_)) => {
-            return Err("product Codex profile must not declare codex_home".to_owned());
         }
     }
     Ok(())
@@ -101,8 +148,8 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
     if !workspace.is_dir() {
         return Err("workspace must resolve to a directory".to_owned());
     }
-    let environment = inherited_environment(&spec.inherit_environment)?;
-    validate_home(&spec, &environment)?;
+    let mut environment = inherited_environment(&spec.inherit_environment)?;
+    prepare_bare_environment(&spec, &mut environment)?;
     let broker = LocalProcessBroker::new(1).map_err(|error| error.to_string())?;
     let product_executable_sha256 = sha256_file(&program)?;
     if product_executable_sha256 != spec.expected_product_executable_sha256 {
@@ -200,11 +247,14 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
     let mut unsupported_controls = vec![
         "adapter conformance is not a Harness-effect or product-quality result",
         "no cross-product model parity has been established",
-        "Codex JSONL does not expose the settled Model identity",
+        "Codex JSONL does not expose the settled Model or Provider identity",
         "Codex exec has no documented hard monetary spend ceiling",
+        "Codex exec exposes no hard Provider-call ceiling for one Turn",
         "Codex built-in Tools are available inside its read-only sandbox",
+        "Codex materializes state under the isolated CODEX_HOME despite --ephemeral",
         "workspace_snapshot is caller-asserted rather than adapter-verified",
-        "environment values, provider routing, and launcher dependencies are not recorded",
+        "credential values and launcher dependencies are not recorded",
+        "the Provider request sidecar is corroborating evidence rather than product settlement",
     ];
     if matches!(spec.profile, Profile::Product) {
         unsupported_controls.push("ambient product configuration is not eliminated");
@@ -239,7 +289,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                 Profile::Bare => "bare",
                 Profile::Product => "product",
             },
-            requested_provider: None,
+            requested_provider: spec.provider,
             requested_model: spec.model,
             observed_models: Vec::new(),
             prompt_sha256,
@@ -250,34 +300,45 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
             inherited_environment_names: spec.inherit_environment,
             timeout_ms: spec.timeout_ms,
             requested_max_budget_usd: None,
-            requested_reasoning_effort: None,
+            requested_reasoning_effort: Some(spec.reasoning_effort),
             requested_max_turns: None,
-            product_sandbox: None,
+            product_sandbox: Some("read-only"),
             unsupported_controls,
         },
         execution,
     })
 }
 
-fn validate_home(spec: &RunSpec, environment: &BTreeMap<String, String>) -> AppResult<()> {
+fn prepare_bare_environment(
+    spec: &RunSpec,
+    environment: &mut BTreeMap<String, String>,
+) -> AppResult<()> {
     let Profile::Bare = spec.profile else {
         return Ok(());
     };
-    let expected = spec
+    let home = spec
+        .home
+        .as_ref()
+        .ok_or_else(|| "bare Codex profile has no home".to_owned())
+        .and_then(|path| canonical_empty_directory(path, "home"))?;
+    let codex_home = spec
         .codex_home
         .as_ref()
         .ok_or_else(|| "bare Codex profile has no codex_home".to_owned())
         .and_then(|path| canonical_empty_directory(path, "codex_home"))?;
-    let configured = environment
-        .get("CODEX_HOME")
-        .ok_or_else(|| "bare Codex profile has no CODEX_HOME environment".to_owned())
-        .and_then(|path| {
-            fs::canonicalize(path)
-                .map_err(|error| format!("cannot canonicalize CODEX_HOME: {error}"))
-        })?;
-    if configured != expected {
-        return Err("codex_home and inherited CODEX_HOME resolve differently".to_owned());
+    if home == codex_home {
+        return Err("bare Codex home and codex_home must be distinct".to_owned());
     }
+    let home = home
+        .to_str()
+        .ok_or_else(|| "home must be valid UTF-8".to_owned())?;
+    let codex_home = codex_home
+        .to_str()
+        .ok_or_else(|| "codex_home must be valid UTF-8".to_owned())?;
+    environment.insert("HOME".to_owned(), home.to_owned());
+    environment.insert("USERPROFILE".to_owned(), home.to_owned());
+    environment.insert("CODEX_HOME".to_owned(), codex_home.to_owned());
+    environment.insert("CODEX_SQLITE_HOME".to_owned(), codex_home.to_owned());
     Ok(())
 }
 
@@ -296,22 +357,84 @@ fn arguments(spec: &RunSpec) -> AppResult<Vec<String>> {
         args.extend([
             "--ignore-user-config".to_owned(),
             "--ignore-rules".to_owned(),
+            "--skip-git-repo-check".to_owned(),
         ]);
     }
     args.extend([
         "--sandbox".to_owned(),
         "read-only".to_owned(),
-        "--ask-for-approval".to_owned(),
-        "never".to_owned(),
         "--model".to_owned(),
         spec.model.clone(),
+        "--config".to_owned(),
+        r#"approval_policy="never""#.to_owned(),
+        "--config".to_owned(),
+        format!(
+            "model_reasoning_effort={}",
+            toml_string(&spec.reasoning_effort)?
+        ),
         "--config".to_owned(),
         format!("developer_instructions={developer_instructions}"),
         "--config".to_owned(),
         r#"web_search="disabled""#.to_owned(),
-        "-".to_owned(),
     ]);
+    if matches!(spec.profile, Profile::Bare) {
+        let provider = spec
+            .provider
+            .as_deref()
+            .ok_or_else(|| "bare Codex profile has no provider".to_owned())?;
+        let provider_base_url = spec
+            .provider_base_url
+            .as_deref()
+            .ok_or_else(|| "bare Codex profile has no provider_base_url".to_owned())?;
+        args.extend([
+            "--config".to_owned(),
+            format!(
+                "model_providers.{BARE_PROVIDER_ID}={{name={},base_url={},env_key={},wire_api=\"responses\",supports_websockets=false}}",
+                toml_string(provider)?,
+                toml_string(provider_base_url)?,
+                toml_string(PROVIDER_TOKEN_ENV)?,
+            ),
+            "--config".to_owned(),
+            format!("model_provider={}", toml_string(BARE_PROVIDER_ID)?),
+            "--config".to_owned(),
+            "features.enable_request_compression=false".to_owned(),
+            "--config".to_owned(),
+            "features.multi_agent=false".to_owned(),
+            "--config".to_owned(),
+            "features.plugins=false".to_owned(),
+            "--config".to_owned(),
+            "features.apps=false".to_owned(),
+            "--config".to_owned(),
+            "skills.include_instructions=false".to_owned(),
+            "--config".to_owned(),
+            "skills.bundled.enabled=false".to_owned(),
+            "--config".to_owned(),
+            "include_apps_instructions=false".to_owned(),
+        ]);
+    }
+    args.push("-".to_owned());
     Ok(args)
+}
+
+fn toml_string(value: &str) -> AppResult<String> {
+    serde_json::to_string(value).map_err(|_| "cannot encode TOML string".to_owned())
+}
+
+fn validate_loopback_provider_base_url(value: &str) -> AppResult<()> {
+    let port = value
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|suffix| suffix.strip_suffix("/v1"))
+        .ok_or_else(|| {
+            "bare Codex provider_base_url must be http://127.0.0.1:<port>/v1".to_owned()
+        })?
+        .parse::<u16>()
+        .map_err(|_| {
+            "bare Codex provider_base_url must contain a valid loopback port".to_owned()
+        })?;
+    if port == 0 {
+        return Err("bare Codex provider_base_url port must be nonzero".to_owned());
+    }
+    Ok(())
 }
 
 pub(super) fn normalize_result(bytes: &[u8]) -> AppResult<NormalizedResult> {
@@ -488,11 +611,15 @@ mod tests {
             workspace: absolute_path("workspace"),
             workspace_snapshot: "empty-fixture".to_owned(),
             profile: Profile::Bare,
+            provider: Some("yh-loopback".to_owned()),
+            provider_base_url: Some("http://127.0.0.1:1234/v1".to_owned()),
             model: "gpt-test".to_owned(),
+            reasoning_effort: "medium".to_owned(),
             system_prompt: "Follow the exact response contract.".to_owned(),
             prompt: "Reply exactly YH-OK".to_owned(),
             timeout_ms: 30_000,
-            inherit_environment: vec!["CODEX_API_KEY".to_owned(), "CODEX_HOME".to_owned()],
+            inherit_environment: vec!["CODEX_API_KEY".to_owned()],
+            home: Some(absolute_path("home")),
             codex_home: Some(absolute_path("codex-home")),
         }
     }
@@ -511,16 +638,40 @@ mod tests {
         assert!(arguments.iter().any(|value| value == "--ignore-rules"));
         assert!(
             arguments
+                .iter()
+                .any(|value| value == "--skip-git-repo-check")
+        );
+        assert!(
+            arguments
                 .windows(2)
                 .any(|pair| pair == ["--sandbox", "read-only"])
         );
         assert!(
             arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "never"])
+                .iter()
+                .any(|value| value == r#"approval_policy="never""#)
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|value| value == r#"model_reasoning_effort="medium""#)
         );
         assert_eq!(arguments.last().map(String::as_str), Some("-"));
         assert!(!arguments.iter().any(|value| value == &spec.prompt));
+        assert!(arguments.iter().any(|value| {
+            value.contains("model_providers.yh_bench=")
+                && value.contains("supports_websockets=false")
+        }));
+        assert!(
+            arguments
+                .iter()
+                .any(|value| value == "skills.include_instructions=false")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|value| value == "skills.bundled.enabled=false")
+        );
     }
 
     #[test]
@@ -537,8 +688,51 @@ mod tests {
         let mut product = valid_spec();
         product.profile = Profile::Product;
         assert!(validate_spec(&product).is_err());
+        product.home = None;
         product.codex_home = None;
+        product.provider = None;
+        product.provider_base_url = None;
         assert!(validate_spec(&product).is_ok());
+
+        let mut inherited_home = valid_spec();
+        inherited_home
+            .inherit_environment
+            .push("codex_sqlite_home".to_owned());
+        assert!(validate_spec(&inherited_home).is_err());
+
+        let mut remote_provider = valid_spec();
+        remote_provider.provider_base_url = Some("https://api.openai.com/v1".to_owned());
+        assert!(validate_spec(&remote_provider).is_err());
+    }
+
+    #[test]
+    fn bare_environment_owns_platform_codex_and_sqlite_homes() {
+        let root = env::temp_dir().join(format!(
+            "yh-codex-environment-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let home = root.join("home");
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&home).expect("create isolated home");
+        fs::create_dir(&codex_home).expect("create isolated Codex home");
+        let mut spec = valid_spec();
+        spec.home = Some(home.clone());
+        spec.codex_home = Some(codex_home.clone());
+        let mut environment = BTreeMap::new();
+        prepare_bare_environment(&spec, &mut environment).expect("prepare bare Codex environment");
+
+        let home = fs::canonicalize(home).expect("canonical home");
+        let codex_home = fs::canonicalize(codex_home).expect("canonical Codex home");
+        assert_eq!(environment["HOME"], home.to_str().expect("UTF-8 home"));
+        assert_eq!(
+            environment["CODEX_HOME"],
+            codex_home.to_str().expect("UTF-8 Codex home")
+        );
+        assert_eq!(environment["CODEX_SQLITE_HOME"], environment["CODEX_HOME"]);
+        assert!(!environment.contains_key("HOMEDRIVE"));
+        assert!(!environment.contains_key("HOMEPATH"));
+        fs::remove_dir_all(root).expect("remove isolated environment");
     }
 
     #[test]
@@ -578,5 +772,82 @@ mod tests {
         let normalized = normalize_result(failed).expect("valid Codex failure");
         assert!(normalized.is_error);
         assert_eq!(normalized.subtype, "turn.failed");
+    }
+
+    #[test]
+    fn checked_in_live_evidence_preserves_request_and_non_claim_boundaries() {
+        let report: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-codex-fixed-output/result.json"
+        ))
+        .expect("checked-in Codex report");
+        let request: Value = serde_json::from_str(include_str!(
+            "../evidence/2026-07-28-codex-fixed-output/provider-request.jsonl"
+        ))
+        .expect("checked-in Codex Provider request");
+        let provider = include_bytes!("../evidence/2026-07-28-codex-fixed-output/provider.mjs");
+
+        assert_eq!(report["format_version"], RUN_FORMAT_VERSION);
+        assert_eq!(report["adapter"]["name"], ADAPTER_VERSION);
+        assert_eq!(report["adapter"]["cli_version"], "codex-cli 0.145.0");
+        assert_eq!(
+            report["adapter"]["adapter_executable_sha256"],
+            "02a0dc688c84be6bfe99b5b5273d86654441a8fdd72c7f5abadf7903e7d3af09"
+        );
+        assert_eq!(
+            report["adapter"]["product_executable_sha256"],
+            "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590"
+        );
+        assert_eq!(report["controls"]["claim_eligible"], false);
+        assert_eq!(
+            report["controls"]["requested_provider"],
+            "yh-loopback-responses"
+        );
+        assert_eq!(report["controls"]["requested_model"], "gpt-5.4");
+        assert_eq!(report["controls"]["requested_reasoning_effort"], "medium");
+        assert_eq!(report["controls"]["product_sandbox"], "read-only");
+        assert_eq!(report["controls"]["observed_models"], serde_json::json!([]));
+        assert_eq!(report["execution"]["status"], "completed");
+        assert!(report["execution"]["settlement"]["actual_cost_usd"].is_null());
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"][2]["item"]["text"],
+            "YH-CODEX-ADAPTER-OK"
+        );
+        assert_eq!(
+            sha256_bytes(provider),
+            "ffdaa14bb95e474ad2a4cfc44ebac5e9ad19d28203a6b9ca565fa2feb7c13782"
+        );
+
+        let mut jsonl = Vec::new();
+        for event in report["execution"]["settlement"]["raw_result"]
+            .as_array()
+            .expect("retained Codex events")
+        {
+            serde_json::to_writer(&mut jsonl, event).expect("encode retained Codex event");
+            jsonl.push(b'\n');
+        }
+        let normalized = normalize_result(&jsonl).expect("normalize retained Codex result");
+        assert!(!normalized.is_error);
+        assert_eq!(normalized.subtype, "turn.completed");
+
+        assert_eq!(request["ordinal"], 1);
+        assert_eq!(request["method"], "POST");
+        assert_eq!(request["path"], "/v1/responses");
+        assert_eq!(request["authorization"], "bearer-present");
+        assert_eq!(request["body"]["model"], "gpt-5.4");
+        assert_eq!(request["body"]["stream"], true);
+        assert_eq!(request["body"]["reasoning"]["effort"], "medium");
+        assert_eq!(request["body"]["instructions"]["has_skills"], false);
+        assert_eq!(request["body"]["instructions"]["has_apps"], false);
+        assert_eq!(
+            request["body"]["tool_names"],
+            serde_json::json!([
+                "exec_command",
+                "write_stdin",
+                "update_plan",
+                "request_user_input",
+                "apply_patch",
+                "view_image"
+            ])
+        );
     }
 }

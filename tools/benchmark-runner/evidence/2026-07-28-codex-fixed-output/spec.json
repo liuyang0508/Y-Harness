@@ -1,0 +1,24 @@
+{
+  "format_version": 2,
+  "run_id": "codex-fixed-output-20260728-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/Users/liuyang/.local/bin/codex",
+  "expected_cli_version": "codex-cli 0.145.0",
+  "expected_product_executable_sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "workspace": "/tmp/yh-codex-fixed-output-20260728.7e69GH/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "profile": "bare",
+  "provider": "yh-loopback-responses",
+  "provider_base_url": "http://127.0.0.1:62078/v1",
+  "model": "gpt-5.4",
+  "reasoning_effort": "medium",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-CODEX-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "CODEX_API_KEY"
+  ],
+  "home": "/tmp/yh-codex-fixed-output-20260728.7e69GH/home-final4",
+  "codex_home": "/tmp/yh-codex-fixed-output-20260728.7e69GH/codex-home-final4"
+}

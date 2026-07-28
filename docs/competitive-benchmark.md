@@ -27,7 +27,8 @@ Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent CLI adapter
 contracts now exist, with one checked-in real Claude Code
 `adapter_conformance` result, one real Grok Build fixed-output result, one real
 Pi fixed-output result, one real OpenCode fixed-output result, one real Hermes
-fixed-output result, and two Codex CF-003 fault records. All have
+fixed-output result, one real Codex fixed-output result, and two Codex CF-003
+fault records. All have
 `claim_eligible: false`: they prove bounded adapters and registered fault
 behavior, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
@@ -273,16 +274,17 @@ The shortest path to credible comparison is:
    conformance record, OpenCode has one real deterministic fixed-output
    conformance record, Hermes has one real deterministic fixed-output
    conformance record, Grok Build has one real deterministic fixed-output
-   conformance record, Codex has two real CF-003 records, and Y-Harness has one
-   real process-restart CF-003 record;
+   conformance record, Codex has one real deterministic fixed-output record
+   plus two real CF-003 records, and Y-Harness has one real process-restart
+   CF-003 record;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
 Provider continuation and durable safe-boundary steering are implemented and
-locally fault-tested in Y-Harness. Seven real released-product records, the
+locally fault-tested in Y-Harness. Eight real released-product records, the
 source-pinned adapter contracts, and the controller-owned CF-003 fixture are
-preserved. Two Codex cells are not a cross-product result. Execution of
+preserved. Three Codex cells are not a cross-product result. Execution of
 CF-001/CF-002 across products, CF-003 other-product cells, in-place interrupted
 Turn continuation, Linux and Windows containment, and broader live external
 integration evidence remain prerequisites for broad superiority claims, not

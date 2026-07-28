@@ -94,19 +94,22 @@ Unsupported controls are data, not prose omitted by an aggregator.
 
 The Codex adapter emits format 2 and likewise fixes `claim_eligible: false`.
 It runs stable `codex exec --json` with an exact CLI version and executable
-digest,
-`--ephemeral`, a read-only product sandbox, approval policy `never`, disabled
-web search, and a developer-instruction override. `bare` additionally requires
-an empty, caller-provided `CODEX_HOME`, API-key authentication,
-`--ignore-user-config`, and `--ignore-rules`; `product` retains ambient product
-configuration and records that limitation.
+digest, `--ephemeral`, a read-only product sandbox, approval policy `never`,
+exact reasoning effort, disabled web search, and a developer-instruction
+override. `bare` additionally owns an initially empty `CODEX_HOME`, requires
+an initially empty distinct platform home, maps `CODEX_SQLITE_HOME` to the
+isolated Codex home, requires API-key authentication and an explicit loopback
+Responses Provider, ignores user config/rules, and disables plugins, Apps,
+multi-Agent behavior, bundled Skills, and automatic Skill/App instructions.
+`product` retains ambient product configuration and records that limitation.
 
-Codex JSONL does not expose settled Model identity, product/API duration,
-actual cost, or a documented hard monetary ceiling. Format 2 therefore records
-an empty `observed_models` list and `null` for those unavailable numeric
-fields. Codex built-in Tools also remain available within its read-only
-sandbox. These differences make the adapter suitable for conformance evidence,
-not a controlled Harness comparison.
+Codex JSONL does not expose settled Provider/Model identity, product/API
+duration, actual cost, a documented hard monetary ceiling, or a hard
+Provider-call ceiling. Format 2 therefore records an empty `observed_models`
+list and `null` for unavailable numeric fields. Codex built-in Tools remain
+available within its read-only sandbox, and it materializes state under the
+isolated Codex home despite `--ephemeral`. These differences make the adapter
+suitable for conformance evidence, not a controlled Harness comparison.
 
 The Codex CF-003 driver emits format 7 and fixes both the released product and
 the analyzed official source to Codex `0.145.0`. It requires empty workspace
@@ -276,9 +279,14 @@ The run used Claude Code `2.1.143`, returned the requested fixed text, and
 observed `MiniMax-M2.7` behind requested model alias `haiku`. This is adapter
 conformance evidence only.
 
-The ordinary format-2 Codex adapter is source- and contract-tested against official snapshot
-[`61a4488`](https://github.com/openai/codex/tree/61a44880a85d2fd0d8770908dea5733495e571c8).
-It has no live fixed-output record.
+The ordinary format-2 Codex adapter is source- and contract-tested against
+official tag
+[`rust-v0.145.0`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
+One real released-product fixed-output record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-codex-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-codex-fixed-output/).
+Its loopback sidecar corroborated one Responses request, exact Model and
+reasoning effort, absent automatic Skill/App instructions, and six visible
+built-in Tools. It remains non-comparative, `claim_eligible: false` evidence.
 
 The source-pinned format-7 driver is additionally tested against official tag
 [`rust-v0.145.0`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).

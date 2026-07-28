@@ -69,15 +69,17 @@ The second adapter consumes Codex's stable non-interactive JSONL surface:
   "workspace": "/absolute/isolated/workspace",
   "workspace_snapshot": "empty-workspace-v1",
   "profile": "bare",
+  "provider": "yh-loopback-responses",
+  "provider_base_url": "http://127.0.0.1:12345/v1",
   "model": "<exact-model>",
+  "reasoning_effort": "medium",
   "system_prompt": "Return only the requested fixed text.",
   "prompt": "Reply exactly YH-ADAPTER-OK",
   "timeout_ms": 30000,
   "inherit_environment": [
-    "CODEX_API_KEY",
-    "CODEX_HOME",
-    "PATH"
+    "CODEX_API_KEY"
   ],
+  "home": "/absolute/empty/platform-home",
   "codex_home": "/absolute/empty/codex-home"
 }
 ```
@@ -87,13 +89,18 @@ cargo run --locked -p y-harness-benchmark-runner -- \
   codex /absolute/path/to/spec.json > external-run.json
 ```
 
-`bare` requires the declared `CODEX_HOME` to be empty before execution and to
-match the inherited environment exactly. `product` must not supply a
-`codex_home` and permits ambient product configuration. Both profiles
-use `--ephemeral`, `--sandbox read-only`, approval policy `never`, disabled web
-search, and bounded JSONL parsing. The output is external-run format 2. Codex
-does not expose observed Model identity, cost, or product/API duration in this
-stream, so those fields remain empty or `null`; they are never guessed.
+`bare` requires distinct initially empty platform and Codex homes, owns the
+child home/`CODEX_HOME`/`CODEX_SQLITE_HOME` environment, and accepts only an
+explicit loopback Responses Provider. It disables user configuration, rules,
+plugins, Apps, multi-Agent behavior, bundled Skills, and automatic Skill/App
+instructions. `product` must not supply bare-profile state or routing and
+permits ambient product configuration. Both profiles use `--ephemeral`,
+`--sandbox read-only`, approval policy `never`, exact reasoning effort,
+disabled web search, and bounded JSONL parsing. The output is external-run
+format 2. Codex does not expose settled Provider/Model identity, cost, or
+product/API duration in this stream, so those fields remain empty or `null`;
+they are never guessed. Built-in Tools remain visible, and Codex materializes
+state inside the isolated Codex home despite `--ephemeral`.
 
 The dedicated Codex CF-003 driver executes the deterministic uncertain-effect
 fixture without an external Model API:

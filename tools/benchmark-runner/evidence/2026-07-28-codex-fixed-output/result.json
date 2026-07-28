@@ -1,0 +1,98 @@
+{
+  "format_version": 2,
+  "adapter": {
+    "name": "codex-exec-jsonl-v2",
+    "version": "0.1.0",
+    "product": "codex",
+    "cli_version": "codex-cli 0.145.0",
+    "adapter_executable_sha256": "02a0dc688c84be6bfe99b5b5273d86654441a8fdd72c7f5abadf7903e7d3af09",
+    "product_executable_sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590"
+  },
+  "coordinate": {
+    "run_id": "codex-fixed-output-20260728-001",
+    "benchmark_version": "adapter-conformance-v1",
+    "case_id": "fixed-output",
+    "workspace_snapshot": "empty-directory-v1",
+    "started_at_ms": 1785206666033,
+    "host_os": "macos",
+    "host_arch": "aarch64"
+  },
+  "controls": {
+    "track": "adapter_conformance",
+    "claim_eligible": false,
+    "profile": "bare",
+    "requested_provider": "yh-loopback-responses",
+    "requested_model": "gpt-5.4",
+    "observed_models": [],
+    "prompt_sha256": "c732ef2bd6c1dc154f5fdd4c5102aba12bf8c47332ad0be8f346664825b33c95",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "tools": "product_builtins_read_only",
+    "permission_mode": "never",
+    "process_isolation": {
+      "kind": "unrestricted"
+    },
+    "inherited_environment_names": [
+      "CODEX_API_KEY"
+    ],
+    "timeout_ms": 30000,
+    "requested_max_budget_usd": null,
+    "requested_reasoning_effort": "medium",
+    "product_sandbox": "read-only",
+    "unsupported_controls": [
+      "adapter conformance is not a Harness-effect or product-quality result",
+      "no cross-product model parity has been established",
+      "Codex JSONL does not expose the settled Model or Provider identity",
+      "Codex exec has no documented hard monetary spend ceiling",
+      "Codex exec exposes no hard Provider-call ceiling for one Turn",
+      "Codex built-in Tools are available inside its read-only sandbox",
+      "Codex materializes state under the isolated CODEX_HOME despite --ephemeral",
+      "workspace_snapshot is caller-asserted rather than adapter-verified",
+      "credential values and launcher dependencies are not recorded",
+      "the Provider request sidecar is corroborating evidence rather than product settlement",
+      "workspace instructions and built-in product behavior are not eliminated"
+    ]
+  },
+  "execution": {
+    "status": "completed",
+    "settlement": {
+      "exit_code": 0,
+      "wall_time_ms": 695,
+      "product_duration_ms": null,
+      "product_api_duration_ms": null,
+      "num_turns": 1,
+      "actual_cost_usd": null,
+      "result_subtype": "turn.completed",
+      "stdout_bytes": 355,
+      "stdout_sha256": "251b454c3559e06e71ca4c5eb101b9ab744cc4e6f4b52f6681b733164aba7fbe",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_result": [
+        {
+          "thread_id": "019fa69b-f362-7ca0-b775-9f47d6bc088f",
+          "type": "thread.started"
+        },
+        {
+          "type": "turn.started"
+        },
+        {
+          "item": {
+            "id": "item_0",
+            "text": "YH-CODEX-ADAPTER-OK",
+            "type": "agent_message"
+          },
+          "type": "item.completed"
+        },
+        {
+          "type": "turn.completed",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0
+          }
+        }
+      ]
+    }
+  }
+}
