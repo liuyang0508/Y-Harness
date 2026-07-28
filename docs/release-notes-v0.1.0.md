@@ -68,8 +68,12 @@ Secret Provider API 2 and Protocol 23 carry trusted Turn authority into direct
 Model credential resolution without serializing actor or tenant data to the
 Provider. Exact tenant/reference environment mappings have no global fallback;
 legacy Secret Providers and shared MCP sessions fail closed for tenant-scoped
-operations. Reference-service tenant credential configuration and
-tenant-partitioned MCP sessions remain explicit open work.
+operations. An additive fixed local-process tenant configuration now binds one
+reference-service deployment's Protocol State/Approval/Task access,
+Evaluation, archives, and direct Model environment Secrets to the same exact
+tenant. Enabled shared MCP configuration fails before launch. This does not
+claim multi-principal tenant routing, a general Secret manager, or
+tenant-partitioned MCP sessions.
 Protocol 24 advertises State/snapshot schema 13; Thread archive format 3
 advances independently, and remote clients cannot author trusted execution
 bindings.

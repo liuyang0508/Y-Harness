@@ -172,6 +172,36 @@ rejects duplicates, unknown route entries, invalid timeouts, and invalid retry
 bounds before Provider construction. See
 [ADR 0087](docs/adr/0087-explicit-configured-model-catalog-and-route.md).
 
+One reference-service process may also be bound to one exact tenant without
+changing Rust code:
+
+```json
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "authority": {
+    "type": "local_process_tenant",
+    "tenant_id": "tenant-a"
+  },
+  "model": {
+    "type": "open_ai_responses",
+    "id": "openai/default",
+    "model": "replace-with-an-available-model-id",
+    "api_key_secret_reference": "openai/default",
+    "api_key_environment": "TENANT_A_OPENAI_API_KEY"
+  }
+}
+```
+
+This is a fixed single-tenant deployment boundary: Protocol State, Approval,
+Task, Evaluation, archive access, and direct Model Secret resolution share the
+same trusted tenant. It is not multi-user authentication. Enabled configured
+MCP servers are rejected because the current clients share sessions; run an
+unscoped service or provide a genuinely tenant-partitioned embedded client.
+Existing unscoped data is never assigned to a tenant by changing this field.
+See
+[ADR 0125](docs/adr/0125-fixed-tenant-reference-service-authority.md).
+
 Executable extension metadata is treated as code, not inert configuration.
 Model, Tool, Memory, Token Counter, Conversation Compactor, Secret, Verifier,
 Grader, and Process Broker metadata is captured through one content-free panic
@@ -558,7 +588,11 @@ an exact tenant/reference mapping and never falls back to a global mapping.
 Current shared stdio and HTTPS MCP sessions likewise reject tenant-scoped Tool
 calls before remote invocation unless an embedding host supplies a genuinely
 tenant-partitioned client. See
-[ADR 0120](docs/adr/0120-authority-aware-secret-resolution.md).
+[ADR 0120](docs/adr/0120-authority-aware-secret-resolution.md). The reference
+service can now select one exact local-process tenant; its direct Model
+environment mappings are assembled through the tenant provider, while enabled
+shared MCP configuration fails before launch. See
+[ADR 0125](docs/adr/0125-fixed-tenant-reference-service-authority.md).
 
 The optional `y-harness-domain-pack` crate sits above the semantic Core. Its
 format-1 immutable snapshots pin exact Workflow, Skill, Tool, Policy,
@@ -807,9 +841,10 @@ Operation, Approval, Task, and optional Domain Pack control-plane records and
 reaches Memory, Policy, Tool, Model Secret resolution, and MCP admission. Task
 Artifact reference metadata inherits its owning Graph's tenant fence, but the
 external blob named by its URI has no Y-Harness storage or authorization
-layer. Quotas, retention, reference-service tenant credential maps,
-tenant-partitioned MCP sessions, and external Artifact storage remain outside
-the current claim.
+layer. The reference service supports a fixed one-process/one-tenant authority
+and exact direct-Model environment mapping. Multi-principal tenant routing,
+general Secret-manager integration, quotas, retention, tenant-partitioned MCP
+sessions, and external Artifact storage remain outside the current claim.
 
 Streaming model providers can emit provisional text through a kernel-owned
 failure-isolated handle. Deltas and total Turn output are byte-bounded; protocol

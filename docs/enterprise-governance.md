@@ -37,7 +37,7 @@ reason to duplicate Runtime or State.
 |---|---|
 | optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
-| authority-aware Secret Provider API plus exact embedded tenant/reference adapter | reference-service tenant credential maps or a general Secret-manager backend |
+| authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
 | durable Approval Inbox | ownership transfer or Human Handoff |
 | digest-bound Thread handoff input | Human Handoff |
@@ -92,6 +92,11 @@ ADR 0124 adds a fail-closed authorization adapter around the optional Domain
 Pack store. Its reference RBAC policy matches exact actor, tenant, and action;
 all reads and transitions are denied before persistence on mismatch or policy
 panic. The store still owns promotion rules and evaluator/approver separation.
+ADR 0125 lets one reference-service process declare one exact local-process
+tenant. Protocol State/Approval/Task access, configured Evaluation, archives,
+and direct Model environment Secrets share that authority. Enabled shared MCP
+configuration fails before launch. This is deployment partitioning, not
+multi-principal authentication or tenant routing.
 
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
@@ -120,7 +125,7 @@ business behavior is present.
 This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
-blob addressed by that URI. Reference-service tenant Secret configuration,
-tenant-partitioned MCP sessions, durable Workflow waits/timers, Human Handoff,
-quota, retention, canary rollout, and multi-node control-plane availability
-remain open.
+blob addressed by that URI. Multi-principal tenant routing, general
+Secret-manager integration, tenant-partitioned MCP sessions, durable Workflow
+waits/timers, Human Handoff, quota, retention, canary rollout, and multi-node
+control-plane availability remain open.

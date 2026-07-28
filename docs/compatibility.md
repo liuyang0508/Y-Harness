@@ -174,6 +174,17 @@ tenant-scoped calls unless a custom implementation proves session partitioning.
 Protocol v23 advertises Secret API 2; State, Approval, Task, service
 configuration, and Model Gateway coordinates are unchanged. See
 [ADR 0120](adr/0120-authority-aware-secret-resolution.md).
+Service schema 1 now additively accepts an optional
+`authority.type = "local_process_tenant"` with one validated `tenant_id`.
+Omission retains the prior unscoped service meaning. The configured tenant is
+applied to local stdio Protocol authority, configured Evaluation, State
+archive commands, and direct OpenAI/HTTPS Model environment Secret resolution.
+Enabled configured MCP servers fail validation in this mode because their
+shared sessions are not tenant-partitioned. Changing this field does not
+migrate existing unscoped State, Approval, or Task ownership; such records
+remain inaccessible under the exact tenant fence. No durable, Protocol,
+Model-Gateway, archive, or service-schema coordinate advances. See
+[ADR 0125](adr/0125-fixed-tenant-reference-service-authority.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from

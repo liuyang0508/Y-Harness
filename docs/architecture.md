@@ -369,7 +369,9 @@ direction:
   semantic Conversation Compactors, completion Verifiers, and Evaluation
   Graders,
   exact-selected MCP Tools, explicitly activated digest-verified project
-  Skills, and Agent Memory Hub Context assembly;
+  Skills, Agent Memory Hub Context assembly, and an optional fixed
+  local-process tenant shared by Protocol State/Approval/Task, configured
+  Evaluation, archives, and direct Model Secret resolution;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
   v24, with bounded tenant-fenced recent-Thread navigation, authoritative
@@ -407,12 +409,12 @@ Linux/Windows
 sandbox brokers, Skill catalogs/private registry authentication and append-only
 transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
-reference-service tenant Secret maps, tenant-partitioned MCP sessions, external
-Artifact storage and authorization, Domain Pack service/protocol integration,
-role and delegation claims, revocation, and policy hot reload remain explicit
-subsequent slices. Task Artifact reference metadata is already part of its
-tenant-fenced Task Graph; this does not authorize or store the referenced
-external content.
+multi-principal reference-service tenant routing, general Secret-manager
+integration, tenant-partitioned MCP sessions, external Artifact storage and
+authorization, Domain Pack service/protocol integration, role and delegation
+claims, revocation, and policy hot reload remain explicit subsequent slices.
+Task Artifact reference metadata is already part of its tenant-fenced Task
+Graph; this does not authorize or store the referenced external content.
 
 ## Client protocol boundary
 

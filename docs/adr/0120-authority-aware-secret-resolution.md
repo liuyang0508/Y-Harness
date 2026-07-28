@@ -59,7 +59,8 @@ tenant-safe would make an unproved isolation claim.
   tenant-scoped use.
 - The reference service's existing environment mappings remain unscoped.
   Service-configuration syntax for tenant credential maps is not introduced
-  by this ADR.
+  by this ADR. ADR 0125 later adds one fixed local-process tenant without
+  introducing multi-principal routing.
 - Tenant-partitioned remote MCP connection pools, OAuth token lifecycle,
   revocation, Secret-manager integrations, and per-tenant service assembly
   remain explicit future work. Protocol v23 is not a complete multi-tenant

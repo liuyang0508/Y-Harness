@@ -74,6 +74,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
         "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
+    assert!(report.contains("authority: local-process / unscoped"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
     assert!(report.contains("verifiers: 0"));
     assert!(report.contains("evaluation graders: 0"));
@@ -903,9 +904,16 @@ fn doctor_accepts_the_checked_in_https_gateway_template() {
     let project = isolated_project("https-template");
     fs::create_dir_all(&project).expect("create HTTPS template project");
     let config_path = project.join("y-harness.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../config/y-harness.https.example.json"))
+            .expect("decode checked-in HTTPS template");
+    config["authority"] = serde_json::json!({
+        "type": "local_process_tenant",
+        "tenant_id": "tenant-https"
+    });
     fs::write(
         &config_path,
-        include_bytes!("../config/y-harness.https.example.json"),
+        serde_json::to_vec_pretty(&config).expect("encode tenant HTTPS template"),
     )
     .expect("write checked-in HTTPS template");
 
@@ -922,6 +930,7 @@ fn doctor_accepts_the_checked_in_https_gateway_template() {
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains("model: gateway/default"));
+    assert!(report.contains("authority: local-process / tenant-https"));
     assert!(report.contains("status: ok"));
     assert!(!report.contains("doctor-placeholder"));
     fs::remove_dir_all(project).expect("remove isolated project");
@@ -1570,6 +1579,10 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
             "data_directory": ".y-harness",
+            "authority": {
+                "type": "local_process_tenant",
+                "tenant_id": "tenant-eval"
+            },
             "model": {"type": "demo"},
             "evaluation": {
                 "case_concurrency": 2,
@@ -1605,7 +1618,7 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
                 "prompt": "grade this candidate",
                 "memory_scope": {
                     "project": "configured-grader-test",
-                    "tenant_id": null,
+                    "tenant_id": "tenant-eval",
                     "tags": ["isolated"]
                 },
                 "timeout_ms": 5_000,
@@ -1644,11 +1657,11 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
         "JSON command grader doctor failed: {}",
         String::from_utf8_lossy(&doctor.stderr)
     );
-    assert!(
-        String::from_utf8(doctor.stdout)
-            .expect("UTF-8 grader doctor report")
-            .contains("evaluation graders: 1")
-    );
+    assert!({
+        let report = String::from_utf8(doctor.stdout).expect("UTF-8 grader doctor report");
+        report.contains("evaluation graders: 1")
+            && report.contains("authority: local-process / tenant-eval")
+    });
 
     let output = Command::new(env!("CARGO_BIN_EXE_yh"))
         .args(["eval", "suite.json", "baseline.json", "y-harness.json"])
@@ -1821,6 +1834,139 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
         assert!(project.join(".y-harness").join(database).is_file());
     }
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn fixed_tenant_service_binds_protocol_state_tasks_and_archives() {
+    let project = isolated_project("fixed-tenant");
+    fs::create_dir_all(&project).expect("create fixed-tenant project");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "authority": {
+                "type": "local_process_tenant",
+                "tenant_id": "tenant-service"
+            },
+            "model": {"type": "demo"}
+        }))
+        .expect("encode fixed-tenant config"),
+    )
+    .expect("write fixed-tenant config");
+
+    let first = serve(
+        &project,
+        vec![
+            request("initialize", ProtocolCommand::Initialize {}),
+            request("create-thread", ProtocolCommand::CreateThread {}),
+            request(
+                "create-graph",
+                ProtocolCommand::CreateTaskGraph {
+                    graph_id: "tenant-graph".to_owned(),
+                    definitions: vec![TaskDefinition {
+                        id: TaskId::from_static("tenant-task"),
+                        description: "remain inside the configured tenant".to_owned(),
+                        dependencies: Default::default(),
+                        priority: 0,
+                        workspace: WorkspaceMode::None,
+                    }],
+                },
+            ),
+        ],
+    );
+    let thread_id = match &first[1].body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ThreadCreated { thread },
+        } => {
+            assert_eq!(thread.tenant_id(), Some("tenant-service"));
+            thread.id.to_string()
+        }
+        other => panic!("unexpected tenant Thread response: {other:?}"),
+    };
+    assert!(matches!(
+        &first[2].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::TaskGraphCreated { graph }
+        } if graph.tenant_id.as_deref() == Some("tenant-service")
+    ));
+
+    let archive_path = project.join("tenant-thread.yh-thread.json");
+    let exported = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["thread", "export", &thread_id])
+        .arg(&archive_path)
+        .arg("y-harness.json")
+        .current_dir(&project)
+        .output()
+        .expect("export fixed-tenant Thread");
+    assert!(
+        exported.status.success(),
+        "fixed-tenant export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let imported_id = "tenant-imported";
+    let imported = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["thread", "import"])
+        .arg(&archive_path)
+        .arg(imported_id)
+        .arg("y-harness.json")
+        .current_dir(&project)
+        .output()
+        .expect("import fixed-tenant Thread");
+    assert!(
+        imported.status.success(),
+        "fixed-tenant import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let recovered = serve(
+        &project,
+        vec![
+            request(
+                "get-thread",
+                ProtocolCommand::GetThread {
+                    thread_id: thread_id.clone(),
+                },
+            ),
+            request(
+                "get-imported",
+                ProtocolCommand::GetThread {
+                    thread_id: imported_id.to_owned(),
+                },
+            ),
+            request(
+                "get-graph",
+                ProtocolCommand::GetTaskGraph {
+                    graph_id: "tenant-graph".to_owned(),
+                },
+            ),
+        ],
+    );
+    assert!(matches!(
+        &recovered[0].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Thread {
+                thread: Some(thread)
+            }
+        } if thread.tenant_id() == Some("tenant-service")
+    ));
+    assert!(matches!(
+        &recovered[1].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Thread {
+                thread: Some(thread)
+            }
+        } if thread.tenant_id() == Some("tenant-service")
+    ));
+    assert!(matches!(
+        &recovered[2].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::TaskGraph {
+                graph: Some(graph)
+            }
+        } if graph.tenant_id.as_deref() == Some("tenant-service")
+    ));
+    fs::remove_dir_all(project).expect("remove fixed-tenant project");
 }
 
 fn request(id: &str, command: ProtocolCommand) -> ProtocolRequest {

@@ -15,28 +15,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox,
-    CONVERSATION_COMPACTOR_API_VERSION, CapabilityOrigin, ContextEngine,
-    ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
-    ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
-    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION, EvaluationBaseline,
-    EvaluationEngine, EvaluationReport, EvaluationSuite, GraderDescriptor, GraderRegistry,
-    HarnessRuntime, InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES,
-    JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel,
-    JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier, JsonProcessConfig,
-    LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP, MAX_PARALLEL_TOOL_CALLS,
-    MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient, MemoryContextConfig,
-    MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
-    ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION, ProcessBroker,
-    ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
-    SignedSkillPackage, SkillEngine, SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry,
-    SkillTransparencyRequirement, SkillTrustStore, SqliteApprovalInbox, SqliteEventStore,
-    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
-    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor,
-    ToolRegistry, VerificationRegistry, VerifierDescriptor, decode_thread_archive,
-    encode_thread_archive, register_selected_mcp_tools, serve_stdio,
+    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, AgentMemoryHubProvider, AllowListPolicy,
+    ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
+    CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
+    ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION, EvaluationBaseline, EvaluationCase,
+    EvaluationEngine, EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor,
+    GraderRegistry, HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler,
+    JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandGrader,
+    JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
+    JsonProcessConfig, LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP,
+    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
+    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
+    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
+    ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
+    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
+    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine,
+    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
+    TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
+    TurnExecutionOptions, TurnOutcome, VerificationRegistry, VerifierDescriptor,
+    decode_thread_archive, encode_thread_archive, register_selected_mcp_tools, serve_stdio,
 };
 
+#[cfg(feature = "https-model")]
+use y_harness::TenantEnvironmentSecretProvider;
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
 use y_harness::{
     EnvironmentSecretProvider, SecretProvider, SecretReference, SecretRequest, TurnId,
@@ -68,6 +71,8 @@ const MAX_CA_BYTES: u64 = 1_048_576;
 struct ServiceConfig {
     schema_version: u32,
     data_directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority: Option<ServiceAuthorityConfig>,
     #[serde(default = "default_max_parallel_tool_calls")]
     max_parallel_tool_calls: usize,
     #[serde(default = "default_max_model_attempts_per_step")]
@@ -101,6 +106,7 @@ impl Default for ServiceConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             data_directory: ".y-harness".to_owned(),
+            authority: None,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
             model: Some(ServiceModelConfig::Demo {
@@ -118,6 +124,14 @@ impl Default for ServiceConfig {
             evaluation: None,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+/// Trusted deployment authority selected before the stdio service accepts input.
+enum ServiceAuthorityConfig {
+    /// Treat every local request as belonging to one exact tenant.
+    LocalProcessTenant { tenant_id: String },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -433,6 +447,80 @@ struct LoadedConfig {
     path: PathBuf,
     root: PathBuf,
     data_directory: PathBuf,
+}
+
+impl LoadedConfig {
+    /// Resolves and revalidates the deployment authority at each trust boundary.
+    fn authority(&self) -> Result<AuthorityContext, HarnessError> {
+        configured_authority(&self.config)
+    }
+}
+
+/// Builds authority only from trusted host configuration, never request data.
+fn configured_authority(config: &ServiceConfig) -> Result<AuthorityContext, HarnessError> {
+    match &config.authority {
+        None => Ok(AuthorityContext::local_process()),
+        Some(ServiceAuthorityConfig::LocalProcessTenant { tenant_id }) => {
+            AuthorityContext::new(ActorIdentity::LocalProcess, Some(tenant_id.clone()))
+        }
+    }
+}
+
+/// Preserves local stdio permissions while replacing its unscoped authority.
+struct FixedLocalProcessAuthorizer {
+    authority: AuthorityContext,
+}
+
+impl ProtocolAuthorizer for FixedLocalProcessAuthorizer {
+    fn allows(&self, principal: &ProtocolPrincipal, _permission: &str) -> bool {
+        matches!(principal, ProtocolPrincipal::LocalProcess)
+    }
+
+    fn authority_context(
+        &self,
+        principal: &ProtocolPrincipal,
+    ) -> Result<AuthorityContext, HarnessError> {
+        if matches!(principal, ProtocolPrincipal::LocalProcess) {
+            Ok(self.authority.clone())
+        } else {
+            Err(HarnessError::InvalidConfiguration(
+                "configured local-process authority cannot resolve a remote principal".to_owned(),
+            ))
+        }
+    }
+}
+
+/// Runs isolated Evaluation State under the same authority as configured service use.
+struct ConfiguredEvaluationTarget {
+    runtime: Arc<HarnessRuntime>,
+    authority: AuthorityContext,
+}
+
+impl EvaluationTarget for ConfiguredEvaluationTarget {
+    fn execute<'a>(
+        &'a self,
+        case: EvaluationCase,
+        cancellation: CancellationToken,
+    ) -> HarnessFuture<'a, TurnOutcome> {
+        Box::pin(async move {
+            let thread = self.runtime.create_thread_as(&self.authority).await?;
+            self.runtime
+                .run_turn_with_options(
+                    &thread.id,
+                    case.prompt,
+                    TurnExecutionOptions {
+                        authority: self.authority.clone(),
+                        memory_scope: case.memory_scope,
+                        context: Vec::new(),
+                        execution_binding: None,
+                        timeout: None,
+                        cancellation,
+                        model_event_sink: None,
+                    },
+                )
+                .await
+        })
+    }
 }
 
 struct ConfiguredModels {
@@ -753,6 +841,7 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
 /// Validates configuration, provider construction, credentials, and storage boundaries.
 pub async fn run_doctor(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
+    let authority = loaded.authority()?;
     let evaluation = build_evaluation(&loaded)?;
     let models = build_models(&loaded).await?;
     let data_state = if loaded.data_directory.exists() {
@@ -775,6 +864,10 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     println!("protocol: {PROTOCOL_VERSION}");
     println!("config schema: {}", loaded.config.schema_version);
     println!("config: {}", loaded.path.display());
+    println!(
+        "authority: local-process / {}",
+        authority.tenant_id().unwrap_or("unscoped")
+    );
     println!("model: {}", models.route[0]);
     println!("models: {}", models.registry.ids().len());
     println!("model route: {}", models.route.join(" -> "));
@@ -887,7 +980,7 @@ pub async fn run_thread_export(
         SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
     ));
     let archive = state
-        .export_thread(&ThreadId::from_string(thread_id))
+        .export_thread_as(&ThreadId::from_string(thread_id), &loaded.authority()?)
         .await?;
     let encoded = encode_thread_archive(&archive)?;
     write_new_file(Path::new(&archive_path), &encoded, "Thread archive")?;
@@ -919,7 +1012,9 @@ pub async fn run_thread_import(
         SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
     ));
     let target_thread_id = ThreadId::from_string(target_thread_id);
-    let imported = state.import_thread(&archive, target_thread_id).await?;
+    let imported = state
+        .import_thread_as(&archive, target_thread_id, &loaded.authority()?)
+        .await?;
     println!(
         "imported Thread {} from {}: {} turns",
         imported.id,
@@ -932,6 +1027,7 @@ pub async fn run_thread_import(
 /// Runs the durable stdio service described by one validated project configuration.
 pub async fn run_service(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
+    let authority = loaded.authority()?;
     fs::create_dir_all(&loaded.data_directory)?;
     require_contained_directory(&loaded.root, &loaded.data_directory)?;
 
@@ -958,7 +1054,8 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let task_port: Arc<dyn TaskCoordinator> = tasks;
     let handler = ProtocolHandler::new(runtime)
         .with_approval_inbox(approval_port)
-        .with_task_coordinator(task_port);
+        .with_task_coordinator(task_port)
+        .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
     let served = serve_stdio(handler).await;
     let shutdown = shutdown_mcp_clients(&mcp_clients).await;
     served?;
@@ -999,8 +1096,12 @@ pub async fn run_evaluation(
         mcp_clients,
     } = assemble_configured_runtime(&loaded, configured_models, capabilities, state)?;
     let evaluation = configured_evaluation.engine()?;
+    let target: Arc<dyn EvaluationTarget> = Arc::new(ConfiguredEvaluationTarget {
+        runtime: Arc::new(runtime),
+        authority: loaded.authority()?,
+    });
     let evaluated = async {
-        let report = evaluation.run(Arc::new(runtime), suite).await?;
+        let report = evaluation.run(target, suite).await?;
         let comparison = baseline.compare(&report)?;
         Ok::<_, y_harness::HarnessError>((report, comparison))
     }
@@ -1166,6 +1267,14 @@ async fn build_capabilities(
         .iter()
         .filter(|configured| configured.enabled)
         .collect::<Vec<_>>();
+    if loaded.authority()?.tenant_id().is_some()
+        && (!enabled_servers.is_empty() || !enabled_https_servers.is_empty())
+    {
+        return Err(
+            "fixed-tenant service authority requires tenant-partitioned MCP sessions; configured shared MCP servers are unsupported"
+                .into(),
+        );
+    }
     #[cfg(not(feature = "https-mcp"))]
     if !enabled_https_servers.is_empty() {
         return Err(
@@ -2129,6 +2238,7 @@ async fn build_model(
             max_concurrency,
         } => {
             let model = build_openai_model(
+                loaded,
                 id,
                 model,
                 api_key_secret_reference,
@@ -2182,9 +2292,33 @@ async fn build_model(
     }
 }
 
+#[cfg(feature = "https-model")]
+/// Selects the unscoped or exact-tenant environment adapter for one Model Secret.
+fn configured_environment_secrets(
+    loaded: &LoadedConfig,
+    reference: &SecretReference,
+    environment: String,
+) -> Result<Arc<dyn SecretProvider>, HarnessError> {
+    let authority = loaded.authority()?;
+    match authority.tenant_id() {
+        None => Ok(Arc::new(EnvironmentSecretProvider::new(
+            "service-environment",
+            BTreeMap::from([(reference.clone(), environment)]),
+        )?)),
+        Some(tenant_id) => Ok(Arc::new(TenantEnvironmentSecretProvider::new(
+            "service-tenant-environment",
+            BTreeMap::from([(
+                tenant_id.to_owned(),
+                BTreeMap::from([(reference.clone(), environment)]),
+            )]),
+        )?)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "https-model")]
 async fn build_openai_model(
+    loaded: &LoadedConfig,
     id: &str,
     model: &str,
     api_key_secret_reference: &str,
@@ -2195,17 +2329,18 @@ async fn build_openai_model(
     max_concurrency: usize,
 ) -> CliResult<Arc<dyn LanguageModel>> {
     let reference = SecretReference::new(api_key_secret_reference.to_owned())?;
-    let secrets = Arc::new(EnvironmentSecretProvider::new(
-        "service-environment",
-        BTreeMap::from([(reference.clone(), api_key_environment.to_owned())]),
-    )?);
+    let secrets =
+        configured_environment_secrets(loaded, &reference, api_key_environment.to_owned())?;
     let _credential = secrets
-        .resolve(SecretRequest {
-            reference: reference.clone(),
-            consumer: id.to_owned(),
-            thread_id: ThreadId::from_static("doctor-thread"),
-            turn_id: TurnId::from_static("doctor-turn"),
-        })
+        .resolve_as(
+            SecretRequest {
+                reference: reference.clone(),
+                consumer: id.to_owned(),
+                thread_id: ThreadId::from_static("doctor-thread"),
+                turn_id: TurnId::from_static("doctor-turn"),
+            },
+            &loaded.authority()?,
+        )
         .await?;
     let config = OpenAiResponsesModelConfig::new(model, reference)?.with_limits(
         Duration::from_millis(request_timeout_ms),
@@ -2220,6 +2355,7 @@ async fn build_openai_model(
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(feature = "https-model"))]
 async fn build_openai_model(
+    _loaded: &LoadedConfig,
     _id: &str,
     _model: &str,
     _api_key_secret_reference: &str,
@@ -2250,17 +2386,18 @@ async fn build_https_model(
     root_ca_path: Option<&str>,
 ) -> CliResult<Arc<dyn LanguageModel>> {
     let reference = SecretReference::new(bearer_secret_reference.to_owned())?;
-    let secrets = Arc::new(EnvironmentSecretProvider::new(
-        "service-environment",
-        BTreeMap::from([(reference.clone(), bearer_environment.to_owned())]),
-    )?);
+    let secrets =
+        configured_environment_secrets(loaded, &reference, bearer_environment.to_owned())?;
     let _credential = secrets
-        .resolve(SecretRequest {
-            reference: reference.clone(),
-            consumer: id.to_owned(),
-            thread_id: ThreadId::from_static("doctor-thread"),
-            turn_id: TurnId::from_static("doctor-turn"),
-        })
+        .resolve_as(
+            SecretRequest {
+                reference: reference.clone(),
+                consumer: id.to_owned(),
+                thread_id: ThreadId::from_static("doctor-thread"),
+                turn_id: TurnId::from_static("doctor-turn"),
+            },
+            &loaded.authority()?,
+        )
         .await?;
     let mut config = HttpsJsonModelConfig::new(endpoint, reference)?.with_limits(
         Duration::from_millis(request_timeout_ms),
@@ -2322,6 +2459,7 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
             format!("max_model_attempts_per_step must be 1-{MAX_MODEL_ATTEMPTS_PER_STEP}").into(),
         );
     }
+    configured_authority(&config)?;
     let root = path
         .parent()
         .ok_or_else(|| format!("config has no parent directory: {}", path.display()))?
@@ -2590,8 +2728,8 @@ mod tests {
         CapabilityOrigin, EvaluationBaseline, EvaluationSuite, LoadedConfig, ServiceConfig,
         ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig,
         ServiceProcessLaunchConfig, ServiceToolConfig, ServiceVerifierConfig, ToolBatchExecution,
-        build_capabilities, build_evaluation, build_models, configured_skill_trust, load_config,
-        resolve_data_directory, verify_file_sha256,
+        build_capabilities, build_evaluation, build_models, configured_authority,
+        configured_skill_trust, load_config, resolve_data_directory, verify_file_sha256,
     };
     use std::{
         fs,
@@ -2651,6 +2789,70 @@ mod tests {
         assert!(resolve_data_directory(Path::new("/project"), "../outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), "/outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), ".").is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_tenant_authority_is_exact_and_rejects_shared_mcp_sessions() {
+        let tenant = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "authority": {
+                "type": "local_process_tenant",
+                "tenant_id": "tenant-a"
+              },
+              "model": {"type": "demo"}
+            }"#,
+        );
+        assert_eq!(
+            configured_authority(&tenant.config)
+                .expect("fixed tenant authority")
+                .tenant_id(),
+            Some("tenant-a")
+        );
+
+        let invalid = serde_json::from_str::<ServiceConfig>(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "authority": {
+                "type": "local_process_tenant",
+                "tenant_id": "\n"
+              },
+              "model": {"type": "demo"}
+            }"#,
+        )
+        .expect("shape-valid authority");
+        assert!(configured_authority(&invalid).is_err());
+
+        let shared_mcp = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "authority": {
+                "type": "local_process_tenant",
+                "tenant_id": "tenant-a"
+              },
+              "model": {"type": "demo"},
+              "mcp_servers": [{
+                "id": "shared",
+                "command": "/unused",
+                "launch": {
+                  "type": "unrestricted",
+                  "max_concurrency": 1
+                }
+              }]
+            }"#,
+        );
+        let error = build_capabilities(&shared_mcp, true)
+            .await
+            .err()
+            .expect("shared MCP must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("requires tenant-partitioned MCP sessions")
+        );
     }
 
     #[test]
