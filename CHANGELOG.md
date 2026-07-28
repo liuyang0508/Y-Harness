@@ -4,6 +4,10 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added Approval Inbox schema 3 with immutable trusted tenant ownership,
+  exact-tenant Memory/SQLite and Protocol fencing, tenant-aware Runtime
+  approval/recovery flow, validated SQLite lookup projections, backup-first
+  schema-2 migration without inferred ownership, and Protocol v21;
 - added a bounded Codex `exec --json` adapter to the independent external
   benchmark runner, preserving JSONL evidence while recording unavailable
   product metrics as unavailable rather than inferred;

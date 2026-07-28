@@ -138,14 +138,22 @@ State schema 12 now binds optional tenant ownership to the authoritative
 Thread creation event, Protocol v20 fences Thread and Operation access by the
 resolved authority, and Thread archive format 2 preserves the new projection.
 Legacy Threads migrate as unscoped rather than receiving guessed ownership.
-Approval and Task protocol surfaces still fail closed for tenant-scoped
-authorities until their own durable schemas advance. See
+At Protocol v20, Approval and Task protocol surfaces still fail closed for
+tenant-scoped authorities until their own durable schemas advance. See
 [ADR 0117](adr/0117-durable-thread-tenant-ownership.md).
 The Rust pre-1.0 API adds tenant-aware State/Runtime methods and
 `EventStore::thread_accessible`; custom stores that override
 `thread_summaries_page` must accept the tenant filter. `Thread` construction
 now keeps ownership engine-controlled and exposes it through `tenant_id()`,
 so external direct struct literals require a source update.
+Approval Inbox schema 3 binds immutable optional tenant ownership to every
+record, and Protocol v21 enables exact-tenant Approval discovery and
+settlement while tenant-scoped Task access remains fail-closed. Schema-2
+records migrate as unscoped; no Thread or actor relationship is used to infer
+ownership. The pre-1.0 `ApprovalInbox` and `ApprovalHandler` APIs add
+authority-aware methods, and custom tenant-aware handlers must durably
+preserve the boundary. See
+[ADR 0118](adr/0118-durable-approval-tenant-ownership.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -533,9 +541,11 @@ portable Thread archives and import provenance, plus
 [ADR 0096](adr/0096-attributed-per-turn-context.md) for schema-11 attributed
 per-Turn context, plus
 [ADR 0117](adr/0117-durable-thread-tenant-ownership.md) for schema-12 Thread
-tenant ownership, Protocol v20 fencing, and archive format 2.
+tenant ownership, Protocol v20 fencing, and archive format 2, plus
+[ADR 0118](adr/0118-durable-approval-tenant-ownership.md) for Approval Inbox
+schema 3 and Protocol v21 tenant fencing.
 
-Approval Inbox schema 1 is independently migrated with:
+Approval Inbox schema 1 or schema 2 is independently migrated with:
 
 ```bash
 yh approval-migrate \
@@ -545,12 +555,13 @@ yh approval-migrate \
 
 All Approval Inbox writers must be stopped. The migration validates and
 fingerprints the complete indexed record set, creates a no-clobber backup,
-orphans pending records whose requester cannot be reconstructed, preserves
-terminal evidence with explicit unattributed actors, and commits schema-2
-writer metadata atomically. New reader + old populated data is supported only
-after this migration; old readers/writers must not access the migrated source.
-Rollback is a backup restore before any schema-2 write, or an explicitly
-data-losing recovery afterward.
+orphans schema-1 pending records whose requester cannot be reconstructed,
+preserves terminal evidence with explicit unattributed actors, retains
+schema-2 lifecycles as unscoped, and commits schema-3 writer metadata and the
+tenant projection atomically. New reader + old populated data is supported
+only after this migration; old readers/writers must not access the migrated
+source. Rollback is a backup restore before any schema-3 write, or an
+explicitly data-losing recovery afterward.
 
 See the [Approval migration runbook](approval-migration.md) and
 [ADR 0063](adr/0063-attributed-separation-of-duty-approvals.md).
@@ -580,8 +591,8 @@ Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
 durable schema support windows are declared per release. State schema 12 reads
 immutable schema-1 through schema-11 history after explicit store migration.
-Approval reads only schema 2 in normal operation; its migration tool alone
-reads schema 1.
+Approval reads only schema 3 in normal operation; its migration tool alone
+reads schema 1 and schema 2.
 
 The MSRV is Rust 1.88.0 and is enforced in CI. Platform support is proven only
 where the exact release commit has green jobs; configuration alone is not

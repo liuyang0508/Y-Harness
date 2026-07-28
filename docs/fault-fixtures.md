@@ -104,7 +104,7 @@ The record is preserved under
 A format-9 Y-Harness run drives real `yh serve` processes, the configured
 JSON-command Model, stdio MCP, and SQLite State. After the controller kills the
 faulting process, restart first observes the abandoned Turn still `running`;
-protocol-v20 exact-Turn recovery then marks it `interrupted` without a Tool
+protocol-v21 exact-Turn recovery then marks it `interrupted` without a Tool
 result, and a new Turn completes without selecting a Tool. Both fixture
 inspections remain one invocation and one effect. The record is preserved
 under

@@ -223,7 +223,7 @@ cargo run --locked --release -p y-harness-benchmark-runner -- \
   y-harness-cf003-restart /absolute/path/to/spec.json
 ```
 
-The adapter drives three real `yh serve` processes over protocol v20: setup,
+The adapter drives three real `yh serve` processes over protocol v21: setup,
 fault injection, then restart. Its spec-bound JSON-command Model selects the
 one stdio MCP Tool before the first process is killed at the durable
 post-effect/pre-result boundary. Restart must first retain the exact Turn as

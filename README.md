@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v20 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v21 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v20 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v21 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -189,7 +189,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v20 specification](docs/protocol.md).
+[client protocol v21 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -452,11 +452,11 @@ blocks; all other Context remains user-level reference data. See
 
 State schema 12 makes optional Thread tenant ownership authoritative at
 creation. Memory and SQLite stores fence every Thread/Turn read and mutation by
-exact trusted tenant, and Protocol v20 applies the same boundary to retained
+exact trusted tenant, and Protocol v21 applies the same boundary to retained
 Operations. Forks inherit the caller tenant; archive imports rebind a new
 target to the importing tenant. Legacy Threads migrate as unscoped rather than
-receiving inferred ownership. Tenant-scoped Approval and Task protocol
-surfaces remain fail-closed pending their own durable schemas. See
+receiving inferred ownership. Tenant-scoped Task protocol surfaces remain
+fail-closed pending its own durable schema. See
 [ADR 0117](docs/adr/0117-durable-thread-tenant-ownership.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
@@ -492,8 +492,17 @@ orphans abandoned work. Protocol 9 intentionally exposes no remote takeover
 without cross-host lease/fencing. Hosts that install the inbox also expose
 typed pending/get/settle commands.
 
-Populated schema-1 Approval Inbox databases require a separate offline
-migration:
+Approval Inbox schema 3 binds every current record to the same optional trusted
+tenant as its owning Turn. Memory and SQLite access require exact tenant
+equality, SQLite validates its tenant lookup projection against the record
+body, and Protocol v21 exposes tenant-scoped Approval list/get/settle without a
+caller-authored tenant selector. Same-tenant settlement still requires an
+independent actor. Schema-2 records migrate as explicitly unscoped; ownership
+is never inferred from a Thread, actor, or database path. See
+[ADR 0118](docs/adr/0118-durable-approval-tenant-ownership.md).
+
+Populated schema-1 and schema-2 Approval Inbox databases require a separate
+offline migration:
 
 ```bash
 cargo run -- approval-migrate \
@@ -503,7 +512,8 @@ cargo run -- approval-migrate \
 
 The backup is no-clobber and SHA-256-bound to the source. Because schema 1 had
 no actor evidence, pending requests are orphaned and terminal identities are
-marked explicitly unattributed. See the
+marked explicitly unattributed. Schema-2 records retain their lifecycle and
+become explicitly unscoped. See the
 [Approval migration runbook](docs/approval-migration.md).
 
 Interrupted-Turn recovery keeps durable orphaning atomic without bulk-loading
@@ -661,7 +671,7 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v20 preserves Protocol v19's 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v21 preserves Protocol v20's 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
@@ -674,7 +684,9 @@ added lineage to bounded content-free Thread summaries without changing State
 schema; Protocol 17 admitted import provenance, and Protocol 18 adds optional
 bounded `start_turn.context`. Protocol 19 adds explicit permissioned recovery
 of one exact abandoned Turn without automatic replay. Protocol 20 adds exact
-Thread and Operation tenant fencing. Steering requires the exact
+Thread and Operation tenant fencing. Protocol 21 adds schema-3 durable
+Approval tenant ownership and tenant-scoped Approval capabilities. Steering
+requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
@@ -767,7 +779,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v20. The Sessions panel shows direct fork ancestry from
+through Protocol v21. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

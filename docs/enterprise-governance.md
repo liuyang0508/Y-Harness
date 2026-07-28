@@ -36,7 +36,7 @@ reason to duplicate Runtime or State.
 | Existing primitive | It does not yet prove |
 |---|---|
 | signed, revocable Skill lifecycle | atomic Domain Pack promotion and rollback |
-| transport Principal plus durable Thread/Operation tenant ownership | tenant-partitioned Approval, Task, Secret, Artifact, and Domain Pack resources |
+| transport Principal plus durable Thread/Operation/Approval tenant ownership | tenant-partitioned Task, Secret, Artifact, and Domain Pack resources |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
 | durable Approval Inbox | ownership transfer or Human Handoff |
 | digest-bound Thread handoff input | Human Handoff |
@@ -77,11 +77,12 @@ reason to duplicate Runtime or State.
 ADR 0116 introduces trusted Turn authority and binds remote Memory scope,
 Policy, and Tool execution to it. ADR 0117 adds authoritative schema-12 tenant
 ownership and exact access fencing for Thread, Turn, recovery, archive,
-handoff, and Protocol Operation state across Memory and SQLite stores.
+handoff, and Protocol Operation state across Memory and SQLite stores. ADR
+0118 adds schema-3 durable Approval ownership, exact tenant list/get/settle,
+restart continuation, and non-inferential schema-2 migration.
 
-This is not a complete multi-tenant claim. Tenant-scoped Approval and Task
-protocol capabilities now fail closed and are not advertised until those
-durable stores bind ownership. Secret, Artifact, Domain Pack activation,
-quota, and retention boundaries are also still open. The next compatible
-slice is durable Approval ownership, followed by Task Graph and worker
-ownership; no tenant value will be inferred for legacy records.
+This is not a complete multi-tenant claim. Tenant-scoped Task protocol
+capabilities still fail closed and are not advertised until Task Graphs bind
+ownership. Secret, Artifact, Domain Pack activation, quota, and retention
+boundaries are also still open. The next compatible slice is Task Graph and
+worker ownership; no tenant value will be inferred for legacy records.

@@ -1,10 +1,10 @@
-# Client protocol v20
+# Client protocol v21
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"20"` is exact. Every request carries that value, and a peer
+Protocol version `"21"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "20",
+  "protocol_version": "21",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "20",
+  "protocol_version": "21",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "20",
+  "protocol_version": "21",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "20",
+  "protocol_version": "21",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "20",
+  "protocol_version": "21",
   "body": {
     "status": "success",
     "result": {
@@ -136,7 +136,7 @@ The result type is `initialized`:
         "engine_version": "0.1.0",
         "state_event_schema": 12,
         "state_snapshot_schema": 12,
-        "approval_inbox_schema": 2,
+        "approval_inbox_schema": 3,
         "task_graph_schema": 1,
         "memory_api": 1,
         "token_counter_api": 1,
@@ -157,10 +157,12 @@ configured; Task permissions appear only when a durable Task Coordinator is
 configured. A client must not infer a permission from a compatibility
 coordinate.
 
-For a tenant-scoped authority, Approval and Task permissions are omitted even
-when those services are configured. Their current durable schemas do not bind
-tenant ownership, so the corresponding commands fail closed until those
-schemas advance.
+For a tenant-scoped authority, Approval permissions are available when the
+durable Approval Inbox is configured. List, get, and settlement are fenced by
+the exact transport-resolved tenant; commands contain no tenant selector. Task
+permissions remain omitted because Task Graph schema 1 does not yet bind
+tenant ownership, and tenant-scoped Task commands fail closed before resource
+access.
 
 ## Methods
 
@@ -571,9 +573,10 @@ the domain page is capped at 2,097,152 encoded bytes.
 The protocol serializes the same public domain records used by an embedded
 host:
 
-- a Thread is `{id, name?, lineage?, created_at_ms, turns, checkpoints}`;
+- a Thread is
+  `{id, name?, lineage?, tenant_id?, created_at_ms, turns, checkpoints}`;
 - a Thread summary is
-  `{thread_id, name?, lineage?, last_sequence, updated_at_ms, stream_version}`;
+  `{thread_id, name?, lineage?, tenant_id?, last_sequence, updated_at_ms, stream_version}`;
 - a Turn is `{id, thread_id, status, items}`;
 - an Item is tagged by `type`;
 - a Stored Event carries
@@ -582,7 +585,7 @@ host:
   budgets plus `healthy`, `warning`, `critical`, `terminal_only`, or
   `exhausted`;
 - an Approval record carries
-  `{schema_version, request, status, revision, requested_at_ms, settled_at_ms}`.
+  `{schema_version, request, tenant_id?, status, revision, requested_at_ms, settled_at_ms}`.
 - a Task Graph summary carries revision, count, terminal state, and bounded
   materialization accounting;
 - a Task claim carries the immutable Task definition and current fenced lease;
@@ -801,7 +804,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v20 value |
+| Boundary | Protocol v21 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |

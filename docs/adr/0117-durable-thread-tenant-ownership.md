@@ -35,6 +35,7 @@ migration ambiguous.
 - Approval and Task records remain unpartitioned in this slice. Tenant-scoped
   Protocol sessions do not advertise their capabilities, and direct commands
   fail before resource access until those stores gain durable ownership.
+  ADR 0118 later closes this boundary for Approval records only.
 
 ## Boundary
 
@@ -46,7 +47,7 @@ store must preserve atomic events and projections; application code uses the
 tenant-aware State/Runtime/Protocol entry points rather than raw store methods.
 
 This is durable Thread and Operation isolation, not complete enterprise
-multi-tenancy. Approval, Task, Secret, Artifact, Domain Pack activation,
+  multi-tenancy. Task, Secret, Artifact, Domain Pack activation,
 quotas, retention, and distributed ownership still require their own
 authoritative schemas and cross-tenant tests.
 
@@ -68,5 +69,5 @@ authoritative schemas and cross-tenant tests.
 - `state::tests::thread_tenant_ownership_fences_reads_mutations_and_reopen`
 - `state::tests::thread_tenant_evidence_requires_schema_twelve`
 - `state::migration::tests::migration_advances_metadata_schemas_without_rewriting_history`
-- `protocol::tests::protocol_tenant_fencing_hides_threads_operations_and_pending_resources`
-- `protocol::tests::protocol_twenty_wire_envelopes_state_provenance_and_permissions_are_stable`
+- `protocol::tests::protocol_tenant_fencing_hides_threads_operations_approvals_and_tasks`
+- `protocol::tests::protocol_twenty_one_wire_envelopes_state_provenance_and_permissions_are_stable`

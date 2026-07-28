@@ -33,7 +33,8 @@ create a false multi-tenant security claim.
   adapters preserve it when delegating an approved reversal.
 - Keep existing durable State and Approval schemas unchanged in this slice.
   Tenant-scoped `PolicyDecision::Ask` and tenant-scoped approval recovery fail
-  closed because their durable evidence does not yet bind a tenant.
+  closed because their durable evidence does not yet bind a tenant. ADR 0118
+  later adds that durable Approval boundary.
 
 ## Boundary
 
@@ -68,7 +69,7 @@ authority argument, and `ToolContext` gains the same value.
 - `runtime::control::tests::trusted_tenant_is_injected_and_cannot_be_overridden`
 - `runtime::control::tests::unscoped_remote_actor_cannot_select_a_memory_tenant`
 - `runtime::tests::trusted_authority_reaches_policy_and_tool_execution`
-- `runtime::tests::tenant_scoped_approval_fails_before_request_or_tool_execution`
+- `runtime::tests::tenant_scoped_approval_is_durable_and_executes_only_after_settlement`
 - `protocol::tests::protocol_authorizer_can_resolve_a_scoped_runtime_authority`
 - `protocol::tests::authority_resolution_panic_fails_closed_before_command_execution`
 - `protocol::tests::start_turn_carries_resolved_actor_into_durable_attribution`

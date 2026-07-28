@@ -40,7 +40,7 @@ not release-ready while any blocking row remains open.
 | Model Provider failures and retry | additive bounded public taxonomy, legacy `Model(String)` compatibility, high-confidence HTTP/transport/protocol mapping, numeric retry hints, content-free Trace evidence, default-disabled 1–8 same-Model retries for four typed transient classes, shared attempt budget, cancellable bounded jitter, retry indices, and provisional-output fencing | constructor/status/trace/privacy plus retry exhaustion/classification/deadline/cancellation/stream/config tests passing; vendor-specific structured quota/content/model-unavailable mapping and distributed recovery remain open |
 | Task orchestration execution | bounded public TaskExecutor scheduler, dependency progress, timeout/panic isolation, exact-lease settlement, stale-result cancellation, fenced paged Mailbox | passing with memory and SQLite coordinator contracts |
 | Task workspace lifecycle | default deny, exact-attempt Provider lease, bounded prepare/release, cleanup-before-settlement, concurrent local isolation, marker/path replacement guards, detached pinned Git Worktree through Process Broker | passing with local directories and real local Git |
-| Task worker protocol | protocol-v20 conditional discovery for unscoped authorities, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests; tenant-scoped discovery and access fail closed pending durable Task ownership |
+| Task worker protocol | protocol-v21 conditional discovery for unscoped authorities, bounded graph/record/claim surfaces, principal-derived ownership, server-clock leases, cross-principal fencing, messaging, CAS recovery, explicit-revision cancellation | passing with authenticated lifecycle and conflict tests; tenant-scoped discovery and access fail closed pending durable Task ownership |
 | Harness regression evaluation | format-2, origin-bound 2-case × 2-grader end-to-end Runtime suite and exact baseline, plus configured external Grader path | `yh eval-smoke` and real isolated `yh eval` process test passing; machine-readable and nonzero on regression |
 | Product and Engine evidence tools | external-run formats 1–6, Codex CF-003 formats 7/8, and Y-Harness CF-003 format 9; exact adapter/product/source/fixture/rollout/config hashes; bounded Claude Code JSON, Codex JSONL, Grok Build headless JSON, Pi JSONL, OpenCode JSONL, Hermes one-shot/usage, and typed Y-Harness stdio processes; deterministic loopback Messages/Responses Providers or spec-bound JSON-command Model; unavailable facts preserved as unavailable; exact-pinned MCP crash/hold-after-effect fixture with durable oracle | adapter/fixture tests plus real Claude Code 2.1.143, Codex 0.145.0, Grok Build 0.2.112, Pi 0.82.1, OpenCode 1.18.5, and Hermes 0.19.0 fixed-output; shared-Provider Claude/Codex and shared-Responses Codex/Grok preflights that machine-reject comparison after exposing fallback/off-coordinate Model calls, protocol, Tool, reasoning, Context, permission, and sandbox differences; Codex single-process/same-Thread restart and Y-Harness explicit-recovery restart CF-003 records passing; all explicitly ineligible for comparison claims, with Claude's Provider probe/config state/product prompt blocks, Grok's rejected default-Model title call, Codex's visible built-ins, unavailable settled identity, identity-bound detached-MCP release marker, new-Turn recovery, no implicit takeover, and no descendant-exit claim recorded |
 | Public API embedding | standalone zero-network hosts run a Policy-controlled Model/Tool loop and a durable fenced Task DAG through public contracts | `embedded` and `orchestrated` examples passing |
@@ -129,9 +129,12 @@ boundary remain explicit.
 - A durable Approval Inbox survives restart, fences competing settlement,
   records the authority-scoped requester and deciding actor, and rejects exact
   actor self-approval inside the CAS boundary. mTLS uses the client leaf
-  certificate fingerprint as the authenticated subject, and schema-1 migration
-  is backup-first and explicitly orphans unattributed pending work. An embedded
-  host with exclusive ownership can resume a schema-3, fingerprint-matched
+  certificate fingerprint as the authenticated subject. Schema-3 records,
+  list/get/settle/orphan operations, and restart continuation are exactly
+  tenant-fenced. Schema-1/schema-2 migration is backup-first, explicitly
+  orphans unattributed schema-1 pending work, and keeps schema-2 records
+  unscoped. An embedded host with exclusive ownership can resume a schema-3,
+  fingerprint-matched
   pre-Tool approval wait across Memory or reopened SQLite stores. Post-decision
   unknown Tool effects remain fail-closed. Mapping certificate Subject/SAN to
   people, tenant/role policy, proving that two certificates belong to
@@ -140,10 +143,10 @@ boundary remain explicit.
 - A trusted per-Turn Authority Context can map a transport principal to an actor
   and tenant, binds remote Memory scope, and reaches State, Policy, and Tool
   execution. Schema-12 Threads, State reads/mutations, recovery, and retained
-  Operations are tenant-fenced. Approval records, Tasks, Secrets, Artifacts,
-  Domain Packs, quotas, and retention are not yet tenant-partitioned, so this
-  is not a complete multi-tenant isolation claim; tenant-scoped Approval and
-  Task protocol access fails closed.
+  Operations plus schema-3 Approval records are tenant-fenced. Tasks, Secrets,
+  Artifacts, Domain Packs, quotas, and retention are not yet
+  tenant-partitioned, so this is not a complete multi-tenant isolation claim;
+  tenant-scoped Task protocol access fails closed.
 - Publisher and transparency-log keys now support live validity and immutable
   revocation, and signed receipts bind log/entry/time metadata to the exact
   package and publisher signature. Exact pin-bound public HTTPS acquisition is

@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v20 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v21 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -50,10 +50,12 @@ new target to the importing tenant.
 Protocol 19 adds permissioned recovery of one exact abandoned Turn without
 automatic replay. The embedded Runtime also carries a validated per-Turn
 Authority Context from a trusted host or protocol authorizer into Memory scope,
-Policy, and Tool execution. Protocol 20 applies the same trusted tenant to
+Policy, and Tool execution. Protocol 21 applies the same trusted tenant to
 Thread, Turn, recovery, handoff, archive, and retained Operation access.
-Tenant-scoped Approval and Task capabilities remain hidden and fail closed
-until their own durable schemas bind ownership.
+Approval Inbox schema 3 and Protocol 21 additionally bind Approval records,
+discovery, and settlement to that tenant while preserving independent-actor
+settlement. Tenant-scoped Task capabilities remain hidden and fail closed
+until Task Graphs bind ownership.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the
@@ -161,9 +163,9 @@ yh serve
 - Rust crate: `0.1.0`
 - optional TUI package: `0.1.0`
 - service configuration: `1`
-- client protocol: `19`
-- State event/snapshot schema: `11` / `11`
-- Approval Inbox schema: `2`
+- client protocol: `21`
+- State event/snapshot schema: `12` / `12`
+- Approval Inbox schema: `3`
 - Task Coordinator schema: `1`
 - HTTPS Model Gateway API: `7`
 
