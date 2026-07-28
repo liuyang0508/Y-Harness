@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "run_id": "claude-code-fixed-output-20260728-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/opt/homebrew/bin/claude",
+  "expected_cli_version": "2.1.143 (Claude Code)",
+  "expected_product_executable_sha256": "2701c6cfd68483f8faf0316a1ba6481a1455a90645ada179f0c48d8c36d722ef",
+  "workspace": "/tmp/yh-claude-fixed-output-20260728.8ZOhEI/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "profile": "bare",
+  "provider": "yh-loopback-anthropic-messages",
+  "provider_base_url": "http://127.0.0.1:64322",
+  "model": "claude-haiku-4-5-20251001",
+  "reasoning_effort": "medium",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-CLAUDE-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "max_budget_usd": 0.1,
+  "max_turns": 1,
+  "inherit_environment": [
+    "ANTHROPIC_API_KEY"
+  ],
+  "home": "/tmp/yh-claude-fixed-output-20260728.8ZOhEI/home-final4",
+  "claude_config_dir": "/tmp/yh-claude-fixed-output-20260728.8ZOhEI/config-final4",
+  "temp_dir": "/tmp/yh-claude-fixed-output-20260728.8ZOhEI/tmp-final4"
+}

@@ -88,18 +88,21 @@ The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
 protocol; it keeps no title or branch store.
 The independent benchmark runner emits exact non-claim external-run formats
 for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
-CLIs. Real released Codex `0.145.0`, Grok Build `0.2.112`, Pi `0.82.1`,
-OpenCode `1.18.5`, and Hermes `0.19.0` fixed-output records preserve formats
-2–6 with deterministic loopback Providers and explicit unsupported controls.
-Grok's request sidecar records a separate session-title call outside the one
-returned main-agent Turn. Codex's sidecar records one request, six visible
-built-in Tools, absent automatic Skill/App instructions, and unavailable
-settled Provider/Model identity. These are adapter conformance records, not
-comparisons. Format 5 uses OpenCode's source-tested run JSONL surface. Format 6
-uses Hermes one-shot stdout plus its strict bounded usage sidecar, an isolated
-bare home, static empty Tool set, exact Provider/Model identity, and
-estimated-cost preservation without relabeling it as actual cost. Hermes's
-argv prompt exposure and missing
+CLIs. Real released Claude Code `2.1.143`, Codex `0.145.0`, Grok Build
+`0.2.112`, Pi `0.82.1`, OpenCode `1.18.5`, and Hermes `0.19.0` fixed-output
+records preserve formats 1–6 with deterministic loopback Providers and
+explicit unsupported controls. Claude's sidecar records one Provider probe,
+one Model request, exact settled Model/usage, projected product cost, on-wire
+thinking, product prompt/date blocks, and isolated config writes. Grok's
+request sidecar records a separate session-title call outside the one returned
+main-agent Turn.
+Codex's sidecar records one request, six visible built-in Tools, absent
+automatic Skill/App instructions, and unavailable settled Provider/Model
+identity. These are adapter conformance records, not comparisons. Format 5 uses
+OpenCode's source-tested run JSONL surface. Format 6 uses Hermes one-shot stdout
+plus its strict bounded usage sidecar, an isolated bare home, static empty Tool
+set, exact Provider/Model identity, and estimated-cost preservation without
+relabeling it as actual cost. Hermes's argv prompt exposure and missing
 system-role/workspace-rule parity remain explicit limitations. Dedicated
 format 7 drives released Codex `0.145.0`
 through a source-pinned deferred Tool-search and MCP crash-after-effect path,

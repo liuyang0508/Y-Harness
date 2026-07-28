@@ -18,14 +18,21 @@ The Claude Code adapter accepts an exact-versioned JSON specification:
   "workspace": "/absolute/isolated/workspace",
   "workspace_snapshot": "empty-workspace-v1",
   "profile": "bare",
-  "model": "claude-haiku-4-5",
+  "provider": "yh-loopback-anthropic-messages",
+  "provider_base_url": "http://127.0.0.1:12345",
+  "model": "claude-haiku-4-5-20251001",
+  "reasoning_effort": "medium",
   "system_prompt": "Return only the requested fixed text.",
   "prompt": "Reply exactly YH-ADAPTER-OK",
   "timeout_ms": 30000,
   "max_budget_usd": 0.10,
+  "max_turns": 1,
   "inherit_environment": [
     "ANTHROPIC_API_KEY"
-  ]
+  ],
+  "home": "/absolute/empty/platform-home",
+  "claude_config_dir": "/absolute/empty/claude-config",
+  "temp_dir": "/absolute/empty/temp"
 }
 ```
 
@@ -36,11 +43,15 @@ cargo run --locked -p y-harness-benchmark-runner -- \
   claude-code /absolute/path/to/spec.json > external-run.json
 ```
 
-`bare` requires Claude Code API-key authentication and suppresses ambient
-hooks, plugins, settings, memory, and keychain auth. `product` permits the
-installed product profile but marks ambient configuration as an unsupported
-control. Both profiles disable Tools, Skills, MCP, session persistence, and
-interactive permission prompts in adapter-format v1.
+`bare` requires API-key authentication, an explicit loopback Anthropic
+Messages Provider, exact effort and Turn ceiling, and three distinct initially
+empty state directories. The adapter owns Provider routing, platform/config/
+temp discovery and nonessential-traffic controls while `--bare` suppresses
+ambient hooks, plugins, settings, memory, and keychain auth. `product` must not
+declare bare controls, permits the installed product profile, and records
+ambient configuration as unsupported. Both profiles disable Tools, Skills,
+MCP, session persistence, and interactive permission prompts in external-run
+format 1.
 
 The Claude output is an external-run format-1 report. It pins the adapter
 binary, observed CLI version, and product executable by SHA-256; hashes
@@ -54,6 +65,12 @@ individual provider call can settle above the requested value before the CLI
 returns `error_max_budget_usd`. Reports therefore preserve both
 `requested_max_budget_usd` and `actual_cost_usd`; callers must not treat the
 requested value as a hard pre-spend fence.
+
+The released `2.1.143` bare probe also showed one unauthenticated Provider
+`HEAD /` before its single Messages request, product prompt/date blocks beyond
+the requested system prompt, and isolated config writes despite
+`--no-session-persistence`. These are retained as unsupported controls rather
+than hidden by the adapter.
 
 The second adapter consumes Codex's stable non-interactive JSONL surface:
 

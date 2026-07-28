@@ -26,7 +26,9 @@ use y_harness::{
 };
 
 const CLAUDE_RUN_FORMAT_VERSION: u32 = 1;
-const CLAUDE_ADAPTER_VERSION: &str = "claude-code-json-v1";
+const CLAUDE_ADAPTER_VERSION: &str = "claude-code-json-v2";
+const CLAUDE_PROVIDER_TOKEN_ENV: &str = "ANTHROPIC_API_KEY";
+const CLAUDE_MAX_TURNS: u64 = 64;
 const MAX_SPEC_BYTES: u64 = 2_097_152;
 const MAX_OUTPUT_BYTES: usize = 2_097_152;
 const MAX_PROMPT_BYTES: usize = 1_048_576;
@@ -59,12 +61,19 @@ struct ClaudeRunSpec {
     workspace: PathBuf,
     workspace_snapshot: String,
     profile: ClaudeProfile,
+    provider: Option<String>,
+    provider_base_url: Option<String>,
     model: String,
+    reasoning_effort: Option<String>,
     system_prompt: String,
     prompt: String,
     timeout_ms: u64,
     max_budget_usd: f64,
+    max_turns: Option<u64>,
     inherit_environment: Vec<String>,
+    home: Option<PathBuf>,
+    claude_config_dir: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -311,6 +320,83 @@ fn validate_spec(spec: &ClaudeRunSpec) -> AppResult<()> {
             "max_budget_usd must be > 0 and <= {MAX_BUDGET_USD}"
         ));
     }
+    match spec.profile {
+        ClaudeProfile::Bare => {
+            let Some(provider) = spec.provider.as_deref() else {
+                return Err("bare Claude Code profile requires provider".to_owned());
+            };
+            validate_text("Claude Code provider", provider)?;
+            let Some(provider_base_url) = spec.provider_base_url.as_deref() else {
+                return Err("bare Claude Code profile requires provider_base_url".to_owned());
+            };
+            validate_claude_loopback_base_url(provider_base_url)?;
+            let Some(reasoning_effort) = spec.reasoning_effort.as_deref() else {
+                return Err("bare Claude Code profile requires reasoning_effort".to_owned());
+            };
+            if !matches!(
+                reasoning_effort,
+                "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
+                return Err("unsupported Claude Code reasoning_effort".to_owned());
+            }
+            if spec
+                .max_turns
+                .is_none_or(|turns| !(1..=CLAUDE_MAX_TURNS).contains(&turns))
+            {
+                return Err(format!(
+                    "bare Claude Code max_turns must be 1-{CLAUDE_MAX_TURNS}"
+                ));
+            }
+            if spec.home.as_ref().is_none_or(|path| !path.is_absolute())
+                || spec
+                    .claude_config_dir
+                    .as_ref()
+                    .is_none_or(|path| !path.is_absolute())
+                || spec
+                    .temp_dir
+                    .as_ref()
+                    .is_none_or(|path| !path.is_absolute())
+            {
+                return Err(
+                    "bare Claude Code profile requires absolute home, claude_config_dir, and temp_dir directories"
+                        .to_owned(),
+                );
+            }
+            if spec.inherit_environment.as_slice() != [CLAUDE_PROVIDER_TOKEN_ENV] {
+                return Err("bare Claude Code profile inherits only ANTHROPIC_API_KEY".to_owned());
+            }
+        }
+        ClaudeProfile::Product => {
+            if spec.provider.is_some()
+                || spec.provider_base_url.is_some()
+                || spec.reasoning_effort.is_some()
+                || spec.max_turns.is_some()
+                || spec.home.is_some()
+                || spec.claude_config_dir.is_some()
+                || spec.temp_dir.is_some()
+            {
+                return Err(
+                    "product Claude Code profile must not declare bare-profile controls".to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_claude_loopback_base_url(value: &str) -> AppResult<()> {
+    let port = value
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| {
+            "bare Claude Code provider_base_url must be http://127.0.0.1:<port>".to_owned()
+        })?
+        .parse::<u16>()
+        .map_err(|_| {
+            "bare Claude Code provider_base_url must contain a valid loopback port".to_owned()
+        })?;
+    if port == 0 {
+        return Err("bare Claude Code provider_base_url port must be nonzero".to_owned());
+    }
     Ok(())
 }
 
@@ -432,7 +518,8 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
     if !workspace.is_dir() {
         return Err("workspace must resolve to a directory".to_owned());
     }
-    let environment = inherited_environment(&spec.inherit_environment)?;
+    let mut environment = inherited_environment(&spec.inherit_environment)?;
+    prepare_claude_environment(&spec, &mut environment)?;
     let broker = LocalProcessBroker::new(1).map_err(|error| error.to_string())?;
     let product_executable_sha256 = sha256_file(&program)?;
     if product_executable_sha256 != spec.expected_product_executable_sha256 {
@@ -456,7 +543,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
     let system_prompt_sha256 = sha256_bytes(spec.system_prompt.as_bytes());
     let started_at_ms = now_ms();
     let started = Instant::now();
-    let args = claude_arguments(&spec);
+    let args = claude_arguments(&spec)?;
     let request = ProcessRequest {
         program,
         args,
@@ -545,10 +632,21 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
         "no cross-product model parity has been established",
         "Tools are disabled, so Agent-loop effectiveness is not measured",
         "workspace_snapshot is caller-asserted rather than adapter-verified",
-        "environment values and provider routing are not recorded",
+        "credential values and launcher dependencies are not recorded",
     ];
     if matches!(spec.profile, ClaudeProfile::Product) {
         unsupported_controls.push("ambient product configuration is not eliminated");
+    } else {
+        unsupported_controls.extend([
+            "the Provider request sidecar is corroborating evidence rather than product settlement",
+            "Claude Code JSON does not expose settled Provider identity",
+            "product-reported cost is a price-table projection for the loopback fixture, not incurred Provider spend",
+            "Claude Code sends an auxiliary HEAD probe before the Model request",
+            "Claude Code exposes no hard Provider-call ceiling for one Turn",
+            "Claude Code materializes configuration state despite --no-session-persistence",
+            "built-in product prompt blocks and current-date Context are not eliminated",
+            "no product OS sandbox is requested because all Tools are disabled",
+        ]);
     }
 
     Ok(ExternalRunReport {
@@ -577,7 +675,7 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
                 ClaudeProfile::Bare => "bare",
                 ClaudeProfile::Product => "product",
             },
-            requested_provider: None,
+            requested_provider: spec.provider,
             requested_model: spec.model,
             observed_models,
             prompt_sha256,
@@ -588,8 +686,8 @@ async fn execute_claude(spec: ClaudeRunSpec) -> AppResult<ExternalRunReport> {
             inherited_environment_names: spec.inherit_environment,
             timeout_ms: spec.timeout_ms,
             requested_max_budget_usd: Some(spec.max_budget_usd),
-            requested_reasoning_effort: None,
-            requested_max_turns: None,
+            requested_reasoning_effort: spec.reasoning_effort,
+            requested_max_turns: spec.max_turns,
             product_sandbox: None,
             unsupported_controls,
         },
@@ -679,8 +777,67 @@ async fn read_cli_version(
     Ok(version)
 }
 
-fn claude_arguments(spec: &ClaudeRunSpec) -> Vec<String> {
-    let mut args = Vec::with_capacity(17);
+fn prepare_claude_environment(
+    spec: &ClaudeRunSpec,
+    environment: &mut BTreeMap<String, String>,
+) -> AppResult<()> {
+    let ClaudeProfile::Bare = spec.profile else {
+        return Ok(());
+    };
+    let home = spec
+        .home
+        .as_ref()
+        .ok_or_else(|| "bare Claude Code profile has no home".to_owned())
+        .and_then(|path| canonical_empty_directory(path, "Claude Code home"))?;
+    let config = spec
+        .claude_config_dir
+        .as_ref()
+        .ok_or_else(|| "bare Claude Code profile has no claude_config_dir".to_owned())
+        .and_then(|path| canonical_empty_directory(path, "Claude Code config directory"))?;
+    let temp = spec
+        .temp_dir
+        .as_ref()
+        .ok_or_else(|| "bare Claude Code profile has no temp_dir".to_owned())
+        .and_then(|path| canonical_empty_directory(path, "Claude Code temp directory"))?;
+    if home == config || home == temp || config == temp {
+        return Err("bare Claude Code state directories must be distinct".to_owned());
+    }
+    let home = home
+        .to_str()
+        .ok_or_else(|| "Claude Code home must be valid UTF-8".to_owned())?;
+    let config = config
+        .to_str()
+        .ok_or_else(|| "Claude Code config directory must be valid UTF-8".to_owned())?;
+    let temp = temp
+        .to_str()
+        .ok_or_else(|| "Claude Code temp directory must be valid UTF-8".to_owned())?;
+    let provider_base_url = spec
+        .provider_base_url
+        .as_deref()
+        .ok_or_else(|| "bare Claude Code profile has no provider_base_url".to_owned())?;
+
+    environment.insert("HOME".to_owned(), home.to_owned());
+    environment.insert("USERPROFILE".to_owned(), home.to_owned());
+    environment.insert("TMPDIR".to_owned(), temp.to_owned());
+    environment.insert("CLAUDE_CONFIG_DIR".to_owned(), config.to_owned());
+    environment.insert("ANTHROPIC_CONFIG_DIR".to_owned(), config.to_owned());
+    environment.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        provider_base_url.to_owned(),
+    );
+    for name in [
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "DISABLE_TELEMETRY",
+        "DISABLE_ERROR_REPORTING",
+        "DISABLE_AUTOUPDATER",
+    ] {
+        environment.insert(name.to_owned(), "1".to_owned());
+    }
+    Ok(())
+}
+
+fn claude_arguments(spec: &ClaudeRunSpec) -> AppResult<Vec<String>> {
+    let mut args = Vec::with_capacity(25);
     if matches!(spec.profile, ClaudeProfile::Bare) {
         args.push("--bare".to_owned());
     }
@@ -703,7 +860,24 @@ fn claude_arguments(spec: &ClaudeRunSpec) -> Vec<String> {
         "--max-budget-usd".to_owned(),
         spec.max_budget_usd.to_string(),
     ]);
-    args
+    if matches!(spec.profile, ClaudeProfile::Bare) {
+        let effort = spec
+            .reasoning_effort
+            .as_ref()
+            .ok_or_else(|| "bare Claude Code profile has no reasoning_effort".to_owned())?;
+        let max_turns = spec
+            .max_turns
+            .ok_or_else(|| "bare Claude Code profile has no max_turns".to_owned())?;
+        args.extend([
+            "--settings".to_owned(),
+            "{}".to_owned(),
+            "--effort".to_owned(),
+            effort.clone(),
+            "--max-turns".to_owned(),
+            max_turns.to_string(),
+        ]);
+    }
+    Ok(args)
 }
 
 fn normalize_claude_result(bytes: &[u8]) -> AppResult<NormalizedClaudeResult> {
@@ -835,12 +1009,7 @@ fn bounded_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use super::{
-        CLAUDE_RUN_FORMAT_VERSION, ClaudeProfile, ClaudeRunSpec, claude_arguments,
-        normalize_claude_result, validate_spec,
-    };
+    use super::*;
 
     fn valid_spec() -> ClaudeRunSpec {
         ClaudeRunSpec {
@@ -854,12 +1023,19 @@ mod tests {
             workspace: absolute_path("workspace"),
             workspace_snapshot: "empty-fixture".to_owned(),
             profile: ClaudeProfile::Bare,
+            provider: Some("yh-loopback".to_owned()),
+            provider_base_url: Some("http://127.0.0.1:1234".to_owned()),
             model: "claude-haiku-4-5".to_owned(),
+            reasoning_effort: Some("medium".to_owned()),
             system_prompt: "Follow the exact response contract.".to_owned(),
             prompt: "Reply exactly YH-OK".to_owned(),
             timeout_ms: 30_000,
             max_budget_usd: 0.1,
+            max_turns: Some(1),
             inherit_environment: vec!["ANTHROPIC_API_KEY".to_owned()],
+            home: Some(absolute_path("home")),
+            claude_config_dir: Some(absolute_path("config")),
+            temp_dir: Some(absolute_path("tmp")),
         }
     }
 
@@ -886,11 +1062,88 @@ mod tests {
     #[test]
     fn claude_command_is_shell_free_bounded_and_receives_prompt_only_on_stdin() {
         let spec = valid_spec();
-        let arguments = claude_arguments(&spec);
+        let arguments = claude_arguments(&spec).expect("Claude Code arguments");
         assert_eq!(arguments.first().map(String::as_str), Some("--bare"));
         assert!(arguments.iter().any(|value| value == "--tools="));
         assert!(arguments.iter().any(|value| value == "--strict-mcp-config"));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--effort", "medium"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--max-turns", "1"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--settings", "{}"])
+        );
         assert!(!arguments.iter().any(|value| value == &spec.prompt));
+    }
+
+    #[test]
+    fn claude_profiles_reject_ambiguous_runtime_authority() {
+        let mut inherited_home = valid_spec();
+        inherited_home
+            .inherit_environment
+            .push("claude_config_dir".to_owned());
+        assert!(validate_spec(&inherited_home).is_err());
+
+        let mut remote_provider = valid_spec();
+        remote_provider.provider_base_url = Some("https://api.anthropic.com".to_owned());
+        assert!(validate_spec(&remote_provider).is_err());
+
+        let mut product = valid_spec();
+        product.profile = ClaudeProfile::Product;
+        assert!(validate_spec(&product).is_err());
+        product.provider = None;
+        product.provider_base_url = None;
+        product.reasoning_effort = None;
+        product.max_turns = None;
+        product.home = None;
+        product.claude_config_dir = None;
+        product.temp_dir = None;
+        assert!(validate_spec(&product).is_ok());
+    }
+
+    #[test]
+    fn claude_bare_environment_owns_home_config_temp_and_provider() {
+        let root = env::temp_dir().join(format!(
+            "yh-claude-environment-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let home = root.join("home");
+        let config = root.join("config");
+        let temp = root.join("tmp");
+        for directory in [&home, &config, &temp] {
+            fs::create_dir_all(directory).expect("create isolated Claude Code directory");
+        }
+        let mut spec = valid_spec();
+        spec.home = Some(home.clone());
+        spec.claude_config_dir = Some(config.clone());
+        spec.temp_dir = Some(temp.clone());
+        let mut environment = BTreeMap::new();
+        prepare_claude_environment(&spec, &mut environment)
+            .expect("prepare bare Claude Code environment");
+
+        assert_eq!(
+            environment["HOME"],
+            fs::canonicalize(home)
+                .expect("canonical Claude Code home")
+                .to_str()
+                .expect("UTF-8 Claude Code home")
+        );
+        assert_eq!(
+            environment["CLAUDE_CONFIG_DIR"],
+            environment["ANTHROPIC_CONFIG_DIR"]
+        );
+        assert_eq!(environment["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1234");
+        assert_eq!(environment["DISABLE_TELEMETRY"], "1");
+        fs::remove_dir_all(root).expect("remove isolated Claude Code environment");
     }
 
     #[test]
@@ -919,5 +1172,83 @@ mod tests {
         assert!(!normalized.is_error);
         assert_eq!(normalized.observed_models, ["MiniMax-M2.7"]);
         assert_eq!(normalized.total_cost_usd, 0.024075000000000003);
+    }
+
+    #[test]
+    fn checked_in_claude_loopback_evidence_preserves_controls_and_auxiliary_probe() {
+        let report: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-claude-code-fixed-output/result.json"
+        ))
+        .expect("checked-in Claude Code loopback report");
+        let requests =
+            include_str!("../evidence/2026-07-28-claude-code-fixed-output/provider-request.jsonl")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("Claude Code Provider request")
+                })
+                .collect::<Vec<_>>();
+        let provider =
+            include_bytes!("../evidence/2026-07-28-claude-code-fixed-output/provider.mjs");
+
+        assert_eq!(report["format_version"], CLAUDE_RUN_FORMAT_VERSION);
+        assert_eq!(report["adapter"]["name"], CLAUDE_ADAPTER_VERSION);
+        assert_eq!(
+            report["adapter"]["adapter_executable_sha256"],
+            "19db0b5d6d1d1bb93ddf66a3a279e38c226fd656b143ebc1b301742ae785d49b"
+        );
+        assert_eq!(
+            report["adapter"]["product_executable_sha256"],
+            "2701c6cfd68483f8faf0316a1ba6481a1455a90645ada179f0c48d8c36d722ef"
+        );
+        assert_eq!(report["controls"]["claim_eligible"], false);
+        assert_eq!(report["controls"]["profile"], "bare");
+        assert_eq!(
+            report["controls"]["requested_provider"],
+            "yh-loopback-anthropic-messages"
+        );
+        assert_eq!(
+            report["controls"]["requested_model"],
+            "claude-haiku-4-5-20251001"
+        );
+        assert_eq!(
+            report["controls"]["observed_models"],
+            serde_json::json!(["claude-haiku-4-5-20251001"])
+        );
+        assert_eq!(report["controls"]["requested_reasoning_effort"], "medium");
+        assert_eq!(report["controls"]["requested_max_turns"], 1);
+        assert_eq!(report["execution"]["status"], "completed");
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"]["result"],
+            "YH-CLAUDE-ADAPTER-OK"
+        );
+        assert_eq!(
+            sha256_bytes(provider),
+            "d8c2c3abde00eb1a98f491610e8890a3f65d458099d35f069f272080d31267e9"
+        );
+        let normalized = normalize_claude_result(
+            &serde_json::to_vec(&report["execution"]["settlement"]["raw_result"])
+                .expect("encode Claude Code result"),
+        )
+        .expect("normalize retained Claude Code result");
+        assert!(!normalized.is_error);
+        assert_eq!(normalized.observed_models, ["claude-haiku-4-5-20251001"]);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["method"], "HEAD");
+        assert_eq!(requests[0]["path"], "/");
+        assert_eq!(requests[1]["method"], "POST");
+        assert_eq!(requests[1]["path"], "/v1/messages?beta=true");
+        assert_eq!(requests[1]["authorization"], "x-api-key-present");
+        assert_eq!(requests[1]["body"]["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(requests[1]["body"]["system"]["has_requested_system"], true);
+        assert_eq!(requests[1]["body"]["tool_names"], serde_json::json!([]));
+        assert_eq!(
+            requests[1]["body"]["thinking"],
+            serde_json::json!({"budget_tokens": 31_999, "type": "enabled"})
+        );
+        assert_eq!(
+            requests[1]["body"]["messages"][0]["last_text"],
+            "Return exactly YH-CLAUDE-ADAPTER-OK"
+        );
     }
 }

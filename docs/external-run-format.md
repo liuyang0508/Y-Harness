@@ -92,6 +92,15 @@ The Claude Code adapter emits format 1 and always records:
 It cannot support a Harness-effect, product-quality, or superiority claim.
 Unsupported controls are data, not prose omitted by an aggregator.
 
+Its `bare` profile owns distinct initially empty platform-home, Claude-config,
+and temp directories; requires API-key authentication plus an explicit
+loopback Anthropic Messages Provider; and fixes reasoning effort, Turn count,
+budget, empty MCP/Tool surfaces, disabled Skills, and nonessential-traffic
+controls. The released product still sends a `HEAD /` Provider probe, adds
+built-in prompt/date Context, and materializes config state despite
+`--no-session-persistence`. Format 1 preserves those limitations. `product`
+retains ambient configuration and cannot declare the bare-only controls.
+
 The Codex adapter emits format 2 and likewise fixes `claim_eligible: false`.
 It runs stable `codex exec --json` with an exact CLI version and executable
 digest, `--ephemeral`, a read-only product sandbox, approval policy `never`,
@@ -278,6 +287,16 @@ The first real format-1 record and its exact input are preserved under
 The run used Claude Code `2.1.143`, returned the requested fixed text, and
 observed `MiniMax-M2.7` behind requested model alias `haiku`. This is adapter
 conformance evidence only.
+
+A second real format-1 record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-claude-code-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-claude-code-fixed-output/).
+The same released `2.1.143` binary called a deterministic loopback Messages
+Provider and reported the exact requested Model, one Turn, usage, and cost.
+Its sidecar preserves the auxiliary `HEAD /`, one authenticated Model request,
+empty Tool list, three system blocks, and the on-wire thinking configuration.
+The product-reported cost is a price-table projection for a free loopback
+fixture, and settled Provider identity is available only from the sidecar. It
+remains non-comparative, `claim_eligible: false` evidence.
 
 The ordinary format-2 Codex adapter is source- and contract-tested against
 official tag
