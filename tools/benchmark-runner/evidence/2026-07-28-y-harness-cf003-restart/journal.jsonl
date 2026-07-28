@@ -1,0 +1,3 @@
+{"type":"initialized","format_version":1,"sequence":0,"fixture_id":"cf003-yh-restart-20260728-006","case":"hold_after_first_effect","operation_id":"effect-yh-restart-20260728-006","expected_payload_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","fixture_spec_sha256":"39290ecd6acc53e8f7117e066fd3a2054fd6f085ea3dd6659632422d016be19f"}
+{"type":"invocation_started","sequence":1,"call_ordinal":1,"operation_id":"effect-yh-restart-20260728-006","payload_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+{"type":"effect_committed","sequence":2,"call_ordinal":1,"operation_id":"effect-yh-restart-20260728-006","payload_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}

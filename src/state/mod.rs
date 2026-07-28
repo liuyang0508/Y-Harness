@@ -2225,25 +2225,51 @@ impl StateEngine {
         Ok(stored)
     }
 
-    /// Marks unfinished Turns interrupted and returns the recovered projection.
+    /// Marks one exact unfinished Turn interrupted and returns the recovered projection.
     ///
     /// Callers must hold exclusive Thread ownership and know that the previous
     /// worker is no longer live. Recovery is a takeover operation, not a normal
-    /// preflight for starting a Turn.
+    /// preflight for starting a Turn. The expected Turn identity is rechecked
+    /// at the optimistic commit boundary, so a stale takeover cannot interrupt
+    /// a newer running Turn.
     pub async fn recover_thread(
         &self,
         thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
     ) -> Result<Option<Thread>, HarnessError> {
         let Some(thread) = self.load_thread(thread_id).await? else {
             return Ok(None);
         };
-        for turn in thread
+        let expected = thread
             .turns
             .iter()
-            .filter(|turn| turn.status == TurnStatus::Running)
+            .find(|turn| &turn.id == expected_turn_id)
+            .ok_or_else(|| {
+                HarnessError::State(format!(
+                    "expected recovery Turn {expected_turn_id} does not belong to thread {thread_id}"
+                ))
+            })?;
+        if expected.status == TurnStatus::Interrupted
+            && thread
+                .turns
+                .iter()
+                .all(|turn| turn.status != TurnStatus::Running)
         {
-            self.finish_turn(turn, TurnStatus::Interrupted).await?;
+            return Ok(Some(thread));
         }
+        if expected.status != TurnStatus::Running
+            || thread
+                .turns
+                .iter()
+                .filter(|turn| turn.status == TurnStatus::Running)
+                .count()
+                != 1
+        {
+            return Err(HarnessError::State(format!(
+                "thread {thread_id} is not awaiting takeover of Turn {expected_turn_id}"
+            )));
+        }
+        self.finish_turn(expected, TurnStatus::Interrupted).await?;
         self.load_thread(thread_id).await
     }
 
@@ -6221,6 +6247,7 @@ mod tests {
     async fn sqlite_reopens_and_marks_unfinished_turn_interrupted_once() {
         let path = temp_database_path();
         let thread_id;
+        let turn_id;
         {
             let state = StateEngine::new(Arc::new(
                 SqliteEventStore::open(&path).await.expect("open database"),
@@ -6228,6 +6255,7 @@ mod tests {
             let thread = state.create_thread().await.expect("create thread");
             thread_id = thread.id;
             let turn = state.start_turn(&thread_id).await.expect("start turn");
+            turn_id = turn.id.clone();
             state
                 .append_item(
                     &turn,
@@ -6261,7 +6289,7 @@ mod tests {
                     .expect("reopen database"),
             ));
             let recovered = state
-                .recover_thread(&thread_id)
+                .recover_thread(&thread_id, &turn_id)
                 .await
                 .expect("recover")
                 .expect("thread exists");
@@ -6277,13 +6305,42 @@ mod tests {
             ));
             let count = state.events(&thread_id).await.expect("events").len();
             state
-                .recover_thread(&thread_id)
+                .recover_thread(&thread_id, &turn_id)
                 .await
                 .expect("second recovery");
             assert_eq!(state.events(&thread_id).await.expect("events").len(), count);
         }
 
         remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn exact_recovery_never_interrupts_a_newer_turn() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state.create_thread().await.expect("create Thread");
+        let abandoned = state.start_turn(&thread.id).await.expect("start old Turn");
+        state
+            .finish_turn(&abandoned, TurnStatus::Interrupted)
+            .await
+            .expect("settle old Turn");
+        let newer = state
+            .start_turn(&thread.id)
+            .await
+            .expect("start newer Turn");
+
+        let error = state
+            .recover_thread(&thread.id, &abandoned.id)
+            .await
+            .expect_err("stale recovery must fail");
+        assert!(matches!(error, HarnessError::State(_)));
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load Thread")
+            .expect("Thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Interrupted);
+        assert_eq!(projected.turns[1].id, newer.id);
+        assert_eq!(projected.turns[1].status, TurnStatus::Running);
     }
 
     #[tokio::test]

@@ -240,9 +240,15 @@ Codex process after that effect, resumed the exact persisted Thread, observed
 Codex's synthetic `aborted` Tool output, and retained one effect without a
 resumed Tool call. This starts a new Turn on the same Thread and uses an
 explicit controller release for Codex's re-grouped MCP child; it is not
-in-place Turn continuation or a descendant-containment proof. No other product
-cell has executed the case, so both observations remain `claim_eligible:
-false`. See
+in-place Turn continuation or a descendant-containment proof.
+
+A format-9 Y-Harness driver now executes the same restart boundary through
+real `yh serve` processes, a configured deterministic JSON-command Model,
+stdio MCP, SQLite, protocol-v19 exact-Turn takeover, and a new Tool-free Turn.
+Restart first preserves the abandoned Turn as `running`, proving recovery was
+not implicit; explicit recovery marks that exact Turn `interrupted`, and the
+oracle remains one invocation/one effect. All three observations remain
+`claim_eligible: false`. See
 [`fault-fixtures.md`](fault-fixtures.md).
 
 ## Implementation order
@@ -252,15 +258,15 @@ The shortest path to credible comparison is:
 1. ~~add a versioned external-run result format and one released-CLI adapter;~~
    completed for format 1 plus Claude Code adapter conformance;
 2. implement deterministic failure-injection Tool fixtures and state-recovery
-   cases; the crash/hold-after-effect fixture, oracle, and released Codex
-   single-process plus same-Thread restart drivers are complete, while other
-   products, in-place Turn continuation, containment, and the remaining fault
-   matrix are open;
+   cases; the crash/hold-after-effect fixture, oracle, released Codex
+   single-process plus same-Thread restart drivers, and Y-Harness explicit
+   restart-recovery driver are complete, while other products, in-place Turn
+   continuation, containment, and the remaining fault matrix are open;
 3. ~~add OpenCode and Hermes Agent adapters without importing their code;~~
    completed as source-pinned formats 5 and 6. Claude Code has one real
-   fixed-output conformance record and Codex has two real CF-003
-   fault-conformance records; Grok Build, Pi, OpenCode, and Hermes remain
-   contract-only;
+   fixed-output conformance record, Codex has two real CF-003 records, and
+   Y-Harness has one real process-restart CF-003 record; Grok Build, Pi,
+   OpenCode, and Hermes remain contract-only;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.

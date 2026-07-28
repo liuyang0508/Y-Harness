@@ -173,6 +173,43 @@ Thread, an appended rollout, zero resumed MCP calls, and one effect before and
 after resume. This is a new Turn on a resumed Thread, not continuation of the
 interrupted Turn; format 8 remains non-comparative and claim-ineligible.
 
+The Y-Harness restart adapter uses external-run format 9:
+
+```json
+{
+  "format_version": 9,
+  "run_id": "yh-cf003-restart-001",
+  "benchmark_version": "cf003-v1",
+  "case_id": "cf-003-y-harness-restart-after-uncertain-effect",
+  "program": "/absolute/path/to/yh",
+  "expected_cli_version": "yh 0.1.0",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "fixture_program": "/absolute/path/to/yh-fault-fixture",
+  "fixture_spec": "/absolute/path/to/fixture-spec.json",
+  "expected_fixture_spec_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/empty/workspace",
+  "workspace_snapshot": "empty-workspace-v1",
+  "timeout_ms": 30000,
+  "effect_wait_timeout_ms": 10000
+}
+```
+
+```bash
+cargo run --locked --release -p y-harness-benchmark-runner -- \
+  y-harness-cf003-restart /absolute/path/to/spec.json
+```
+
+The adapter drives three real `yh serve` processes over protocol v19: setup,
+fault injection, then restart. Its spec-bound JSON-command Model selects the
+one stdio MCP Tool before the first process is killed at the durable
+post-effect/pre-result boundary. Restart must first retain the exact Turn as
+`running`; permissioned recovery then interrupts only the expected Turn at the
+State compare-and-append boundary, and a separate Tool-free Turn completes.
+The external fixture must remain at one invocation and one effect throughout.
+Format 9 is claim-ineligible and does not assert descendant-process exit,
+in-place Turn continuation, distributed failure detection, or Model reasoning
+quality.
+
 The Grok Build adapter consumes the official headless JSON surface:
 
 ```json

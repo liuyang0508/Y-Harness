@@ -19,8 +19,10 @@ const MAX_JOURNAL_BYTES: u64 = 1_048_576;
 const MAX_JOURNAL_RECORDS: usize = 1_024;
 const MAX_JOURNAL_RECORD_BYTES: usize = 4_096;
 const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
+const MAX_MODEL_REQUEST_BYTES: u64 = 2_097_152;
 const MAX_RELEASE_BYTES: u64 = 256;
 const MAX_ID_BYTES: usize = 128;
+const MAX_MODEL_TEXT_BYTES: usize = 1_024;
 const INTENTIONAL_CRASH_EXIT_CODE: i32 = 86;
 const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -43,6 +45,18 @@ struct FixtureSpec {
     journal: PathBuf,
     operation_id: String,
     expected_payload_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<ModelFixtureSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelFixtureSpec {
+    call_id: String,
+    registered_tool_name: String,
+    trigger_prompt: String,
+    post_restart_prompt: String,
+    post_restart_message: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -283,8 +297,83 @@ fn run() -> AppResult<Option<Value>> {
             serve(FixtureJournal::open(spec)?)?;
             Ok(None)
         }
+        "model" => model(&spec).map(Some),
         _ => Err(usage()),
     }
+}
+
+fn model(spec: &FixtureSpec) -> AppResult<Value> {
+    let configured = spec
+        .model
+        .as_ref()
+        .ok_or_else(|| "fixture spec has no deterministic Model configuration".to_owned())?;
+    let request = read_model_request()?;
+    let object = request
+        .as_object()
+        .ok_or_else(|| "Model request must be a JSON object".to_owned())?;
+    for identity in ["thread_id", "turn_id"] {
+        if object.get(identity).and_then(Value::as_str).is_none() {
+            return Err(format!("Model request has no string {identity}"));
+        }
+    }
+    let items = object
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Model request has no items array".to_owned())?;
+    let prompt = items
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("user_message"))
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Model request has no user message".to_owned())?;
+    let tools = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Model request has no tools array".to_owned())?;
+    let matching_tools = tools
+        .iter()
+        .filter(|tool| {
+            tool.get("name").and_then(Value::as_str)
+                == Some(configured.registered_tool_name.as_str())
+        })
+        .count();
+    if tools.len() != 1 || matching_tools != 1 {
+        return Err("Model request does not expose the one pinned Tool".to_owned());
+    }
+    if prompt == configured.trigger_prompt {
+        return Ok(json!({
+            "type": "tool_call",
+            "call_id": configured.call_id,
+            "name": configured.registered_tool_name,
+            "input": {
+                "operation_id": spec.operation_id,
+                "payload_sha256": spec.expected_payload_sha256
+            }
+        }));
+    }
+    if prompt == configured.post_restart_prompt {
+        return Ok(json!({
+            "type": "message",
+            "content": configured.post_restart_message
+        }));
+    }
+    Err("Model request has an unexpected latest user prompt".to_owned())
+}
+
+fn read_model_request() -> AppResult<Value> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock().take(MAX_MODEL_REQUEST_BYTES.saturating_add(1));
+    let mut bytes = Vec::new();
+    input
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read Model request: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MODEL_REQUEST_BYTES {
+        return Err(format!(
+            "Model request exceeds {MAX_MODEL_REQUEST_BYTES} bytes"
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Model request is not valid JSON".to_owned())
 }
 
 fn serve(mut journal: FixtureJournal) -> AppResult<()> {
@@ -561,7 +650,7 @@ fn write_mcp_frame(writer: &mut impl Write, response: &Value) -> AppResult<()> {
 }
 
 fn usage() -> String {
-    "usage: yh-fault-fixture <prepare|serve|inspect> <fixture-spec.json>".to_owned()
+    "usage: yh-fault-fixture <prepare|serve|inspect|model> <fixture-spec.json>".to_owned()
 }
 
 fn write_report(report: &Value) -> ExitCode {
@@ -605,10 +694,38 @@ fn validate_spec(spec: &FixtureSpec) -> AppResult<()> {
     if !is_lower_sha256(&spec.expected_payload_sha256) {
         return Err("expected_payload_sha256 must be 64 lowercase hexadecimal bytes".to_owned());
     }
+    if let Some(model) = &spec.model {
+        validate_id("model.call_id", &model.call_id)?;
+        validate_id("model.registered_tool_name", &model.registered_tool_name)?;
+        for (kind, value) in [
+            ("model.trigger_prompt", &model.trigger_prompt),
+            ("model.post_restart_prompt", &model.post_restart_prompt),
+            ("model.post_restart_message", &model.post_restart_message),
+        ] {
+            validate_model_text(kind, value)?;
+        }
+        if model.trigger_prompt == model.post_restart_prompt {
+            return Err("deterministic Model prompts must be distinct".to_owned());
+        }
+    }
     if !spec.journal.is_absolute() {
         return Err("fixture journal path must be absolute".to_owned());
     }
     let _ = resolved_journal_path(spec)?;
+    Ok(())
+}
+
+fn validate_model_text(kind: &str, value: &str) -> AppResult<()> {
+    if value.trim().is_empty()
+        || value.len() > MAX_MODEL_TEXT_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(format!(
+            "{kind} must be 1-{MAX_MODEL_TEXT_BYTES} bounded text bytes"
+        ));
+    }
     Ok(())
 }
 
@@ -960,8 +1077,9 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FixtureCase, FixtureSpec, JournalRecord, MAX_MCP_FRAME_BYTES, classify,
-        controller_released, fixture_spec_sha256, parse_journal, read_mcp_frame, release_path,
+        FixtureCase, FixtureSpec, JournalRecord, MAX_MCP_FRAME_BYTES, ModelFixtureSpec, classify,
+        controller_released, fixture_spec_sha256, model, parse_journal, read_mcp_frame,
+        release_path, validate_spec,
     };
     use serde_json::json;
     use std::{
@@ -980,6 +1098,7 @@ mod tests {
             journal: absolute_path("journal.jsonl"),
             operation_id: "operation-1".to_owned(),
             expected_payload_sha256: "a".repeat(64),
+            model: None,
         }
     }
 
@@ -1103,5 +1222,28 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(oversized));
         let error = read_mcp_frame(&mut reader).expect_err("oversized frame");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn deterministic_model_configuration_is_strict() {
+        let mut spec = spec();
+        spec.model = Some(ModelFixtureSpec {
+            call_id: "call-1".to_owned(),
+            registered_tool_name: "fault.commit_effect".to_owned(),
+            trigger_prompt: "trigger".to_owned(),
+            post_restart_prompt: "audit".to_owned(),
+            post_restart_message: "observed".to_owned(),
+        });
+        validate_spec(&spec).expect("valid Model fixture");
+        spec.model
+            .as_mut()
+            .expect("Model fixture")
+            .post_restart_prompt = "trigger".to_owned();
+        assert!(validate_spec(&spec).is_err());
+
+        // `model` reads the real process stdin, so its request/response path is
+        // exercised by the released process conformance driver. This unit test
+        // keeps the spec-level hidden coupling from drifting.
+        let _model_entrypoint: fn(&FixtureSpec) -> Result<serde_json::Value, String> = model;
     }
 }

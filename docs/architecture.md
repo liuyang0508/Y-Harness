@@ -278,11 +278,12 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v18 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v19 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
   explicit Token Counter and Conversation Compactor API coordinate; protocol
-  18 adds bounded per-Turn Context and schema-11 attribution, protocol 17
+  19 adds permissioned exact-Turn recovery takeover without automatic replay,
+  protocol 18 adds bounded per-Turn Context and schema-11 attribution, protocol 17
   admits schema-10 Thread import provenance, protocol 16 adds direct lineage
   to bounded content-free Thread summaries, while
   protocol 15 retains protocol 14's bounded Task record/claim pages, server-clock

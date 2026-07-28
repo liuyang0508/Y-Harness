@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-25
+- Amended by: ADR 0113 (permissioned, exact-Turn protocol takeover)
 
 ## Context
 
@@ -29,6 +30,11 @@ does not prove that a worker is dead or grant takeover authority.
 - Do not expose recovery through the current remote client protocol. Adding a
   takeover command would first require a separately authenticated ownership or
   fencing authority.
+
+ADR 0113 later satisfies the serviceability part of this condition with a
+separate `thread.recover` permission, required exact-Turn fencing, same-host
+live-Operation refusal, and an explicit caller-owned takeover contract. It
+does not claim distributed lease or failure-detection semantics.
 
 ## Consequences
 

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "fixture_id": "cf003-yh-restart-20260728-006",
+  "case": "hold_after_first_effect",
+  "expected_fixture_executable_sha256": "a523232071037bc17e6bbf349f2aa065765c627bc51cd6ae1e21a12f6f897672",
+  "journal": "/tmp/yh-self-cf003-20260728.NjvM1Q/controller/journal.jsonl",
+  "operation_id": "effect-yh-restart-20260728-006",
+  "expected_payload_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "model": {
+    "call_id": "yh-cf003-call-1",
+    "registered_tool_name": "fault.commit_effect",
+    "trigger_prompt": "Trigger the deterministic Y-Harness CF-003 effect.",
+    "post_restart_prompt": "Audit the recovered Thread without invoking any Tool.",
+    "post_restart_message": "Y_HARNESS_CF003_RESTART_OBSERVED"
+  }
+}

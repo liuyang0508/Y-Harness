@@ -1,10 +1,10 @@
-# Client protocol v18
+# Client protocol v19
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"18"` is exact. Every request carries that value, and a peer
+Protocol version `"19"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "18",
+  "protocol_version": "19",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "18",
+  "protocol_version": "19",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "18",
+  "protocol_version": "19",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "18",
+  "protocol_version": "19",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "18",
+  "protocol_version": "19",
   "body": {
     "status": "success",
     "result": {
@@ -128,13 +128,14 @@ The result type is `initialized`:
         "thread.get",
         "thread.list",
         "thread.name",
+        "thread.recover",
         "turn.start",
         "turn.steer"
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 8,
-        "state_snapshot_schema": 8,
+        "state_event_schema": 11,
+        "state_snapshot_schema": 11,
         "approval_inbox_schema": 2,
         "task_graph_schema": 1,
         "memory_api": 1,
@@ -142,7 +143,7 @@ The result type is `initialized`:
         "conversation_compactor_api": 1,
         "secret_api": 1,
         "skill_api": "1",
-        "model_gateway_api": "6",
+        "model_gateway_api": "7",
         "workspace_provider_api": "1"
       }
     }
@@ -171,6 +172,7 @@ than `before_sequence`.
 | `list_threads` | optional `before_sequence`, optional `limit` | `thread.list` | `threads` |
 | `set_thread_name` | `thread_id`, optional `name` | `thread.name` | `thread_named` |
 | `get_thread` | `thread_id` | `thread.get` | `thread` |
+| `recover_thread` | `thread_id`, `expected_turn_id` | `thread.recover` | `thread_recovered` |
 | `get_thread_capacity` | `thread_id` | `thread.capacity` | `thread_capacity` |
 | `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `context`, optional `timeout_ms` | `turn.start` | `turn_started` |
 | `steer_turn` | `thread_id`, `expected_turn_id`, `content` | `turn.steer` | `turn_steered` |
@@ -300,6 +302,23 @@ or:
 revision returns `approval_conflict`. The authenticated transport principal,
 not a request body field, becomes the deciding actor. The immutable requester
 cannot settle its own request.
+
+`recover_thread` is an explicit takeover mutation, never a read-side or
+startup side effect. The caller must first establish that the previous worker
+has stopped and that it owns the Thread exclusively. `expected_turn_id` fences
+the exact abandoned running Turn the caller observed and is rechecked at the
+State optimistic-commit boundary. A stale identity, a terminal status other
+than `interrupted`, or a live operation in the same Protocol host fails without
+mutation. Retrying the same request after that Turn is already `interrupted`
+is idempotent while no newer Turn is running.
+
+Recovery appends an `interrupted` terminal event and abandons approvals the old
+Turn can no longer consume. It does not resume the interrupted stack,
+synthesize a Tool result, or replay Model/Tool work. Starting a replacement
+Turn remains a separate `start_turn` request. Network hosts should grant
+`thread.recover` only to a principal whose surrounding control plane can prove
+the exclusive takeover condition; the permission itself is not a distributed
+lease.
 
 ## Thread and operation lifecycle
 
@@ -778,7 +797,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"18"` |
+| `unsupported_version` | Request protocol is not exactly `"19"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |

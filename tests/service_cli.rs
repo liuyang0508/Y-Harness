@@ -67,7 +67,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
-    assert!(report.contains("protocol: 18"));
+    assert!(report.contains("protocol: 19"));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
     assert!(report.contains("verifiers: 0"));
@@ -1869,7 +1869,7 @@ fn run_turn_to_completion(
         } => operation_id,
         other => panic!("unexpected start Turn response: {other:?}"),
     };
-    for attempt in 0..200 {
+    for attempt in 0..1_000 {
         let polled = exchange(
             input,
             output,

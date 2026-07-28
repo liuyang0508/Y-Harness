@@ -36,7 +36,7 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"18","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"19","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
@@ -44,6 +44,9 @@ printf '%s\n' \
 - [ ] 能力包含 Thread、Approval 和 Task Worker 表面。
 - [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db` 已创建。
 - [ ] 服务重启后此前创建的 Thread 和 Task Graph 仍可读取。
+- [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
+      `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
+      或新的 running Turn 时均不修改 State。
 
 自动化证据：
 
@@ -153,6 +156,10 @@ yh skill verify "$project/y-harness.json"
 - [ ] Hermes 的 estimated cost 不得写成 actual cost；system prompt
       降级为 user 前缀、prompt 位于 argv、workspace rules 未被证明关闭、
       Python launcher 哈希不覆盖依赖图等限制必须进入报告。
+- [ ] `yh-bench y-harness-cf003-restart <spec>` 只接受 format 9 的空工作区
+      和哈希锁定二进制；真实服务重启先保留 abandoned Turn 为 `running`，
+      显式精确 Turn recovery 后为 `interrupted`，新 Turn 无 Tool 完成，
+      独立 oracle 前后均保持一次调用/一次 effect。
 - [ ] 所有 released-product 适配器始终输出
       `claim_eligible: false`；单产品 conformance 不能作为效果超越证据。
 

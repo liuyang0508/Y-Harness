@@ -44,6 +44,13 @@ The strict spec pins:
 - exact expected payload SHA-256; and
 - an absolute controller-owned journal path.
 
+For the Y-Harness format-9 cell, the same spec may additionally bind a
+JSON-command Model call identity, exact registered Tool name, distinct trigger
+and post-restart prompts, and fixed audit message. `model` accepts only a
+bounded request exposing exactly that Tool and one of those two latest user
+prompts. This supplies deterministic decisions without moving Model behavior
+into Runtime Core.
+
 `prepare` uses create-new semantics and never clobbers evidence. `serve` holds
 an exclusive file lock for its lifetime. Each JSONL record is independently
 bounded, the whole journal has count and byte ceilings, and every intentional
@@ -94,8 +101,17 @@ controller release marker instead of claiming complete descendant cleanup.
 The record is preserved under
 [`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart/).
 
+A format-9 Y-Harness run drives real `yh serve` processes, the configured
+JSON-command Model, stdio MCP, and SQLite State. After the controller kills the
+faulting process, restart first observes the abandoned Turn still `running`;
+protocol-v19 exact-Turn recovery then marks it `interrupted` without a Tool
+result, and a new Turn completes without selecting a Tool. Both fixture
+inspections remain one invocation and one effect. The record is preserved
+under
+[`tools/benchmark-runner/evidence/2026-07-28-y-harness-cf003-restart`](../tools/benchmark-runner/evidence/2026-07-28-y-harness-cf003-restart/).
+
 CF-003 still does not kill a Harness process at every State settlement
 boundary or cover timeout, oversized result, malformed protocol, descendant
-containment, sandbox escape, or other products. The Codex restart starts a new
+containment, sandbox escape, or every product. Both restart cells start a new
 Turn on the same Thread rather than continuing the interrupted Turn in place.
 Those boundaries must not be inferred from this case.

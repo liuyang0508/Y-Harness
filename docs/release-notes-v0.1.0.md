@@ -102,7 +102,12 @@ requires Codex's synthetic `aborted` Tool output, and proves that the durable
 effect remains singular. It records Codex's detached MCP child release and
 new-Turn recovery instead of claiming descendant cleanup or in-place Turn
 continuation. Binary-to-source equivalence and same-Model parity remain
-unproven. No OpenCode or Hermes live/comparative result is claimed.
+unproven. Format 9 drives real `yh serve` processes through a spec-bound
+JSON-command Model, stdio MCP, SQLite restart, permissioned exact-Turn
+recovery, and a Tool-free audit Turn. State rechecks the expected Turn at the
+optimistic-commit boundary, while the report explicitly declines descendant
+cleanup, in-place continuation, reasoning-quality, and comparative claims. No
+OpenCode or Hermes live/comparative result is claimed.
 
 ## Start
 
@@ -122,7 +127,7 @@ yh serve
 - Rust crate: `0.1.0`
 - optional TUI package: `0.1.0`
 - service configuration: `1`
-- client protocol: `18`
+- client protocol: `19`
 - State event/snapshot schema: `11` / `11`
 - Approval Inbox schema: `2`
 - Task Coordinator schema: `1`

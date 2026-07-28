@@ -182,7 +182,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v18 specification](docs/protocol.md).
+[client protocol v19 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -193,10 +193,10 @@ and protocol snapshots.
 The controlled same-model and product-default rules required for any
 “outperforms” claim live in the
 [competitive Harness benchmark](docs/competitive-benchmark.md).
-Checked released-product evidence currently includes one Claude Code
-fixed-output probe plus Codex `0.145.0` single-process and same-Thread restart
-CF-003 probes. All are explicitly claim-ineligible; none is presented as a
-cross-product comparison.
+Checked execution evidence currently includes one Claude Code fixed-output
+probe, Codex `0.145.0` single-process and same-Thread restart CF-003 probes,
+and one Y-Harness service-process explicit-recovery CF-003 probe. All are
+explicitly claim-ineligible; none is presented as a cross-product comparison.
 Current proof and open blockers are tracked in
 [Release readiness](docs/release-readiness.md). Exact pre-1.0 wire, persistence,
 API, and migration rules live in the

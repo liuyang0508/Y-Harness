@@ -6,6 +6,7 @@ mod grok_build;
 mod hermes;
 mod opencode;
 mod pi;
+mod y_harness_fault;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -144,6 +145,7 @@ enum BenchmarkReport {
     External(Box<ExternalRunReport>),
     CodexFault(Box<codex_fault::Report>),
     CodexRestartFault(Box<codex_fault::RestartReport>),
+    YHarnessRestartFault(Box<y_harness_fault::Report>),
 }
 
 #[derive(Serialize)]
@@ -246,12 +248,17 @@ async fn run() -> AppResult<BenchmarkReport> {
         "pi" => pi::execute(pi::read_spec(&spec_path)?)
             .await
             .map(|report| BenchmarkReport::External(Box::new(report))),
+        "y-harness-cf003-restart" => {
+            y_harness_fault::execute(y_harness_fault::read_spec(&spec_path)?)
+                .await
+                .map(|report| BenchmarkReport::YHarnessRestartFault(Box::new(report)))
+        }
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex|codex-cf003|codex-cf003-restart|grok-build|hermes|opencode|pi> <run-spec.json>".to_owned()
+    "usage: yh-bench <claude-code|codex|codex-cf003|codex-cf003-restart|grok-build|hermes|opencode|pi|y-harness-cf003-restart> <run-spec.json>".to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {

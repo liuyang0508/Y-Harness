@@ -22,24 +22,27 @@ turning it into a comparative score. They are produced by the independent
   independent MCP effect oracle without turning them into a score; and
 - format 8 adds a controller-cancelled Codex process, exact persisted rollout
   identity, same-Thread `exec resume`, source-defined synthetic `aborted`
-  output, and before/after no-replay observations.
+  output, and before/after no-replay observations; and
+- format 9 drives Y-Harness itself through real typed stdio service processes,
+  SQLite restart, permissioned exact-Turn recovery, and the same independent
+  one-effect oracle.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, `6`, `7`, or `8`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1` through `9`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/provider/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
 | `execution` | Exactly one `completed`, `product_error`, or `adapter_error` settlement. |
 
-The table's execution variants describe formats 1–6. Formats 7 and 8 keep the
-same adapter, coordinate, and non-claim control principles but have fault-specific
-execution object: bounded process evidence, strict Codex JSONL, deterministic
-Provider request summaries, and a separately validated fixture observation.
-Their `passed` field means only that the pre-registered fault experiment
-satisfied all four contracts.
+The table's execution variants describe formats 1–6. Formats 7–9 keep the same
+adapter, coordinate, and non-claim control principles but have fault-specific
+execution objects. Formats 7/8 retain strict Codex JSONL and deterministic
+Provider summaries; format 9 retains typed Y-Harness Protocol/State recovery
+evidence. All validate the fixture independently. Their `passed` field means
+only that the pre-registered fault experiment satisfied its closed contracts.
 
 `completed` and `product_error` contain the same `settlement` shape:
 
@@ -148,6 +151,30 @@ settlement rather than claiming complete descendant cleanup. Recovery starts a
 new Turn on the same Thread; it does not resume the interrupted Turn's stack.
 The deterministic Provider, binary/source, built-in Tool, containment, and
 claim-eligibility limitations remain explicit.
+
+Format 9 uses an empty workspace and hash-pinned release `yh`,
+`yh-fault-fixture`, and `yh-bench` executables. The fixture's optional
+spec-bound Model mode accepts the complete JSON-command `ModelRequest`,
+requires exactly the registered `fault.commit_effect` Tool, selects that Tool
+for the trigger prompt, and returns a fixed Tool-free message only for the
+post-restart audit prompt. The controller creates a Thread in a clean service
+process, starts the fault Turn in a second process, waits for the exact durable
+effect boundary, reads the still-running Thread projection, and kills that
+service before a Tool result can settle.
+
+The restarted service must first observe the same Turn still `running`; this
+proves restart did not perform unsafe implicit takeover. The controller then
+sends protocol-v19 `recover_thread` with the exact abandoned Turn identity.
+The same Turn must become `interrupted` with one Tool call and zero Tool
+results. A separate new Turn must complete with the fixed assistant message
+and no Tool. Fixture inspections after interruption and after the new Turn
+must both remain exactly one invocation and one effect.
+
+Format 9 records that only the product process was killed and that the held
+fixture required its identity-bound release marker; it does not claim generic
+descendant containment. It also records that interrupted execution is not
+continued in place and deterministic Model reasoning is not a quality
+measurement. It is always `claim_eligible: false`.
 
 The Grok Build adapter emits format 3 and also fixes
 `claim_eligible: false`. `bare` runs inject empty exact `HOME`, `USERPROFILE`,
@@ -261,6 +288,12 @@ One real released-product restart record is preserved under
 It passed the same-Thread, synthetic-abort, and one-effect/no-replay gates,
 while explicitly recording detached-fixture release and new-Turn recovery.
 It remains non-comparative, `claim_eligible: false` evidence.
+
+One real format-9 Y-Harness process-restart record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-y-harness-cf003-restart`](../tools/benchmark-runner/evidence/2026-07-28-y-harness-cf003-restart/).
+It passed the no-implicit-takeover, exact explicit recovery, same-Thread,
+new-Turn completion, and one-effect/no-replay gates. It remains
+non-comparative, `claim_eligible: false` evidence.
 
 The Grok Build adapter is source- and contract-tested against official snapshot
 [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2).

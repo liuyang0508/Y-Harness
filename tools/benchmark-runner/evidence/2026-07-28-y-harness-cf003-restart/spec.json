@@ -1,0 +1,16 @@
+{
+  "format_version": 9,
+  "run_id": "yh-cf003-restart-20260728-006",
+  "benchmark_version": "cf003-v1",
+  "case_id": "cf-003-y-harness-restart-after-uncertain-effect",
+  "program": "/Users/liuyang/Desktop/AIAgent/Y-Harness/target/release/yh",
+  "expected_cli_version": "yh 0.1.0",
+  "expected_product_executable_sha256": "ddf57f792ae51d184846bef3a9e43ec2900a5c2a577617c054c6a2d741144b60",
+  "fixture_program": "/Users/liuyang/Desktop/AIAgent/Y-Harness/target/release/yh-fault-fixture",
+  "fixture_spec": "/tmp/yh-self-cf003-20260728.NjvM1Q/controller/fixture-spec.json",
+  "expected_fixture_spec_sha256": "a28ef0e19ab2e3b27bb3443d7b24a31025e020bad4bdf248753379fc99d583d6",
+  "workspace": "/tmp/yh-self-cf003-20260728.NjvM1Q/workspace",
+  "workspace_snapshot": "empty-workspace-20260728",
+  "timeout_ms": 30000,
+  "effect_wait_timeout_ms": 10000
+}

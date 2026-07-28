@@ -515,12 +515,17 @@ impl HarnessRuntime {
     pub async fn recover_thread(
         &self,
         thread_id: &ThreadId,
+        expected_turn_id: &TurnId,
     ) -> Result<Option<Thread>, HarnessError> {
-        let recovered = self.state.recover_thread(thread_id).await?;
+        let recovered = self
+            .state
+            .recover_thread(thread_id, expected_turn_id)
+            .await?;
         if let Some(thread) = &recovered {
-            for turn in thread
+            if let Some(turn) = thread
                 .turns
                 .iter()
+                .find(|turn| &turn.id == expected_turn_id)
                 .filter(|turn| turn.status == TurnStatus::Interrupted)
             {
                 self.approvals
@@ -7209,7 +7214,7 @@ mod tests {
                 .expect("recovery handler"),
         ));
         let recovered = recovered_runtime
-            .recover_thread(&thread.id)
+            .recover_thread(&thread.id, &pending.request.authorization.turn_id)
             .await
             .expect("recover")
             .expect("thread");

@@ -11,7 +11,7 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"18"` | exact `Initialize` request/response |
+| Client protocol | `"19"` | exact `Initialize` request/response |
 | State events | `11` | per-event durable envelope; reads schemas 1 through 11 |
 | State snapshots | `11` | cache body; incompatible caches are discarded |
 | Approval Inbox | `2` | per-record durable body after explicit migration |
@@ -154,6 +154,13 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `19` preserves protocol-v18 framing, paging, State schema-11
+projections, and Model-gateway API 7 coordinates. It adds the explicitly
+permissioned `recover_thread` takeover mutation, required
+`expected_turn_id` fencing, and the `thread_recovered` settlement. Recovery
+remains caller-authorized and never automatic; protocol-v18 clients must fail
+exact initialization rather than start new work on an abandoned running Turn.
 
 Client protocol `18` preserves protocol-v17 commands, framing, authority,
 lineage, and Thread archive projections. It adds optional bounded

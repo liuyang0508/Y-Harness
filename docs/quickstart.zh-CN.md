@@ -101,7 +101,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"18","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"19","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 

@@ -37,7 +37,7 @@ use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "18";
+pub const PROTOCOL_VERSION: &str = "19";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -65,7 +65,7 @@ const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 26] = [
+const PROTOCOL_PERMISSIONS: [&str; 27] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -78,6 +78,7 @@ const PROTOCOL_PERMISSIONS: [&str; 26] = [
     "thread.get",
     "thread.list",
     "thread.name",
+    "thread.recover",
     "turn.start",
     "turn.steer",
     "approval.get",
@@ -141,6 +142,14 @@ pub enum ProtocolCommand {
     GetThread {
         /// Opaque Thread identity.
         thread_id: String,
+    },
+    /// Takes over one Thread after the caller has established that its
+    /// previous worker is no longer live.
+    RecoverThread {
+        /// Opaque Thread identity.
+        thread_id: String,
+        /// Exact abandoned running Turn observed by the takeover authority.
+        expected_turn_id: String,
     },
     /// Reads finite journal capacity and pressure for one Thread.
     GetThreadCapacity {
@@ -334,6 +343,7 @@ impl ProtocolCommand {
             Self::ListThreads { .. } => "thread.list",
             Self::SetThreadName { .. } => "thread.name",
             Self::GetThread { .. } => "thread.get",
+            Self::RecoverThread { .. } => "thread.recover",
             Self::GetThreadCapacity { .. } => "thread.capacity",
             Self::StartTurn { .. } => "turn.start",
             Self::SteerTurn { .. } => "turn.steer",
@@ -573,6 +583,11 @@ pub enum ProtocolResult {
     /// Loaded Thread or explicit absence.
     Thread {
         /// Projected Thread when found.
+        thread: Option<Thread>,
+    },
+    /// Explicit exclusive-takeover settlement.
+    ThreadRecovered {
+        /// Recovered Thread, or `None` when the identity does not exist.
         thread: Option<Thread>,
     },
     /// Journal pressure before the finite Thread boundary.
@@ -1104,6 +1119,7 @@ impl ProtocolHandler {
                     "thread.events".to_owned(),
                     "thread.get".to_owned(),
                     "thread.name".to_owned(),
+                    "thread.recover".to_owned(),
                     "turn.start".to_owned(),
                     "turn.steer".to_owned(),
                 ];
@@ -1204,6 +1220,56 @@ impl ProtocolHandler {
                 let thread_id = ThreadId::from_string(thread_id);
                 let thread = self.runtime.load_thread(&thread_id).await?;
                 Ok(ProtocolResult::Thread { thread })
+            }
+            ProtocolCommand::RecoverThread {
+                thread_id,
+                expected_turn_id,
+            } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                validate_opaque_id("expected_turn_id", &expected_turn_id)?;
+                let thread_id = ThreadId::from_string(thread_id);
+                let expected_turn_id = TurnId::from_string(expected_turn_id);
+                if self.operations.lock().await.values().any(|operation| {
+                    matches!(
+                        &operation.status,
+                        OperationStatus::Running {
+                            thread_id: active_thread
+                        } if active_thread == &thread_id
+                    )
+                }) {
+                    return Err(HarnessError::Protocol(format!(
+                        "thread {thread_id} still has a live operation in this protocol host"
+                    )));
+                }
+                let Some(current) = self.runtime.load_thread(&thread_id).await? else {
+                    return Ok(ProtocolResult::ThreadRecovered { thread: None });
+                };
+                let expected = current
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == expected_turn_id)
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(format!(
+                            "expected recovery Turn {expected_turn_id} does not belong to thread {thread_id}"
+                        ))
+                    })?;
+                let running_turns = current
+                    .turns
+                    .iter()
+                    .filter(|turn| turn.status == crate::TurnStatus::Running)
+                    .count();
+                if !((expected.status == crate::TurnStatus::Running && running_turns == 1)
+                    || (expected.status == crate::TurnStatus::Interrupted && running_turns == 0))
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "thread {thread_id} is not awaiting takeover of Turn {expected_turn_id}"
+                    )));
+                }
+                let thread = self
+                    .runtime
+                    .recover_thread(&thread_id, &expected_turn_id)
+                    .await?;
+                Ok(ProtocolResult::ThreadRecovered { thread })
             }
             ProtocolCommand::GetThreadCapacity { thread_id } => {
                 validate_opaque_id("thread_id", &thread_id)?;
@@ -2516,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_eighteen_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_nineteen_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2524,14 +2590,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "18",
+                "protocol_version": "19",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "18",
+                "protocol_version": "19",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2540,7 +2606,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "18",
+                "protocol_version": "19",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2562,7 +2628,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "18",
+                "protocol_version": "19",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2815,6 +2881,14 @@ mod tests {
                 },
                 "get_thread",
                 "thread.get",
+            ),
+            (
+                ProtocolCommand::RecoverThread {
+                    thread_id: "thread-fixture".to_owned(),
+                    expected_turn_id: "turn-fixture".to_owned(),
+                },
+                "recover_thread",
+                "thread.recover",
             ),
             (
                 ProtocolCommand::GetThreadCapacity {
@@ -3591,6 +3665,176 @@ mod tests {
                 && capacity.remaining_events == 999_999
                 && capacity.level == StateCapacityLevel::Healthy
         ));
+    }
+
+    #[tokio::test]
+    async fn thread_recovery_is_explicit_idempotent_and_protocol_authorized() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = Arc::new(HarnessRuntime::new(
+            Arc::new(ImmediateModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state.clone(),
+        ));
+        let thread = runtime.create_thread().await.expect("create Thread");
+        let turn = state
+            .start_turn(&thread.id)
+            .await
+            .expect("start abandoned Turn");
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::UserMessage {
+                    content: "before worker loss".to_owned(),
+                }),
+            )
+            .await
+            .expect("append abandoned input");
+        let handler = ProtocolHandler::new(runtime);
+        let initialized = handler
+            .handle(request("init-recovery", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. }
+            } if capabilities.contains(&"thread.recover".to_owned())
+        ));
+
+        let stale = handler
+            .handle(request(
+                "recover-stale-turn",
+                ProtocolCommand::RecoverThread {
+                    thread_id: thread.id.to_string(),
+                    expected_turn_id: "turn-stale".to_owned(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            stale.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: false,
+                    ..
+                }
+            } if code == "invalid_request"
+        ));
+        assert_eq!(
+            state
+                .load_thread(&thread.id)
+                .await
+                .expect("load after stale recovery")
+                .expect("Thread")
+                .turns[0]
+                .status,
+            TurnStatus::Running
+        );
+
+        let recovered = handler
+            .handle(request(
+                "recover-thread",
+                ProtocolCommand::RecoverThread {
+                    thread_id: thread.id.to_string(),
+                    expected_turn_id: turn.id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            recovered.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadRecovered {
+                    thread: Some(ref recovered)
+                }
+            } if recovered.turns[0].id == turn.id
+                && recovered.turns[0].status == TurnStatus::Interrupted
+        ));
+        let event_count = state
+            .events(&thread.id)
+            .await
+            .expect("recovery events")
+            .len();
+        let repeated = handler
+            .handle(request(
+                "recover-thread-again",
+                ProtocolCommand::RecoverThread {
+                    thread_id: thread.id.to_string(),
+                    expected_turn_id: turn.id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            repeated.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadRecovered {
+                    thread: Some(ref recovered)
+                }
+            } if recovered.turns[0].status == TurnStatus::Interrupted
+        ));
+        assert_eq!(
+            state
+                .events(&thread.id)
+                .await
+                .expect("idempotent recovery events")
+                .len(),
+            event_count
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_recovery_refuses_a_live_operation_in_the_same_host() {
+        let handler = handler(Arc::new(PendingModel));
+        let created = handler
+            .handle(request("create-live", ProtocolCommand::CreateThread {}))
+            .await;
+        let thread_id = match created.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let started = handler
+            .handle(request(
+                "start-live",
+                ProtocolCommand::StartTurn {
+                    thread_id: thread_id.to_string(),
+                    prompt: "still owned".to_owned(),
+                    memory_scope: Default::default(),
+                    context: Vec::new(),
+                    timeout_ms: None,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            &started.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { .. }
+            }
+        ));
+        let refused = handler
+            .handle(request(
+                "recover-live",
+                ProtocolCommand::RecoverThread {
+                    thread_id: thread_id.to_string(),
+                    expected_turn_id: "turn-live".to_owned(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            refused.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: false,
+                    ..
+                }
+            } if code == "invalid_request"
+        ));
+        let report = handler
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect("shutdown live operation");
+        assert_eq!(report.remaining_operations, 0);
     }
 
     #[tokio::test]
