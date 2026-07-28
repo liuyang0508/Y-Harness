@@ -27,9 +27,10 @@ cost, not zero.
   evidence. Record the requested Model, reasoning effort, one-Turn ceiling,
   product `read-only` sandbox, and observed Models from `modelUsage`.
 - In `bare`, inject exact empty `HOME`, `USERPROFILE`, and `GROK_HOME`
-  directories and inherit only an explicit environment-name allowlist that
-  must contain `XAI_API_KEY`. Keep `product` as an ambient-configuration
-  profile.
+  directories, require an explicit Provider label, own an exact
+  `http://127.0.0.1:<port>/v1` custom-model endpoint, and inherit only an
+  explicit environment-name allowlist that must contain `XAI_API_KEY`. Keep
+  `product` as an ambient-configuration profile.
 - Write the prompt to a create-exclusive file outside the workspace, make it
   owner-only on Unix, pass only its path to the CLI, and remove it on every
   ordinary return path. Reject non-UTF-8 paths because the product CLI accepts
@@ -44,8 +45,9 @@ cost, not zero.
   reported cost fields and serialize actual cost as `null` without a tick
   field.
 - Declare session persistence, MCP meta-tools, project instructions, lack of a
-  hard spend fence, caller-asserted workspace identity, and unverified product
-  sandbox behavior as unsupported controls.
+  hard spend fence, auxiliary Model calls outside the main-agent Turn ceiling,
+  caller-asserted workspace identity, and unverified product sandbox behavior
+  as unsupported controls.
 - Keep every result on `adapter_conformance` with `claim_eligible: false`.
 
 ## Consequences
@@ -55,8 +57,10 @@ truthful Model, Turn, Token, and complete-cost evidence without confusing Grok
 4.5 with the Harness or claiming benchmark parity.
 
 The one-Turn read-only profile intentionally does not measure Agent-loop or
-Tool effectiveness. A live conformance record, multi-Turn Tool cases, and
-same-Model cross-Harness runs remain separate future evidence.
+Tool effectiveness. One released `0.2.112` fixed-output run now proves the
+bounded adapter path and also demonstrates that session-title generation is
+an auxiliary Provider call outside the returned main-agent count. Multi-Turn
+Tool cases and same-Model cross-Harness runs remain separate future evidence.
 
 ## Evidence
 
@@ -64,8 +68,16 @@ same-Model cross-Harness runs remain separate future evidence.
   [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2)
   defines the CLI flags, headless JSON envelope, isolation roots, and
   incomplete-usage semantics used here.
+- Release-conformance snapshot
+  [`02d9359`](https://github.com/xai-org/grok-build/tree/02d9359435d0e9c20a20945679389cdce441e431)
+  additionally defines the custom-model endpoint and current headless request
+  behavior exercised by `0.2.112`.
 - `y-harness-benchmark-runner` tests cover bare-home authority, prompt-file
   privacy and cleanup, bounded command construction, successful usage/cost
-  normalization, and product errors without spend.
+  normalization, product errors without spend, and the checked-in released
+  binary record.
+- [`2026-07-28-grok-build-fixed-output`](../../tools/benchmark-runner/evidence/2026-07-28-grok-build-fixed-output/)
+  preserves the official signed macOS `0.2.112` binary identity, exact adapter
+  result, and sanitized loopback requests.
 - [`external-run-format.md`](../external-run-format.md) defines the retained
   evidence and non-claim boundary.

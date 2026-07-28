@@ -7,6 +7,15 @@ const RUN_FORMAT_VERSION: u32 = 3;
 const MAX_TURNS: u64 = 1;
 const MAX_MODELS: usize = 64;
 const USD_TICKS_PER_USD: f64 = 10_000_000_000.0;
+const OWNED_BARE_ENVIRONMENT: [&str; 7] = [
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "GROK_HOME",
+    "GROK_MODELS_BASE_URL",
+    "GROK_MODELS_LIST_URL",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +37,8 @@ pub(super) struct RunSpec {
     workspace: PathBuf,
     workspace_snapshot: String,
     profile: Profile,
+    provider: Option<String>,
+    models_base_url: Option<String>,
     model: String,
     reasoning_effort: String,
     system_prompt: String,
@@ -98,31 +109,54 @@ fn validate_spec(spec: &RunSpec) -> AppResult<()> {
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    match (spec.profile, spec.home.as_ref(), spec.grok_home.as_ref()) {
-        (Profile::Bare, Some(home), Some(grok_home))
-            if home.is_absolute() && grok_home.is_absolute() =>
-        {
+    match spec.profile {
+        Profile::Bare => {
+            let (Some(home), Some(grok_home)) = (spec.home.as_ref(), spec.grok_home.as_ref())
+            else {
+                return Err(
+                    "bare Grok Build profile requires absolute home and grok_home directories"
+                        .to_owned(),
+                );
+            };
+            if !home.is_absolute() || !grok_home.is_absolute() {
+                return Err(
+                    "bare Grok Build profile requires absolute home and grok_home directories"
+                        .to_owned(),
+                );
+            }
+            let provider = spec
+                .provider
+                .as_deref()
+                .ok_or_else(|| "bare Grok Build profile requires provider".to_owned())?;
+            validate_text("Grok Build provider", provider)?;
+            let models_base_url = spec
+                .models_base_url
+                .as_deref()
+                .ok_or_else(|| "bare Grok Build profile requires models_base_url".to_owned())?;
+            validate_loopback_models_base_url(models_base_url)?;
             if !inherited.contains("XAI_API_KEY") {
                 return Err("bare Grok Build profile requires XAI_API_KEY inheritance".to_owned());
             }
-            if ["HOME", "USERPROFILE", "GROK_HOME"]
+            if OWNED_BARE_ENVIRONMENT
                 .iter()
                 .any(|name| inherited.contains(name))
             {
                 return Err(
-                    "bare Grok Build profile owns HOME, USERPROFILE, and GROK_HOME".to_owned(),
+                    "bare Grok Build profile owns its state and routing environment".to_owned(),
                 );
             }
         }
-        (Profile::Bare, _, _) => {
-            return Err(
-                "bare Grok Build profile requires absolute home and grok_home directories"
-                    .to_owned(),
-            );
-        }
-        (Profile::Product, None, None) => {}
-        (Profile::Product, _, _) => {
-            return Err("product Grok Build profile must not declare home or grok_home".to_owned());
+        Profile::Product => {
+            if spec.home.is_some()
+                || spec.grok_home.is_some()
+                || spec.provider.is_some()
+                || spec.models_base_url.is_some()
+            {
+                return Err(
+                    "product Grok Build profile must not declare bare-profile state or routing"
+                        .to_owned(),
+                );
+            }
         }
     }
     Ok(())
@@ -260,9 +294,10 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
         "Grok Build exposes no documented hard monetary spend ceiling",
         "read_file and always-on MCP meta-tools remain visible to the Model",
         "the product persists session state even in an isolated bare home",
+        "requested_max_turns bounds main-agent rounds, not auxiliary Model calls such as session title generation",
         "workspace_snapshot is caller-asserted rather than adapter-verified",
         "the product read-only sandbox is not independently verified by this adapter",
-        "environment values, provider routing, and launcher dependencies are not recorded",
+        "credential values and launcher dependencies are not recorded",
     ];
     if matches!(spec.profile, Profile::Product) {
         unsupported_controls.push("ambient product configuration is not eliminated");
@@ -300,7 +335,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                 Profile::Bare => "bare",
                 Profile::Product => "product",
             },
-            requested_provider: None,
+            requested_provider: spec.provider,
             requested_model: spec.model,
             observed_models,
             prompt_sha256,
@@ -340,15 +375,41 @@ fn prepare_bare_environment(
     if home == grok_home {
         return Err("bare Grok Build home and grok_home must be distinct".to_owned());
     }
-    environment.insert("HOME".to_owned(), utf8_path(&home, "home")?.to_owned());
+    let home = utf8_path(&home, "home")?.to_owned();
+    let grok_home = utf8_path(&grok_home, "grok_home")?.to_owned();
+    let models_base_url = spec
+        .models_base_url
+        .as_ref()
+        .ok_or_else(|| "bare Grok Build profile has no models_base_url".to_owned())?
+        .to_owned();
+    for name in OWNED_BARE_ENVIRONMENT {
+        environment.insert(name.to_owned(), String::new());
+    }
+    environment.insert("HOME".to_owned(), home.clone());
+    environment.insert("USERPROFILE".to_owned(), home);
+    environment.insert("GROK_HOME".to_owned(), grok_home);
     environment.insert(
-        "USERPROFILE".to_owned(),
-        utf8_path(&home, "home")?.to_owned(),
+        "GROK_MODELS_LIST_URL".to_owned(),
+        format!("{models_base_url}/models"),
     );
-    environment.insert(
-        "GROK_HOME".to_owned(),
-        utf8_path(&grok_home, "grok_home")?.to_owned(),
-    );
+    environment.insert("GROK_MODELS_BASE_URL".to_owned(), models_base_url);
+    Ok(())
+}
+
+fn validate_loopback_models_base_url(value: &str) -> AppResult<()> {
+    let port = value
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|suffix| suffix.strip_suffix("/v1"))
+        .ok_or_else(|| {
+            "bare Grok Build models_base_url must be http://127.0.0.1:<port>/v1".to_owned()
+        })?
+        .parse::<u16>()
+        .map_err(|_| {
+            "bare Grok Build models_base_url must contain a valid loopback port".to_owned()
+        })?;
+    if port == 0 {
+        return Err("bare Grok Build models_base_url port must be nonzero".to_owned());
+    }
     Ok(())
 }
 
@@ -648,11 +709,13 @@ mod tests {
             benchmark_version: "adapter-probe-v1".to_owned(),
             case_id: "fixed-output".to_owned(),
             program: absolute_path("grok"),
-            expected_cli_version: "grok 0.2.105".to_owned(),
+            expected_cli_version: "grok 0.2.112 (9bbd559437aa)".to_owned(),
             expected_product_executable_sha256: "c".repeat(64),
             workspace: absolute_path("workspace"),
             workspace_snapshot: "empty-fixture".to_owned(),
             profile: Profile::Bare,
+            provider: Some("yh-loopback".to_owned()),
+            models_base_url: Some("http://127.0.0.1:1234/v1".to_owned()),
             model: "grok-4.5".to_owned(),
             reasoning_effort: "low".to_owned(),
             system_prompt: "Follow the exact response contract.".to_owned(),
@@ -675,6 +738,60 @@ mod tests {
             .inherit_environment
             .push("GROK_HOME".to_owned());
         assert!(validate_spec(&inherited_home).is_err());
+
+        let mut inherited_endpoint = spec.clone();
+        inherited_endpoint
+            .inherit_environment
+            .push("GROK_MODELS_BASE_URL".to_owned());
+        assert!(validate_spec(&inherited_endpoint).is_err());
+
+        let mut invalid_endpoint = spec.clone();
+        invalid_endpoint.models_base_url = Some("https://api.x.ai/v1".to_owned());
+        assert!(validate_spec(&invalid_endpoint).is_err());
+        invalid_endpoint.models_base_url = Some("http://127.0.0.1:0/v1".to_owned());
+        assert!(validate_spec(&invalid_endpoint).is_err());
+
+        let mut product = spec.clone();
+        product.profile = Profile::Product;
+        product.provider = None;
+        product.models_base_url = None;
+        product.home = None;
+        product.grok_home = None;
+        validate_spec(&product).expect("valid product profile");
+        product.provider = Some("ambient".to_owned());
+        assert!(validate_spec(&product).is_err());
+
+        let root = env::temp_dir().join(format!(
+            "yh-grok-environment-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let home = root.join("home");
+        let grok_home = root.join("grok-home");
+        fs::create_dir_all(&home).expect("create isolated home");
+        fs::create_dir(&grok_home).expect("create isolated Grok home");
+        let mut isolated = spec.clone();
+        isolated.home = Some(home.clone());
+        isolated.grok_home = Some(grok_home.clone());
+        let mut environment = BTreeMap::new();
+        prepare_bare_environment(&isolated, &mut environment)
+            .expect("prepare bare Grok Build environment");
+        let canonical_home = fs::canonicalize(&home).expect("canonical home");
+        let canonical_grok_home = fs::canonicalize(&grok_home).expect("canonical Grok home");
+        assert_eq!(
+            environment["HOME"],
+            canonical_home.to_str().expect("UTF-8 home")
+        );
+        assert_eq!(
+            environment["GROK_HOME"],
+            canonical_grok_home.to_str().expect("UTF-8 Grok home")
+        );
+        assert_eq!(
+            environment["GROK_MODELS_LIST_URL"],
+            "http://127.0.0.1:1234/v1/models"
+        );
+        assert_eq!(environment["HOMEDRIVE"], "");
+        fs::remove_dir_all(root).expect("remove isolated environment");
 
         let mut missing_key = spec;
         missing_key.inherit_environment.clear();
@@ -787,5 +904,83 @@ mod tests {
         };
         assert!(!path.exists());
         fs::remove_dir(&directory).expect("remove prompt test directory");
+    }
+
+    #[test]
+    fn checked_in_live_evidence_preserves_auxiliary_call_and_non_claim_boundaries() {
+        let report: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-grok-build-fixed-output/result.json"
+        ))
+        .expect("checked-in Grok Build report");
+        let requests =
+            include_str!("../evidence/2026-07-28-grok-build-fixed-output/provider-request.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("Provider request JSON"))
+                .collect::<Vec<_>>();
+        let provider =
+            include_bytes!("../evidence/2026-07-28-grok-build-fixed-output/provider.mjs");
+
+        assert_eq!(report["format_version"], RUN_FORMAT_VERSION);
+        assert_eq!(
+            report["adapter"]["cli_version"],
+            "grok 0.2.112 (9bbd559437aa)"
+        );
+        assert_eq!(
+            report["adapter"]["product_executable_sha256"],
+            "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4"
+        );
+        assert_eq!(report["controls"]["claim_eligible"], false);
+        assert_eq!(
+            report["controls"]["requested_provider"],
+            "yh-loopback-responses"
+        );
+        assert_eq!(report["controls"]["requested_model"], "grok-4.5");
+        assert_eq!(
+            report["controls"]["observed_models"],
+            serde_json::json!(["grok-4.5"])
+        );
+        assert_eq!(report["execution"]["status"], "completed");
+        assert_eq!(report["execution"]["settlement"]["num_turns"], 1);
+        assert!(report["execution"]["settlement"]["actual_cost_usd"].is_null());
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"]["text"],
+            "YH-GROK-BUILD-ADAPTER-OK"
+        );
+        assert_eq!(
+            sha256_bytes(provider),
+            "db0caf5a4c407e5734bb864a8a6414940f4959fca45f9bf87d4ab7deb9ed6df3"
+        );
+
+        let normalized = normalize_result(
+            &serde_json::to_vec(&report["execution"]["settlement"]["raw_result"])
+                .expect("encode retained Grok Build result"),
+        )
+        .expect("normalize retained Grok Build result");
+        assert!(!normalized.is_error);
+        assert_eq!(normalized.num_turns, 1);
+        assert_eq!(normalized.observed_models, ["grok-4.5"]);
+        assert_eq!(normalized.cost, None);
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["path"], "/v1/models");
+        assert_eq!(requests[0]["authorization"], "bearer-present");
+        for request in &requests[1..] {
+            assert_eq!(request["path"], "/v1/responses");
+            assert_eq!(request["authorization"], "bearer-present");
+            assert_eq!(request["body"]["model"], "grok-4.5");
+            assert_eq!(request["body"]["stream"], true);
+        }
+        assert_eq!(
+            requests[1]["body"]["tool_names"],
+            serde_json::json!(["session_title"])
+        );
+        assert_eq!(
+            requests[2]["body"]["tool_names"],
+            serde_json::json!(["read_file", "search_tool", "use_tool"])
+        );
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"]["modelUsage"]["grok-4.5"]["modelCalls"],
+            1
+        );
     }
 }

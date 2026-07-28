@@ -25,11 +25,11 @@ a governed local baseline; comparative effectiveness is unverified.**
 External-run formats 1/2/3/4/5/6 plus Codex CF-003 formats 7/8 and released
 Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent CLI adapter
 contracts now exist, with one checked-in real Claude Code
-`adapter_conformance` result, one real Pi fixed-output result, one real
-OpenCode fixed-output result, one real Hermes fixed-output result, and two
-Codex CF-003 fault records. All have `claim_eligible: false`: they prove
-bounded adapters and registered fault behavior, not that either Harness is
-better. See
+`adapter_conformance` result, one real Grok Build fixed-output result, one real
+Pi fixed-output result, one real OpenCode fixed-output result, one real Hermes
+fixed-output result, and two Codex CF-003 fault records. All have
+`claim_eligible: false`: they prove bounded adapters and registered fault
+behavior, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
 
 Grok Build is an official open-source coding Agent, TUI, and Harness, so it is
@@ -37,8 +37,10 @@ a source-level baseline. Grok 4.5 remains a separate Model coordinate and is
 the audited Grok Build snapshot's checked-in default. A released Grok Build
 run may enter the product-default track; it enters the Harness-control track
 only when the same Model and authority controls can actually be fixed. The
-Grok Build adapter currently has bounded contract evidence but no live or
-comparative result. See
+Grok Build adapter has one real released-binary fixed-output record, but no
+comparative result. Its one main-agent Turn also generated an auxiliary title
+call, so it establishes neither a hard Provider-call ceiling nor Harness
+effect. See
 [`reference-analysis.md`](reference-analysis.md).
 
 ## Two tracks
@@ -270,14 +272,15 @@ The shortest path to credible comparison is:
    fixed-output conformance record, Pi has one real deterministic fixed-output
    conformance record, OpenCode has one real deterministic fixed-output
    conformance record, Hermes has one real deterministic fixed-output
+   conformance record, Grok Build has one real deterministic fixed-output
    conformance record, Codex has two real CF-003 records, and Y-Harness has one
-   real process-restart CF-003 record; Grok Build remains contract-only;
+   real process-restart CF-003 record;
 4. run the Harness-control track with one mutually supported model;
 5. add product-default and stochastic task suites only after deterministic
    parity is reproducible.
 
 Provider continuation and durable safe-boundary steering are implemented and
-locally fault-tested in Y-Harness. Six real released-product records, the
+locally fault-tested in Y-Harness. Seven real released-product records, the
 source-pinned adapter contracts, and the controller-owned CF-003 fixture are
 preserved. Two Codex cells are not a cross-product result. Execution of
 CF-001/CF-002 across products, CF-003 other-product cells, in-place interrupted

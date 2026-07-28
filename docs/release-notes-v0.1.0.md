@@ -90,13 +90,17 @@ The independent benchmark runner emits exact non-claim external-run formats
 for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
 CLIs. Real released Pi `0.82.1`, OpenCode `1.18.5`, and Hermes `0.19.0`
 fixed-output records now preserve formats 4, 5, and 6 with deterministic
-loopback Providers and explicit unsupported controls; they are adapter
-conformance, not comparisons. Format 5 uses OpenCode's source-tested run JSONL
-surface. Format 6 uses Hermes one-shot stdout plus its strict bounded usage
-sidecar, an isolated bare home, static empty Tool set, exact Provider/Model
-identity, and estimated-cost preservation without relabeling it as actual
-cost. Hermes's argv prompt exposure and missing system-role/workspace-rule
-parity remain explicit limitations. Dedicated format 7 drives released Codex `0.145.0`
+loopback Providers and explicit unsupported controls. Released Grok Build
+`0.2.112` likewise preserves one format-3 fixed-output record through its
+adapter-owned custom-model endpoint. Its request sidecar records a separate
+session-title call outside the one returned main-agent Turn. These are adapter
+conformance records, not comparisons. Format 5 uses OpenCode's source-tested
+run JSONL surface. Format 6 uses Hermes one-shot stdout plus its strict bounded
+usage sidecar, an isolated bare home, static empty Tool set, exact
+Provider/Model identity, and estimated-cost preservation without relabeling it
+as actual cost. Hermes's argv prompt exposure and missing
+system-role/workspace-rule parity remain explicit limitations. Dedicated
+format 7 drives released Codex `0.145.0`
 through a source-pinned deferred Tool-search and MCP crash-after-effect path,
 then validates the durable fixture journal independently. Its checked CF-003
 record is non-comparative and claim-ineligible. Format 8 additionally cancels

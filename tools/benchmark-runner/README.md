@@ -224,6 +224,8 @@ The Grok Build adapter consumes the official headless JSON surface:
   "workspace": "/absolute/isolated/workspace",
   "workspace_snapshot": "empty-workspace-v1",
   "profile": "bare",
+  "provider": "yh-loopback-responses",
+  "models_base_url": "http://127.0.0.1:43123/v1",
   "model": "grok-4.5",
   "reasoning_effort": "low",
   "system_prompt": "Return only the requested fixed text.",
@@ -244,8 +246,11 @@ cargo run --locked -p y-harness-benchmark-runner -- \
 ```
 
 `bare` injects exact empty `HOME`, `USERPROFILE`, and `GROK_HOME` directories
-instead of inheriting ambient product state. `product` must omit `home` and
-`grok_home` and may inherit its normal environment explicitly.
+instead of inheriting ambient product state. It requires an explicit Provider
+label and an adapter-owned `http://127.0.0.1:<port>/v1` custom-model endpoint;
+the endpoint environment cannot be inherited. `product` must omit
+`provider`, `models_base_url`, `home`, and `grok_home`, and may inherit its
+normal environment explicitly.
 `prompt_directory` must be empty and outside the benchmark workspace. Both
 profiles use a create-exclusive prompt file that is owner-only on Unix and
 removed after execution; Windows callers must protect the supplied directory
@@ -254,7 +259,9 @@ They also use an exact Model and reasoning effort; one maximum Turn;
 `dontAsk`; the product's `read-only` sandbox; disabled Memory, planning,
 Subagents, questions, web Tools, and automatic updates; and a `read_file` Tool
 allowlist. Grok Build's always-on MCP meta-tools and session persistence remain
-declared unsupported controls.
+declared unsupported controls. The one-Turn ceiling applies to main-agent
+rounds; auxiliary Model calls such as session-title generation are not
+bounded or counted by that field.
 
 External-run format 3 preserves Grok Build's observed `modelUsage`, Turn count,
 and cost only when the product reports complete cost. Complete cost includes
@@ -262,8 +269,12 @@ and cost only when the product reports complete cost. Complete cost includes
 the product's float projection disagrees. Missing or partial cost remains
 `null` with no tick field; the requested Model is never copied into observed
 Models.
-There is no checked-in live Grok Build result yet, so this adapter provides
-contract evidence only.
+A real released-Grok Build `0.2.112` deterministic fixed-output record is
+checked in under
+[`evidence/2026-07-28-grok-build-fixed-output`](evidence/2026-07-28-grok-build-fixed-output).
+It remains `claim_eligible: false`; the request sidecar observed one auxiliary
+title call plus the one main-agent call, and there is no comparative Grok
+Build run.
 
 The Pi adapter consumes the released coding agent's JSONL lifecycle:
 

@@ -1,0 +1,25 @@
+{
+  "format_version": 3,
+  "run_id": "grok-build-02112-deterministic-20260728-003",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/tmp/yh-grok-build-02112.358ixk/grok",
+  "expected_cli_version": "grok 0.2.112 (9bbd559437aa)",
+  "expected_product_executable_sha256": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4",
+  "workspace": "/tmp/yh-grok-build-run.0nJg8e/workspace",
+  "workspace_snapshot": "empty-workspace-20260728",
+  "profile": "bare",
+  "provider": "yh-loopback-responses",
+  "models_base_url": "http://127.0.0.1:58100/v1",
+  "model": "grok-4.5",
+  "reasoning_effort": "low",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-GROK-BUILD-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "XAI_API_KEY"
+  ],
+  "home": "/tmp/yh-grok-build-run.0nJg8e/home",
+  "grok_home": "/tmp/yh-grok-build-run.0nJg8e/grok-home",
+  "prompt_directory": "/tmp/yh-grok-build-run.0nJg8e/prompt"
+}

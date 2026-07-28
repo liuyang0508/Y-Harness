@@ -8,10 +8,10 @@ endorsement of every implementation choice in those projects.
 The baseline source snapshot was reviewed on 2026-07-25, the Turn-steering and
 Grok Build deltas on 2026-07-26, and the current Pi capability delta on
 2026-07-27. The released Hermes CLI adapter delta was reviewed on 2026-07-28.
-The released Codex CF-003 delta was also reviewed on 2026-07-28. Every source
-observation below links to an immutable commit. The repositories were inspected
-locally from shallow checkouts; their full test suites were not executed as
-part of this audit.
+The released Codex CF-003 and Grok Build adapter deltas were also reviewed on
+2026-07-28. Every source observation below links to an immutable commit. The
+repositories were inspected locally from shallow checkouts; their full test
+suites were not executed as part of this audit.
 
 Evidence has three levels:
 
@@ -54,6 +54,12 @@ package `0.19.0`, at
 That coordinate supports only the released-CLI findings and does not relabel
 the earlier architectural observations.
 
+The released Grok Build adapter additionally audits public snapshot
+[`02d9359`](https://github.com/xai-org/grok-build/tree/02d9359435d0e9c20a20945679389cdce441e431),
+whose `SOURCE_REV` is `1adcd1f477870e4a97bacbd6be78c8a3bfbac46d`.
+The official `0.2.112` binary independently identifies its build as abbreviated
+revision `9bbd559437aa`; no full public-source match is claimed.
+
 The dedicated Codex fault driver additionally pins official tag
 `rust-v0.145.0`, released CLI `0.145.0`, at
 [`25af12f`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
@@ -82,7 +88,7 @@ gate.
 | Tool, MCP, and isolation | Pi ships useful file/shell/image Tools and rich hooks, but intentionally has no built-in MCP, permission popups, or sandbox. Extensions run with the launching user's authority. | `src/execution`, `src/transport`, `src/runtime/policy.rs`, and `src/approval` provide governed Tool registration, stdio plus authenticated HTTPS JSON-response MCP, durable approval, and bounded process/network authority. | **Different strengths.** Preserve Y-Harness authority boundaries while adding multi-Tool ergonomics; bounded SSE/OAuth and broader Tool catalogs remain open, and ambient in-process extension authority stays rejected. |
 | Packages, Skills, and extensions | `pi install/remove/list/update/config` manages npm, git, URL, local, user, project, and temporary sources. Packages may provide executable TypeScript extensions, Skills, prompts, and themes; `/reload` hot-loads resources. | `src/skill` verifies exact identity, dependencies, budgets, digests, publisher signatures, revocation, and transparency evidence. `yh skill install`, `install-external`, and `install-https` manage bounded declarative stores while preserving local versus signed-External trust and keeping activation separate. | **Partially aligned with stronger supply-chain authority.** Local and exact public-HTTPS installation are implemented without ambient execution. Dependency download, update/catalog/private-registry UX, hot reload, executable-extension isolation, and ecosystem breadth remain open. |
 | Session and product surface | JSONL session trees support resume, tree navigation, fork, clone, compaction, import/export, and RPC. `getTree()` defensively assembles the entry DAG; `createBranchedSession` extracts the root-to-leaf path, preserves entry identities, re-chains retained entries, records `parentSession`, and writes the new file incrementally. `navigateTree()` may summarize the abandoned old-leaf suffix and append that derived text on the selected branch. | Authoritative SQLite Thread/Turn/Item State, recovery, checkpoints, bounded lineage-aware recent-Thread Protocol paging, explicit durable names, Protocol-backed TUI resume, schema-10 portable archives, and schema-11 attributed per-Turn Context are implemented. Fork preserves historical evidence identity and exact lineage; archive import is atomic. Format-1 Thread handoff preparation computes a bounded source-only Turn delta, binds it to source/target identities and a canonical digest, and converts any host-generated candidate into attributed content-free Context evidence. | **Partially aligned by a different State model.** Durable fork/clone-at-head, bounded recent-page forests, integrity-bound import/export, and read-only Thread-handoff preparation are Engine-owned. Pi's entry-level mutable leaf and automatic in-session navigation are deliberately rejected as a second branch authority. Candidate synthesis remains provider/host-selected and its factual quality requires evaluation. JSON is a bounded interchange format, not authoritative State. |
-| Evaluation | `packages/evals` contains an executable Pi harness adapter. OpenCode exposes source-tested `run --format json` step events. Hermes `0.19.0` exposes one-shot stdout plus a JSON usage sidecar. | External-run formats 4, 5, and 6 drive the released Pi, OpenCode, and Hermes CLIs. They pin binary/version, bound process evidence, support isolated bare state, disable Tools, and preserve only source-supported lifecycle/identity/cost facts. Hermes estimated cost remains distinct from actual cost. Released Pi `0.82.1`, OpenCode `1.18.5`, and Hermes `0.19.0` runs completed against deterministic loopback Providers and are retained with their explicit unsupported controls. | **Partially aligned.** Contract tests pass, and Pi, OpenCode, and Hermes each have one real non-claim fixed-output record. No deterministic same-model or Harness-effect comparison exists. Superiority remains unverified. |
+| Evaluation | `packages/evals` contains an executable Pi harness adapter. OpenCode exposes source-tested `run --format json` step events. Hermes `0.19.0` exposes one-shot stdout plus a JSON usage sidecar. Grok Build exposes bounded headless JSON and an OpenAI-compatible custom-model endpoint. | External-run formats 3 through 6 drive released Grok Build, Pi, OpenCode, and Hermes CLIs. They pin binary/version, bound process evidence, support isolated bare state, and preserve only source-supported lifecycle/identity/cost facts. Hermes estimated cost remains distinct from actual cost. Released Grok Build `0.2.112`, Pi `0.82.1`, OpenCode `1.18.5`, and Hermes `0.19.0` runs completed against deterministic loopback Providers and are retained with their explicit unsupported controls. | **Partially aligned.** Contract tests pass, and Grok Build, Pi, OpenCode, and Hermes each have one real non-claim fixed-output record. The Grok sidecar also proves its one main-agent Turn used a separate title call. No deterministic same-model or Harness-effect comparison exists. Superiority remains unverified. |
 
 The adoption rule is therefore selective rather than superficial: take Pi's
 small loop, provider normalization, ordered multi-Tool semantics, package UX,
@@ -136,10 +142,10 @@ Four useful design inputs follow without copying product semantics:
    Tools merely because the provider protocol uses similar nouns.
 
 Y-Harness may add xAI as a direct Model provider and Grok 4.5 as a controlled
-Model cell. Released Grok Build now has a bounded external adapter contract,
-but no live result. Source comparison is possible; superiority is still
-unproven until both systems run the same versioned workloads under declared
-controls.
+Model cell. Released Grok Build now has a bounded external adapter contract
+and one real deterministic `0.2.112` conformance record. That record is not a
+same-Model or quality comparison; superiority is still unproven until both
+systems run the same versioned workloads under declared controls.
 
 ## 2026-07-26 Turn-steering delta
 
@@ -191,7 +197,7 @@ recovery are still unmeasured.
 | Orchestration | Codex and Claude Code expose mature multi-agent/product workflows. OpenCode has subagents and worktree/control-plane code. Hermes has delegation across many surfaces. Pi has simple steering/follow-up semantics. Grok Build exposes Subagents, workflows, goals, worktrees, and long-running task paths. | Task DAGs, leases, fencing, mailbox, and workspace lifecycle are architecturally substantial. Multi-node consensus, durable orphan reaping, remote executors, and comparative task success are not proven. |
 | Verification | Claude Code has stop hooks and verification-oriented skills; Codex has review/hook paths; Hermes records verification evidence. | Verification is a first-class engine layer rather than only a prompt convention. Its real-world graders and false-completion rate still need competitive measurement. |
 | Observability | Codex has OpenTelemetry modules and rich runtime events. Hermes has a versioned observer contract. OpenCode uses Effect/OTel. Claude Code and Pi expose extensive events. | Failure-isolated, content-free evidence now includes typed Provider failure class/status/retry facts without diagnostics. Exporter breadth, distributed traces, operator UX, and overhead comparisons are open. |
-| Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner, configured origin-bound external Graders, real non-comparative released-Pi, OpenCode, and Hermes fixed-output cells, and two real non-comparative Codex CF-003 cells: single-process and same-Thread restart. None is a competitive result; the fixed-output cells disable Tools, and the Codex cells do not prove in-place interrupted-Turn continuation. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
+| Evaluation | Pi includes an executable harness adapter. Hermes records trajectories. All public projects have substantial tests, but their tests are not a controlled cross-Harness comparison. | Y-Harness has a versioned regression runner, configured origin-bound external Graders, real non-comparative released-Grok Build, Pi, OpenCode, and Hermes fixed-output cells, and two real non-comparative Codex CF-003 cells: single-process and same-Thread restart. None is a competitive result; the fixed-output cells do not execute Tools, Grok still exposes read/MCP meta-tools and an auxiliary title call, and the Codex cells do not prove in-place interrupted-Turn continuation. The required cross-Harness protocol is defined in [`competitive-benchmark.md`](competitive-benchmark.md). |
 
 The architectural boundary is competitive; the product effect is not yet
 competitive evidence. A typed abstraction, a passing unit test, or a larger

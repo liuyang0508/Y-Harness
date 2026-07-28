@@ -178,9 +178,9 @@ measurement. It is always `claim_eligible: false`.
 
 The Grok Build adapter emits format 3 and also fixes
 `claim_eligible: false`. `bare` runs inject empty exact `HOME`, `USERPROFILE`,
-and `GROK_HOME` roots while inheriting only declared secrets such as
-`XAI_API_KEY`; `product` runs retain explicitly inherited ambient
-configuration. The adapter supplies the prompt through a private
+and `GROK_HOME` roots, own an exact loopback custom-model endpoint, and inherit
+only declared secrets such as `XAI_API_KEY`; `product` runs retain explicitly
+inherited ambient configuration. The adapter supplies the prompt through a private
 create-exclusive file, makes it owner-only on Unix, removes it after execution,
 requests one exact Turn and reasoning effort, disables Memory, planning,
 Subagents, questions, web Tools, and updates, and requests the product's
@@ -190,9 +190,11 @@ ACLs as an unsupported control.
 Grok Build's `read_file` and always-on MCP meta-tools remain visible, and the
 product persists its session beneath the isolated Grok home. Format 3 records
 those limitations, the requested reasoning effort and Turn ceiling, and the
-product sandbox. It derives observed Models only from `modelUsage`; a complete
-cost retains both the float projection and exact integer ticks. Absent or
-partial cost remains `null`, never zero, and has no tick field.
+product sandbox. The Turn ceiling and `modelUsage` count main-agent rounds,
+not auxiliary calls such as session-title generation. It derives observed
+Models only from `modelUsage`; a complete cost retains both the float
+projection and exact integer ticks. Absent or partial cost remains `null`,
+never zero, and has no tick field.
 
 The Pi adapter emits format 4 and fixes `claim_eligible: false`. `bare`
 injects an exact empty `PI_CODING_AGENT_DIR`; `product` may retain explicitly
@@ -298,10 +300,17 @@ It passed the no-implicit-takeover, exact explicit recovery, same-Thread,
 new-Turn completion, and one-effect/no-replay gates. It remains
 non-comparative, `claim_eligible: false` evidence.
 
-The Grok Build adapter is source- and contract-tested against official snapshot
-[`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2).
-No real Grok Build result is checked in yet, so it also contributes no live
-product evidence.
+The Grok Build adapter's original contract is source-tested against official
+snapshot
+[`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2);
+the released custom-endpoint path was additionally audited at
+[`02d9359`](https://github.com/xai-org/grok-build/tree/02d9359435d0e9c20a20945679389cdce441e431).
+One real released-Grok Build `0.2.112` fixed-output record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-grok-build-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-grok-build-fixed-output/).
+It used the official signed macOS binary, isolated state roots, and a
+deterministic loopback Responses Provider. Its sidecar observed a model-list
+request, one auxiliary title call, and one main-agent call. It remains
+non-comparative, `claim_eligible: false` adapter-conformance evidence.
 
 The Pi adapter is source- and contract-tested against official snapshot
 [`cee5ff7`](https://github.com/earendil-works/pi/tree/cee5ff7520d8828bed9955ef00419e995d1f91e0).

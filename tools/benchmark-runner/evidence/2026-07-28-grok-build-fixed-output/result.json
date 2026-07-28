@@ -1,0 +1,95 @@
+{
+  "format_version": 3,
+  "adapter": {
+    "name": "grok-build-json-v1",
+    "version": "0.1.0",
+    "product": "grok-build",
+    "cli_version": "grok 0.2.112 (9bbd559437aa)",
+    "adapter_executable_sha256": "0b156cf3956ab8473d468cc7acafe1ec5660ae72afb7d261703613bf91c6add1",
+    "product_executable_sha256": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4"
+  },
+  "coordinate": {
+    "run_id": "grok-build-02112-deterministic-20260728-003",
+    "benchmark_version": "adapter-conformance-v1",
+    "case_id": "fixed-output",
+    "workspace_snapshot": "empty-workspace-20260728",
+    "started_at_ms": 1785204906375,
+    "host_os": "macos",
+    "host_arch": "aarch64"
+  },
+  "controls": {
+    "track": "adapter_conformance",
+    "claim_eligible": false,
+    "profile": "bare",
+    "requested_provider": "yh-loopback-responses",
+    "requested_model": "grok-4.5",
+    "observed_models": [
+      "grok-4.5"
+    ],
+    "prompt_sha256": "9a036f08d4939f9458ca48fcee1dbdbeeaabc7b445659c4ce5a02437fae311dc",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "tools": "read_file_plus_mcp_meta",
+    "permission_mode": "dont_ask",
+    "process_isolation": {
+      "kind": "unrestricted"
+    },
+    "inherited_environment_names": [
+      "XAI_API_KEY"
+    ],
+    "timeout_ms": 30000,
+    "requested_max_budget_usd": null,
+    "requested_reasoning_effort": "low",
+    "requested_max_turns": 1,
+    "product_sandbox": "read-only",
+    "unsupported_controls": [
+      "adapter conformance is not a Harness-effect or product-quality result",
+      "no cross-product model parity has been established",
+      "Grok Build exposes no documented hard monetary spend ceiling",
+      "read_file and always-on MCP meta-tools remain visible to the Model",
+      "the product persists session state even in an isolated bare home",
+      "requested_max_turns bounds main-agent rounds, not auxiliary Model calls such as session title generation",
+      "workspace_snapshot is caller-asserted rather than adapter-verified",
+      "the product read-only sandbox is not independently verified by this adapter",
+      "credential values and launcher dependencies are not recorded",
+      "workspace instructions and project compatibility configuration are not ignored"
+    ]
+  },
+  "execution": {
+    "status": "completed",
+    "settlement": {
+      "exit_code": 0,
+      "wall_time_ms": 328,
+      "product_duration_ms": null,
+      "product_api_duration_ms": null,
+      "num_turns": 1,
+      "actual_cost_usd": null,
+      "result_subtype": "EndTurn",
+      "stdout_bytes": 498,
+      "stdout_sha256": "6ccdd07871407a01228314e10236e99806185f6dff7235ddae835e6f37deb26b",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_result": {
+        "modelUsage": {
+          "grok-4.5": {
+            "cacheReadInputTokens": 0,
+            "inputTokens": 10,
+            "modelCalls": 1,
+            "outputTokens": 5
+          }
+        },
+        "num_turns": 1,
+        "requestId": "73839bd7-b1d8-4430-9c84-9ab22c543087",
+        "sessionId": "019fa681-1aa7-7ef2-9aa8-188be48e7fde",
+        "stopReason": "EndTurn",
+        "text": "YH-GROK-BUILD-ADAPTER-OK",
+        "usage": {
+          "cache_read_input_tokens": 0,
+          "input_tokens": 10,
+          "output_tokens": 5,
+          "reasoning_tokens": 0,
+          "total_tokens": 15
+        }
+      }
+    }
+  }
+}
