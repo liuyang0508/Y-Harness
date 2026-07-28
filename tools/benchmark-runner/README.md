@@ -369,7 +369,10 @@ complete evidence for them. The requested agent prompt remains additive to
 OpenCode's own product/provider instructions, and the CLI exposes neither a
 hard monetary nor a hard provider-call ceiling. OpenCode may still initialize
 or update its plugin SDK dependency cache; that limitation is recorded rather
-than hidden. No live OpenCode result or comparative run is checked in.
+than hidden. A real released-OpenCode deterministic fixed-output record is
+checked in under
+[`evidence/2026-07-28-opencode-fixed-output`](evidence/2026-07-28-opencode-fixed-output).
+It remains `claim_eligible: false`; there is no comparative OpenCode run.
 
 The Hermes Agent adapter consumes its released one-shot output plus the
 side-channel usage report:

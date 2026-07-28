@@ -1,0 +1,19 @@
+{
+  "format_version": 5,
+  "run_id": "opencode-1185-deterministic-20260728-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/tmp/yh-opencode-1185.kcztqV/node_modules/opencode-darwin-arm64/bin/opencode",
+  "expected_cli_version": "1.18.5",
+  "expected_product_executable_sha256": "45922f63cf068f5c72d44cf18d1cde9816f359668258608b0272e54c304106c1",
+  "workspace": "/tmp/yh-opencode-run.lNlaKb/workspace",
+  "workspace_snapshot": "empty-workspace-20260728",
+  "profile": "bare",
+  "model": "yh-loopback/local-deterministic",
+  "variant": null,
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-OPENCODE-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": ["OPENCODE_CONFIG"],
+  "home": "/tmp/yh-opencode-run.lNlaKb/home-immutable"
+}

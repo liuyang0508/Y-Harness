@@ -221,7 +221,9 @@ select one exact `provider/model` plus optional variant, suppress project
 configuration, external plugins, updates, model refresh, compaction, sharing,
 snapshots, title generation, and formatter/LSP activation, and deny all Tools
 through a generated primary agent. Caller-controlled Model, variant, and agent
-prompt reject `{env:...}` / `{file:...}` configuration substitutions.
+prompt reject `{env:...}` / `{file:...}` configuration substitutions. The
+explicitly requested Provider is reported separately from the combined
+requested Model coordinate.
 
 Format 5 accepts only one stable Session's ordered `step_start`, optional
 reasoning/text, and `step_finish` records, or one final product error. Tool
@@ -311,8 +313,12 @@ adapter-conformance evidence.
 
 The OpenCode adapter is source- and contract-tested against official snapshot
 [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b).
-No real OpenCode result is checked in yet, so it contributes no live product
-evidence.
+One real released-OpenCode fixed-output record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-opencode-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-opencode-fixed-output/).
+It used an immutable custom Provider file, a deterministic loopback Provider,
+and an isolated bare home. It remains non-comparative,
+`claim_eligible: false` adapter-conformance evidence; settled Model identity
+remains unavailable.
 
 The Hermes Agent adapter is source- and contract-tested against official
 release `v2026.7.20`, commit

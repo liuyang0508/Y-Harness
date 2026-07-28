@@ -72,8 +72,10 @@ does not expose settled Model identity or distinct API duration, and has no
 adapter-proven hard monetary or provider-call ceiling. The Process Broker
 clears undeclared environment values but is not an OS sandbox. OpenCode may
 still initialize or update its plugin SDK dependency cache; the adapter records
-that unsupported control. A live OpenCode record and any same-Model comparative
-workload remain separate work.
+that unsupported control. One released OpenCode `1.18.5` fixed-output record
+now exercises the real JSONL boundary with an isolated bare home, immutable
+custom Provider file, and deterministic loopback Provider. It remains
+`claim_eligible: false`; any same-Model comparative workload is separate work.
 
 ## Rejected alternatives
 
@@ -96,6 +98,8 @@ workload remain separate work.
 - `opencode::tests::profile_and_model_validation_reject_ambiguous_authority`
 - `opencode::tests::jsonl_preserves_step_cost_and_finish_reason`
 - `opencode::tests::jsonl_rejects_tools_cross_session_and_trailing_errors`
+- `opencode::tests::checked_in_live_evidence_preserves_provider_and_non_claim_boundaries`
+- `tools/benchmark-runner/evidence/2026-07-28-opencode-fixed-output`
 - Official OpenCode run JSONL process tests at snapshot `7534d23`
 - zero-default and all-feature workspace gates
 

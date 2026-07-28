@@ -130,6 +130,11 @@ fn validate_spec(spec: &RunSpec) -> AppResult<()> {
 }
 
 pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
+    let requested_provider = spec
+        .model
+        .split_once('/')
+        .map(|(provider, _)| provider.to_owned())
+        .ok_or_else(|| "OpenCode model has no provider".to_owned())?;
     let program = fs::canonicalize(&spec.program)
         .map_err(|error| format!("cannot canonicalize program: {error}"))?;
     if !program.is_file() {
@@ -282,7 +287,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
                 Profile::Bare => "bare",
                 Profile::Product => "product",
             },
-            requested_provider: None,
+            requested_provider: Some(requested_provider),
             requested_model: spec.model,
             observed_models: Vec::new(),
             prompt_sha256,
@@ -795,5 +800,62 @@ mod tests {
                 .expect("valid product error");
         assert!(error.is_error);
         assert_eq!(error.total_cost_usd, None);
+    }
+
+    #[test]
+    fn checked_in_live_evidence_preserves_provider_and_non_claim_boundaries() {
+        let report: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-opencode-fixed-output/result.json"
+        ))
+        .expect("checked-in OpenCode report");
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-opencode-fixed-output/provider-request.jsonl"
+        ))
+        .expect("checked-in OpenCode Provider request");
+        let provider_config =
+            include_bytes!("../evidence/2026-07-28-opencode-fixed-output/opencode.json");
+
+        assert_eq!(report["format_version"], RUN_FORMAT_VERSION);
+        assert_eq!(report["adapter"]["cli_version"], "1.18.5");
+        assert_eq!(report["controls"]["claim_eligible"], false);
+        assert_eq!(report["controls"]["profile"], "bare");
+        assert_eq!(report["controls"]["requested_provider"], "yh-loopback");
+        assert_eq!(
+            report["controls"]["requested_model"],
+            "yh-loopback/local-deterministic"
+        );
+        assert_eq!(report["controls"]["observed_models"], serde_json::json!([]));
+        assert_eq!(report["execution"]["status"], "completed");
+        assert_eq!(report["execution"]["settlement"]["num_turns"], 1);
+        assert_eq!(report["execution"]["settlement"]["actual_cost_usd"], 0.0);
+        assert_eq!(
+            sha256_bytes(provider_config),
+            "b49fc14ae270cbfe11f5a7ce90b483b4bdb7f004b47cdb1db54252f503b36f39"
+        );
+
+        let mut product_stdout = Vec::new();
+        for event in report["execution"]["settlement"]["raw_result"]
+            .as_array()
+            .expect("OpenCode events")
+        {
+            serde_json::to_writer(&mut product_stdout, event).expect("encode OpenCode event");
+            product_stdout.push(b'\n');
+        }
+        let normalized =
+            normalize_result(&product_stdout).expect("normalize retained OpenCode events");
+        assert!(!normalized.is_error);
+        assert_eq!(normalized.subtype, "stop");
+        assert_eq!(normalized.num_turns, 1);
+        assert_eq!(normalized.total_cost_usd, Some(0.0));
+
+        assert_eq!(request["path"], "/v1/chat/completions");
+        assert_eq!(request["authorization"], "bearer-present");
+        assert_eq!(request["body"]["model"], "local-deterministic");
+        assert_eq!(request["body"]["stream"], true);
+        assert!(request["body"].get("tools").is_none());
+        assert_eq!(
+            request["body"]["messages"][1]["content"],
+            "Return exactly YH-OPENCODE-ADAPTER-OK"
+        );
     }
 }

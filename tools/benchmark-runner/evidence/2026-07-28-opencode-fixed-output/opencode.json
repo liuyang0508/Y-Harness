@@ -1,0 +1,32 @@
+{
+  "provider": {
+    "yh-loopback": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Y-Harness deterministic fixture",
+      "options": {
+        "baseURL": "http://127.0.0.1:52748/v1",
+        "apiKey": "fixture-token",
+        "timeout": 10000
+      },
+      "models": {
+        "local-deterministic": {
+          "name": "Y-Harness deterministic fixture",
+          "reasoning": false,
+          "tool_call": false,
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 8192,
+            "output": 256
+          },
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+          }
+        }
+      }
+    }
+  }
+}

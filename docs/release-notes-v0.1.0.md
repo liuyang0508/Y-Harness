@@ -88,10 +88,10 @@ The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
 protocol; it keeps no title or branch store.
 The independent benchmark runner emits exact non-claim external-run formats
 for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
-CLIs. A real released Pi `0.82.1` fixed-output record now preserves format 4
-with a deterministic loopback Provider and explicit unsupported controls; it
-is adapter conformance, not a comparison. Format 5 uses OpenCode's
-source-tested run JSONL surface. Format 6 uses
+CLIs. Real released Pi `0.82.1` and OpenCode `1.18.5` fixed-output records now
+preserve formats 4 and 5 with deterministic loopback Providers and explicit
+unsupported controls; they are adapter conformance, not comparisons. Format 5
+uses OpenCode's source-tested run JSONL surface. Format 6 uses
 Hermes `0.19.0` one-shot stdout plus its strict bounded usage sidecar, an
 isolated bare home, static empty Tool set, exact Provider/Model identity, and
 estimated-cost preservation without relabeling it as actual cost. Hermes's
@@ -110,7 +110,7 @@ JSON-command Model, stdio MCP, SQLite restart, permissioned exact-Turn
 recovery, and a Tool-free audit Turn. State rechecks the expected Turn at the
 optimistic-commit boundary, while the report explicitly declines descendant
 cleanup, in-place continuation, reasoning-quality, and comparative claims. No
-OpenCode or Hermes live/comparative result is claimed.
+Hermes live or cross-product comparative result is claimed.
 
 ## Start
 
