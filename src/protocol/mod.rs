@@ -37,7 +37,7 @@ pub use task::{TaskGraphSummary, TaskRecordPage};
 use task::{TaskProtocolService, TaskWorkerAccess};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "22";
+pub const PROTOCOL_VERSION: &str = "23";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -2726,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_two_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_three_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2734,14 +2734,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "22",
+                "protocol_version": "23",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "22",
+                "protocol_version": "23",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2750,7 +2750,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "22",
+                "protocol_version": "23",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2772,7 +2772,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "22",
+                "protocol_version": "23",
                 "body": {
                     "status": "success",
                     "result": {

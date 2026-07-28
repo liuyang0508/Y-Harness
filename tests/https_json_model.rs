@@ -110,6 +110,7 @@ async fn exclusive_private_ca_https_round_trip() {
         .complete_with_metadata(ModelRequest {
             thread_id: ThreadId::generate(),
             turn_id: TurnId::generate(),
+            authority: y_harness::AuthorityContext::local_process(),
             items: Vec::new(),
             context: Vec::new(),
             tools: Vec::new(),
@@ -185,6 +186,7 @@ async fn private_model_gateway_requires_and_accepts_client_identity() {
             .complete(ModelRequest {
                 thread_id: ThreadId::generate(),
                 turn_id: TurnId::generate(),
+                authority: y_harness::AuthorityContext::local_process(),
                 items: Vec::new(),
                 context: Vec::new(),
                 tools: Vec::new(),
@@ -206,6 +208,7 @@ async fn private_model_gateway_requires_and_accepts_client_identity() {
         .complete(ModelRequest {
             thread_id: ThreadId::generate(),
             turn_id: TurnId::generate(),
+            authority: y_harness::AuthorityContext::local_process(),
             items: Vec::new(),
             context: Vec::new(),
             tools: Vec::new(),
@@ -231,6 +234,7 @@ async fn authenticated_https_gateway_round_trip() {
         .complete_with_metadata(ModelRequest {
             thread_id: ThreadId::generate(),
             turn_id: TurnId::generate(),
+            authority: y_harness::AuthorityContext::local_process(),
             items: Vec::new(),
             context: Vec::new(),
             tools: Vec::new(),

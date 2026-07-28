@@ -34,6 +34,7 @@ async fn direct_openai_responses_round_trip() {
         .complete_with_metadata(ModelRequest {
             thread_id: ThreadId::from_static("openai-live-thread"),
             turn_id: TurnId::from_static("openai-live-turn"),
+            authority: y_harness::AuthorityContext::local_process(),
             items: vec![Item::new(ItemKind::UserMessage {
                 content: "Reply with a short greeting.".to_owned(),
             })],

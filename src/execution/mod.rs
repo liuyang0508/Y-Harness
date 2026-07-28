@@ -1855,6 +1855,7 @@ mod tests {
             .complete(ModelRequest {
                 thread_id: ThreadId::from_static("thread-test"),
                 turn_id: TurnId::from_static("turn-test"),
+                authority: crate::AuthorityContext::local_process(),
                 items: Vec::new(),
                 context: Vec::new(),
                 tools: Vec::new(),
@@ -2083,6 +2084,7 @@ mod tests {
             .complete_with_metadata(ModelRequest {
                 thread_id: ThreadId::from_static("thread-test"),
                 turn_id: TurnId::from_static("turn-test"),
+                authority: crate::AuthorityContext::local_process(),
                 items: Vec::new(),
                 context: Vec::new(),
                 tools: Vec::new(),
@@ -2143,6 +2145,7 @@ mod tests {
             .complete(ModelRequest {
                 thread_id: ThreadId::from_static("thread-test"),
                 turn_id: TurnId::from_static("turn-test"),
+                authority: crate::AuthorityContext::local_process(),
                 items: Vec::new(),
                 context: Vec::new(),
                 tools: Vec::new(),
@@ -2175,6 +2178,7 @@ mod tests {
             .complete(ModelRequest {
                 thread_id: ThreadId::from_static("thread-test"),
                 turn_id: TurnId::from_static("turn-test"),
+                authority: crate::AuthorityContext::local_process(),
                 items: Vec::new(),
                 context: Vec::new(),
                 tools: Vec::new(),
@@ -2345,6 +2349,7 @@ mod tests {
             .complete(ModelRequest {
                 thread_id: ThreadId::from_static("thread-test"),
                 turn_id: TurnId::from_static("turn-test"),
+                authority: crate::AuthorityContext::local_process(),
                 items: vec![Item::new(ItemKind::ToolCall {
                     model_id: Some("fixture/model".to_owned()),
                     model_origin: Some(CapabilityOrigin::BuiltIn),
@@ -2461,6 +2466,7 @@ mod tests {
                 ModelRequest {
                     thread_id: ThreadId::from_static("thread-test"),
                     turn_id: TurnId::from_static("turn-test"),
+                    authority: crate::AuthorityContext::local_process(),
                     items: Vec::new(),
                     context: Vec::new(),
                     tools: Vec::new(),

@@ -179,12 +179,15 @@ impl OpenAiResponsesModel {
         let body = build_request_body(&self.config.model, &request, stream.is_some())?;
         let credential = self
             .secrets
-            .resolve(SecretRequest {
-                reference: self.config.api_key.clone(),
-                consumer: self.id.clone(),
-                thread_id: request.thread_id,
-                turn_id: request.turn_id,
-            })
+            .resolve_as(
+                SecretRequest {
+                    reference: self.config.api_key.clone(),
+                    consumer: self.id.clone(),
+                    thread_id: request.thread_id,
+                    turn_id: request.turn_id,
+                },
+                &request.authority,
+            )
             .await
             .map_err(|_| HarnessError::Model("OpenAI credential resolution failed".to_owned()))?;
         let authorization = authorization_header(&credential)?;
@@ -926,6 +929,7 @@ mod tests {
         ModelRequest {
             thread_id: ThreadId::from_static("thread-openai"),
             turn_id: TurnId::from_static("turn-openai"),
+            authority: crate::AuthorityContext::local_process(),
             items: vec![
                 Item::new(ItemKind::UserMessage {
                     content: "weather?".to_owned(),

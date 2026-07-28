@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v22 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v23 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v22 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v23 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -189,7 +189,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v22 specification](docs/protocol.md).
+[client protocol v23 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -536,6 +536,18 @@ yh task-migrate \
 See the [Task migration runbook](docs/task-migration.md) and
 [ADR 0119](docs/adr/0119-durable-task-graph-tenant-ownership.md).
 
+Secret Provider API 2 receives the same trusted per-Turn authority used by
+State, Policy, Tool, Approval, and Task execution. Direct HTTPS gateway and
+OpenAI adapters resolve credentials against that authority while keeping it
+out of serialized Model payloads. Existing Secret Providers still serve
+unscoped hosts; tenant-scoped requests fail closed until a Provider implements
+authority-aware resolution. The embedded tenant environment Provider requires
+an exact tenant/reference mapping and never falls back to a global mapping.
+Current shared stdio and HTTPS MCP sessions likewise reject tenant-scoped Tool
+calls before remote invocation unless an embedding host supplies a genuinely
+tenant-partitioned client. See
+[ADR 0120](docs/adr/0120-authority-aware-secret-resolution.md).
+
 Completion verifiers are registered through a typed, collision-safe registry.
 All must pass before an assistant candidate completes the Turn. Retryable
 failures return structured feedback to the Agent Loop; hard failures terminate
@@ -688,8 +700,9 @@ immutable optional tenant envelope and duplicates that owner in the SQLite
 lookup key; reads validate both representations before returning data.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v22 preserves Protocol v21's 2 MiB request and 16 MiB response ceilings,
-byte-authoritative Thread capacity, Token Counter and Conversation Compactor
+protocol. Protocol v23 preserves Protocol v22's 2 MiB request and 16 MiB
+response ceilings, byte-authoritative Thread capacity, Token Counter and
+Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
 schema-6 durable safe-boundary Turn steering, schema-7 atomic ordered
@@ -704,7 +717,9 @@ of one exact abandoned Turn without automatic replay. Protocol 20 adds exact
 Thread and Operation tenant fencing. Protocol 21 adds schema-3 durable
 Approval tenant ownership and tenant-scoped Approval capabilities. Protocol
 22 adds schema-2 durable Task Graph ownership, tenant-partitioned Graph
-identity, and the complete tenant-scoped worker lifecycle. Steering
+identity, and the complete tenant-scoped worker lifecycle. Protocol 23 adds
+Secret Provider API 2 with trusted-authority credential resolution and
+fail-closed shared MCP session fencing. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -742,12 +757,14 @@ listener. Server identity and client trust roots are operator-supplied PEM
 files; TLS handshakes, connections, idle time, frames per session, and shutdown
 are bounded. The client leaf certificate becomes a SHA-256 principal, and an
 exact allow-list gates every protocol capability before execution;
-`Initialize` advertises only granted capabilities. Subject/SAN identity,
-durable tenant/role isolation, revocation, and hot policy reload are
-intentionally not yet claimed. A host authorizer may resolve a transport
-principal to a validated per-Turn actor/tenant Authority Context, but current
-tenant binding covers Memory, Policy, and Tool execution rather than durable
-Thread ownership.
+`Initialize` advertises only granted capabilities. Subject/SAN-to-role mapping,
+revocation, and hot policy reload are intentionally not yet claimed. A host
+authorizer may resolve a transport principal to a validated per-Turn
+actor/tenant Authority Context. That tenant now fences durable Thread,
+Operation, Approval, and Task state and reaches Memory, Policy, Tool, Model
+Secret resolution, and MCP admission. Artifact storage, Domain Packs, quotas,
+retention, reference-service tenant credential maps, and tenant-partitioned
+MCP sessions remain outside the current claim.
 
 Streaming model providers can emit provisional text through a kernel-owned
 failure-isolated handle. Deltas and total Turn output are byte-bounded; protocol
@@ -798,7 +815,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v22. The Sessions panel shows direct fork ancestry from
+through Protocol v23. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

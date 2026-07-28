@@ -1,10 +1,10 @@
-# Client protocol v22
+# Client protocol v23
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"22"` is exact. Every request carries that value, and a peer
+Protocol version `"23"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "22",
+  "protocol_version": "23",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "22",
+  "protocol_version": "23",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "22",
+  "protocol_version": "23",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "22",
+  "protocol_version": "23",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "22",
+  "protocol_version": "23",
   "body": {
     "status": "success",
     "result": {
@@ -141,7 +141,7 @@ The result type is `initialized`:
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
-        "secret_api": 1,
+        "secret_api": 2,
         "skill_api": "1",
         "model_gateway_api": "7",
         "workspace_provider_api": "1"
@@ -161,6 +161,14 @@ For a tenant-scoped authority, Approval and Task permissions are available
 when their durable stores are configured. Approval list/get/settlement and
 the complete Task Graph/worker lifecycle are fenced by the exact
 transport-resolved tenant; commands contain no tenant selector.
+
+Secret Provider API 2 receives that same trusted authority inside the Engine.
+Legacy Secret Providers remain usable for unscoped operations and fail closed
+for tenant-scoped resolution. Direct Model adapters do not serialize actor or
+tenant authority into Model Provider payloads. Current shared stdio and HTTPS
+MCP clients likewise reject tenant-scoped Tool calls before invoking the
+remote client unless an embedding host supplies a client implementation that
+proves tenant-partitioned credentials and sessions.
 
 ## Methods
 
@@ -810,7 +818,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v22 value |
+| Boundary | Protocol v23 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -843,7 +851,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"22"` |
+| `unsupported_version` | Request protocol is not exactly `"23"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |

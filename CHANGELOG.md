@@ -4,6 +4,10 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added Secret Provider API 2 with trusted per-Turn authority, exact
+  tenant/reference environment resolution, non-serialized Model authority,
+  direct HTTPS/OpenAI credential fencing, fail-closed legacy Providers and
+  shared MCP sessions, and Protocol v23;
 - added Task Graph schema 2 with immutable trusted tenant ownership,
   tenant-partitioned Graph identities, exact-tenant Memory/SQLite and Protocol
   fencing for the complete worker/lease/mailbox lifecycle, validated SQLite

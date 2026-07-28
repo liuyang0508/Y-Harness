@@ -119,6 +119,7 @@ pub use runtime::{
 pub use secret::{
     EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretProvider,
     SecretProviderDescriptor, SecretReference, SecretRegistry, SecretRequest, SecretValue,
+    TenantEnvironmentSecretProvider,
 };
 #[cfg(feature = "https-skill")]
 pub use skill::{

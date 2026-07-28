@@ -1036,6 +1036,7 @@ impl HarnessRuntime {
             let request = ModelRequest {
                 thread_id: thread_id.clone(),
                 turn_id: turn.id.clone(),
+                authority: options.authority.clone(),
                 items,
                 context: context_blocks.clone(),
                 tools: self.tools.descriptors(),
@@ -1437,6 +1438,7 @@ impl HarnessRuntime {
         let original_request = ModelRequest {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
+            authority: options.authority.clone(),
             items: original_items,
             context: compilation.blocks.clone(),
             tools: self.tools.descriptors(),
@@ -3548,6 +3550,9 @@ fn require_runtime_capacity(capacity: &StateCapacity) -> Result<(), HarnessError
 }
 
 pub(crate) fn validate_model_request(request: &ModelRequest) -> Result<(), HarnessError> {
+    request
+        .authority
+        .validate_current("Model request authority")?;
     validate_model_request_json_shapes(request)?;
     crate::json::bounded_serialized_size(request, MAX_MODEL_REQUEST_BYTES).map_or_else(
         |error| {
@@ -4007,6 +4012,10 @@ mod tests {
     }
 
     struct AuthorityRecordingPolicy {
+        observed: Arc<Mutex<Option<AuthorityContext>>>,
+    }
+
+    struct AuthorityRecordingModel {
         observed: Arc<Mutex<Option<AuthorityContext>>>,
     }
 
@@ -4528,6 +4537,21 @@ mod tests {
                     name: "echo".to_owned(),
                     input: json!({ "text": prompt }),
                 })
+            })
+        }
+    }
+
+    impl LanguageModel for AuthorityRecordingModel {
+        fn id(&self) -> &str {
+            "test/authority-recording-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                *self.observed.lock().map_err(|_| {
+                    HarnessError::Model("model authority recorder poisoned".to_owned())
+                })? = Some(request.authority.clone());
+                EchoModel.complete(request).await
             })
         }
     }
@@ -5631,6 +5655,7 @@ mod tests {
         .expect("scoped authority");
         let observed_policy = Arc::new(Mutex::new(None));
         let observed_tool = Arc::new(Mutex::new(None));
+        let observed_model = Arc::new(Mutex::new(None));
         let mut tools = ToolRegistry::new();
         tools
             .register(
@@ -5641,7 +5666,9 @@ mod tests {
             )
             .expect("probe Tool");
         let runtime = HarnessRuntime::new(
-            Arc::new(EchoModel),
+            Arc::new(AuthorityRecordingModel {
+                observed: observed_model.clone(),
+            }),
             tools,
             Arc::new(AuthorityRecordingPolicy {
                 observed: observed_policy.clone(),
@@ -5660,6 +5687,13 @@ mod tests {
             )
             .await
             .expect("Turn");
+        assert_eq!(
+            observed_model
+                .lock()
+                .expect("observed Model authority")
+                .as_ref(),
+            Some(&authority)
+        );
         assert_eq!(
             observed_policy
                 .lock()
@@ -10362,6 +10396,7 @@ mod tests {
         let request = ModelRequest {
             thread_id: ThreadId::generate(),
             turn_id: crate::TurnId::generate(),
+            authority: crate::AuthorityContext::local_process(),
             items: vec![crate::Item::new(ItemKind::ToolCall {
                 model_id: Some("test/model".to_owned()),
                 model_origin: Some(CapabilityOrigin::BuiltIn),

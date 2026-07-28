@@ -78,6 +78,10 @@ internals or read Engine storage directly.
   without dumping secrets or memory bodies.
 - Durable configuration stores only `SecretReference`; resolved values are
   non-serializable, debug-redacted, short-lived, and zeroized on drop.
+- Tenant-scoped Secret resolution receives trusted in-process
+  `AuthorityContext`, never a caller-authored tenant field. Legacy Providers
+  and missing exact tenant/reference mappings fail closed. Model Provider
+  payloads must not serialize execution authority.
 - Authenticated HTTP adapters disable redirects, ambient proxies, automatic
   retries, referers, and cookies unless a separately reviewed contract requires
   them. Sensitive headers are marked as such and response bodies are read
@@ -210,6 +214,10 @@ internals or read Engine storage directly.
   returning cancellation; they never retry an ambiguous Tool call. A queued
   call cancelled before acquiring the session must return without disturbing
   unrelated in-flight work.
+- A shared MCP client or session must reject tenant-scoped Tool execution
+  before remote invocation. Supporting tenant calls requires an implementation
+  that partitions credentials and all server/session state by the trusted Tool
+  authority; changing a shared credential between calls is insufficient.
 - Remote MCP must reuse the same provider-neutral client and Tool/Memory
   registration path. The shipped HTTPS adapter accepts only exact
   credential-free HTTPS URLs, resolves a configured Secret for each request,

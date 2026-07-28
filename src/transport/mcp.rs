@@ -93,6 +93,28 @@ pub trait McpClient: Send + Sync {
             }
         })
     }
+
+    /// Calls one tool under the Runtime's trusted Tool authority.
+    ///
+    /// Legacy clients fail closed for tenant-scoped calls because a shared
+    /// session may carry credentials or server state across tenants.
+    fn call_tool_with_context<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: Value,
+        context: ToolContext,
+    ) -> HarnessFuture<'a, Value> {
+        Box::pin(async move {
+            context.authority.validate_current("MCP Tool authority")?;
+            if context.authority.tenant_id().is_some() {
+                return Err(HarnessError::Mcp(
+                    "MCP client does not support tenant-partitioned sessions".to_owned(),
+                ));
+            }
+            self.call_tool_with_cancellation(name, arguments, context.cancellation)
+                .await
+        })
+    }
 }
 
 struct McpToolAdapter {
@@ -113,7 +135,7 @@ impl Tool for McpToolAdapter {
     fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value> {
         Box::pin(async move {
             self.client
-                .call_tool_with_cancellation(&self.remote_name, input, context.cancellation)
+                .call_tool_with_context(&self.remote_name, input, context)
                 .await
         })
     }
@@ -1016,9 +1038,10 @@ mod tests {
         register_selected_mcp_tools, tool_result_value,
     };
     use crate::{
-        AllowListPolicy, CancellationToken, CapabilityOrigin, ExecutionPhase, HarnessError,
-        HarnessFuture, HarnessRuntime, ItemKind, LanguageModel, MemoryEventStore, ModelOutput,
-        ModelRequest, StateEngine, ToolRegistry, TurnExecutionOptions, TurnStatus, TurnStopReason,
+        ActorIdentity, AllowListPolicy, AuthorityContext, CancellationToken, CapabilityOrigin,
+        ExecutionPhase, HarnessError, HarnessFuture, HarnessRuntime, ItemKind, LanguageModel,
+        MemoryEventStore, ModelOutput, ModelRequest, StateEngine, ThreadId, ToolContext,
+        ToolRegistry, TurnExecutionOptions, TurnId, TurnStatus, TurnStopReason,
     };
 
     struct FakeMcpClient {
@@ -1163,6 +1186,39 @@ mod tests {
                 .isolation,
             crate::ProcessIsolation::Unrestricted
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_clients_fail_before_a_tenant_scoped_call() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = FakeMcpClient {
+            tools: Vec::new(),
+            calls: calls.clone(),
+        };
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "mcp-worker".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("authority");
+        let error = client
+            .call_tool_with_context(
+                "echo",
+                json!({"text": "hidden"}),
+                ToolContext {
+                    thread_id: ThreadId::from_static("thread"),
+                    turn_id: TurnId::from_static("turn"),
+                    call_id: "call".to_owned(),
+                    authority,
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .await
+            .expect_err("tenant session must fail closed");
+        assert!(error.to_string().contains("tenant-partitioned sessions"));
+        assert!(calls.lock().expect("calls").is_empty());
     }
 
     #[cfg(target_os = "macos")]

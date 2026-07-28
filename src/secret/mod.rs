@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use zeroize::Zeroizing;
 
 use crate::{
-    CapabilityOrigin, HarnessError, HarnessFuture, ThreadId, TurnId,
+    AuthorityContext, CapabilityOrigin, HarnessError, HarnessFuture, ThreadId, TurnId,
     kernel::{
         capture_capability_metadata, validate_capability_name, validate_capability_origin,
         validate_registry_growth,
@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Current Y-Harness Secret Provider contract version.
-pub const SECRET_API_VERSION: u32 = 1;
+pub const SECRET_API_VERSION: u32 = 2;
 
 const MAX_SECRET_REFERENCE_BYTES: usize = 256;
 const MAX_SECRET_VALUE_BYTES: usize = 65_536;
@@ -126,6 +126,26 @@ pub trait SecretProvider: Send + Sync {
 
     /// Resolves one explicitly scoped reference without persistence or caching.
     fn resolve<'a>(&'a self, request: SecretRequest) -> HarnessFuture<'a, SecretValue>;
+
+    /// Resolves one reference under trusted actor and tenant authority.
+    ///
+    /// Legacy providers remain usable for unscoped embedded operations but
+    /// fail closed for tenant-scoped access until they override this method.
+    fn resolve_as<'a>(
+        &'a self,
+        request: SecretRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, SecretValue> {
+        Box::pin(async move {
+            authority.validate_current("Secret Provider authority")?;
+            if authority.tenant_id().is_some() {
+                return Err(HarnessError::Secret(
+                    "secret provider does not support tenant-scoped resolution".to_owned(),
+                ));
+            }
+            self.resolve(request).await
+        })
+    }
 }
 
 /// Registered resolver and its operator-assigned trust origin.
@@ -238,14 +258,116 @@ impl SecretProvider for EnvironmentSecretProvider {
             let variable = self.mappings.get(&request.reference).ok_or_else(|| {
                 HarnessError::Secret("secret reference is not mapped by this provider".to_owned())
             })?;
-            let value = env::var(variable).map_err(|_| {
-                HarnessError::Secret(
-                    "mapped environment credential is unavailable or not Unicode".to_owned(),
-                )
-            })?;
-            SecretValue::new(value.into_bytes())
+            resolve_environment_value(variable)
         })
     }
+}
+
+/// Explicit tenant-to-environment mapping for embedded enterprise hosts.
+///
+/// Each lookup requires an exact trusted tenant. Unscoped and cross-tenant
+/// requests never fall back to another tenant or to ambient variable names.
+pub struct TenantEnvironmentSecretProvider {
+    descriptor: SecretProviderDescriptor,
+    mappings: BTreeMap<String, BTreeMap<SecretReference, String>>,
+}
+
+impl TenantEnvironmentSecretProvider {
+    /// Creates a resolver from exact tenant/reference maps.
+    pub fn new(
+        name: impl Into<String>,
+        tenant_mappings: BTreeMap<String, BTreeMap<SecretReference, String>>,
+    ) -> Result<Self, HarnessError> {
+        let descriptor = SecretProviderDescriptor {
+            name: name.into(),
+            description:
+                "Resolves explicitly tenant-mapped process environment variables on demand"
+                    .to_owned(),
+            api_version: SECRET_API_VERSION,
+        };
+        validate_secret_descriptor(&descriptor)?;
+        let total = tenant_mappings
+            .values()
+            .try_fold(0_usize, |total, mappings| {
+                total.checked_add(mappings.len()).ok_or_else(|| {
+                    HarnessError::InvalidConfiguration(
+                        "tenant environment secret mapping count overflow".to_owned(),
+                    )
+                })
+            })?;
+        if tenant_mappings.is_empty()
+            || tenant_mappings.values().any(BTreeMap::is_empty)
+            || total == 0
+            || total > MAX_SECRET_MAPPINGS
+        {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "tenant environment secret mappings must contain 1-{MAX_SECRET_MAPPINGS} total entries"
+            )));
+        }
+        for (tenant_id, references) in &tenant_mappings {
+            AuthorityContext::validate_tenant(tenant_id)?;
+            for variable in references.values() {
+                if !valid_environment_name(variable) {
+                    return Err(HarnessError::InvalidConfiguration(
+                        "tenant environment secret mappings contain an invalid variable name"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            descriptor,
+            mappings: tenant_mappings,
+        })
+    }
+}
+
+impl SecretProvider for TenantEnvironmentSecretProvider {
+    fn descriptor(&self) -> SecretProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn resolve<'a>(&'a self, _request: SecretRequest) -> HarnessFuture<'a, SecretValue> {
+        Box::pin(async {
+            Err(HarnessError::Secret(
+                "tenant environment secret provider requires tenant authority".to_owned(),
+            ))
+        })
+    }
+
+    fn resolve_as<'a>(
+        &'a self,
+        request: SecretRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, SecretValue> {
+        Box::pin(async move {
+            authority.validate_current("Secret Provider authority")?;
+            let tenant_id = authority.tenant_id().ok_or_else(|| {
+                HarnessError::Secret(
+                    "tenant environment secret provider requires tenant authority".to_owned(),
+                )
+            })?;
+            let variable = self
+                .mappings
+                .get(tenant_id)
+                .and_then(|mappings| mappings.get(&request.reference))
+                .ok_or_else(|| {
+                    HarnessError::Secret(
+                        "secret reference is not mapped for this tenant".to_owned(),
+                    )
+                })?;
+            resolve_environment_value(variable)
+        })
+    }
+}
+
+fn resolve_environment_value(variable: &str) -> Result<SecretValue, HarnessError> {
+    let value = env::var(variable).map_err(|_| {
+        HarnessError::Secret(
+            "mapped environment credential is unavailable or not Unicode".to_owned(),
+        )
+    })?;
+    SecretValue::new(value.into_bytes())
 }
 
 fn validate_secret_descriptor(descriptor: &SecretProviderDescriptor) -> Result<(), HarnessError> {
@@ -283,8 +405,12 @@ mod tests {
     use super::{
         EnvironmentSecretProvider, SECRET_API_VERSION, SecretProvider, SecretProviderDescriptor,
         SecretReference, SecretRegistry, SecretRequest, SecretValue,
+        TenantEnvironmentSecretProvider,
     };
-    use crate::{CapabilityOrigin, HarnessError, HarnessFuture, ThreadId, TurnId};
+    use crate::{
+        ActorIdentity, AuthorityContext, CapabilityOrigin, HarnessError, HarnessFuture, ThreadId,
+        TurnId,
+    };
 
     struct FixedProvider;
 
@@ -345,5 +471,71 @@ mod tests {
                 "mapped environment credential is unavailable or not Unicode".to_owned()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_fails_closed_for_tenant_authority() {
+        let request = request("model/gateway");
+        let error = FixedProvider
+            .resolve_as(request, &authority("tenant-a"))
+            .await
+            .expect_err("legacy tenant resolution");
+        assert_eq!(
+            error,
+            HarnessError::Secret(
+                "secret provider does not support tenant-scoped resolution".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_environment_provider_never_falls_back_across_tenants() {
+        let reference = SecretReference::new("model/gateway").expect("reference");
+        let provider = TenantEnvironmentSecretProvider::new(
+            "tenant-environment",
+            BTreeMap::from([(
+                "tenant-a".to_owned(),
+                BTreeMap::from([(
+                    reference,
+                    "YH_TEST_DELIBERATELY_MISSING_TENANT_A".to_owned(),
+                )]),
+            )]),
+        )
+        .expect("provider");
+        let mapped = provider
+            .resolve_as(request("model/gateway"), &authority("tenant-a"))
+            .await
+            .expect_err("mapped variable is deliberately absent");
+        assert!(mapped.to_string().contains("unavailable"));
+        let hidden = provider
+            .resolve_as(request("model/gateway"), &authority("tenant-b"))
+            .await
+            .expect_err("cross-tenant mapping");
+        assert!(hidden.to_string().contains("not mapped for this tenant"));
+        let unscoped = provider
+            .resolve(request("model/gateway"))
+            .await
+            .expect_err("unscoped access");
+        assert!(unscoped.to_string().contains("requires tenant authority"));
+    }
+
+    fn request(reference: &str) -> SecretRequest {
+        SecretRequest {
+            reference: SecretReference::new(reference).expect("reference"),
+            consumer: "provider/model".to_owned(),
+            thread_id: ThreadId::from_static("thread"),
+            turn_id: TurnId::from_static("turn"),
+        }
+    }
+
+    fn authority(tenant_id: &str) -> AuthorityContext {
+        AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "secret-test".to_owned(),
+            },
+            Some(tenant_id.to_owned()),
+        )
+        .expect("authority")
     }
 }

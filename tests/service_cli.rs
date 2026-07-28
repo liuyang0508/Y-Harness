@@ -14,14 +14,16 @@ use std::{
 };
 
 use ed25519_dalek::{Signer, SigningKey};
+use y_harness::{
+    APPROVAL_INBOX_SCHEMA_VERSION, Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand,
+    ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult, SECRET_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillPackage,
+    SkillSignature, SkillTransparencyReceipt, SqliteEventStore, StateEngine,
+    TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskId, ThreadId, TurnStatus, WorkspaceMode,
+    decode_thread_archive,
+};
 #[cfg(unix)]
 use y_harness::{CapabilityOrigin, OperationStatus};
-use y_harness::{
-    Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand, ProtocolRequest, ProtocolResponse,
-    ProtocolResponseBody, ProtocolResult, SignedSkillPackage, SkillPackage, SkillSignature,
-    SkillTransparencyReceipt, SqliteEventStore, StateEngine, TaskDefinition, TaskId, ThreadId,
-    TurnStatus, WorkspaceMode, decode_thread_archive,
-};
 
 #[test]
 fn init_is_no_clobber_and_doctor_validates_the_project() {
@@ -67,7 +69,10 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
-    assert!(report.contains("protocol: 21"));
+    assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
+    assert!(report.contains(&format!(
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+    )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
     assert!(report.contains("verifiers: 0"));

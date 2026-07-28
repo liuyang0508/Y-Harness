@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v22 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v23 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -58,6 +58,12 @@ settlement. Task Graph schema 2 and Protocol 22 bind the complete Graph,
 worker lease, and mailbox lifecycle to that same trusted tenant, while
 partitioning caller-selected Graph IDs by tenant. Historical schema-1 Graphs
 migrate as explicitly unscoped.
+Secret Provider API 2 and Protocol 23 carry trusted Turn authority into direct
+Model credential resolution without serializing actor or tenant data to the
+Provider. Exact tenant/reference environment mappings have no global fallback;
+legacy Secret Providers and shared MCP sessions fail closed for tenant-scoped
+operations. Reference-service tenant credential configuration and
+tenant-partitioned MCP sessions remain explicit open work.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the

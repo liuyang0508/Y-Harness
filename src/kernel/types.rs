@@ -779,6 +779,11 @@ pub struct ModelRequest {
     pub thread_id: ThreadId,
     /// Active turn.
     pub turn_id: TurnId,
+    /// Trusted Turn authority available only to in-process Harness adapters.
+    ///
+    /// This field is intentionally excluded from serialized provider payloads.
+    #[serde(skip)]
+    pub authority: AuthorityContext,
     /// Ordered conversation and runtime items.
     pub items: Vec<Item>,
     /// Compiled external context, kept distinct from conversation history.
@@ -1479,9 +1484,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        HarnessError, MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS,
-        MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
-        ModelContinuation, ModelProviderFailure, ModelProviderFailureKind, ModelUsage,
+        ActorIdentity, AuthorityContext, HarnessError, MAX_MODEL_CONTINUATION_BYTES,
+        MAX_MODEL_CONTINUATION_ITEMS, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
+        MAX_MODEL_PROVIDER_RETRY_AFTER_MS, ModelContinuation, ModelProviderFailure,
+        ModelProviderFailureKind, ModelRequest, ModelUsage, ThreadId, TurnId,
     };
 
     #[test]
@@ -1575,5 +1581,31 @@ mod tests {
         }))
         .expect("legacy cost is safely ignored");
         assert_eq!(legacy.cost_usd_ticks, None);
+    }
+
+    #[test]
+    fn model_request_keeps_authority_out_of_provider_payloads() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "caller".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("authority");
+        let request = ModelRequest {
+            thread_id: ThreadId::from_static("thread"),
+            turn_id: TurnId::from_static("turn"),
+            authority,
+            items: Vec::new(),
+            context: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        let encoded = serde_json::to_value(&request).expect("serialize request");
+        assert!(encoded.get("authority").is_none());
+        let decoded: ModelRequest =
+            serde_json::from_value(encoded).expect("deserialize provider payload");
+        assert_eq!(decoded.authority, AuthorityContext::local_process());
     }
 }

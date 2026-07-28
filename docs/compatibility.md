@@ -11,11 +11,11 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"20"` | exact `Initialize` request/response |
+| Client protocol | `"23"` | exact `Initialize` request/response |
 | State events | `12` | per-event durable envelope; reads schemas 1 through 12 |
 | State snapshots | `12` | cache body; incompatible caches are discarded |
-| Approval Inbox | `2` | per-record durable body after explicit migration |
-| Task Coordinator | `1` | per-graph SQLite schema column |
+| Approval Inbox | `3` | per-record durable body after explicit migration |
+| Task Coordinator | `2` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
@@ -23,7 +23,7 @@ upgrade support that has not been tested.
 | Thread archive format | `2` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
-| Secret Provider API | `1` | exact descriptor registration |
+| Secret Provider API | `2` | exact descriptor registration and trusted-authority resolution |
 | Skill package API | `"1"` | exact manifest validation |
 | HTTPS model gateway API | `"7"` | exact request/response header |
 
@@ -161,6 +161,19 @@ an independent caller-selected identity namespace. Schema-1 Graphs migrate as
 unscoped; no Thread, worker, path, or deployment relationship is used to infer
 ownership. The pre-1.0 `TaskCoordinator` API adds authority-aware methods. See
 [ADR 0119](adr/0119-durable-task-graph-tenant-ownership.md).
+Secret Provider API 2 adds trusted-authority resolution. The default method
+preserves existing unscoped providers but rejects tenant-scoped resolution
+until the provider explicitly implements it. The built-in tenant environment
+provider requires an exact tenant/reference mapping and has no global
+fallback. `ModelRequest` now carries trusted authority in process, so external
+Rust struct literals must initialize it, but Serde excludes it from Model
+Provider and JSON-command payloads. Direct HTTPS gateway and OpenAI adapters
+resolve credentials with the Turn authority. `McpClient` similarly adds a
+defaulted context-aware call method; current shared sessions reject
+tenant-scoped calls unless a custom implementation proves session partitioning.
+Protocol v23 advertises Secret API 2; State, Approval, Task, service
+configuration, and Model Gateway coordinates are unchanged. See
+[ADR 0120](adr/0120-authority-aware-secret-resolution.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -213,6 +226,26 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `23` preserves protocol-v22 commands, framing, authority,
+tenant-owned State/Approval/Task projections, and Model Gateway API 7. It
+advertises Secret Provider API 2. Trusted Model authority remains in process
+and is absent from provider JSON; legacy Secret Providers and shared MCP
+sessions fail closed for tenant-scoped use. Protocol-v22 clients must fail
+exact initialization rather than assume Secret API 1 behavior.
+
+Client protocol `22` preserves protocol-v21 commands, framing, authority,
+State schema 12, and Approval Inbox schema 3. It advances Task Graphs to
+schema 2, carries immutable optional tenant ownership in summaries, and enables
+exact-tenant Graph administration plus the complete worker/lease/mailbox
+lifecycle. Protocol-v21 clients must fail exact initialization rather than
+discard Task ownership.
+
+Client protocol `21` preserves protocol-v20 commands, framing, Thread and
+Operation tenant fencing, and Task schema 1 behavior. It advances Approval
+Inbox records to schema 3, projects immutable optional tenant ownership, and
+enables exact-tenant Approval discovery and settlement. Protocol-v20 clients
+must fail exact initialization rather than discard Approval ownership.
 
 Client protocol `20` preserves protocol-v19 commands, framing, paging,
 authorization, and recovery semantics. It advances advertised State
@@ -552,7 +585,9 @@ tenant ownership, Protocol v20 fencing, and archive format 2, plus
 [ADR 0118](adr/0118-durable-approval-tenant-ownership.md) for Approval Inbox
 schema 3 and Protocol v21 tenant fencing, plus
 [ADR 0119](adr/0119-durable-task-graph-tenant-ownership.md) for Task Graph
-schema 2 and Protocol v22 tenant fencing.
+schema 2 and Protocol v22 tenant fencing, plus
+[ADR 0120](adr/0120-authority-aware-secret-resolution.md) for Secret Provider
+API 2, in-process Model authority, MCP session fencing, and Protocol v23.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 

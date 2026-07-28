@@ -56,9 +56,10 @@ direction:
   provenance on model-produced State;
 - construction-time frozen model identity, with synchronous metadata panic
   isolation and no provider re-entry while recording State or Observability;
-- a versioned Secret Provider registry with opaque serializable references,
-  non-serializable zeroizing values, debug redaction, and an explicit
-  environment-variable allow-list adapter;
+- a versioned Secret Provider API 2 registry with opaque serializable
+  references, non-serializable zeroizing values, debug redaction,
+  trusted-authority resolution, a global environment allow-list adapter for
+  unscoped hosts, and an exact tenant/reference adapter with no fallback;
 - an exact-versioned HTTPS JSON model-gateway adapter with TLS 1.2+, on-demand
   bearer resolution, disabled redirects/proxies/retries/referers, bounded
   concurrency/time/body retention, pooled connections, client-safe errors, and
@@ -225,6 +226,10 @@ direction:
   Memory/SQLite list/get/settle/orphan fencing, validated lookup projection,
   attributed same-tenant separation of duty, restart continuation, and
   explicitly unscoped schema-2 migration;
+- Task Graph schema 2 immutable optional tenant ownership over the whole Graph,
+  including leases, messages, and Artifacts, with tenant-partitioned identity,
+  exact Memory/SQLite CAS fencing, validated lookup projections, and explicitly
+  unscoped schema-1 migration;
 - content-free bounded Thread summaries that project the same direct lineage
   for Protocol clients without loading full histories or creating a second
   branch authority;
@@ -244,7 +249,9 @@ direction:
 - atomic namespaced MCP catalog registration into the ordinary Tool registry,
   preserving external origin and all Policy/approval/State boundaries, with
   cooperative in-flight cancellation and bounded session settlement before a
-  cancelled or timed-out Turn becomes terminal;
+  cancelled or timed-out Turn becomes terminal; shared clients reject
+  tenant-scoped calls before remote invocation unless an implementation
+  explicitly partitions credentials and sessions by trusted authority;
 - a first-party Agent Memory Hub adapter for search, bounded read, governed
   write, resume brief, and health;
 - an isolated real-process integration test covering MCP negotiation, tool
@@ -298,10 +305,12 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v22 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v23 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 22
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 23
+  advertises Secret Provider API 2 and fail-closed MCP session fencing,
+  protocol 22
   adds schema-2 durable Task Graph tenant ownership and the tenant-scoped
   worker lifecycle, protocol 21 adds schema-3 Approval tenant fencing, and
   protocol 20 adds authoritative schema-12
@@ -333,9 +342,10 @@ direction:
   default;
 - a validated per-Turn Authority Context resolved by the existing protocol
   authorizer, with panic-isolated fail-closed mapping, trusted tenant-to-Memory
-  scope binding, durable Thread/Operation tenant ownership, and the same
-  actor/tenant authority passed to State, Policy, and Tool execution without
-  caller-authored identity fields;
+  scope binding, durable Thread/Operation/Approval/Task tenant ownership, and
+  the same actor/tenant authority passed to State, Policy, Tool, direct Model
+  Secret resolution, and MCP admission without caller-authored identity fields
+  or serialized Provider identity fields;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service and isolated configured
   Evaluation commands, explicitly launched shell-free JSON Models, Tools,
@@ -345,7 +355,7 @@ direction:
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v22, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v23, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
@@ -380,7 +390,8 @@ Linux/Windows
 sandbox brokers, Skill catalogs/private registry authentication and append-only
 transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
-remaining Task/Secret/Artifact tenant ownership, role and delegation claims, revocation, and
+reference-service tenant Secret maps, tenant-partitioned MCP sessions, Artifact
+and Domain Pack tenant ownership, role and delegation claims, revocation, and
 policy hot reload remain explicit subsequent slices.
 
 ## Client protocol boundary

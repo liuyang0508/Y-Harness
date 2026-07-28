@@ -470,12 +470,15 @@ impl HttpsJsonModel {
             })?;
         let credential = self
             .secrets
-            .resolve(SecretRequest {
-                reference: self.config.bearer_secret.clone(),
-                consumer: self.id.clone(),
-                thread_id: request.thread_id.clone(),
-                turn_id: request.turn_id.clone(),
-            })
+            .resolve_as(
+                SecretRequest {
+                    reference: self.config.bearer_secret.clone(),
+                    consumer: self.id.clone(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                },
+                &request.authority,
+            )
             .await
             .map_err(|_| HarnessError::Model("model credential resolution failed".to_owned()))?;
         validate_bearer_secret(&credential)?;
@@ -1013,6 +1016,8 @@ mod tests {
 
     struct FixedSecret;
 
+    struct TenantSecret;
+
     impl SecretProvider for FixedSecret {
         fn descriptor(&self) -> SecretProviderDescriptor {
             SecretProviderDescriptor {
@@ -1024,6 +1029,35 @@ mod tests {
 
         fn resolve<'a>(&'a self, _request: SecretRequest) -> HarnessFuture<'a, SecretValue> {
             Box::pin(async { SecretValue::new(b"fixture-token".to_vec()) })
+        }
+    }
+
+    impl SecretProvider for TenantSecret {
+        fn descriptor(&self) -> SecretProviderDescriptor {
+            SecretProviderDescriptor {
+                name: "tenant".to_owned(),
+                description: "Test tenant credential".to_owned(),
+                api_version: SECRET_API_VERSION,
+            }
+        }
+
+        fn resolve<'a>(&'a self, _request: SecretRequest) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async { Err(HarnessError::Secret("tenant authority required".to_owned())) })
+        }
+
+        fn resolve_as<'a>(
+            &'a self,
+            _request: SecretRequest,
+            authority: &'a crate::AuthorityContext,
+        ) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async move {
+                if authority.tenant_id() != Some("tenant-a") {
+                    return Err(HarnessError::Secret(
+                        "tenant credential unavailable".to_owned(),
+                    ));
+                }
+                SecretValue::new(b"tenant-token".to_vec())
+            })
         }
     }
 
@@ -1132,6 +1166,7 @@ mod tests {
         ModelRequest {
             thread_id: ThreadId::from_static("thread"),
             turn_id: TurnId::from_static("turn"),
+            authority: crate::AuthorityContext::local_process(),
             items: Vec::new(),
             context: Vec::new(),
             tools: Vec::new(),
@@ -1189,6 +1224,48 @@ mod tests {
             "https://models.example.test/v1/complete"
         );
         assert_eq!(recorded[0].body, request());
+    }
+
+    #[tokio::test]
+    async fn direct_gateway_resolves_credentials_with_in_process_turn_authority() {
+        let response = ModelResponse::from(ModelOutput::Message {
+            content: "done".to_owned(),
+        });
+        let transport = Arc::new(RecordingTransport {
+            recorded: Mutex::new(Vec::new()),
+            api_version: Some(MODEL_GATEWAY_API_VERSION.to_owned()),
+            response_body: serde_json::to_vec(&response).expect("response"),
+        });
+        let config = HttpsJsonModelConfig::new(
+            "https://models.example.test/v1/complete",
+            SecretReference::new("model/gateway").expect("reference"),
+        )
+        .expect("config");
+        let model = HttpsJsonModel::with_transport(
+            "gateway/model",
+            config,
+            Arc::new(TenantSecret),
+            transport.clone(),
+        )
+        .expect("model");
+        let mut request = request();
+        request.authority = crate::AuthorityContext::new(
+            crate::ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "model-caller".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
+        model.complete(request).await.expect("completion");
+
+        let recorded = transport.recorded.lock().expect("recorded");
+        assert_eq!(recorded[0].bearer, b"tenant-token");
+        assert_eq!(
+            recorded[0].body.authority,
+            crate::AuthorityContext::local_process(),
+            "trusted authority must not enter the serialized provider body"
+        );
     }
 
     #[tokio::test]
