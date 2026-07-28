@@ -20,7 +20,8 @@ use super::{
     workspace::{validate_provider_descriptor, validate_workspace_lease},
 };
 use crate::{
-    CancellationToken, HarnessError, HarnessFuture, TaskGraphId, TaskId,
+    AuthorityContext, CancellationToken, ExecutionBinding, HarnessError, HarnessFuture,
+    TaskGraphId, TaskId,
     isolation::isolate_future,
     kernel::{capture_capability_metadata, now_ms, validate_capability_name},
 };
@@ -61,6 +62,7 @@ pub struct TaskMailbox {
     coordinator: Arc<dyn TaskCoordinator>,
     graph_id: TaskGraphId,
     claim: TaskClaim,
+    authority: AuthorityContext,
     cancellation: CancellationToken,
 }
 
@@ -100,7 +102,11 @@ impl TaskMailbox {
                 body.clone(),
                 now_ms(),
             )?;
-            match self.coordinator.compare_and_swap(snapshot).await {
+            match self
+                .coordinator
+                .compare_and_swap_as(snapshot, &self.authority)
+                .await
+            {
                 Ok(_) => return Ok(message),
                 Err(HarnessError::OrchestrationConflict { .. }) => {
                     tokio::task::yield_now().await;
@@ -124,9 +130,12 @@ impl TaskMailbox {
     }
 
     async fn load_graph(&self) -> Result<TaskGraphSnapshot, HarnessError> {
-        self.coordinator.load(&self.graph_id).await?.ok_or_else(|| {
-            HarnessError::Orchestration(format!("Task Graph {} does not exist", self.graph_id))
-        })
+        self.coordinator
+            .load_as(&self.graph_id, &self.authority)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::Orchestration(format!("Task Graph {} does not exist", self.graph_id))
+            })
     }
 }
 
@@ -164,6 +173,8 @@ pub struct Orchestrator {
     poll_interval: Duration,
     workspace_provider: Arc<dyn WorkspaceProvider>,
     workspace_descriptor: WorkspaceProviderDescriptor,
+    authority: AuthorityContext,
+    execution_binding: Option<ExecutionBinding>,
 }
 
 impl Orchestrator {
@@ -188,7 +199,34 @@ impl Orchestrator {
             poll_interval: DEFAULT_POLL_INTERVAL,
             workspace_provider,
             workspace_descriptor,
+            authority: AuthorityContext::local_process(),
+            execution_binding: None,
         })
+    }
+
+    /// Installs the trusted tenant authority and optional governed execution
+    /// coordinate used for every claim created by this scheduler.
+    ///
+    /// Embedding hosts must derive both values from their authenticated control
+    /// plane rather than from Task-authored data.
+    pub fn with_execution_context(
+        mut self,
+        authority: AuthorityContext,
+        execution_binding: Option<ExecutionBinding>,
+    ) -> Result<Self, HarnessError> {
+        authority.validate_current("Orchestrator authority")?;
+        if let Some(binding) = &execution_binding {
+            binding.validate()?;
+            if binding.tenant_id() != authority.tenant_id() {
+                return Err(HarnessError::InvalidConfiguration(
+                    "Orchestrator execution binding tenant does not match its trusted authority"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.authority = authority;
+        self.execution_binding = execution_binding;
+        Ok(self)
     }
 
     /// Installs one frozen Workspace Provider for all claims executed by this
@@ -367,6 +405,7 @@ impl Orchestrator {
             executor: self.executor.clone(),
             workspace_provider: self.workspace_provider.clone(),
             workspace_descriptor: self.workspace_descriptor.clone(),
+            authority: self.authority.clone(),
             graph_id: graph_id.clone(),
             claim: claim.clone(),
             timeout: self.task_timeout,
@@ -379,9 +418,12 @@ impl Orchestrator {
     }
 
     async fn load_graph(&self, graph_id: &TaskGraphId) -> Result<TaskGraphSnapshot, HarnessError> {
-        self.coordinator.load(graph_id).await?.ok_or_else(|| {
-            HarnessError::Orchestration(format!("Task Graph {graph_id} does not exist"))
-        })
+        self.coordinator
+            .load_as(graph_id, &self.authority)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::Orchestration(format!("Task Graph {graph_id} does not exist"))
+            })
     }
 
     async fn claim_available(
@@ -400,16 +442,21 @@ impl Orchestrator {
             if snapshot.graph().is_terminal() {
                 return Ok(Vec::new());
             }
-            let claimed = snapshot.graph_mut().claim_ready(
+            let claimed = snapshot.graph_mut().claim_ready_with_binding(
                 &self.worker,
                 now_ms(),
                 lease_duration_ms,
                 maximum,
+                self.execution_binding.as_ref(),
             )?;
             if claimed.is_empty() {
                 return Ok(claimed);
             }
-            match self.coordinator.compare_and_swap(snapshot).await {
+            match self
+                .coordinator
+                .compare_and_swap_as(snapshot, &self.authority)
+                .await
+            {
                 Ok(_) => return Ok(claimed),
                 Err(HarnessError::OrchestrationConflict { .. }) => {
                     tokio::task::yield_now().await;
@@ -466,7 +513,11 @@ impl Orchestrator {
                     .graph_mut()
                     .fail(&claim.task.id, &claim.lease.id, now, reason)?;
             }
-            match self.coordinator.compare_and_swap(snapshot).await {
+            match self
+                .coordinator
+                .compare_and_swap_as(snapshot, &self.authority)
+                .await
+            {
                 Ok(_) => return Ok(()),
                 Err(HarnessError::OrchestrationConflict { .. }) => {
                     tokio::task::yield_now().await;
@@ -492,6 +543,7 @@ struct ClaimExecution {
     executor: Arc<dyn TaskExecutor>,
     workspace_provider: Arc<dyn WorkspaceProvider>,
     workspace_descriptor: WorkspaceProviderDescriptor,
+    authority: AuthorityContext,
     graph_id: TaskGraphId,
     claim: TaskClaim,
     timeout: Duration,
@@ -547,6 +599,7 @@ async fn execute_claim(
         coordinator: execution.coordinator,
         graph_id: execution.graph_id.clone(),
         claim: execution.claim.clone(),
+        authority: execution.authority,
         cancellation: task_cancellation.clone(),
     };
     let request = TaskExecutionRequest {
@@ -755,7 +808,7 @@ fn claim_is_current(graph: &TaskGraph, claim: &TaskClaim, now_ms: u64) -> bool {
                     && lease.attempt == claim.lease.attempt
                     && lease.expires_at_ms > now_ms
         )
-    })
+    }) && graph.execution_binding_for_lease(&claim.lease.id) == claim.execution_binding.as_ref()
 }
 
 fn validate_duration(
@@ -819,11 +872,11 @@ mod tests {
 
     use super::{Orchestrator, TaskExecutionRequest, TaskExecutor, TaskMailbox};
     use crate::{
-        CancellationToken, HarnessError, HarnessFuture, LocalDirectoryWorkspaceProvider,
-        MemoryTaskCoordinator, SqliteTaskCoordinator, TaskCompletion, TaskCoordinator,
-        TaskDefinition, TaskGraph, TaskGraphId, TaskId, TaskStatus, WorkspaceDisposition,
-        WorkspaceLease, WorkspaceMode, WorkspaceProvider, WorkspaceProviderDescriptor,
-        WorkspaceProvisioning, WorkspaceRequest,
+        ActorIdentity, AuthorityContext, CancellationToken, ExecutionBinding, HarnessError,
+        HarnessFuture, LocalDirectoryWorkspaceProvider, MemoryTaskCoordinator,
+        SqliteTaskCoordinator, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph,
+        TaskGraphId, TaskId, TaskStatus, WorkspaceDisposition, WorkspaceLease, WorkspaceMode,
+        WorkspaceProvider, WorkspaceProviderDescriptor, WorkspaceProvisioning, WorkspaceRequest,
     };
 
     fn task(id: &'static str, dependencies: &[&'static str]) -> TaskDefinition {
@@ -960,6 +1013,76 @@ mod tests {
         assert!(snapshot.graph().tasks().all(|record| {
             matches!(record.status, TaskStatus::Completed { .. }) && record.attempts == 1
         }));
+    }
+
+    struct BoundExecutor {
+        expected: ExecutionBinding,
+    }
+
+    impl TaskExecutor for BoundExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: TaskExecutionRequest,
+        ) -> HarnessFuture<'a, TaskCompletion> {
+            Box::pin(async move {
+                if request.claim.execution_binding.as_ref() != Some(&self.expected) {
+                    return Err(HarnessError::Orchestration(
+                        "executor received the wrong execution binding".to_owned(),
+                    ));
+                }
+                Ok(completion(&request.claim.task.id))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_orchestrator_binds_claim_before_executor_entry() {
+        let coordinator = Arc::new(MemoryTaskCoordinator::new());
+        let graph_id = TaskGraphId::from_static("graph-bound-runner");
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "runner".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("authority");
+        coordinator
+            .create_as(
+                graph_id.clone(),
+                TaskGraph::new(vec![task("task-bound", &[])]).expect("graph"),
+                &authority,
+            )
+            .await
+            .expect("create graph");
+        let binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("binding");
+        let snapshot = Orchestrator::new(
+            coordinator,
+            Arc::new(BoundExecutor {
+                expected: binding.clone(),
+            }),
+            "worker-bound",
+        )
+        .expect("orchestrator")
+        .with_execution_context(authority, Some(binding.clone()))
+        .expect("execution context")
+        .run(&graph_id, CancellationToken::new())
+        .await
+        .expect("terminal graph");
+
+        assert!(snapshot.graph().is_terminal());
+        let evidence = snapshot.graph().attempt_bindings().collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].execution_binding, binding);
     }
 
     struct ConcurrentWorkspaceExecutor {
@@ -1652,6 +1775,7 @@ mod tests {
             coordinator: coordinator.clone(),
             graph_id: graph_id.clone(),
             claim: claim.clone(),
+            authority: AuthorityContext::local_process(),
             cancellation: CancellationToken::new(),
         };
         let mut fenced = coordinator
@@ -1794,6 +1918,34 @@ mod tests {
                 Duration::from_micros(1_900),
                 Duration::from_millis(1),
             )
+            .is_err()
+        );
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test".to_owned(),
+                subject: "runner".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("authority");
+        let mismatched = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            Some("tenant-b".to_owned()),
+        )
+        .expect("binding");
+        assert!(
+            Orchestrator::new(
+                Arc::new(MemoryTaskCoordinator::new()),
+                Arc::new(IsolatedFailureExecutor),
+                "worker-config",
+            )
+            .expect("orchestrator")
+            .with_execution_context(authority, Some(mismatched))
             .is_err()
         );
     }

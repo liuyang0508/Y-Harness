@@ -15,7 +15,7 @@ use super::{MAX_TASK_GRAPH_JSON_BYTES, TaskGraph};
 use crate::{AuthorityContext, HarnessError, HarnessFuture, TaskGraphId, sqlite::bounded_text};
 
 /// Current durable Task Coordinator graph schema.
-pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 2;
+pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 3;
 
 /// Revisioned, durable Task Graph aggregate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -145,7 +145,7 @@ impl TaskCoordinator for MemoryTaskCoordinator {
         Box::pin(async move {
             authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&graph_id)?;
-            validate_graph(&graph)?;
+            validate_graph(&graph, authority.tenant_id())?;
             let mut graphs = self.graphs.lock().await;
             let key = (
                 tenant_storage_key(authority.tenant_id()).to_owned(),
@@ -191,7 +191,7 @@ impl TaskCoordinator for MemoryTaskCoordinator {
         Box::pin(async move {
             authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(&snapshot.id)?;
-            validate_graph(&snapshot.graph)?;
+            validate_graph(&snapshot.graph, authority.tenant_id())?;
             if snapshot.tenant_id() != authority.tenant_id() {
                 return Err(graph_does_not_exist(&snapshot.id));
             }
@@ -491,8 +491,9 @@ fn validate_graph_id(graph_id: &TaskGraphId) -> Result<(), HarnessError> {
     Ok(())
 }
 
-fn validate_graph(graph: &TaskGraph) -> Result<(), HarnessError> {
+fn validate_graph(graph: &TaskGraph, tenant_id: Option<&str>) -> Result<(), HarnessError> {
     graph.validate_integrity()?;
+    graph.validate_execution_binding_tenant(tenant_id)?;
     let bytes = serde_json::to_vec(graph)
         .map_err(|error| HarnessError::Orchestration(format!("encode Task Graph: {error}")))?;
     if bytes.len() > MAX_TASK_GRAPH_JSON_BYTES {
@@ -522,6 +523,7 @@ pub(super) fn encode_graph(
     tenant_id: Option<&str>,
 ) -> Result<String, HarnessError> {
     graph.validate_integrity()?;
+    graph.validate_execution_binding_tenant(tenant_id)?;
     let json = serde_json::to_string(&StoredTaskGraphRef { tenant_id, graph })
         .map_err(|error| HarnessError::Orchestration(format!("encode Task Graph: {error}")))?;
     if json.len() > MAX_TASK_GRAPH_JSON_BYTES {
@@ -554,6 +556,9 @@ pub(super) fn decode_snapshot(
         ));
     }
     stored.graph.validate_integrity()?;
+    stored
+        .graph
+        .validate_execution_binding_tenant(tenant_id.as_deref())?;
     Ok(TaskGraphSnapshot {
         id,
         tenant_id,
@@ -679,8 +684,8 @@ mod tests {
 
     use super::{MemoryTaskCoordinator, SqliteTaskCoordinator, TaskCoordinator};
     use crate::{
-        ActorIdentity, AuthorityContext, HarnessError, TaskCompletion, TaskDefinition, TaskGraph,
-        TaskGraphId, TaskId, WorkspaceMode,
+        ActorIdentity, AuthorityContext, ExecutionBinding, HarnessError, TaskCompletion,
+        TaskDefinition, TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
     };
 
     fn graph() -> TaskGraph {
@@ -875,6 +880,61 @@ mod tests {
             .await
             .expect_err("tenant projection drift must fail closed");
         assert!(matches!(error, HarnessError::Orchestration(_)));
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn task_attempt_binding_is_tenant_exact_and_survives_sqlite_reopen() {
+        let path = temporary_database_path();
+        let coordinator = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("create current store");
+        let tenant_a = authority("tenant-a");
+        let binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            7,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("binding");
+        let mut bound = graph();
+        let claim = bound
+            .claim_ready_with_binding("worker-a", 100, 10, 1, Some(&binding))
+            .expect("claim")
+            .remove(0);
+        let graph_id = TaskGraphId::from_static("graph-bound");
+        coordinator
+            .create_as(graph_id.clone(), bound.clone(), &tenant_a)
+            .await
+            .expect("persist bound graph");
+        let mismatch = coordinator
+            .create_as(
+                TaskGraphId::from_static("graph-bound-mismatch"),
+                bound,
+                &authority("tenant-b"),
+            )
+            .await
+            .expect_err("binding cannot cross tenant");
+        assert!(mismatch.to_string().contains("binding tenant"));
+        drop(coordinator);
+
+        let reopened = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("reopen coordinator");
+        let restored = reopened
+            .load_as(&graph_id, &tenant_a)
+            .await
+            .expect("load")
+            .expect("bound graph");
+        assert_eq!(
+            restored
+                .graph()
+                .execution_binding_for_lease(&claim.lease.id),
+            Some(&binding)
+        );
         remove_database_files(&path);
     }
 

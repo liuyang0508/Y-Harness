@@ -15,11 +15,12 @@ use tokio::task;
 
 use super::{
     MAX_TASK_GRAPH_JSON_BYTES, SqliteTaskCoordinator, TASK_GRAPH_SCHEMA_VERSION, TaskGraph,
-    coordinator::encode_graph,
+    coordinator::{decode_snapshot, encode_graph},
 };
 use crate::{HarnessError, TaskGraphId, sqlite::bounded_text};
 
-const PREVIOUS_TASK_GRAPH_SCHEMA_VERSION: u32 = 1;
+const LEGACY_TASK_GRAPH_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_TASK_GRAPH_SCHEMA_VERSION: u32 = 2;
 const MIN_MIGRATION_WORKING_BYTES: u64 = 1_048_576;
 const MIGRATION_PAGE: usize = 16;
 const BACKUP_MANIFEST_TABLE: &str = "y_harness_task_migration_backup";
@@ -63,12 +64,35 @@ struct LegacyLayout {
     has_schema_version: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationSource {
+    SchemaOne(LegacyLayout),
+    SchemaTwo,
+}
+
+impl MigrationSource {
+    const fn version(self) -> u32 {
+        match self {
+            Self::SchemaOne(_) => LEGACY_TASK_GRAPH_SCHEMA_VERSION,
+            Self::SchemaTwo => PREVIOUS_TASK_GRAPH_SCHEMA_VERSION,
+        }
+    }
+
+    const fn has_schema_column(self) -> bool {
+        match self {
+            Self::SchemaOne(layout) => layout.has_schema_version,
+            Self::SchemaTwo => true,
+        }
+    }
+}
+
 impl SqliteTaskCoordinator {
-    /// Migrates a schema-1 SQLite Task Graph store after creating or
+    /// Migrates a schema-1 or schema-2 SQLite Task Graph store after creating or
     /// validating a complete rollback backup.
     ///
-    /// Every old and new writer must be stopped. Historical graphs remain
-    /// explicitly unscoped because tenant ownership cannot be inferred safely.
+    /// Every old and new writer must be stopped. Schema-1 graphs remain
+    /// explicitly unscoped because tenant ownership cannot be inferred safely;
+    /// schema-2 ownership is preserved exactly.
     pub async fn migrate(
         path: impl AsRef<Path>,
         backup_path: impl AsRef<Path>,
@@ -100,7 +124,7 @@ fn migrate_sync(
         ));
     }
     let historical_graphs = graph_count(&connection)?;
-    let Some(layout) = legacy_layout(&connection)? else {
+    let Some(source) = migration_source(&connection)? else {
         let fingerprint = current_store_fingerprint(&connection)?;
         return Ok(TaskMigrationReport {
             status: TaskMigrationStatus::AlreadyCurrent,
@@ -112,7 +136,7 @@ fn migrate_sync(
             backup_path: None,
         });
     };
-    let fingerprint = legacy_store_fingerprint(&connection, layout)?;
+    let fingerprint = source_store_fingerprint(&connection, source)?;
     if fingerprint.graph_count != historical_graphs {
         return Err(HarnessError::Orchestration(
             "Task Graph count changed during migration preflight".to_owned(),
@@ -123,7 +147,7 @@ fn migrate_sync(
     if stop == MigrationStop::AfterPreflight {
         return Err(injected_stop("after preflight"));
     }
-    create_or_validate_backup(path, backup_path, layout, fingerprint)?;
+    create_or_validate_backup(path, backup_path, source, fingerprint)?;
     if stop == MigrationStop::AfterBackup {
         return Err(injected_stop("after backup"));
     }
@@ -131,8 +155,8 @@ fn migrate_sync(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-    if legacy_layout(&transaction)? != Some(layout)
-        || legacy_store_fingerprint(&transaction, layout)? != fingerprint
+    if migration_source(&transaction)? != Some(source)
+        || source_store_fingerprint(&transaction, source)? != fingerprint
     {
         return Err(HarnessError::Orchestration(
             "SQLite Task Graph store changed after migration backup; stop all writers and retry with a new backup"
@@ -142,7 +166,7 @@ fn migrate_sync(
     transaction
         .execute_batch(
             "
-            CREATE TABLE task_graphs_v2 (
+            CREATE TABLE task_graphs_v3 (
                 tenant_id      TEXT NOT NULL,
                 graph_id       TEXT NOT NULL,
                 schema_version INTEGER NOT NULL,
@@ -153,12 +177,17 @@ fn migrate_sync(
             ",
         )
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-    migrate_legacy_graphs(&transaction, layout)?;
+    match source {
+        MigrationSource::SchemaOne(layout) => {
+            migrate_schema_one_graphs(&transaction, layout)?;
+        }
+        MigrationSource::SchemaTwo => migrate_schema_two_graphs(&transaction)?,
+    }
     transaction
         .execute_batch(
             "
             DROP TABLE task_graphs;
-            ALTER TABLE task_graphs_v2 RENAME TO task_graphs;
+            ALTER TABLE task_graphs_v3 RENAME TO task_graphs;
             ",
         )
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
@@ -171,7 +200,7 @@ fn migrate_sync(
 
     Ok(TaskMigrationReport {
         status: TaskMigrationStatus::Migrated,
-        from_graph_schema: PREVIOUS_TASK_GRAPH_SCHEMA_VERSION,
+        from_graph_schema: source.version(),
         to_graph_schema: TASK_GRAPH_SCHEMA_VERSION,
         historical_graphs,
         required_backup_bytes,
@@ -180,7 +209,7 @@ fn migrate_sync(
     })
 }
 
-fn migrate_legacy_graphs(
+fn migrate_schema_one_graphs(
     transaction: &Transaction<'_>,
     layout: LegacyLayout,
 ) -> Result<(), HarnessError> {
@@ -195,7 +224,7 @@ fn migrate_legacy_graphs(
             let current = encode_graph(&graph, None)?;
             let changed = transaction
                 .execute(
-                    "INSERT INTO task_graphs_v2
+                    "INSERT INTO task_graphs_v3
                         (tenant_id, graph_id, schema_version, revision, graph_json)
                      VALUES ('', ?1, ?2, ?3, ?4)",
                     params![
@@ -214,6 +243,117 @@ fn migrate_legacy_graphs(
             after_id = graph_id;
         }
     }
+}
+
+fn migrate_schema_two_graphs(transaction: &Transaction<'_>) -> Result<(), HarnessError> {
+    let mut after_tenant = String::new();
+    let mut after_id = String::new();
+    loop {
+        let page = schema_two_page(transaction, &after_tenant, &after_id)?;
+        if page.is_empty() {
+            return Ok(());
+        }
+        for (tenant, graph_id, revision, encoded) in page {
+            let graph = decode_schema_two_graph(&tenant, &graph_id, revision, &encoded)?;
+            let tenant_id = (!tenant.is_empty()).then_some(tenant.as_str());
+            let current = encode_graph(&graph, tenant_id)?;
+            let changed = transaction
+                .execute(
+                    "INSERT INTO task_graphs_v3
+                        (tenant_id, graph_id, schema_version, revision, graph_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        tenant,
+                        graph_id,
+                        i64::from(TASK_GRAPH_SCHEMA_VERSION),
+                        revision,
+                        current
+                    ],
+                )
+                .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+            if changed != 1 {
+                return Err(HarnessError::Orchestration(
+                    "schema-2 Task Graph migration changed an unexpected row count".to_owned(),
+                ));
+            }
+            after_tenant = tenant;
+            after_id = graph_id;
+        }
+    }
+}
+
+fn schema_two_page(
+    connection: &Connection,
+    after_tenant: &str,
+    after_id: &str,
+) -> Result<Vec<(String, String, i64, String)>, HarnessError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT length(CAST(tenant_id AS BLOB)), tenant_id,
+                    length(CAST(graph_id AS BLOB)), graph_id, revision,
+                    length(CAST(graph_json AS BLOB)), graph_json
+             FROM task_graphs
+             WHERE schema_version = ?1
+               AND (tenant_id > ?2 OR (tenant_id = ?2 AND graph_id > ?3))
+             ORDER BY tenant_id, graph_id
+             LIMIT ?4",
+        )
+        .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+    let rows = statement
+        .query_map(
+            params![
+                i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION),
+                after_tenant,
+                after_id,
+                i64::try_from(MIGRATION_PAGE).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok((
+                    bounded_text(row, 0, 1, 256, "schema-2 Task tenant")?,
+                    bounded_text(row, 2, 3, 256, "schema-2 Task Graph identity")?,
+                    row.get::<_, i64>(4)?,
+                    bounded_text(
+                        row,
+                        5,
+                        6,
+                        MAX_TASK_GRAPH_JSON_BYTES,
+                        "schema-2 Task Graph snapshot",
+                    )?,
+                ))
+            },
+        )
+        .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+    let mut page = Vec::with_capacity(MIGRATION_PAGE);
+    for row in rows {
+        let (tenant, graph_id, revision, encoded) =
+            row.map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+        decode_schema_two_graph(&tenant, &graph_id, revision, &encoded)?;
+        page.push((tenant, graph_id, revision, encoded));
+    }
+    Ok(page)
+}
+
+fn decode_schema_two_graph(
+    tenant: &str,
+    graph_id: &str,
+    revision: i64,
+    encoded: &str,
+) -> Result<TaskGraph, HarnessError> {
+    validate_graph_id(graph_id)?;
+    validate_revision(revision)?;
+    let snapshot = decode_snapshot(
+        TaskGraphId::from_string(graph_id.to_owned()),
+        tenant,
+        i64::from(TASK_GRAPH_SCHEMA_VERSION),
+        revision,
+        encoded,
+    )?;
+    if snapshot.graph().attempt_bindings().next().is_some() {
+        return Err(HarnessError::Orchestration(
+            "schema-2 Task Graph cannot contain attempt execution bindings".to_owned(),
+        ));
+    }
+    Ok(snapshot.graph().clone())
 }
 
 fn legacy_page(
@@ -243,7 +383,7 @@ fn legacy_page(
             .query(params![
                 after_id,
                 page_size,
-                i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION)
+                i64::from(LEGACY_TASK_GRAPH_SCHEMA_VERSION)
             ])
             .map_err(|error| HarnessError::Orchestration(error.to_string()))?
     } else {
@@ -319,6 +459,45 @@ fn legacy_store_fingerprint(
     })
 }
 
+fn schema_two_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint, HarnessError> {
+    let mut after_tenant = String::new();
+    let mut after_id = String::new();
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    loop {
+        let page = schema_two_page(connection, &after_tenant, &after_id)?;
+        if page.is_empty() {
+            break;
+        }
+        for (tenant, graph_id, revision, encoded) in page {
+            for value in [&tenant, &graph_id, &encoded] {
+                update_fingerprint_text(&mut hasher, value)?;
+            }
+            hasher.update(revision.to_le_bytes());
+            count = count.checked_add(1).ok_or_else(|| {
+                HarnessError::Orchestration("Task Graph count overflow".to_owned())
+            })?;
+            after_tenant = tenant;
+            after_id = graph_id;
+        }
+    }
+    hasher.update(count.to_le_bytes());
+    Ok(StoreFingerprint {
+        graph_count: count,
+        graphs_sha256: hasher.finalize().into(),
+    })
+}
+
+fn source_store_fingerprint(
+    connection: &Connection,
+    source: MigrationSource,
+) -> Result<StoreFingerprint, HarnessError> {
+    match source {
+        MigrationSource::SchemaOne(layout) => legacy_store_fingerprint(connection, layout),
+        MigrationSource::SchemaTwo => schema_two_store_fingerprint(connection),
+    }
+}
+
 fn current_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint, HarnessError> {
     let mut statement = connection
         .prepare(
@@ -374,7 +553,7 @@ fn current_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint
     })
 }
 
-fn legacy_layout(connection: &Connection) -> Result<Option<LegacyLayout>, HarnessError> {
+fn migration_source(connection: &Connection) -> Result<Option<MigrationSource>, HarnessError> {
     let columns = table_columns(connection)?;
     let has_tenant = columns.iter().any(|(name, _)| name == "tenant_id");
     let has_schema = columns.iter().any(|(name, _)| name == "schema_version");
@@ -396,21 +575,29 @@ fn legacy_layout(connection: &Connection) -> Result<Option<LegacyLayout>, Harnes
         && tenant_pk == 1
         && graph_pk == 2
     {
-        let unsupported: Option<i64> = connection
-            .query_row(
-                "SELECT schema_version FROM task_graphs
-                 WHERE schema_version != ?1 LIMIT 1",
-                [i64::from(TASK_GRAPH_SCHEMA_VERSION)],
-                |row| row.get(0),
-            )
-            .optional()
+        let mut statement = connection
+            .prepare("SELECT DISTINCT schema_version FROM task_graphs ORDER BY schema_version")
             .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-        if let Some(schema) = unsupported {
-            return Err(HarnessError::Orchestration(format!(
-                "unsupported Task Graph schema version {schema}"
-            )));
+        let schemas = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| HarnessError::Orchestration(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+        if schemas.is_empty() {
+            return Ok(None);
         }
-        return Ok(None);
+        return match schemas.as_slice() {
+            [schema] if *schema == i64::from(TASK_GRAPH_SCHEMA_VERSION) => Ok(None),
+            [schema] if *schema == i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION) => {
+                Ok(Some(MigrationSource::SchemaTwo))
+            }
+            [schema] => Err(HarnessError::Orchestration(format!(
+                "unsupported Task Graph schema version {schema}"
+            ))),
+            _ => Err(HarnessError::Orchestration(
+                "mixed Task Graph schema versions require operator repair".to_owned(),
+            )),
+        };
     }
     let expected_legacy_columns = if has_schema { 4 } else { 3 };
     if columns.len() == expected_legacy_columns
@@ -424,7 +611,7 @@ fn legacy_layout(connection: &Connection) -> Result<Option<LegacyLayout>, Harnes
                 .query_row(
                     "SELECT schema_version FROM task_graphs
                      WHERE schema_version != ?1 LIMIT 1",
-                    [i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION)],
+                    [i64::from(LEGACY_TASK_GRAPH_SCHEMA_VERSION)],
                     |row| row.get(0),
                 )
                 .optional()
@@ -435,9 +622,9 @@ fn legacy_layout(connection: &Connection) -> Result<Option<LegacyLayout>, Harnes
                 )));
             }
         }
-        return Ok(Some(LegacyLayout {
+        return Ok(Some(MigrationSource::SchemaOne(LegacyLayout {
             has_schema_version: has_schema,
-        }));
+        })));
     }
     Err(HarnessError::Orchestration(
         "unsupported SQLite Task Graph table layout".to_owned(),
@@ -567,25 +754,25 @@ fn migration_space_preflight(
 fn create_or_validate_backup(
     source_path: &Path,
     backup_path: &Path,
-    layout: LegacyLayout,
+    source: MigrationSource,
     fingerprint: StoreFingerprint,
 ) -> Result<(), HarnessError> {
     if backup_path.exists() {
-        return validate_backup(backup_path, layout, fingerprint);
+        return validate_backup(backup_path, source, fingerprint);
     }
     let partial_path = partial_backup_path(backup_path);
-    let source = Connection::open(source_path)
+    let source_connection = Connection::open(source_path)
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
-    configure_connection(&source)?;
+    configure_connection(&source_connection)?;
     let partial_text = partial_path.to_str().ok_or_else(|| {
         HarnessError::Orchestration("Task Graph migration partial path is not UTF-8".to_owned())
     })?;
-    source
+    source_connection
         .execute("VACUUM INTO ?1", [partial_text])
         .map_err(|error| {
             HarnessError::Orchestration(format!("cannot create Task Graph backup: {error}"))
         })?;
-    drop(source);
+    drop(source_connection);
 
     let backup = Connection::open(&partial_path)
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
@@ -613,11 +800,11 @@ fn create_or_validate_backup(
                  VALUES (1, ?1, ?2, ?3, ?4, ?5)"
             ),
             params![
-                i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION),
+                i64::from(source.version()),
                 i64::from(TASK_GRAPH_SCHEMA_VERSION),
                 to_i64(fingerprint.graph_count, "Task Graph count")?,
                 fingerprint_hex(&fingerprint.graphs_sha256),
-                i64::from(layout.has_schema_version),
+                i64::from(source.has_schema_column()),
             ],
         )
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
@@ -634,12 +821,12 @@ fn create_or_validate_backup(
     fs::remove_file(&partial_path)
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
     sync_parent_directory(backup_path)?;
-    validate_backup(backup_path, layout, fingerprint)
+    validate_backup(backup_path, source, fingerprint)
 }
 
 fn validate_backup(
     backup_path: &Path,
-    layout: LegacyLayout,
+    source: MigrationSource,
     expected: StoreFingerprint,
 ) -> Result<(), HarnessError> {
     if !backup_path.is_file() {
@@ -684,13 +871,13 @@ fn validate_backup(
             )
         })?;
     let expected_hex = fingerprint_hex(&expected.graphs_sha256);
-    if manifest.0 != i64::from(PREVIOUS_TASK_GRAPH_SCHEMA_VERSION)
+    if manifest.0 != i64::from(source.version())
         || manifest.1 != i64::from(TASK_GRAPH_SCHEMA_VERSION)
         || manifest.2 != to_i64(expected.graph_count, "Task Graph count")?
         || manifest.3 != expected_hex
-        || manifest.4 != i64::from(layout.has_schema_version)
-        || legacy_layout(&backup)? != Some(layout)
-        || legacy_store_fingerprint(&backup, layout)? != expected
+        || manifest.4 != i64::from(source.has_schema_column())
+        || migration_source(&backup)? != Some(source)
+        || source_store_fingerprint(&backup, source)? != expected
     {
         return Err(HarnessError::Orchestration(
             "SQLite Task Graph backup does not match the migration source".to_owned(),
@@ -793,8 +980,8 @@ mod tests {
 
     use super::{BACKUP_MANIFEST_TABLE, TaskMigrationStatus, migrate_with_stop, table_exists};
     use crate::{
-        ActorIdentity, AuthorityContext, SqliteTaskCoordinator, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
+        ActorIdentity, AuthorityContext, ExecutionBinding, SqliteTaskCoordinator, TaskCoordinator,
+        TaskDefinition, TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
     };
 
     #[tokio::test]
@@ -886,6 +1073,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_preserves_schema_two_tenant_ownership() {
+        let source = temporary_database_path("schema-two-source");
+        let backup = temporary_database_path("schema-two-backup");
+        create_schema_two_store(&source);
+
+        let open_error = match SqliteTaskCoordinator::open(&source).await {
+            Ok(_) => panic!("schema-2 store must require migration"),
+            Err(error) => error,
+        };
+        assert!(open_error.to_string().contains("schema version 2"));
+        let report = SqliteTaskCoordinator::migrate(&source, &backup)
+            .await
+            .expect("migrate schema 2");
+        assert_eq!(report.status, TaskMigrationStatus::Migrated);
+        assert_eq!(report.from_graph_schema, 2);
+        assert_eq!(report.historical_graphs, 2);
+
+        let coordinator = SqliteTaskCoordinator::open(&source)
+            .await
+            .expect("open migrated store");
+        let graph_id = TaskGraphId::from_static("shared-schema-two");
+        for tenant in ["tenant-a", "tenant-b"] {
+            let snapshot = coordinator
+                .load_as(&graph_id, &authority(tenant))
+                .await
+                .expect("load tenant graph")
+                .expect("tenant graph");
+            assert_eq!(snapshot.tenant_id(), Some(tenant));
+            assert_eq!(snapshot.revision(), 7);
+            assert_eq!(snapshot.graph().attempt_bindings().count(), 0);
+        }
+        remove_database_files(&source);
+        remove_database_files(&backup);
+    }
+
+    #[test]
+    fn schema_two_migration_restarts_after_every_mutating_phase() {
+        for phase in ["after_preflight", "after_backup", "before_commit"] {
+            let source = temporary_database_path(&format!("schema-two-{phase}"));
+            let backup = temporary_database_path(&format!("schema-two-{phase}-backup"));
+            create_schema_two_store(&source);
+
+            migrate_with_stop(&source, &backup, phase).expect_err("injected stop");
+            let report = migrate_with_stop(&source, &backup, "none").expect("resume migration");
+            assert_eq!(report.status, TaskMigrationStatus::Migrated);
+            assert_eq!(report.from_graph_schema, 2);
+            remove_database_files(&source);
+            remove_database_files(&backup);
+        }
+    }
+
+    #[tokio::test]
     async fn current_store_is_idempotent_without_creating_backup() {
         let source = temporary_database_path("current-source");
         let backup = temporary_database_path("current-backup");
@@ -927,6 +1166,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_two_cannot_smuggle_schema_three_attempt_evidence() {
+        let source = temporary_database_path("schema-two-smuggled-source");
+        let backup = temporary_database_path("schema-two-smuggled-backup");
+        create_schema_two_store(&source);
+        let binding = ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            "1.0.0",
+            "a".repeat(64),
+            "b".repeat(64),
+            1,
+            Some("tenant-a".to_owned()),
+        )
+        .expect("binding");
+        let mut smuggled = graph();
+        smuggled
+            .claim_ready_with_binding("worker", 100, 10, 1, Some(&binding))
+            .expect("bound claim");
+        let encoded =
+            super::encode_graph(&smuggled, Some("tenant-a")).expect("encode smuggled graph");
+        let connection = Connection::open(&source).expect("open schema-2 store");
+        connection
+            .execute(
+                "UPDATE task_graphs SET graph_json = ?1 WHERE tenant_id = 'tenant-a'",
+                [encoded],
+            )
+            .expect("inject new evidence under old schema");
+        drop(connection);
+
+        let error = SqliteTaskCoordinator::migrate(&source, &backup)
+            .await
+            .expect_err("schema-2 evidence smuggling");
+        assert!(error.to_string().contains("cannot contain attempt"));
+        assert!(!backup.exists());
+        remove_database_files(&source);
+    }
+
+    #[tokio::test]
     async fn migration_never_reuses_a_backup_from_different_history() {
         let first = temporary_database_path("first-source");
         let second = temporary_database_path("second-source");
@@ -943,10 +1220,10 @@ mod tests {
         assert!(error.to_string().contains("does not match"));
         let second_db = Connection::open(&second).expect("open untouched second source");
         assert_eq!(
-            super::legacy_layout(&second_db).expect("legacy layout"),
-            Some(super::LegacyLayout {
+            super::migration_source(&second_db).expect("legacy layout"),
+            Some(super::MigrationSource::SchemaOne(super::LegacyLayout {
                 has_schema_version: true
-            })
+            }))
         );
         remove_database_files(&first);
         remove_database_files(&second);
@@ -1006,6 +1283,36 @@ mod tests {
 
     fn create_legacy_store(path: &Path, with_schema: bool) {
         create_legacy_store_with_id(path, with_schema, "legacy-graph");
+    }
+
+    fn create_schema_two_store(path: &Path) {
+        let connection = Connection::open(path).expect("open schema-2 store");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE task_graphs (
+                    tenant_id      TEXT NOT NULL,
+                    graph_id       TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    revision       INTEGER NOT NULL CHECK(revision > 0),
+                    graph_json     TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, graph_id)
+                );
+                ",
+            )
+            .expect("create schema-2 table");
+        for tenant in ["tenant-a", "tenant-b"] {
+            let encoded =
+                super::encode_graph(&graph(), Some(tenant)).expect("encode schema-2 graph");
+            connection
+                .execute(
+                    "INSERT INTO task_graphs
+                        (tenant_id, graph_id, schema_version, revision, graph_json)
+                     VALUES (?1, 'shared-schema-two', 2, 7, ?2)",
+                    params![tenant, encoded],
+                )
+                .expect("insert schema-2 graph");
+        }
     }
 
     fn create_legacy_store_with_id(path: &Path, with_schema: bool, graph_id: &str) {

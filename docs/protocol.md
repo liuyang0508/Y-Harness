@@ -1,10 +1,10 @@
-# Client protocol v24
+# Client protocol v25
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"24"` is exact. Every request carries that value, and a peer
+Protocol version `"25"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "24",
+  "protocol_version": "25",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "24",
+  "protocol_version": "25",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "24",
+  "protocol_version": "25",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "24",
+  "protocol_version": "25",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "24",
+  "protocol_version": "25",
   "body": {
     "status": "success",
     "result": {
@@ -137,7 +137,7 @@ The result type is `initialized`:
         "state_event_schema": 13,
         "state_snapshot_schema": 13,
         "approval_inbox_schema": 3,
-        "task_graph_schema": 2,
+        "task_graph_schema": 3,
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
@@ -500,7 +500,10 @@ contains its immutable `definition`, `attempts`, and one tagged `status`:
 `claim_tasks` derives the lease owner from the authenticated transport
 principal. It is always `local-process` for trusted stdio or the exact
 lowercase SHA-256 client-certificate fingerprint for mTLS. No request field can
-select or override that worker identity. A successful result includes the
+select or override that worker identity or author an execution binding.
+Protocol-owned claims are unbound; they fail closed rather than take over a
+Task that previously entered governed bound mode through an embedded
+Orchestrator. A successful result includes the
 durable graph revision, derived worker, and fenced claims:
 
 ```json
@@ -841,7 +844,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v24 value |
+| Boundary | Protocol v25 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -874,7 +877,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"24"` |
+| `unsupported_version` | Request protocol is not exactly `"25"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -904,8 +907,11 @@ integration tests prove exact-ID durable steering acceptance. Task integration
 tests prove conditional discovery, exact-tenant namespace/fencing, bounded
 cursor paging, principal-derived worker ownership, cross-principal lease
 fencing, server-clock heartbeat, messaging, terminal recovery, and
-explicit-revision cancellation. Coordinator tests additionally prove
-schema-1 migration, reopen behavior, and tenant-projection drift rejection.
+explicit-revision cancellation. Coordinator and migration tests additionally
+prove append-only Task-attempt binding, retry anti-downgrade, pre-executor
+binding, exact-tenant persistence, schema-1/schema-2 migration restart,
+evidence-smuggling rejection, reopen behavior, and tenant-projection drift
+rejection.
 Process tests additionally prove stdout purity, one response per request,
 and asynchronous Turn control. The independent `y-harness-tui` package has
 TestBackend rendering tests and a real-PTY smoke gate against `yh serve-demo`;

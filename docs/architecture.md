@@ -237,10 +237,13 @@ direction:
   Memory/SQLite list/get/settle/orphan fencing, validated lookup projection,
   attributed same-tenant separation of duty, restart continuation, and
   explicitly unscoped schema-2 migration;
-- Task Graph schema 2 immutable optional tenant ownership over the whole Graph,
-  including leases, messages, and Artifacts, with tenant-partitioned identity,
-  exact Memory/SQLite CAS fencing, validated lookup projections, and explicitly
-  unscoped schema-1 migration;
+- Task Graph schema 3 immutable optional tenant ownership over the whole Graph,
+  including leases, messages, Artifacts, and append-only Task-attempt execution
+  bindings; exact Task/lease/attempt/worker evidence, governed-retry
+  anti-downgrade, tenant-partitioned identity, exact Memory/SQLite CAS fencing,
+  trusted Orchestrator binding before executor entry, validated lookup
+  projections, explicitly unscoped schema-1 migration, and exact-tenant
+  schema-2 migration;
 - content-free bounded Thread summaries that project the same direct lineage
   for Protocol clients without loading full histories or creating a second
   branch authority;
@@ -316,12 +319,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v24 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v25 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 24
-  advertises schema-13 execution binding evidence while keeping binding
-  authorship embedded-only, protocol 23 advertises Secret Provider API 2 and
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 25
+  advertises Task Graph schema 3 for embedded-only governed attempt binding,
+  protocol 24 advertises schema-13 Turn execution binding evidence while
+  keeping binding authorship embedded-only, protocol 23 advertises Secret Provider API 2 and
   fail-closed MCP session fencing,
   protocol 22
   adds schema-2 durable Task Graph tenant ownership and the tenant-scoped

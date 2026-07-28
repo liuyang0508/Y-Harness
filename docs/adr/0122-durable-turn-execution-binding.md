@@ -60,7 +60,7 @@ field, or a bearer credential.
   disposable snapshots are rebuilt.
 - This does not implement control-plane roles, distributed activation fencing,
   component locking, canary rollout, Workflow deployment, or Task-attempt
-  binding.
+  binding. Task-attempt binding is specified separately by ADR 0123.
 
 ## Rejected alternatives
 

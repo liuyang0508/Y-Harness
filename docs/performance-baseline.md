@@ -214,7 +214,8 @@ The manual ignored test constructs one near-limit schema-1 Graph containing
 1,000 Tasks with maximum-size descriptions. Fixture construction is excluded
 from the timer. The timed operation validates the complete Graph, creates and
 verifies a no-clobber SHA-256-bound SQLite backup, revalidates the source, and
-atomically writes the schema-2 tenant envelope and partitioned key.
+atomically writes the schema-3 tenant envelope and partitioned key without
+inventing historical attempt-binding evidence.
 
 ```bash
 cargo test --release --locked -p y-harness \
@@ -224,7 +225,7 @@ cargo test --release --locked -p y-harness \
 
 | Historical Graphs | Tasks | Schema path | Elapsed |
 |---:|---:|---:|---:|
-| 1 | 1,000 | Task Graph 1 → 2 | 1,199.172 ms |
+| 1 | 1,000 | Task Graph 1 → 3 | 830.583 ms |
 
 This single local sample was measured on the reference environment on
 2026-07-29. It is bounded migration evidence, not a stable latency SLA.

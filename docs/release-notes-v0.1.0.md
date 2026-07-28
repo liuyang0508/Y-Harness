@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v24 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v25 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -73,8 +73,14 @@ tenant-partitioned MCP sessions remain explicit open work.
 Protocol 24 advertises State/snapshot schema 13; Thread archive format 3
 advances independently, and remote clients cannot author trusted execution
 bindings.
+Task Graph schema 3 and Protocol 25 add append-only exact-attempt execution
+bindings for trusted embedded Orchestrators. Evidence is committed before
+Workspace or executor entry, survives retry and settlement, and is
+tenant-exact. Once a Task enters bound mode, an unbound retry fails closed.
+Schema-1/schema-2 stores migrate backup-first; schema-2 tenant ownership is
+preserved and old rows cannot claim new evidence.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v24. Format/store schema 1 pins immutable component snapshots and a
+Protocol v25. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its proof

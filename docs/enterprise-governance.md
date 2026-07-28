@@ -35,7 +35,7 @@ reason to duplicate Runtime or State.
 
 | Existing primitive | It does not yet prove |
 |---|---|
-| optional immutable Domain Pack snapshots plus tenant-fenced promotion, activation, rollback, and schema-13 Turn execution binding | remote control-plane exposure, Task-attempt binding, role authorization, canary rollout, or multi-node control-plane HA |
+| optional immutable Domain Pack snapshots plus tenant-fenced promotion, activation, rollback, schema-13 Turn binding, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, role authorization, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API plus exact embedded tenant/reference adapter | reference-service tenant credential maps or a general Secret-manager backend |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
@@ -84,6 +84,10 @@ restart continuation, and non-inferential schema-2 migration. ADR 0119 adds
 schema-2 Task Graph ownership across Tasks, leases, messages, and Artifact
 reference metadata. ADR 0120 carries trusted authority into Secret resolution
 and fails closed for tenant-scoped legacy Providers and shared MCP sessions.
+ADR 0122 records an exact generic execution coordinate on each governed Turn.
+ADR 0123 advances Task Graphs to schema 3 and persists the same coordinate per
+exact Task attempt before executor entry, retaining governed retries and
+preventing downgrade to unbound execution.
 
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
@@ -97,10 +101,12 @@ ADR 0122 adds a Domain-Pack-neutral Engine `ExecutionBinding`. The control
 plane converts its proof into that content-free record; Runtime persists it
 once per Turn, excludes it from Model Context, checks tenant equality, and
 requires exact evidence on approval resume. This closes the Turn side of
-ordered item 2. Task-attempt binding remains open and requires its own Task
-Graph migration.
+ordered item 2. ADR 0123 closes the embedded Task side: the same generic
+binding is committed with the exact lease before Workspace/executor entry,
+retained after expiry and settlement, and required on every later retry once
+governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v24 client
+Domain Pack lifecycle remains deliberately outside Core and the v25 client
 protocol. The
 embedding control service must authenticate and authorize install, evaluation,
 approval, and activation operations, collect truthful component inventories,

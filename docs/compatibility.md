@@ -11,7 +11,7 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"24"` | exact `Initialize` request/response |
+| Client protocol | `"25"` | exact `Initialize` request/response |
 | State events | `13` | per-event durable envelope; reads schemas 1 through 13 |
 | State snapshots | `13` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
@@ -183,6 +183,14 @@ binding is present. Protocol v24 advertises the new State/snapshot coordinates
 but does not expose a binding-authoring command; archive format is a separate
 Rust/CLI coordinate. See
 [ADR 0122](adr/0122-durable-turn-execution-binding.md).
+Task Graph schema 3 adds append-only `TaskAttemptBinding` evidence and the
+optional exact binding on `TaskClaim`. `Orchestrator::with_execution_context`
+adds trusted tenant-aware execution; current Protocol workers cannot author a
+binding or take over a Task after it enters bound mode. Protocol v25
+advertises Task schema 3. Schema-1/schema-2 SQLite stores require the explicit
+backup-first migration; schema-2 ownership is preserved without inventing
+historical attempt evidence. See
+[ADR 0123](adr/0123-durable-task-attempt-execution-binding.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -614,7 +622,9 @@ schema 2 and Protocol v22 tenant fencing, plus
 [ADR 0120](adr/0120-authority-aware-secret-resolution.md) for Secret Provider
 API 2, in-process Model authority, MCP session fencing, and Protocol v23, plus
 [ADR 0122](adr/0122-durable-turn-execution-binding.md) for schema-13 Turn
-execution evidence, archive format 3, and Protocol v24.
+execution evidence, archive format 3, and Protocol v24, plus
+[ADR 0123](adr/0123-durable-task-attempt-execution-binding.md) for Task Graph
+schema 3 governed attempt evidence and Protocol v25.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -637,20 +647,23 @@ explicitly data-losing recovery afterward.
 See the [Approval migration runbook](approval-migration.md) and
 [ADR 0063](adr/0063-attributed-separation-of-duty-approvals.md).
 
-Task Graph schema 1 is independently migrated with:
+Task Graph schema 1 or schema 2 is independently migrated with:
 
 ```bash
 yh task-migrate \
   /absolute/path/tasks.db \
-  /absolute/path/tasks-v1.rollback.db
+  /absolute/path/tasks-v2.rollback.db
 ```
 
 All Task Coordinator writers must be stopped. The migration validates and
 fingerprints every bounded Graph, creates a no-clobber backup, retains every
-lifecycle, lease, message, and artifact, and converts historical Graphs to
-explicitly unscoped schema-2 aggregates. It never infers tenant ownership.
-The earlier unreleased table without a version column is accepted as the same
-schema-1 source shape. See the
+lifecycle, lease, message, and artifact, and writes schema-3 aggregates.
+Schema-1 Graphs become explicitly unscoped; schema-2 tenant ownership remains
+exact. Neither path invents historical Task-attempt binding evidence. A
+schema-2 body that claims schema-3 binding evidence fails closed. The earlier
+unreleased table without a version column is accepted as the same schema-1
+source shape. Old writers must not access a migrated store, and rollback is
+supported only by restoring the backup before any schema-3 write. See the
 [Task migration runbook](task-migration.md).
 
 The first durable schema change must ship with:

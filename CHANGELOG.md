@@ -4,6 +4,10 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added Task Graph schema 3 with append-only tenant-exact execution-binding
+  evidence per Task attempt, trusted Orchestrator authority, persistence before
+  Workspace/executor entry, retry anti-downgrade, exact claim propagation,
+  backup-first schema-1/schema-2 migration, and Protocol v25;
 - added Secret Provider API 2 with trusted per-Turn authority, exact
   tenant/reference environment resolution, non-serialized Model authority,
   direct HTTPS/OpenAI credential fencing, fail-closed legacy Providers and

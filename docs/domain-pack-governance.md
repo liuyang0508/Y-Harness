@@ -100,7 +100,7 @@ install, evaluate, approve, activate, deactivate, rollback, and bind action
 through its Policy boundary. It must also produce truthful component
 inventories and keep installed components immutable for the binding lifetime.
 
-The current package is a Rust library, not a Protocol v24 command, CLI, remote
+The current package is a Rust library, not a Protocol v25 command, CLI, remote
 control-plane service, registry, or automatic config mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, Workflow
 timers, Human Handoff, or domain-specific Evaluation content.
@@ -109,5 +109,8 @@ Task `Artifact` reference metadata is a separate boundary. It inherits the
 tenant of its durable Task Graph, but Y-Harness does not yet store or authorize
 the external blob named by the `uri`.
 
-Turn execution binding is implemented; durable Task-attempt binding remains a
-separate Task Graph schema change and is not claimed here.
+Turn and embedded Task-attempt execution binding are implemented in generic
+Core types. This package only converts its exact activation proof into
+`ExecutionBinding`; the embedding host must pass that value with trusted
+authority to the Runtime or `Orchestrator`. Remote Protocol binding control
+and detailed Task-binding evidence inspection are not claimed.

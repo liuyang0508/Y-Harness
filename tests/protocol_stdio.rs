@@ -251,7 +251,7 @@ async fn task_migration_cli_preserves_legacy_graphs_as_unscoped() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(backup.is_file());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Task Graph schema 1 -> 2"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Task Graph schema 1 -> 3"));
 
     let coordinator = SqliteTaskCoordinator::open(&source)
         .await

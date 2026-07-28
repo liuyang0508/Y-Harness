@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v24 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v25 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v24 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v25 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -190,7 +190,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v24 specification](docs/protocol.md).
+[client protocol v25 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -531,17 +531,18 @@ Interrupted-Turn recovery keeps durable orphaning atomic without bulk-loading
 every approval body: SQLite selects a bounded identity set, then validates and
 updates one record at a time inside the same immediate transaction.
 
-Task Graph schema 2 binds the complete Graph aggregate—including leases,
-messages, and Artifacts—to the trusted optional tenant. Tenant is part of the
-Memory/SQLite Graph key, so the same caller-selected Graph ID may exist in
-different tenant namespaces. Every protocol lifecycle operation uses exact
-tenant equality. Existing schema-1 databases require an offline,
-backup-first migration; historical Graphs remain explicitly unscoped:
+Task Graph schema 3 binds the complete Graph aggregate—including leases,
+messages, Artifacts, and append-only governed attempt evidence—to the trusted
+optional tenant. Tenant is part of the Memory/SQLite Graph key, so the same
+caller-selected Graph ID may exist in different tenant namespaces. Every
+protocol lifecycle operation uses exact tenant equality. Existing schema-1 or
+schema-2 databases require an offline, backup-first migration; schema-1
+Graphs remain explicitly unscoped and schema-2 ownership is preserved:
 
 ```bash
 yh task-migrate \
   /absolute/path/tasks.db \
-  /absolute/path/tasks-v1.rollback.db
+  /absolute/path/tasks-v2.rollback.db
 ```
 
 See the [Task migration runbook](docs/task-migration.md) and
@@ -723,12 +724,14 @@ network authority. See
 Task Graphs also own a conservative 64 MiB materialization charge shared with
 the Coordinator. Construction and deserialization establish it; Task status
 and message mutations update it incrementally before commit. Current and
-remaining capacity are inspectable. Schema 2 wraps the persisted Graph in an
-immutable optional tenant envelope and duplicates that owner in the SQLite
-lookup key; reads validate both representations before returning data.
+remaining capacity are inspectable. Schema 3 wraps the persisted Graph in an
+immutable optional tenant envelope, duplicates that owner in the SQLite lookup
+key, and retains append-only exact Task-attempt execution bindings across
+expiry, retry, and settlement; reads validate every representation before
+returning data.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v24 preserves Protocol v23's 2 MiB request and 16 MiB
+protocol. Protocol v25 preserves Protocol v24's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -750,7 +753,11 @@ Secret Provider API 2 with trusted-authority credential resolution and
 fail-closed shared MCP session fencing. Protocol 24 advertises State and
 snapshot schema 13 for durable Turn execution bindings; Thread archive format
 3 advances independently. Remote protocol callers still cannot author
-bindings. Steering
+bindings. Protocol 25 advertises Task Graph schema 3; a trusted embedded
+Orchestrator commits exact Task/lease/attempt/worker binding evidence before
+Workspace or executor entry, retains it after retry and settlement, and
+rejects an unbound retry after governance begins. Protocol workers cannot
+author that evidence or take over a bound Task. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -849,7 +856,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v24. The Sessions panel shows direct fork ancestry from
+through Protocol v25. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

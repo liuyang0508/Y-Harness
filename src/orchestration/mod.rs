@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
-    ArtifactId, HarnessError, TaskId, TaskLeaseId, TaskMessageId, kernel::validate_capability_name,
+    ArtifactId, ExecutionBinding, HarnessError, TaskId, TaskLeaseId, TaskMessageId,
+    kernel::validate_capability_name,
 };
 
 pub use coordinator::{
@@ -30,6 +31,7 @@ const MAX_CLAIMS_PER_BATCH: usize = 64;
 const MAX_DEPENDENCIES_PER_TASK: usize = 1_024;
 const MAX_ARTIFACTS_PER_COMPLETION: usize = 1_024;
 const MAX_MESSAGES: usize = 100_000;
+const MAX_TASK_ATTEMPT_BINDINGS: usize = 100_000;
 const MAX_MESSAGE_PAGE_ITEMS: usize = 256;
 const MAX_MESSAGE_PAGE_BYTES: usize = 2_097_152;
 pub(crate) const MAX_TASK_GRAPH_JSON_BYTES: usize = 67_108_864;
@@ -78,6 +80,24 @@ pub struct TaskLease {
     pub attempt: u32,
     /// Caller-supplied clock deadline in Unix milliseconds.
     pub expires_at_ms: u64,
+}
+
+/// Immutable deployment evidence for one exact Task attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAttemptBinding {
+    /// Task whose attempt was bound.
+    pub task_id: TaskId,
+    /// Lease fencing token issued for this attempt.
+    pub lease_id: TaskLeaseId,
+    /// Monotonic Task-local attempt number.
+    pub attempt: u32,
+    /// Worker identity that received the lease.
+    pub claimed_by: String,
+    /// Caller-supplied claim time in Unix milliseconds.
+    pub claimed_at_ms: u64,
+    /// Exact governed deployment and environment coordinate.
+    pub execution_binding: ExecutionBinding,
 }
 
 /// Immutable Artifact reference produced by a completed Task.
@@ -157,6 +177,9 @@ pub struct TaskClaim {
     pub task: TaskDefinition,
     /// Current ownership grant.
     pub lease: TaskLease,
+    /// Governed execution coordinate, when this Task has entered bound mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<ExecutionBinding>,
 }
 
 /// Ordered message passed between Tasks or their workers.
@@ -195,6 +218,8 @@ pub struct TaskMessagePage {
 pub struct TaskGraph {
     tasks: BTreeMap<TaskId, TaskRecord>,
     messages: Vec<TaskMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attempt_bindings: Vec<TaskAttemptBinding>,
     next_message_sequence: u64,
     #[serde(skip)]
     materialization_charge_bytes: usize,
@@ -204,6 +229,8 @@ pub struct TaskGraph {
 struct TaskGraphWire {
     tasks: BTreeMap<TaskId, TaskRecord>,
     messages: Vec<TaskMessage>,
+    #[serde(default)]
+    attempt_bindings: Vec<TaskAttemptBinding>,
     next_message_sequence: u64,
 }
 
@@ -211,6 +238,7 @@ struct TaskMutation {
     id: TaskId,
     status: TaskStatus,
     attempts: u32,
+    attempt_binding: Option<TaskAttemptBinding>,
 }
 
 #[derive(Serialize)]
@@ -229,6 +257,7 @@ impl<'de> Deserialize<'de> for TaskGraph {
         let mut graph = Self {
             tasks: wire.tasks,
             messages: wire.messages,
+            attempt_bindings: wire.attempt_bindings,
             next_message_sequence: wire.next_message_sequence,
             materialization_charge_bytes: 0,
         };
@@ -285,6 +314,7 @@ impl TaskGraph {
         let mut graph = Self {
             tasks,
             messages: Vec::new(),
+            attempt_bindings: Vec::new(),
             next_message_sequence: 1,
             materialization_charge_bytes: 0,
         };
@@ -301,6 +331,20 @@ impl TaskGraph {
     /// Returns every Task projection in identity order.
     pub fn tasks(&self) -> impl Iterator<Item = &TaskRecord> {
         self.tasks.values()
+    }
+
+    /// Returns immutable governed execution evidence in claim order.
+    pub fn attempt_bindings(&self) -> impl Iterator<Item = &TaskAttemptBinding> {
+        self.attempt_bindings.iter()
+    }
+
+    /// Returns the governed coordinate recorded for one exact lease.
+    #[must_use]
+    pub fn execution_binding_for_lease(&self, lease_id: &TaskLeaseId) -> Option<&ExecutionBinding> {
+        self.attempt_bindings
+            .iter()
+            .find(|evidence| &evidence.lease_id == lease_id)
+            .map(|evidence| &evidence.execution_binding)
     }
 
     /// Returns whether every Task has reached a terminal state.
@@ -361,7 +405,27 @@ impl TaskGraph {
         lease_duration_ms: u64,
         maximum: usize,
     ) -> Result<Vec<TaskClaim>, HarnessError> {
+        self.claim_ready_with_binding(owner, now_ms, lease_duration_ms, maximum, None)
+    }
+
+    /// Releases expired leases, propagates blocked dependencies, and claims
+    /// work under one trusted execution coordinate.
+    ///
+    /// Once a Task has a bound attempt, every later attempt must also be
+    /// bound. This prevents an ungoverned worker from silently downgrading a
+    /// governed Task after a retry or lease expiry.
+    pub fn claim_ready_with_binding(
+        &mut self,
+        owner: &str,
+        now_ms: u64,
+        lease_duration_ms: u64,
+        maximum: usize,
+        execution_binding: Option<&ExecutionBinding>,
+    ) -> Result<Vec<TaskClaim>, HarnessError> {
         validate_capability_name("worker", owner)?;
+        if let Some(binding) = execution_binding {
+            binding.validate()?;
+        }
         if lease_duration_ms == 0 || !(1..=MAX_CLAIMS_PER_BATCH).contains(&maximum) {
             return Err(HarnessError::Orchestration(format!(
                 "lease duration must be positive and maximum claims must be 1-{MAX_CLAIMS_PER_BATCH}"
@@ -429,6 +493,17 @@ impl TaskGraph {
                 .then_with(|| left_id.cmp(right_id))
         });
         ready.truncate(maximum);
+        if execution_binding.is_none()
+            && ready.iter().any(|(_, task_id)| {
+                self.attempt_bindings
+                    .iter()
+                    .any(|evidence| &evidence.task_id == task_id)
+            })
+        {
+            return Err(HarnessError::Orchestration(
+                "a governed Task retry requires an execution binding".to_owned(),
+            ));
+        }
         let selected = ready
             .iter()
             .map(|(_, task_id)| task_id.clone())
@@ -446,6 +521,7 @@ impl TaskGraph {
                 id: task_id.clone(),
                 status: TaskStatus::Pending,
                 attempts: record.attempts,
+                attempt_binding: None,
             });
         }
 
@@ -463,16 +539,26 @@ impl TaskGraph {
                 attempt: attempts,
                 expires_at_ms,
             };
+            let attempt_binding = execution_binding.map(|execution_binding| TaskAttemptBinding {
+                task_id: task_id.clone(),
+                lease_id: lease.id.clone(),
+                attempt: attempts,
+                claimed_by: owner.to_owned(),
+                claimed_at_ms: now_ms,
+                execution_binding: execution_binding.clone(),
+            });
             mutations.push(TaskMutation {
                 id: task_id.clone(),
                 status: TaskStatus::Running {
                     lease: lease.clone(),
                 },
                 attempts,
+                attempt_binding,
             });
             claims.push(TaskClaim {
                 task: record.definition.clone(),
                 lease,
+                execution_binding: execution_binding.cloned(),
             });
         }
         self.apply_task_mutations(mutations)?;
@@ -503,6 +589,7 @@ impl TaskGraph {
             id: task_id.clone(),
             status: TaskStatus::Running { lease },
             attempts,
+            attempt_binding: None,
         }])
     }
 
@@ -525,6 +612,7 @@ impl TaskGraph {
             id: task_id.clone(),
             status: TaskStatus::Completed { completion },
             attempts,
+            attempt_binding: None,
         }])
     }
 
@@ -549,6 +637,7 @@ impl TaskGraph {
             id: task_id.clone(),
             status: TaskStatus::Failed { reason },
             attempts,
+            attempt_binding: None,
         }];
         mutations.extend(self.blocked_mutations(&pending_overrides, Some(task_id)));
         self.apply_task_mutations(mutations)
@@ -583,6 +672,7 @@ impl TaskGraph {
             id: task_id.clone(),
             status: TaskStatus::Cancelled { reason },
             attempts,
+            attempt_binding: None,
         }];
         mutations.extend(self.blocked_mutations(&pending_overrides, Some(task_id)));
         self.apply_task_mutations(mutations)
@@ -698,6 +788,7 @@ impl TaskGraph {
                     id: record.definition.id.clone(),
                     status: TaskStatus::Pending,
                     attempts: record.attempts,
+                    attempt_binding: None,
                 });
             }
         }
@@ -752,6 +843,7 @@ impl TaskGraph {
                                 reason: format!("dependency {dependency} did not complete"),
                             },
                             attempts: record.attempts,
+                            attempt_binding: None,
                         })
                 })
                 .collect::<Vec<_>>();
@@ -773,12 +865,35 @@ impl TaskGraph {
         for message in &self.messages {
             total = checked_graph_charge_add(total, message_materialization_charge(message)?)?;
         }
+        for evidence in &self.attempt_bindings {
+            total =
+                checked_graph_charge_add(total, attempt_binding_materialization_charge(evidence)?)?;
+        }
         validate_graph_charge(total)?;
         Ok(total)
     }
 
     fn apply_task_mutations(&mut self, mutations: Vec<TaskMutation>) -> Result<(), HarnessError> {
+        let appended_bindings = mutations
+            .iter()
+            .filter(|mutation| mutation.attempt_binding.is_some())
+            .count();
+        if self
+            .attempt_bindings
+            .len()
+            .checked_add(appended_bindings)
+            .is_none_or(|count| count > MAX_TASK_ATTEMPT_BINDINGS)
+        {
+            return Err(HarnessError::Orchestration(format!(
+                "Task Graph exceeds {MAX_TASK_ATTEMPT_BINDINGS} attempt bindings"
+            )));
+        }
         let mut seen = BTreeSet::new();
+        let mut lease_ids = self
+            .attempt_bindings
+            .iter()
+            .map(|evidence| evidence.lease_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut next_charge = self.materialization_charge_bytes;
         for mutation in &mutations {
             if !seen.insert(mutation.id.clone()) {
@@ -805,6 +920,33 @@ impl TaskGraph {
                     )
                 })
                 .and_then(|charge| checked_graph_charge_add(charge, candidate_charge))?;
+            if let Some(evidence) = &mutation.attempt_binding {
+                validate_attempt_binding(evidence)?;
+                let TaskStatus::Running { lease } = &mutation.status else {
+                    return Err(HarnessError::Orchestration(
+                        "Task attempt binding requires a running mutation".to_owned(),
+                    ));
+                };
+                if evidence.task_id != mutation.id
+                    || evidence.lease_id != lease.id
+                    || evidence.attempt != mutation.attempts
+                    || evidence.attempt != lease.attempt
+                    || evidence.claimed_by != lease.owner
+                {
+                    return Err(HarnessError::Orchestration(
+                        "Task attempt binding does not match its lease".to_owned(),
+                    ));
+                }
+                if !lease_ids.insert(evidence.lease_id.clone()) {
+                    return Err(HarnessError::Orchestration(
+                        "duplicate Task attempt binding lease".to_owned(),
+                    ));
+                }
+                next_charge = checked_graph_charge_add(
+                    next_charge,
+                    attempt_binding_materialization_charge(evidence)?,
+                )?;
+            }
         }
         validate_graph_charge(next_charge)?;
 
@@ -814,8 +956,28 @@ impl TaskGraph {
                 record.status = mutation.status;
                 record.attempts = mutation.attempts;
             }
+            if let Some(evidence) = mutation.attempt_binding {
+                self.attempt_bindings.push(evidence);
+            }
         }
         self.materialization_charge_bytes = next_charge;
+        Ok(())
+    }
+
+    pub(super) fn validate_execution_binding_tenant(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        if let Some(evidence) = self
+            .attempt_bindings
+            .iter()
+            .find(|evidence| evidence.execution_binding.tenant_id() != tenant_id)
+        {
+            return Err(HarnessError::Orchestration(format!(
+                "Task {} attempt {} execution binding tenant does not match the Task Graph owner",
+                evidence.task_id, evidence.attempt
+            )));
+        }
         Ok(())
     }
 
@@ -859,6 +1021,70 @@ impl TaskGraph {
                 | TaskStatus::Cancelled { reason }
                 | TaskStatus::Blocked { reason } => {
                     validate_task_text("Task terminal reason", reason)?;
+                }
+            }
+        }
+        if self.attempt_bindings.len() > MAX_TASK_ATTEMPT_BINDINGS {
+            return Err(HarnessError::Orchestration(format!(
+                "Task Graph exceeds {MAX_TASK_ATTEMPT_BINDINGS} attempt bindings"
+            )));
+        }
+        let mut lease_ids = BTreeSet::new();
+        let mut attempts_by_task = BTreeMap::<TaskId, BTreeSet<u32>>::new();
+        let mut evidence_by_lease = BTreeMap::new();
+        for evidence in &self.attempt_bindings {
+            validate_attempt_binding(evidence)?;
+            let record = self.tasks.get(&evidence.task_id).ok_or_else(|| {
+                HarnessError::Orchestration(format!(
+                    "Task attempt binding references missing Task {}",
+                    evidence.task_id
+                ))
+            })?;
+            if evidence.attempt == 0 || evidence.attempt > record.attempts {
+                return Err(HarnessError::Orchestration(format!(
+                    "Task {} attempt binding exceeds its attempt counter",
+                    evidence.task_id
+                )));
+            }
+            if !lease_ids.insert(evidence.lease_id.clone())
+                || !attempts_by_task
+                    .entry(evidence.task_id.clone())
+                    .or_default()
+                    .insert(evidence.attempt)
+            {
+                return Err(HarnessError::Orchestration(
+                    "duplicate Task attempt binding evidence".to_owned(),
+                ));
+            }
+            evidence_by_lease.insert(evidence.lease_id.clone(), evidence);
+        }
+        for record in self.tasks.values() {
+            let Some(bound_attempts) = attempts_by_task.get(&record.definition.id) else {
+                continue;
+            };
+            let first = *bound_attempts.iter().next().ok_or_else(|| {
+                HarnessError::Orchestration("Task attempt binding index is empty".to_owned())
+            })?;
+            if (first..=record.attempts).any(|attempt| !bound_attempts.contains(&attempt)) {
+                return Err(HarnessError::Orchestration(format!(
+                    "Task {} has an unbound attempt after entering governed mode",
+                    record.definition.id
+                )));
+            }
+            if let TaskStatus::Running { lease } = &record.status {
+                let evidence = evidence_by_lease.get(&lease.id).ok_or_else(|| {
+                    HarnessError::Orchestration(format!(
+                        "running governed Task {} has no binding for its current lease",
+                        record.definition.id
+                    ))
+                })?;
+                if evidence.task_id != record.definition.id
+                    || evidence.attempt != lease.attempt
+                    || evidence.claimed_by != lease.owner
+                {
+                    return Err(HarnessError::Orchestration(
+                        "running Task lease does not match its attempt binding".to_owned(),
+                    ));
                 }
             }
         }
@@ -959,6 +1185,31 @@ fn message_materialization_charge(message: &TaskMessage) -> Result<usize, Harnes
         .len()
         .checked_add(1)
         .ok_or_else(|| HarnessError::Orchestration("Task message charge overflow".to_owned()))
+}
+
+fn attempt_binding_materialization_charge(
+    evidence: &TaskAttemptBinding,
+) -> Result<usize, HarnessError> {
+    serde_json::to_vec(evidence)
+        .map_err(|error| {
+            HarnessError::Orchestration(format!("encode Task attempt binding: {error}"))
+        })?
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| HarnessError::Orchestration("Task binding charge overflow".to_owned()))
+}
+
+fn validate_attempt_binding(evidence: &TaskAttemptBinding) -> Result<(), HarnessError> {
+    validate_task_id(&evidence.task_id)?;
+    validate_capability_name("worker", &evidence.claimed_by)?;
+    if evidence.attempt == 0 {
+        return Err(HarnessError::Orchestration(
+            "Task attempt binding number must be positive".to_owned(),
+        ));
+    }
+    evidence.execution_binding.validate().map_err(|error| {
+        HarnessError::Orchestration(format!("invalid Task attempt execution binding: {error}"))
+    })
 }
 
 fn checked_graph_charge_add(left: usize, right: usize) -> Result<usize, HarnessError> {
@@ -1124,7 +1375,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{TaskCompletion, TaskDefinition, TaskGraph, TaskStatus, WorkspaceMode};
-    use crate::{HarnessError, TaskId};
+    use crate::{ExecutionBinding, HarnessError, TaskId};
 
     fn task(id: &'static str, dependencies: &[&'static str], priority: i32) -> TaskDefinition {
         TaskDefinition {
@@ -1137,6 +1388,77 @@ mod tests {
             priority,
             workspace: WorkspaceMode::Isolated,
         }
+    }
+
+    fn execution_binding(version: &str, revision: u64) -> ExecutionBinding {
+        ExecutionBinding::new(
+            "domain-pack",
+            "course-assistant",
+            version,
+            "a".repeat(64),
+            "b".repeat(64),
+            revision,
+            None,
+        )
+        .expect("execution binding")
+    }
+
+    #[test]
+    fn governed_attempt_bindings_survive_retry_and_cannot_be_downgraded() {
+        let mut graph = TaskGraph::new(vec![task("task-a", &[], 0)]).expect("graph");
+        let first_binding = execution_binding("1.0.0", 1);
+        let first = graph
+            .claim_ready_with_binding("worker-a", 100, 10, 1, Some(&first_binding))
+            .expect("first claim")
+            .remove(0);
+        assert_eq!(first.execution_binding.as_ref(), Some(&first_binding));
+        assert_eq!(
+            graph.execution_binding_for_lease(&first.lease.id),
+            Some(&first_binding)
+        );
+
+        let downgrade = graph
+            .claim_ready("worker-b", 110, 10, 1)
+            .expect_err("governed retry cannot become unbound");
+        assert!(
+            downgrade
+                .to_string()
+                .contains("requires an execution binding")
+        );
+        assert_eq!(
+            graph.task(&first.task.id).expect("Task").attempts,
+            1,
+            "failed downgrade must not mutate the graph"
+        );
+
+        let second_binding = execution_binding("1.1.0", 2);
+        let second = graph
+            .claim_ready_with_binding("worker-b", 110, 10, 1, Some(&second_binding))
+            .expect("governed retry")
+            .remove(0);
+        assert_eq!(second.lease.attempt, 2);
+        assert_eq!(second.execution_binding.as_ref(), Some(&second_binding));
+        graph
+            .complete(
+                &second.task.id,
+                &second.lease.id,
+                111,
+                TaskCompletion {
+                    summary: "done".to_owned(),
+                    artifacts: Vec::new(),
+                },
+            )
+            .expect("complete");
+
+        let encoded = serde_json::to_string(&graph).expect("encode");
+        let restored: TaskGraph = serde_json::from_str(&encoded).expect("decode");
+        restored.validate_integrity().expect("valid restored graph");
+        let evidence = restored.attempt_bindings().collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].lease_id, first.lease.id);
+        assert_eq!(evidence[1].lease_id, second.lease.id);
+        assert_eq!(evidence[0].execution_binding, first_binding);
+        assert_eq!(evidence[1].execution_binding, second_binding);
     }
 
     #[test]

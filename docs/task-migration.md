@@ -1,8 +1,7 @@
 # Task Graph schema migration
 
-Task Graph schema 2 adds durable optional tenant ownership and a
-tenant-partitioned Graph identity. Normal readers write and accept schema 2
-only.
+Task Graph schema 3 adds append-only, tenant-exact execution-binding evidence
+for governed Task attempts. Normal readers write and accept schema 3 only.
 
 ## Preconditions
 
@@ -15,16 +14,20 @@ Run:
 ```bash
 yh task-migrate \
   /absolute/path/tasks.db \
-  /absolute/path/tasks-v1.rollback.db
+  /absolute/path/tasks-v2.rollback.db
 ```
 
-The command validates every bounded schema-1 Graph, fingerprints its exact
-identity, revision, and JSON, creates or verifies a no-clobber SQLite backup,
-then replaces the table atomically. Historical Graphs receive `tenant=None`;
-no tenant is inferred.
+The command accepts schema 1 or schema 2, validates every bounded Graph,
+fingerprints its exact tenant, identity, revision, and JSON, creates or
+verifies a no-clobber SQLite backup, then replaces the table atomically.
 
-The older unreleased table without a `schema_version` column is accepted as
-the same schema-1 source shape. Any other layout or schema fails closed.
+- Schema-1 Graphs receive `tenant=None`; no tenant is inferred.
+- Schema-2 Graph tenant ownership and every lifecycle field are preserved
+  exactly. Historical Graphs have no attempt-binding evidence.
+- The older unreleased table without a `schema_version` column is accepted as
+  the same schema-1 source shape.
+- Mixed, unknown, malformed, or schema-2 rows carrying schema-3 evidence fail
+  before backup publication or source mutation.
 
 ## Verification
 
@@ -38,13 +41,13 @@ yh doctor /absolute/path/y-harness.json
 ```
 
 `integrity_check` must return `ok`. The table must contain `tenant_id`, and
-`yh doctor` must report Task Graph schema 2.
+`yh doctor` must report Task Graph schema 3.
 
 ## Rollback boundary
 
-Before any schema-2 writer runs, stop all processes and restore the rollback
-database as the source. After a schema-2 write, restoring the old backup
+Before any schema-3 writer runs, stop all processes and restore the rollback
+database as the source. After a schema-3 write, restoring the old backup
 discards that newer work; there is no automatic backward conversion.
 
-Never let schema-1 and schema-2 writers share a database. The backup is a
-rollback artifact, not a live replica.
+Never let schema-1/schema-2 and schema-3 writers share a database. The backup
+is a rollback artifact, not a live replica.

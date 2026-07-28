@@ -1,4 +1,4 @@
-//! Bounded Protocol v24 client over a supervised `yh` child process.
+//! Bounded Protocol v25 client over a supervised `yh` child process.
 
 use std::{
     error::Error,
