@@ -88,8 +88,8 @@ history plus durable lineage in State, and check alternate-screen and
 bracketed-paste restoration. The 64 MiB State migration, 126.9 MiB Approval
 Inbox migration, and near-limit 1,000-Task Graph migration tests are
 deliberately manual.
-The final Core package size and clean-tree verification are refreshed after
-the current State-13/Approval-3/Task-2/Secret-2/Protocol-24 gates; Cargo's
+The 238-file / 3.3 MiB Core package (721.2 KiB compressed) verifies from the
+current State-13/Approval-3/Task-2/Secret-2/Protocol-24 candidate; Cargo's
 `--allow-dirty` escape hatch is not used.
 Five integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:
