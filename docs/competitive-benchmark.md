@@ -114,7 +114,7 @@ machine-checkable oracle.
 | Area | Required workload |
 |---|---|
 | Context | retrieve facts across long histories; preserve tool call/result pairs; recover from text, image, and tool-output overflow |
-| Agent Loop | multi-step tool use, steering during execution, cancellation, provider timeout, retry, failover, and truncated tool arguments |
+| Agent Loop | multi-step tool use, steering during execution, cancellation, provider timeout, retry, failover, shared retry/failover attempt exhaustion, auxiliary model calls, and truncated tool arguments |
 | Tool Runtime | sequential and parallel-safe calls, exclusive calls, malformed input, oversized result, timeout, descendant cleanup, and sandbox escape probes |
 | State | kill at every settlement boundary, reopen state, resume permitted work, and prove uncertain effects are not replayed |
 | Memory | same corpus and query set, scoped retrieval, provenance, poisoned-memory rejection, and downstream task gain |

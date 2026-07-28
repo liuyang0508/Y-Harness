@@ -1260,6 +1260,8 @@ pub enum HarnessError {
     Trace(String),
     /// Agent Loop exhausted its configured step budget.
     MaxSteps(usize),
+    /// One Agent Loop step exhausted its Model Provider-call budget.
+    MaxModelAttempts(usize),
     /// A caller cancelled the Turn during an external operation.
     Cancelled {
         /// Operation active when cancellation was observed.
@@ -1351,6 +1353,9 @@ impl Display for HarnessError {
             ),
             Self::Trace(message) => write!(formatter, "trace error: {message}"),
             Self::MaxSteps(max) => write!(formatter, "agent loop exceeded {max} steps"),
+            Self::MaxModelAttempts(max) => {
+                write!(formatter, "model step exceeded {max} Provider attempts")
+            }
             Self::Cancelled { phase } => {
                 write!(formatter, "turn cancelled during {phase:?}")
             }

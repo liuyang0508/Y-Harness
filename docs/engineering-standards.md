@@ -241,6 +241,13 @@ internals or read Engine storage directly.
   to Route fallback and cannot itself open timeout cooldown.
 - Every invoked Model call reports a zero-based retry index in content-free
   Observability. Cooldown-skipped candidates were not calls and have no index.
+- Retry and Route fallback share one explicit per-step Model-attempt budget.
+  Check it before invoking Provider code; exhausting it is a typed Runtime
+  error, not another Provider failure. Combined with `max_steps`, it is the
+  hard bound for calls crossing the registered `LanguageModel` boundary.
+- Do not claim that this budget counts calls made internally by Compactors,
+  Verifiers, Tools, MCP servers, or other extensions. A hidden downstream call
+  requires an explicit contract before Runtime can govern or attribute it.
 - Observer errors, panics, backpressure, and capacity loss cannot alter Agent
   Loop settlement and must be exposed through explicit drop counters.
 - Provisional model streams are application content, never Observability

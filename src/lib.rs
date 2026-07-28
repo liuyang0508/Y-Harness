@@ -108,8 +108,9 @@ pub use protocol::{
     serve_stdio,
 };
 pub use runtime::{
-    AllowListPolicy, ApprovalHandler, DEFAULT_MAX_PARALLEL_TOOL_CALLS, DenyAllApprovals,
-    HarnessRuntime, LanguageModel, MAX_MODEL_RETRIES, MAX_MODEL_RETRY_DELAY_MS,
+    AllowListPolicy, ApprovalHandler, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, DenyAllApprovals, HarnessRuntime, LanguageModel,
+    MAX_MODEL_ATTEMPTS_PER_STEP, MAX_MODEL_RETRIES, MAX_MODEL_RETRY_DELAY_MS,
     MAX_PARALLEL_TOOL_CALLS, ModelRetryPolicy, PolicyEngine, SteeringReceipt, Tool,
     TurnExecutionOptions,
 };

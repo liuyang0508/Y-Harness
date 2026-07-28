@@ -180,6 +180,10 @@ direction:
   bounded equal-jitter exponential backoff, remains cancellable, stops after
   provisional output, and records every invoked retry index without replaying
   a Turn or Tool effect;
+- an independent 1–144 Runtime Model-attempt budget shared by every retry and
+  Route candidate in one Agent Loop step (16 by default), yielding the hard
+  Runtime-managed Turn bound `max_steps × max_model_attempts_per_step` without
+  claiming visibility into model calls hidden inside extension providers;
 - a strict service-configured Model catalog whose operator-owned IDs are stable
   aliases, whose credential references remain per Model, and whose explicit
   route is validated before Provider construction without adding a second

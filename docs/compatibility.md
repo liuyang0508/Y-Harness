@@ -58,6 +58,14 @@ They may independently add a default-disabled `retry` object with 1–8
 additional calls and 1–60,000 millisecond initial/maximum delays. Only typed
 rate-limit, overload, server, and transport failures are eligible, and retries
 share the existing candidate deadline.
+The additive defaulted `max_model_attempts_per_step` service field accepts
+1–144 and defaults to 16. It bounds all Runtime `LanguageModel` invocations in
+one Agent Loop step across retry and Route fallback. The Rust API additively
+exposes the same builder, constants, derived Turn-bound query, and
+`HarnessError::MaxModelAttempts`; exhaustive matches on the public pre-1.0
+error enum require a source update. State, Client Protocol, snapshots, and
+Model Gateway formats do not change. See
+[ADR 0114](adr/0114-bounded-runtime-model-attempts-per-step.md).
 The Rust API additively exposes `HarnessError::ModelProvider` and bounded
 `ModelProviderFailure` evidence, plus `ModelRetryPolicy`. Existing providers
 may continue returning `HarnessError::Model(String)`; only exhaustive matches

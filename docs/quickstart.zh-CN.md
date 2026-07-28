@@ -601,6 +601,11 @@ attempt deadline 明确判定的超时；普通 Provider 字符串错误不会�
 错误字符串、认证、配额、请求、模型不可用、内容策略和协议失败不会
 被猜测为瞬时错误。重试与首次调用共享同一个 Model attempt deadline，
 等待可取消，收到任何临时流内容后立即禁止重试和 Route fallback。
+顶层 `max_model_attempts_per_step` 同时约束同模型重试和 Route fallback，
+合法范围为 1–144，默认 16；Runtime 会在超限 Provider 调用发生前失败。
+结合默认 `max_steps = 32`，默认 Turn 最多跨越 512 次 Runtime 管理的
+Model 调用。此边界不虚构对 Compactor、Verifier、Tool 或 MCP
+实现内部隐藏模型调用的可见性。
 `yh doctor` 会在 Provider 构造和服务启动前报告目录、精确 Route、
 冷却值和重试边界。修改目录或 Route 后需要受控重启服务；当前没有
 热加载、自动发现、通用错误熔断或按价格/负载猜测路由。

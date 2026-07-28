@@ -148,6 +148,12 @@ the candidate attempt deadline, stop after provisional output, and never
 replay a Turn or Tool effect. Model-produced State retains the actual successful
 Model identity and origin for durable provenance, while Observability records
 every invoked retry index and explicit cooldown skips.
+Retry and Route calls also share an independent per-Agent-Loop-step budget:
+16 by default, configurable from 1 through 144. The Runtime-managed whole-Turn
+ceiling is `max_steps × max_model_attempts_per_step` (512 under both defaults);
+the budget fails before an excess Provider call. It does not pretend to count
+model calls hidden inside arbitrary Compactor, Verifier, Tool, or MCP
+implementations.
 Registry-selected identity is never re-queried from provider code. The
 compatibility constructor captures, panic-isolates, validates, and freezes
 `LanguageModel::id()` exactly once; a bad identity rejects execution before
@@ -156,7 +162,8 @@ See [ADR 0018](docs/adr/0018-model-registry-and-provenance.md) and
 [ADR 0070](docs/adr/0070-explicit-bounded-model-failover.md),
 [ADR 0099](docs/adr/0099-observable-model-attempt-timeout-cooldown.md), plus
 [ADR 0100](docs/adr/0100-typed-model-provider-failure-evidence.md) and
-[ADR 0101](docs/adr/0101-bounded-typed-model-retry-policy.md).
+[ADR 0101](docs/adr/0101-bounded-typed-model-retry-policy.md), and
+[ADR 0114](docs/adr/0114-bounded-runtime-model-attempts-per-step.md).
 The reference service exposes the same contract through a mutually exclusive
 `models` catalog plus `model_route`; configured IDs are stable operator aliases,
 each Model keeps its own environment-backed Secret reference, and `yh doctor`

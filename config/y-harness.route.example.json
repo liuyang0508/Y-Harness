@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "data_directory": ".y-harness",
+  "max_model_attempts_per_step": 16,
   "models": [
     {
       "type": "open_ai_responses",

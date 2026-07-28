@@ -2,6 +2,7 @@
   "schema_version": 1,
   "data_directory": ".y-harness",
   "max_parallel_tool_calls": 4,
+  "max_model_attempts_per_step": 16,
   "model": {
     "type": "open_ai_responses",
     "id": "openai/default",

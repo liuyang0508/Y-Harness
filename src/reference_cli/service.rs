@@ -18,22 +18,23 @@ use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox,
     CONVERSATION_COMPACTOR_API_VERSION, CapabilityOrigin, ContextEngine,
     ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
-    ConversationContextConfig, DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION,
-    EvaluationBaseline, EvaluationEngine, EvaluationReport, EvaluationSuite, GraderDescriptor,
-    GraderRegistry, HarnessRuntime, InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES,
+    ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION, EvaluationBaseline,
+    EvaluationEngine, EvaluationReport, EvaluationSuite, GraderDescriptor, GraderRegistry,
+    HarnessRuntime, InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES,
     JsonCommandConversationCompactor, JsonCommandGrader, JsonCommandModel,
     JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier, JsonProcessConfig,
-    LanguageModel, LocalProcessBroker, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES,
-    MacOsSeatbeltBroker, McpClient, MemoryContextConfig, MemoryEventStore, MemoryFailureMode,
-    MemoryHealthStatus, MemoryProvider, MemoryRegistry, ModelRegistry, ModelRetryPolicy,
-    NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolHandler, SECRET_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
-    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
-    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine,
-    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
-    TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
-    VerificationRegistry, VerifierDescriptor, decode_thread_archive, encode_thread_archive,
-    register_selected_mcp_tools, serve_stdio,
+    LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP, MAX_PARALLEL_TOOL_CALLS,
+    MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient, MemoryContextConfig,
+    MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider, MemoryRegistry,
+    ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION, ProcessBroker,
+    ProtocolHandler, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
+    SignedSkillPackage, SkillEngine, SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry,
+    SkillTransparencyRequirement, SkillTrustStore, SqliteApprovalInbox, SqliteEventStore,
+    SqliteTaskCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority,
+    TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor,
+    ToolRegistry, VerificationRegistry, VerifierDescriptor, decode_thread_archive,
+    encode_thread_archive, register_selected_mcp_tools, serve_stdio,
 };
 
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
@@ -69,6 +70,8 @@ struct ServiceConfig {
     data_directory: String,
     #[serde(default = "default_max_parallel_tool_calls")]
     max_parallel_tool_calls: usize,
+    #[serde(default = "default_max_model_attempts_per_step")]
+    max_model_attempts_per_step: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<ServiceModelConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -99,6 +102,7 @@ impl Default for ServiceConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             data_directory: ".y-harness".to_owned(),
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+            max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
             model: Some(ServiceModelConfig::Demo {
                 id: default_demo_model_id(),
             }),
@@ -810,6 +814,10 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         loaded.config.max_parallel_tool_calls
     );
     println!(
+        "model attempt budget: {} per Agent Loop step",
+        loaded.config.max_model_attempts_per_step
+    );
+    println!(
         "verifiers: {}",
         capabilities.verification.descriptors().len()
     );
@@ -1056,6 +1064,8 @@ fn assemble_configured_runtime(
         runtime = runtime.with_model_timeout_cooldown(cooldown)?;
     }
     runtime = runtime.with_max_parallel_tool_calls(loaded.config.max_parallel_tool_calls)?;
+    runtime =
+        runtime.with_max_model_attempts_per_step(loaded.config.max_model_attempts_per_step)?;
     Ok(ConfiguredRuntime {
         runtime: runtime
             .with_context_engine(context)
@@ -2307,6 +2317,11 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
     if !(1..=MAX_PARALLEL_TOOL_CALLS).contains(&config.max_parallel_tool_calls) {
         return Err(format!("max_parallel_tool_calls must be 1-{MAX_PARALLEL_TOOL_CALLS}").into());
     }
+    if !(1..=MAX_MODEL_ATTEMPTS_PER_STEP).contains(&config.max_model_attempts_per_step) {
+        return Err(
+            format!("max_model_attempts_per_step must be 1-{MAX_MODEL_ATTEMPTS_PER_STEP}").into(),
+        );
+    }
     let root = path
         .parent()
         .ok_or_else(|| format!("config has no parent directory: {}", path.display()))?
@@ -2489,6 +2504,10 @@ const fn default_max_parallel_tool_calls() -> usize {
     DEFAULT_MAX_PARALLEL_TOOL_CALLS
 }
 
+const fn default_max_model_attempts_per_step() -> usize {
+    DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP
+}
+
 fn default_current_directory() -> String {
     ".".to_owned()
 }
@@ -2589,6 +2608,10 @@ mod tests {
         assert_eq!(
             defaulted.max_parallel_tool_calls,
             super::DEFAULT_MAX_PARALLEL_TOOL_CALLS
+        );
+        assert_eq!(
+            defaulted.max_model_attempts_per_step,
+            super::DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP
         );
         let explicitly_safe = serde_json::from_str::<ServiceConfig>(
             r#"{
@@ -2710,6 +2733,41 @@ mod tests {
             error
                 .to_string()
                 .contains("max_parallel_tool_calls must be 1-64")
+        );
+        fs::remove_dir_all(root).expect("remove config fixture");
+    }
+
+    #[test]
+    fn config_rejects_an_unbounded_model_attempt_limit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "y-harness-model-attempt-config-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create config fixture");
+        let path = root.join("y-harness.json");
+        fs::write(
+            &path,
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "max_model_attempts_per_step": 0,
+              "model": {"type": "demo"}
+            }"#,
+        )
+        .expect("write invalid config");
+
+        let error = load_config(path.to_str().expect("UTF-8 fixture path"))
+            .err()
+            .expect("reject invalid Model attempt limit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("max_model_attempts_per_step must be 1-144")
         );
         fs::remove_dir_all(root).expect("remove config fixture");
     }

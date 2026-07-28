@@ -45,6 +45,7 @@ const MAX_RUNTIME_ERROR_CHARS: usize = 4_096;
 const MAX_MODEL_CALL_ID_BYTES: usize = 256;
 const MAX_PROVIDER_EVIDENCE_ID_BYTES: usize = 256;
 const MAX_POLICY_REASON_BYTES: usize = 4_096;
+const DEFAULT_MAX_AGENT_STEPS: usize = 32;
 const MAX_AGENT_STEPS: usize = 256;
 const MAX_MODEL_ROUTE_ENTRIES: usize = 16;
 const DEFAULT_MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,6 +55,11 @@ const MAX_MODEL_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(86_400);
 pub const MAX_MODEL_RETRIES: u8 = 8;
 /// Maximum configured fallback delay between calls to the same Model.
 pub const MAX_MODEL_RETRY_DELAY_MS: u64 = 60_000;
+/// Default Provider-call ceiling for one Agent Loop Model step.
+pub const DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP: usize = MAX_MODEL_ROUTE_ENTRIES;
+/// Hard Provider-call ceiling for one Agent Loop Model step.
+pub const MAX_MODEL_ATTEMPTS_PER_STEP: usize =
+    MAX_MODEL_ROUTE_ENTRIES * (MAX_MODEL_RETRIES as usize + 1);
 const DEFAULT_MAX_CONCURRENT_TURNS: usize = 32;
 const MAX_CONCURRENT_TURNS: usize = 4_096;
 /// Default same-batch concurrency ceiling for explicitly `ParallelSafe` Tools.
@@ -163,6 +169,7 @@ pub struct HarnessRuntime {
     turn_controls: Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
     max_concurrent_turns: usize,
     max_parallel_tool_calls: usize,
+    max_model_attempts_per_step: usize,
     max_steps: usize,
 }
 
@@ -191,7 +198,8 @@ impl HarnessRuntime {
             turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-            max_steps: 32,
+            max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+            max_steps: DEFAULT_MAX_AGENT_STEPS,
         }
     }
 
@@ -233,7 +241,8 @@ impl HarnessRuntime {
             turn_controls: Mutex::new(BTreeMap::new()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-            max_steps: 32,
+            max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+            max_steps: DEFAULT_MAX_AGENT_STEPS,
         })
     }
 
@@ -316,6 +325,27 @@ impl HarnessRuntime {
     pub fn with_model_retry_policy(mut self, policy: ModelRetryPolicy) -> Self {
         self.models.retry_policy = Some(policy);
         self
+    }
+
+    /// Sets the Provider-call ceiling for each Agent Loop Model step.
+    ///
+    /// Route failover and same-Model retries share this budget. Together with
+    /// `max_steps`, it gives a hard Runtime-managed Model-call bound for one
+    /// Turn, including Turns resumed after approval.
+    pub fn with_max_model_attempts_per_step(mut self, limit: usize) -> Result<Self, HarnessError> {
+        if !(1..=MAX_MODEL_ATTEMPTS_PER_STEP).contains(&limit) {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Model attempts per step must be 1-{MAX_MODEL_ATTEMPTS_PER_STEP}"
+            )));
+        }
+        self.max_model_attempts_per_step = limit;
+        Ok(self)
+    }
+
+    /// Returns the maximum Runtime-managed Model calls possible in one Turn.
+    #[must_use]
+    pub const fn model_attempts_per_turn_bound(&self) -> usize {
+        self.max_steps * self.max_model_attempts_per_step
     }
 
     /// Sets the maximum number of Turns executing concurrently in this Runtime.
@@ -1767,6 +1797,7 @@ impl HarnessRuntime {
         }
         let mut request = Some(request);
         let total = candidates.len();
+        let mut attempts = 0_usize;
         for (index, registered) in candidates.into_iter().enumerate() {
             let model_id = registered.identity.get()?;
             let (attempt_deadline, attempt_timeout_elapsed) =
@@ -1788,6 +1819,12 @@ impl HarnessRuntime {
             let mut initial_request = Some(attempt_request);
             let mut retry_index = 0_u8;
             loop {
+                if attempts == self.max_model_attempts_per_step {
+                    return Err(HarnessError::MaxModelAttempts(
+                        self.max_model_attempts_per_step,
+                    ));
+                }
+                attempts += 1;
                 let request = if retry_index == 0 {
                     initial_request.take().ok_or_else(|| {
                         HarnessError::Model(
@@ -8229,6 +8266,143 @@ mod tests {
         assert!(
             ModelRetryPolicy::new(1, Duration::from_millis(2), Duration::from_millis(1)).is_err()
         );
+    }
+
+    #[test]
+    fn model_attempt_budget_is_bounded_and_exposes_the_turn_ceiling() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(UsageModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_model_attempts_per_step(3)
+        .expect("bounded attempt budget")
+        .with_max_steps(4);
+
+        assert_eq!(runtime.model_attempts_per_turn_bound(), 12);
+        assert!(matches!(
+            HarnessRuntime::new(
+                Arc::new(UsageModel),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_max_model_attempts_per_step(0),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            HarnessRuntime::new(
+                Arc::new(UsageModel),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_max_model_attempts_per_step(super::MAX_MODEL_ATTEMPTS_PER_STEP + 1),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_attempt_budget_stops_retry_before_an_extra_provider_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HarnessRuntime::new(
+            Arc::new(TypedRetryModel {
+                id: "test/retry-budget",
+                calls: calls.clone(),
+                kind: ModelProviderFailureKind::Transport,
+                retry_after_ms: None,
+                succeeds_on_call: None,
+                emit_before_failure: false,
+                failure_observed: None,
+            }),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_retry_policy(
+            ModelRetryPolicy::new(8, Duration::from_millis(1), Duration::from_millis(1))
+                .expect("retry policy"),
+        )
+        .with_max_model_attempts_per_step(2)
+        .expect("attempt budget");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "bounded retry")
+            .await
+            .expect_err("attempt budget must stop retry");
+
+        assert_eq!(error, HarnessError::MaxModelAttempts(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn model_attempt_budget_stops_failover_before_an_extra_provider_call() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let mut models = ModelRegistry::new();
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteFailingModel {
+                    calls: primary_calls.clone(),
+                    emit_delta: false,
+                }),
+            )
+            .expect("primary");
+        models
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(RouteSuccessModel {
+                    calls: secondary_calls.clone(),
+                }),
+            )
+            .expect("secondary");
+        let runtime = HarnessRuntime::from_model_registry_failover(
+            &models,
+            &["test/route-primary", "test/route-secondary"],
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .expect("route")
+        .with_max_model_attempts_per_step(1)
+        .expect("attempt budget");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "bounded failover")
+            .await
+            .expect_err("attempt budget must stop failover");
+
+        assert_eq!(error, HarnessError::MaxModelAttempts(1));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn model_attempt_budget_resets_for_each_agent_loop_step() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime(
+            calls.clone(),
+            AllowListPolicy::deny_by_default().allow("echo"),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_model_attempts_per_step(1)
+        .expect("one attempt per step");
+        let thread = runtime.create_thread().await.expect("thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "two model steps")
+            .await
+            .expect("each step gets its own attempt");
+
+        assert_eq!(
+            outcome.final_text,
+            r#"observed: {"text":"two model steps"}"#
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
