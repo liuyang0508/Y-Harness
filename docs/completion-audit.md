@@ -74,9 +74,9 @@ YH_BIN=/isolated/prefix/bin/yh python3 examples/task_worker_client.py \
 The all-feature workspace run contains 344 passing library tests plus
 2 manual size tests, 10 CLI configuration tests, 23 Engine process/service tests, 11 TUI
 unit/render tests, 2 local private-gateway TLS integration tests, 2 local
-private-MCP TLS integration tests, 52 product/Engine evidence-adapter tests, and 6
-deterministic fault-fixture tests: 450 passing plus 7 explicitly ignored
-fixtures in total. The no-default-feature workspace run contains 421 passing tests plus 3 ignored
+private-MCP TLS integration tests, 53 product/Engine evidence-adapter tests, and 6
+deterministic fault-fixture tests: 451 passing plus 7 explicitly ignored
+fixtures in total. The no-default-feature workspace run contains 422 passing tests plus 3 ignored
 manual/environment fixtures. The demo and configured PTY
 smoke gates submit real Turns, create atomic child Threads, verify parent/child
 history plus durable lineage in State, and check alternate-screen and
@@ -121,6 +121,11 @@ has been produced yet. The first shared-Provider Claude Code/Codex preflight
 completed but correctly returned `not_comparable`: the common requested Model
 identifier triggered Codex fallback metadata, and protocol, Tool, reasoning,
 sandbox, Context, and settlement controls remained unequal.
+
+The follow-up Codex/Grok Build preflight aligned the main protocol and
+`gpt-5.4` identifier but remained `not_comparable`: Grok attempted a rejected
+`grok-4.5` title call, while Tool, Context, reasoning-summary, permission,
+call-count, and identity-settlement controls still differed.
 
 “No bugs” is not a verifiable permanent state. The enforceable completion rule
 is zero known critical/high defects plus named, reproducible evidence for every

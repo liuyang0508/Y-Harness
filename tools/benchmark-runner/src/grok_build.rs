@@ -983,4 +983,198 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn checked_in_responses_preflight_rejects_auxiliary_model_and_tool_drift() {
+        let codex_spec: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-responses-control-preflight/codex-spec.json"
+        ))
+        .expect("checked-in Codex Responses-control spec");
+        let grok_spec: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-responses-control-preflight/grok-build-spec.json"
+        ))
+        .expect("checked-in Grok Build Responses-control spec");
+        let manifest: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-responses-control-preflight/preflight.json"
+        ))
+        .expect("checked-in Responses-control preflight");
+        let codex: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-responses-control-preflight/codex-result.json"
+        ))
+        .expect("checked-in Codex Responses-control result");
+        let grok: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-responses-control-preflight/grok-build-result.json"
+        ))
+        .expect("checked-in Grok Build Responses-control result");
+        let requests = include_str!(
+            "../evidence/2026-07-28-responses-control-preflight/provider-request.jsonl"
+        )
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).expect("Responses-control Provider request")
+        })
+        .collect::<Vec<_>>();
+        let provider =
+            include_bytes!("../evidence/2026-07-28-responses-control-preflight/provider.mjs");
+
+        assert_eq!(manifest["verdict"], "not_comparable");
+        assert_eq!(manifest["eligible_for_harness_effect_claim"], false);
+        assert_eq!(
+            sha256_bytes(provider),
+            manifest["shared_requested_controls"]["provider_executable_sha256"]
+        );
+        for field in [
+            "benchmark_version",
+            "case_id",
+            "workspace_snapshot",
+            "profile",
+            "provider",
+            "model",
+            "reasoning_effort",
+            "system_prompt",
+            "prompt",
+            "timeout_ms",
+        ] {
+            assert_eq!(
+                codex_spec[field], grok_spec[field],
+                "shared Responses input coordinate {field}"
+            );
+        }
+        assert_eq!(
+            codex_spec["provider_base_url"],
+            grok_spec["models_base_url"]
+        );
+        assert_eq!(
+            codex_spec["expected_product_executable_sha256"],
+            codex["adapter"]["product_executable_sha256"]
+        );
+        assert_eq!(
+            grok_spec["expected_product_executable_sha256"],
+            grok["adapter"]["product_executable_sha256"]
+        );
+        assert_eq!(
+            sha256_bytes(
+                codex_spec["system_prompt"]
+                    .as_str()
+                    .expect("Codex system prompt")
+                    .as_bytes()
+            ),
+            codex["controls"]["system_prompt_sha256"]
+        );
+        assert_eq!(
+            sha256_bytes(
+                grok_spec["prompt"]
+                    .as_str()
+                    .expect("Grok Build prompt")
+                    .as_bytes()
+            ),
+            grok["controls"]["prompt_sha256"]
+        );
+        for field in [
+            "requested_provider",
+            "requested_model",
+            "prompt_sha256",
+            "system_prompt_sha256",
+            "requested_reasoning_effort",
+            "timeout_ms",
+            "product_sandbox",
+        ] {
+            assert_eq!(
+                codex["controls"][field], grok["controls"][field],
+                "shared requested control {field}"
+            );
+        }
+        assert_eq!(codex["controls"]["claim_eligible"], false);
+        assert_eq!(grok["controls"]["claim_eligible"], false);
+        assert_eq!(
+            codex["execution"]["settlement"]["raw_result"][2]["item"]["text"],
+            "YH-RESPONSES-CONTROL-OK"
+        );
+        assert_eq!(
+            codex["execution"]["settlement"]["raw_result"]
+                .as_array()
+                .expect("Codex retained events")
+                .len(),
+            4
+        );
+        assert!(
+            codex["execution"]["settlement"]["raw_result"]
+                .as_array()
+                .expect("Codex retained events")
+                .iter()
+                .all(|event| event["type"] != "error" && event["item"]["type"] != "error")
+        );
+        assert_eq!(
+            grok["execution"]["settlement"]["raw_result"]["text"],
+            "YH-RESPONSES-CONTROL-OK"
+        );
+        assert_eq!(codex["controls"]["observed_models"], serde_json::json!([]));
+        assert_eq!(
+            grok["controls"]["observed_models"],
+            serde_json::json!(["gpt-5.4"])
+        );
+
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["product"], "codex_main");
+        assert_eq!(requests[0]["response_status"], 200);
+        assert_eq!(requests[1]["product"], "grok_catalog");
+        assert_eq!(requests[1]["response_status"], 200);
+        assert_eq!(requests[2]["product"], "grok_title");
+        assert_eq!(requests[2]["body"]["model"], "grok-4.5");
+        assert_eq!(requests[2]["response_status"], 422);
+        assert_eq!(requests[3]["product"], "grok_main");
+        assert_eq!(requests[3]["response_status"], 200);
+        assert_eq!(requests[0]["path"], "/v1/responses");
+        assert_eq!(requests[2]["path"], "/v1/responses");
+        assert_eq!(requests[3]["path"], "/v1/responses");
+        assert_eq!(requests[0]["body"]["model"], "gpt-5.4");
+        assert_eq!(requests[3]["body"]["model"], "gpt-5.4");
+        assert!(
+            requests[0]["body"]["input"]
+                .as_array()
+                .expect("Codex input")
+                .iter()
+                .any(|item| item["has_requested_system"] == true)
+        );
+        assert!(
+            requests[3]["body"]["input"]
+                .as_array()
+                .expect("Grok Build input")
+                .iter()
+                .any(|item| item["has_requested_prompt"] == true)
+        );
+        assert_eq!(
+            requests[0]["body"]["tool_names"],
+            serde_json::json!([
+                "exec_command",
+                "write_stdin",
+                "update_plan",
+                "request_user_input",
+                "apply_patch",
+                "view_image"
+            ])
+        );
+        assert_eq!(
+            requests[2]["body"]["tool_names"],
+            serde_json::json!(["session_title"])
+        );
+        assert_eq!(
+            requests[3]["body"]["tool_names"],
+            serde_json::json!(["read_file", "search_tool", "use_tool"])
+        );
+        assert_eq!(
+            requests[0]["body"]["reasoning"],
+            serde_json::json!({"effort": "medium"})
+        );
+        assert_eq!(
+            requests[3]["body"]["reasoning"],
+            serde_json::json!({"effort": "medium", "summary": "concise"})
+        );
+        assert_eq!(codex["controls"]["permission_mode"], "never");
+        assert_eq!(grok["controls"]["permission_mode"], "dont_ask");
+        assert_eq!(
+            grok["execution"]["settlement"]["raw_result"]["modelUsage"]["gpt-5.4"]["modelCalls"],
+            1
+        );
+    }
 }

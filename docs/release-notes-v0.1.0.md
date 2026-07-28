@@ -124,7 +124,12 @@ class, and fixed response. Its machine verdict is `not_comparable`: Codex
 reported fallback Model metadata, the products used different protocols,
 Tools, reasoning representations, Context, and sandboxes, and identical Model
 implementation was not settled. No cross-product comparative result is
-claimed.
+claimed. A follow-up Codex/Grok Build preflight aligned both main calls on the
+same Provider process, Responses protocol, `gpt-5.4`, prompts, effort, and
+read-only sandbox requests. It still returned `not_comparable`: Grok attempted
+a `grok-4.5` title call that the fixture rejected with HTTP 422 and then
+silently continued; Tool schemas, Context, reasoning summaries, permission
+modes, call counts, and Codex identity settlement also remained unequal.
 
 ## Start
 

@@ -29,8 +29,8 @@ ambient-product result, one real deterministic Claude Code fixed-output
 result, one real Grok Build fixed-output result, one real Pi fixed-output
 result, one real OpenCode fixed-output result, one real Hermes fixed-output
 result, one real Codex fixed-output result, one shared-Provider Claude
-Code/Codex Harness-control preflight, and two Codex CF-003 fault records. All
-have
+Code/Codex Harness-control preflight, one shared-Responses Codex/Grok Build
+preflight, and two Codex CF-003 fault records. All have
 `claim_eligible: false`: they prove bounded adapters and registered fault
 behavior, not that either Harness is better. See
 [`external-run-format.md`](external-run-format.md).
@@ -84,6 +84,20 @@ identity. A shared string and fixture therefore did not establish an
 identically implemented Model coordinate. No shared Tool workload may be
 promoted to this track until that identity gap and the Tool, Context, sandbox,
 budget, and Provider-call-ceiling differences are equalized.
+
+The second real preflight is preserved under
+[`2026-07-28-responses-control-preflight`](../tools/benchmark-runner/evidence/2026-07-28-responses-control-preflight/).
+It narrowed the gap: released Codex `0.145.0` and Grok Build `0.2.112` used one
+Provider process, OpenAI Responses, `gpt-5.4`, matching prompts, `medium`
+effort, and read-only product sandbox requests for their main Agent calls.
+Codex emitted no fallback-Model event and Grok settled `gpt-5.4` in its main
+result. The complete product Turn still failed parity. Grok issued an
+auxiliary title request with `grok-4.5`; the fixture rejected it with HTTP 422
+and Grok silently continued. Codex exposed six built-in Tools, while Grok
+exposed three different main Tools plus the title Tool, injected different
+Context, requested a different reasoning summary, and made an extra catalog
+request. The machine verdict therefore remains `not_comparable`, and the
+single-run wall times support no latency claim.
 
 ### Product-default track
 

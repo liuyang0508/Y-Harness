@@ -1,0 +1,25 @@
+{
+  "format_version": 3,
+  "run_id": "responses-control-grok-build-20260728-001",
+  "benchmark_version": "harness-control-preflight-v1",
+  "case_id": "shared-responses-fixed-output",
+  "program": "/private/tmp/yh-grok-build-02112.358ixk/grok",
+  "expected_cli_version": "grok 0.2.112 (9bbd559437aa)",
+  "expected_product_executable_sha256": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4",
+  "workspace": "/private/tmp/yh-responses-control-20260728.D5PmXt/grok-workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "profile": "bare",
+  "provider": "yh-shared-responses-control",
+  "models_base_url": "http://127.0.0.1:57024/v1",
+  "model": "gpt-5.4",
+  "reasoning_effort": "medium",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-RESPONSES-CONTROL-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "XAI_API_KEY"
+  ],
+  "home": "/private/tmp/yh-responses-control-20260728.D5PmXt/grok-home",
+  "grok_home": "/private/tmp/yh-responses-control-20260728.D5PmXt/grok-config",
+  "prompt_directory": "/private/tmp/yh-responses-control-20260728.D5PmXt/grok-prompt"
+}

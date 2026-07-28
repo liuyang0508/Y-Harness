@@ -320,6 +320,18 @@ emitted a fallback-Model-metadata event for the shared Claude identifier and
 did not settle Model or Provider identity, so same-Model parity was not
 established.
 
+A second preflight is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-responses-control-preflight`](../tools/benchmark-runner/evidence/2026-07-28-responses-control-preflight/).
+Released Codex `0.145.0` and Grok Build `0.2.112` aligned their main calls on
+one Provider process, OpenAI Responses, `gpt-5.4`, matching prompts and effort,
+and read-only sandbox requests. It also remains a composition of existing
+format-2 and format-3 `adapter_conformance` reports, not a new format or a
+comparative cell. The sidecar proves that Grok's auxiliary title call used
+`grok-4.5`; the fixture returned HTTP 422 and Grok completed without surfacing
+that failure in its final result. Different Provider-call counts, Tool
+schemas, Context, reasoning summaries, permission modes, and incomplete Codex
+identity settlement keep the machine verdict `not_comparable`.
+
 The source-pinned format-7 driver is additionally tested against official tag
 [`rust-v0.145.0`](https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0).
 One real released-product CF-003 record is preserved under

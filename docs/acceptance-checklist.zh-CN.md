@@ -163,6 +163,9 @@ yh skill verify "$project/y-harness.json"
 - [ ] Claude Code/Codex 共享 Provider 预检必须核对相同请求坐标与真实
       wire sidecar；只要 Model 元数据、协议、Tool、推理、Context、沙箱、
       预算或调用上限未对齐，机器结论必须保持 `not_comparable`。
+- [ ] Codex/Grok Build 共享 Responses 预检必须覆盖模型目录、主 Agent 和
+      所有辅助 Model 请求；辅助调用漂移到产品默认 Model 或其失败被静默
+      吞掉时，不得把主请求对齐表述为整个 Turn 的 Model 对齐。
 - [ ] 所有 released-product 适配器始终输出
       `claim_eligible: false`；单产品 conformance 不能作为效果超越证据。
 

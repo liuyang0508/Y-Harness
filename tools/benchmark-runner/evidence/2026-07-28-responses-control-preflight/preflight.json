@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "experiment": "responses_control_preflight",
+  "verdict": "not_comparable",
+  "eligible_for_harness_effect_claim": false,
+  "reports": {
+    "codex": "codex-result.json",
+    "grok_build": "grok-build-result.json"
+  },
+  "shared_requested_controls": {
+    "provider_process": "provider.mjs",
+    "provider_executable_sha256": "329266186315ad3dba0eb338a498fee60d9bda58ccad9e3de7a480aba7bd4077",
+    "provider_label": "yh-shared-responses-control",
+    "main_protocol": "openai_responses",
+    "main_model_identifier": "gpt-5.4",
+    "reasoning_effort_label": "medium",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "prompt_sha256": "f2fd2ae659a42d1a1d72557c3126080a55467e7bfe9f758d7b69d2201877d148",
+    "timeout_ms": 30000,
+    "workspace_snapshot": "empty-directory-v1",
+    "product_sandbox_request": "read-only",
+    "expected_output": "YH-RESPONSES-CONTROL-OK"
+  },
+  "established": [
+    "both released products completed against one deterministic loopback Provider process",
+    "both main-agent requests used OpenAI Responses, gpt-5.4, the requested prompts, medium effort, and read-only product sandbox requests",
+    "Codex emitted no fallback Model-metadata event and Grok Build settled gpt-5.4 in its main-agent result",
+    "the fixture returned the same deterministic main-agent output"
+  ],
+  "blocking_differences": [
+    "Grok Build issued an auxiliary title request with grok-4.5 instead of the requested gpt-5.4 main Model",
+    "the fixture rejected that off-coordinate title request with HTTP 422 and Grok Build continued without surfacing the failure in its final result",
+    "Codex issued one Model request while Grok Build issued two Model requests plus one catalog request",
+    "Codex exposed six built-in Tools while Grok Build exposed three different main-agent Tools and one title Tool",
+    "Codex did not request a reasoning summary while Grok Build requested concise summaries",
+    "the products injected different built-in Context and used different permission modes",
+    "Codex JSONL did not settle Model or Provider identity; the Provider sidecar remains corroborating evidence",
+    "neither product exposed a common hard monetary budget or Provider-call ceiling",
+    "single-run wall times are retained as process evidence but are not eligible for a latency comparison"
+  ],
+  "next_required_control": "Eliminate or identically route every auxiliary Model call, equalize Tool schemas, Context, permission semantics, budgets, and call ceilings, and settle the same Provider and Model identity before executing a shared Tool workload."
+}

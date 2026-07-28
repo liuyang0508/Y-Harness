@@ -481,5 +481,14 @@ reasoning representations, and sandbox semantics. This preflight is a
 machine-checked refusal to overclaim, not an additional report format or a
 Harness-effect result.
 
+The follow-up
+[`2026-07-28-responses-control-preflight`](evidence/2026-07-28-responses-control-preflight/)
+record uses the format-2 Codex and format-3 Grok Build adapters against one
+Responses fixture. Their main calls align on `gpt-5.4`, prompts, effort, and
+read-only sandbox requests, but the verdict remains `not_comparable`. The
+sidecar proves that Grok attempted an auxiliary `grok-4.5` title call, received
+HTTP 422, and silently continued; Tool, Context, reasoning-summary, permission,
+call-count, and identity-settlement controls also differ.
+
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).
