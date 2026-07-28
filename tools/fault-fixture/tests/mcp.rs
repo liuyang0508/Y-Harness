@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,8 @@ use y_harness::{
     StdioMcpLaunchAuthority,
 };
 
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn fixture_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_yh-fault-fixture"))
 }
@@ -22,8 +25,11 @@ fn temp_fixture(case: &str) -> (PathBuf, PathBuf) {
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_nanos();
-    let directory =
-        env::temp_dir().join(format!("yh-fault-fixture-{}-{nonce}", std::process::id()));
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = env::temp_dir().join(format!(
+        "yh-fault-fixture-{}-{nonce}-{sequence}",
+        std::process::id()
+    ));
     fs::create_dir(&directory).expect("create fixture directory");
     let spec_path = directory.join("fixture.json");
     let journal_path = directory.join("journal.jsonl");
