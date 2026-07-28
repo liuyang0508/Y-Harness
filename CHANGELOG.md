@@ -4,6 +4,11 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added Task Graph schema 2 with immutable trusted tenant ownership,
+  tenant-partitioned Graph identities, exact-tenant Memory/SQLite and Protocol
+  fencing for the complete worker/lease/mailbox lifecycle, validated SQLite
+  lookup projections, backup-first schema-1 migration without inferred
+  ownership, and Protocol v22;
 - added Approval Inbox schema 3 with immutable trusted tenant ownership,
   exact-tenant Memory/SQLite and Protocol fencing, tenant-aware Runtime
   approval/recovery flow, validated SQLite lookup projections, backup-first

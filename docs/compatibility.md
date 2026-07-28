@@ -154,6 +154,13 @@ ownership. The pre-1.0 `ApprovalInbox` and `ApprovalHandler` APIs add
 authority-aware methods, and custom tenant-aware handlers must durably
 preserve the boundary. See
 [ADR 0118](adr/0118-durable-approval-tenant-ownership.md).
+Task Graph schema 2 binds immutable optional tenant ownership to the complete
+Graph aggregate, and Protocol v22 enables exact-tenant Graph administration
+and worker lifecycle commands. The `(tenant, graph_id)` key gives each tenant
+an independent caller-selected identity namespace. Schema-1 Graphs migrate as
+unscoped; no Thread, worker, path, or deployment relationship is used to infer
+ownership. The pre-1.0 `TaskCoordinator` API adds authority-aware methods. See
+[ADR 0119](adr/0119-durable-task-graph-tenant-ownership.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -543,7 +550,9 @@ per-Turn context, plus
 [ADR 0117](adr/0117-durable-thread-tenant-ownership.md) for schema-12 Thread
 tenant ownership, Protocol v20 fencing, and archive format 2, plus
 [ADR 0118](adr/0118-durable-approval-tenant-ownership.md) for Approval Inbox
-schema 3 and Protocol v21 tenant fencing.
+schema 3 and Protocol v21 tenant fencing, plus
+[ADR 0119](adr/0119-durable-task-graph-tenant-ownership.md) for Task Graph
+schema 2 and Protocol v22 tenant fencing.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -566,9 +575,21 @@ explicitly data-losing recovery afterward.
 See the [Approval migration runbook](approval-migration.md) and
 [ADR 0063](adr/0063-attributed-separation-of-duty-approvals.md).
 
-The Task Coordinator recognizes its earlier unreleased development table and
-adds the version-1 column with a constant default; this path is covered by a
-fail-closed schema test and is not a public support window.
+Task Graph schema 1 is independently migrated with:
+
+```bash
+yh task-migrate \
+  /absolute/path/tasks.db \
+  /absolute/path/tasks-v1.rollback.db
+```
+
+All Task Coordinator writers must be stopped. The migration validates and
+fingerprints every bounded Graph, creates a no-clobber backup, retains every
+lifecycle, lease, message, and artifact, and converts historical Graphs to
+explicitly unscoped schema-2 aggregates. It never infers tenant ownership.
+The earlier unreleased table without a version column is accepted as the same
+schema-1 source shape. See the
+[Task migration runbook](task-migration.md).
 
 The first durable schema change must ship with:
 
@@ -592,7 +613,9 @@ minor release when doing so does not preserve a security defect. Protocol and
 durable schema support windows are declared per release. State schema 12 reads
 immutable schema-1 through schema-11 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
-reads schema 1 and schema 2.
+reads schema 1 and schema 2. Task coordination reads only schema 2 in normal
+operation; `task-migrate` alone reads schema 1 and the earlier unversioned
+development layout.
 
 The MSRV is Rust 1.88.0 and is enforced in CI. Platform support is proven only
 where the exact release commit has green jobs; configuration alone is not

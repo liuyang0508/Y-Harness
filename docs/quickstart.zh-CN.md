@@ -62,7 +62,7 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v21 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v22 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -88,9 +88,9 @@ my-harness/
 默认配置使用本地演示模型。`doctor` 验证配置版本、模型构造、凭据、
 Provider 权限和数据目录边界，但不会打开或创建数据库。
 
-## 4. 运行 Protocol v21 服务
+## 4. 运行 Protocol v22 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v21 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v22 帧：
 
 ```bash
 yh serve y-harness.json
@@ -101,7 +101,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"21","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"22","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 
@@ -116,6 +116,14 @@ printf '%s\n' \
 
 三个 SQLite 权威库均使用 WAL、`synchronous=FULL` 和精确 schema
 校验。服务重启后 Thread 与 Task Graph 仍可恢复。
+
+从旧版 Task Graph schema 1 升级时，先停止所有服务并执行：
+
+```bash
+yh task-migrate .y-harness/tasks.db .y-harness/tasks-v1.rollback.db
+```
+
+迁移不会猜测历史 Graph 的租户；它们会保留为显式非租户数据。
 
 终态 Thread 可以在项目之间迁移，文件只承担传输，State Engine 仍是
 唯一语义权威：

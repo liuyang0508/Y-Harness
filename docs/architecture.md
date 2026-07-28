@@ -298,12 +298,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v21 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v22 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 21
-  adds schema-3 Approval tenant fencing while tenant-scoped Task surfaces
-  remain fail-closed, protocol 20 adds authoritative schema-12
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 22
+  adds schema-2 durable Task Graph tenant ownership and the tenant-scoped
+  worker lifecycle, protocol 21 adds schema-3 Approval tenant fencing, and
+  protocol 20 adds authoritative schema-12
   Thread/Operation tenant fencing, protocol 19
   adds permissioned exact-Turn recovery takeover without automatic replay,
   protocol 18 adds bounded per-Turn Context and schema-11 attribution, protocol 17
@@ -344,7 +345,7 @@ direction:
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v21, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v22, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;

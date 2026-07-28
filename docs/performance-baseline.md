@@ -192,7 +192,7 @@ The manual ignored test constructs the maximum supported 256 schema-1 records
 for one Turn, excluding fixture construction from the timer. The 133,038,080
 record bytes exercise preflight validation, a no-clobber compact SQLite backup,
 SHA-256 manifest and full indexed-row fingerprints, source revalidation, and
-the bounded transactional schema-2 rewrite.
+the bounded transactional schema-3 rewrite.
 
 ```bash
 cargo test --release --locked --all-features --lib \
@@ -202,8 +202,29 @@ cargo test --release --locked --all-features --lib \
 
 | Historical records | Record bytes | Schema path | Elapsed |
 |---:|---:|---:|---:|
-| 256 | 133,038,080 bytes | Approval Inbox 1 → 2 | 844.781 ms |
+| 256 | 133,038,080 bytes | Approval Inbox 1 → 3 | 996.619 ms |
 
 This single local sample was measured on the reference environment on
-2026-07-25. It proves bounded completion at the supported fixture size; it is
+2026-07-29. It proves bounded completion at the supported fixture size; it is
 not a stable latency SLA.
+
+## Task Graph schema migration workload
+
+The manual ignored test constructs one near-limit schema-1 Graph containing
+1,000 Tasks with maximum-size descriptions. Fixture construction is excluded
+from the timer. The timed operation validates the complete Graph, creates and
+verifies a no-clobber SHA-256-bound SQLite backup, revalidates the source, and
+atomically writes the schema-2 tenant envelope and partitioned key.
+
+```bash
+cargo test --release --locked -p y-harness \
+  orchestration::migration::tests::migrates_a_near_limit_task_graph_fixture \
+  --all-features -- --ignored --nocapture
+```
+
+| Historical Graphs | Tasks | Schema path | Elapsed |
+|---:|---:|---:|---:|
+| 1 | 1,000 | Task Graph 1 → 2 | 1,199.172 ms |
+
+This single local sample was measured on the reference environment on
+2026-07-29. It is bounded migration evidence, not a stable latency SLA.

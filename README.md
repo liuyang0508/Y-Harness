@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v21 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v22 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v21 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v22 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -189,7 +189,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v21 specification](docs/protocol.md).
+[client protocol v22 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -452,11 +452,11 @@ blocks; all other Context remains user-level reference data. See
 
 State schema 12 makes optional Thread tenant ownership authoritative at
 creation. Memory and SQLite stores fence every Thread/Turn read and mutation by
-exact trusted tenant, and Protocol v21 applies the same boundary to retained
+exact trusted tenant, and Protocol v20 applies the same boundary to retained
 Operations. Forks inherit the caller tenant; archive imports rebind a new
 target to the importing tenant. Legacy Threads migrate as unscoped rather than
-receiving inferred ownership. Tenant-scoped Task protocol surfaces remain
-fail-closed pending its own durable schema. See
+receiving inferred ownership. Task ownership is independently bound by Task
+Graph schema 2 rather than inferred from a Thread. See
 [ADR 0117](docs/adr/0117-durable-thread-tenant-ownership.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
@@ -519,6 +519,22 @@ become explicitly unscoped. See the
 Interrupted-Turn recovery keeps durable orphaning atomic without bulk-loading
 every approval body: SQLite selects a bounded identity set, then validates and
 updates one record at a time inside the same immediate transaction.
+
+Task Graph schema 2 binds the complete Graph aggregate—including leases,
+messages, and Artifacts—to the trusted optional tenant. Tenant is part of the
+Memory/SQLite Graph key, so the same caller-selected Graph ID may exist in
+different tenant namespaces. Every protocol lifecycle operation uses exact
+tenant equality. Existing schema-1 databases require an offline,
+backup-first migration; historical Graphs remain explicitly unscoped:
+
+```bash
+yh task-migrate \
+  /absolute/path/tasks.db \
+  /absolute/path/tasks-v1.rollback.db
+```
+
+See the [Task migration runbook](docs/task-migration.md) and
+[ADR 0119](docs/adr/0119-durable-task-graph-tenant-ownership.md).
 
 Completion verifiers are registered through a typed, collision-safe registry.
 All must pass before an assistant candidate completes the Turn. Retryable
@@ -667,11 +683,12 @@ network authority. See
 Task Graphs also own a conservative 64 MiB materialization charge shared with
 the Coordinator. Construction and deserialization establish it; Task status
 and message mutations update it incrementally before commit. Current and
-remaining capacity are inspectable, while the persisted v1 JSON shape stays
-unchanged and the Coordinator still performs an exact final encoding check.
+remaining capacity are inspectable. Schema 2 wraps the persisted Graph in an
+immutable optional tenant envelope and duplicates that owner in the SQLite
+lookup key; reads validate both representations before returning data.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v21 preserves Protocol v20's 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v22 preserves Protocol v21's 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
@@ -685,7 +702,9 @@ schema; Protocol 17 admitted import provenance, and Protocol 18 adds optional
 bounded `start_turn.context`. Protocol 19 adds explicit permissioned recovery
 of one exact abandoned Turn without automatic replay. Protocol 20 adds exact
 Thread and Operation tenant fencing. Protocol 21 adds schema-3 durable
-Approval tenant ownership and tenant-scoped Approval capabilities. Steering
+Approval tenant ownership and tenant-scoped Approval capabilities. Protocol
+22 adds schema-2 durable Task Graph ownership, tenant-partitioned Graph
+identity, and the complete tenant-scoped worker lifecycle. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -779,7 +798,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v21. The Sessions panel shows direct fork ancestry from
+through Protocol v22. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

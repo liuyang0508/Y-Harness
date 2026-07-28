@@ -1,10 +1,10 @@
-# Client protocol v21
+# Client protocol v22
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"21"` is exact. Every request carries that value, and a peer
+Protocol version `"22"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "21",
+  "protocol_version": "22",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "21",
+  "protocol_version": "22",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "21",
+  "protocol_version": "22",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "21",
+  "protocol_version": "22",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "21",
+  "protocol_version": "22",
   "body": {
     "status": "success",
     "result": {
@@ -137,7 +137,7 @@ The result type is `initialized`:
         "state_event_schema": 12,
         "state_snapshot_schema": 12,
         "approval_inbox_schema": 3,
-        "task_graph_schema": 1,
+        "task_graph_schema": 2,
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
@@ -157,12 +157,10 @@ configured; Task permissions appear only when a durable Task Coordinator is
 configured. A client must not infer a permission from a compatibility
 coordinate.
 
-For a tenant-scoped authority, Approval permissions are available when the
-durable Approval Inbox is configured. List, get, and settlement are fenced by
-the exact transport-resolved tenant; commands contain no tenant selector. Task
-permissions remain omitted because Task Graph schema 1 does not yet bind
-tenant ownership, and tenant-scoped Task commands fail closed before resource
-access.
+For a tenant-scoped authority, Approval and Task permissions are available
+when their durable stores are configured. Approval list/get/settlement and
+the complete Task Graph/worker lifecycle are fenced by the exact
+transport-resolved tenant; commands contain no tenant selector.
 
 ## Methods
 
@@ -469,6 +467,7 @@ durable. `get_task_graph` returns either `null` or bounded metadata:
   "type": "task_graph",
   "graph": {
     "graph_id": "build-42",
+    "tenant_id": "tenant-a",
     "revision": 7,
     "task_count": 2,
     "terminal": true,
@@ -477,6 +476,13 @@ durable. `get_task_graph` returns either `null` or bounded metadata:
   }
 }
 ```
+
+`tenant_id` is present only for a tenant-owned Graph. It is bound at creation
+from trusted transport authority. Exact tenant equality applies to Graph
+administration, claims, leases, settlement, and messages. An unscoped caller
+sees only unscoped Graphs; a different tenant observes `null` or the same
+nonexistence error used for a missing Graph. Graph IDs form a namespace per
+tenant.
 
 `get_task_records` returns identity-ordered records, an optional
 `next_after_task_id`, and `has_more`. Its cursor is exclusive. Every record
@@ -586,8 +592,8 @@ host:
   `exhausted`;
 - an Approval record carries
   `{schema_version, request, tenant_id?, status, revision, requested_at_ms, settled_at_ms}`.
-- a Task Graph summary carries revision, count, terminal state, and bounded
-  materialization accounting;
+- a Task Graph summary carries optional immutable tenant, revision, count,
+  terminal state, and bounded materialization accounting;
 - a Task claim carries the immutable Task definition and current fenced lease;
 - a Task message carries graph-local sequence, sender, recipient, body, and
   server-clock creation time.
@@ -804,7 +810,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v21 value |
+| Boundary | Protocol v22 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -837,7 +843,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"20"` |
+| `unsupported_version` | Request protocol is not exactly `"22"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -863,9 +869,11 @@ Thread-name evidence, schema-7 Tool-call batch evidence, schema-6
 Steering evidence, schema-5 Provider Continuation evidence, schema-4
 Tool-origin evidence, all method tags, and their permission mapping. Turn
 integration tests prove exact-ID durable steering acceptance. Task integration
-tests prove conditional discovery, bounded cursor
-paging, principal-derived ownership, cross-principal fencing, server-clock
-heartbeat, messaging, terminal recovery, and explicit-revision cancellation.
+tests prove conditional discovery, exact-tenant namespace/fencing, bounded
+cursor paging, principal-derived worker ownership, cross-principal lease
+fencing, server-clock heartbeat, messaging, terminal recovery, and
+explicit-revision cancellation. Coordinator tests additionally prove
+schema-1 migration, reopen behavior, and tenant-projection drift rejection.
 Process tests additionally prove stdout purity, one response per request,
 and asynchronous Turn control. The independent `y-harness-tui` package has
 TestBackend rendering tests and a real-PTY smoke gate against `yh serve-demo`;

@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v21 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v22 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -50,12 +50,14 @@ new target to the importing tenant.
 Protocol 19 adds permissioned recovery of one exact abandoned Turn without
 automatic replay. The embedded Runtime also carries a validated per-Turn
 Authority Context from a trusted host or protocol authorizer into Memory scope,
-Policy, and Tool execution. Protocol 21 applies the same trusted tenant to
+Policy, and Tool execution. Protocol 20 applies the same trusted tenant to
 Thread, Turn, recovery, handoff, archive, and retained Operation access.
 Approval Inbox schema 3 and Protocol 21 additionally bind Approval records,
 discovery, and settlement to that tenant while preserving independent-actor
-settlement. Tenant-scoped Task capabilities remain hidden and fail closed
-until Task Graphs bind ownership.
+settlement. Task Graph schema 2 and Protocol 22 bind the complete Graph,
+worker lease, and mailbox lifecycle to that same trusted tenant, while
+partitioning caller-selected Graph IDs by tenant. Historical schema-1 Graphs
+migrate as explicitly unscoped.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the
