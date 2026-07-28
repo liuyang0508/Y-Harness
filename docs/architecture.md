@@ -145,7 +145,7 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-11 writer, and no mutation of authoritative history or
+  current schema-12 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
 - optional 1–64-block per-Turn reference Context with pre-State count/byte/
   identity validation, fixed non-authoritative labeling, provider-specific
@@ -217,6 +217,10 @@ direction:
 - schema-11 attributed invocation Context with ephemeral bodies, ordered
   source/reference provenance, independent byte/token bounds, and no mutation
   of conversation or branch authority;
+- schema-12 authoritative optional Thread tenant ownership with exact
+  Thread/Turn/Operation fencing, validated disposable Memory/SQLite lookup
+  projections, unscoped legacy migration, inherited fork ownership, and
+  importing-tenant archive rebind;
 - content-free bounded Thread summaries that project the same direct lineage
   for Protocol clients without loading full histories or creating a second
   branch authority;
@@ -290,11 +294,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v19 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v20 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol
-  19 adds permissioned exact-Turn recovery takeover without automatic replay,
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 20
+  adds authoritative schema-12 Thread/Operation tenant fencing while
+  tenant-scoped Approval and Task surfaces remain fail-closed, protocol 19
+  adds permissioned exact-Turn recovery takeover without automatic replay,
   protocol 18 adds bounded per-Turn Context and schema-11 attribution, protocol 17
   admits schema-10 Thread import provenance, protocol 16 adds direct lineage
   to bounded content-free Thread summaries, while
@@ -321,8 +327,9 @@ direction:
   default;
 - a validated per-Turn Authority Context resolved by the existing protocol
   authorizer, with panic-isolated fail-closed mapping, trusted tenant-to-Memory
-  scope binding, and the same actor/tenant authority passed to Policy and Tool
-  execution without caller-authored identity fields;
+  scope binding, durable Thread/Operation tenant ownership, and the same
+  actor/tenant authority passed to State, Policy, and Tool execution without
+  caller-authored identity fields;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service and isolated configured
   Evaluation commands, explicitly launched shell-free JSON Models, Tools,
@@ -332,7 +339,8 @@ direction:
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v19, with bounded recent-Thread navigation, authoritative Thread projection,
+  v20, with bounded tenant-fenced recent-Thread navigation, authoritative
+  Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded

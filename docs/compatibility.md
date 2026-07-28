@@ -11,15 +11,16 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"19"` | exact `Initialize` request/response |
-| State events | `11` | per-event durable envelope; reads schemas 1 through 11 |
-| State snapshots | `11` | cache body; incompatible caches are discarded |
+| Client protocol | `"20"` | exact `Initialize` request/response |
+| State events | `12` | per-event durable envelope; reads schemas 1 through 12 |
+| State snapshots | `12` | cache body; incompatible caches are discarded |
 | Approval Inbox | `2` | per-record durable body after explicit migration |
 | Task Coordinator | `1` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
 | Thread handoff request format | `1` | canonical bounded summarizer-input envelope |
+| Thread archive format | `2` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `1` | exact descriptor registration |
@@ -133,6 +134,18 @@ caller-authored identity field, State event, Approval record, Client Protocol,
 or service configuration coordinate changes. Tenant-scoped approvals fail
 closed until a later durable schema binds their tenant evidence. See
 [ADR 0116](adr/0116-trusted-turn-authority-context.md).
+State schema 12 now binds optional tenant ownership to the authoritative
+Thread creation event, Protocol v20 fences Thread and Operation access by the
+resolved authority, and Thread archive format 2 preserves the new projection.
+Legacy Threads migrate as unscoped rather than receiving guessed ownership.
+Approval and Task protocol surfaces still fail closed for tenant-scoped
+authorities until their own durable schemas advance. See
+[ADR 0117](adr/0117-durable-thread-tenant-ownership.md).
+The Rust pre-1.0 API adds tenant-aware State/Runtime methods and
+`EventStore::thread_accessible`; custom stores that override
+`thread_summaries_page` must accept the tenant filter. `Thread` construction
+now keeps ownership engine-controlled and exposes it through `tenant_id()`,
+so external direct struct literals require a source update.
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an
@@ -185,6 +198,16 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `20` preserves protocol-v19 commands, framing, paging,
+authorization, and recovery semantics. It advances advertised State
+coordinates to schema 12 and carries optional tenant ownership on Thread,
+Thread-summary, and `thread_created` projections. Every Thread and retained
+Operation access is fenced by the trusted authority's exact tenant; Protocol
+requests contain no tenant selector. Tenant-scoped sessions omit Approval and
+Task capabilities and reject those commands until their durable stores gain
+tenant ownership. Protocol-v19 clients must fail exact initialization rather
+than silently discard ownership evidence.
 
 Client protocol `19` preserves protocol-v18 framing, paging, State schema-11
 projections, and Model-gateway API 7 coordinates. It adds the explicitly
@@ -310,6 +333,13 @@ Client protocol `3` added exact recovery-byte fields to the protocol-v2
 Thread-capacity result. Protocol versions remain exact rather than rolling
 field negotiation.
 
+State event schema `12` adds optional tenant ownership to the authoritative
+`thread_created` event. SQLite persists a nullable same-transaction
+`streams.tenant_id` lookup projection and validates it against the journal on
+open. Exact tenant equality gates State reads and mutations. Schema-12 readers
+accept immutable schema-1 through schema-11 history after explicit migration,
+and the schema-12 writer emits only schema 12.
+
 State event schema `11` adds `invocation_context`, a content-free Item carrying
 the authenticated Turn actor plus 1–64 ordered source/reference pairs, exact
 source/model-visible SHA-256 values, and bounded byte/token charges. The body
@@ -373,6 +403,8 @@ State event schema `2` added content-free `conversation_summary` evidence. Its
 body remains ephemeral Context; original conversation Items remain immutable
 schema-1 or schema-2 events.
 
+State snapshot schema `12` admits authoritative Thread tenant ownership.
+State snapshot schema `11` admits invocation-context evidence.
 State snapshot schema `10` admits immutable Thread import provenance. Older
 snapshots are disposable and are ignored. State snapshot schema `9` admits
 fork provenance, while schema `8` admits Thread names. State snapshot schema
@@ -441,30 +473,31 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1 through 10 are supported migration sources. Populated SQLite
+State schemas 1 through 11 are supported migration sources. Populated SQLite
 stores at any of those coordinates require the explicit backup-first command
-below before a schema-11 Runtime can open them:
+below before a schema-12 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v11.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v12.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
 disk space, creates and validates a no-clobber SQLite backup, conditionally
-adds the nullable Thread-name projection for pre-v8 sources, drops disposable
+adds the nullable Thread-name projection for pre-v8 sources, adds the nullable
+Thread-tenant projection without inferring legacy ownership, drops disposable
 old snapshots, and advances
 event/snapshot writer metadata in one immediate transaction. Historical event
 JSON and schema labels are never rewritten. An interrupted schema-1 through
-schema-10 run can reuse its validated backup.
+schema-11 run can reuse its validated backup.
 
-The schema-11 reader/new writer decision is asymmetric:
+The schema-12 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1 through schema-10 events remain readable;
-- old reader + new writer: unsupported and fails on schema-11 metadata or
+  schema-1 through schema-11 events remain readable;
+- old reader + new writer: unsupported and fails on schema-12 metadata or
   events;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-11 event
+- downgrade: supported only by restoring the backup before any schema-12 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -498,7 +531,9 @@ Protocol-16 lineage-aware summary projection, plus
 [ADR 0095](adr/0095-portable-integrity-bound-thread-archives.md) for schema-10
 portable Thread archives and import provenance, plus
 [ADR 0096](adr/0096-attributed-per-turn-context.md) for schema-11 attributed
-per-Turn context.
+per-Turn context, plus
+[ADR 0117](adr/0117-durable-thread-tenant-ownership.md) for schema-12 Thread
+tenant ownership, Protocol v20 fencing, and archive format 2.
 
 Approval Inbox schema 1 is independently migrated with:
 
@@ -543,8 +578,8 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 11 reads
-immutable schema-1 through schema-10 history after explicit store migration.
+durable schema support windows are declared per release. State schema 12 reads
+immutable schema-1 through schema-11 history after explicit store migration.
 Approval reads only schema 2 in normal operation; its migration tool alone
 reads schema 1.
 

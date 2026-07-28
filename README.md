@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v19 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v20 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v19 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v20 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -189,7 +189,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v19 specification](docs/protocol.md).
+[client protocol v20 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -347,16 +347,16 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-11 writer
+introduced bounded content-free evidence, and the current schema-12 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1 through schema-10 SQLite
+Populated schema-1 through schema-11 SQLite
 databases require an offline, backup-first migration before the current
 Runtime opens them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v11.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v12.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -434,7 +434,9 @@ yh thread import <archive> <target-thread-id> [config]
 ```
 
 Export never overwrites its destination, import rejects altered or oversized
-archives before mutation, and a running Turn is not exportable. See
+archives before mutation, and a running Turn is not exportable. The current
+archive root is format 2 so older readers cannot silently discard schema-12
+tenant ownership. See
 [ADR 0095](docs/adr/0095-portable-integrity-bound-thread-archives.md).
 
 State schema 11 adds optional per-Turn reference Context without adding another
@@ -447,6 +449,15 @@ byte/token charges. The body is ephemeral and never becomes a user/assistant
 Item. Direct OpenAI requests reserve provider `instructions` for verified Skill
 blocks; all other Context remains user-level reference data. See
 [ADR 0096](docs/adr/0096-attributed-per-turn-context.md).
+
+State schema 12 makes optional Thread tenant ownership authoritative at
+creation. Memory and SQLite stores fence every Thread/Turn read and mutation by
+exact trusted tenant, and Protocol v20 applies the same boundary to retained
+Operations. Forks inherit the caller tenant; archive imports rebind a new
+target to the importing tenant. Legacy Threads migrate as unscoped rather than
+receiving inferred ownership. Tenant-scoped Approval and Task protocol
+surfaces remain fail-closed pending their own durable schemas. See
+[ADR 0117](docs/adr/0117-durable-thread-tenant-ownership.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
 longest identical Turn prefix and selects a bounded newest source-only delta.
@@ -650,18 +661,20 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v19 preserves Protocol v18's 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v20 preserves Protocol v19's 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
 schema-6 durable safe-boundary Turn steering, schema-7 atomic ordered
 Tool-call batches, schema-8 Engine-owned Thread names, and schema-9 atomic
 Thread forks with immutable direct lineage, schema-10 integrity-bound Thread
-import provenance, and schema-11 attributed invocation Context. Protocol 16
+import provenance, schema-11 attributed invocation Context, and schema-12
+durable Thread tenant ownership. Protocol 16
 added lineage to bounded content-free Thread summaries without changing State
 schema; Protocol 17 admitted import provenance, and Protocol 18 adds optional
 bounded `start_turn.context`. Protocol 19 adds explicit permissioned recovery
-of one exact abandoned Turn without automatic replay. Steering requires the exact
+of one exact abandoned Turn without automatic replay. Protocol 20 adds exact
+Thread and Operation tenant fencing. Steering requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
@@ -754,7 +767,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v19. The Sessions panel shows direct fork ancestry from
+through Protocol v20. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

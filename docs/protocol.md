@@ -1,10 +1,10 @@
-# Client protocol v19
+# Client protocol v20
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"19"` is exact. Every request carries that value, and a peer
+Protocol version `"20"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "19",
+  "protocol_version": "20",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "19",
+  "protocol_version": "20",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "19",
+  "protocol_version": "20",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "19",
+  "protocol_version": "20",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "19",
+  "protocol_version": "20",
   "body": {
     "status": "success",
     "result": {
@@ -134,8 +134,8 @@ The result type is `initialized`:
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 11,
-        "state_snapshot_schema": 11,
+        "state_event_schema": 12,
+        "state_snapshot_schema": 12,
         "approval_inbox_schema": 2,
         "task_graph_schema": 1,
         "memory_api": 1,
@@ -156,6 +156,11 @@ principal. Approval permissions appear only when a durable Approval Inbox is
 configured; Task permissions appear only when a durable Task Coordinator is
 configured. A client must not infer a permission from a compatibility
 coordinate.
+
+For a tenant-scoped authority, Approval and Task permissions are omitted even
+when those services are configured. Their current durable schemas do not bind
+tenant ownership, so the corresponding commands fail closed until those
+schemas advance.
 
 ## Methods
 
@@ -206,11 +211,12 @@ than `before_sequence`.
 ```
 
 For the trusted local-process boundary, `tenant_id` remains an explicit
-embedding-host scope. For an authenticated remote principal, the protocol
-authorizer must resolve the trusted tenant: Runtime injects an omitted matching
-tenant, rejects a mismatch, and rejects tenant selection by an unscoped
-authenticated actor before creating Turn State. This is Memory-scope binding,
-not evidence that Thread or other durable resources are tenant-partitioned.
+embedding-host Memory scope. For an authenticated remote principal, the
+protocol authorizer resolves the trusted tenant: Runtime injects an omitted
+matching tenant, rejects a mismatch, and rejects tenant selection by an
+unscoped authenticated actor before creating Turn State. The request cannot
+select Thread ownership; every Thread and retained Operation is independently
+fenced by the authority resolved from the transport.
 
 `prompt` must contain 1–1,048,576 UTF-8 bytes after rejecting all-whitespace
 input. `timeout_ms`, when present, must be greater than zero and fit the host
@@ -351,6 +357,7 @@ newest first:
   "type": "threads",
   "threads": [{
     "thread_id": "thread-...",
+    "tenant_id": "tenant-a",
     "name": "Harness design",
     "lineage": {
       "parent_thread_id": "thread-parent",
@@ -375,6 +382,9 @@ the first page when refreshing. Summaries contain no message content. Protocol
 projections, allowing a client to build a forest from the bounded page without
 loading full histories. A root Thread omits it; an ancestor outside the current
 page remains an opaque parent identity. Summaries do not replace `get_thread`.
+`tenant_id` is present only for a tenant-owned Thread. Listing returns exact
+tenant matches; unscoped sessions see only legacy or explicitly unscoped
+Threads.
 
 `start_turn` returns immediately with a process-local `operation_id`. It does
 not return the terminal Turn:
@@ -404,6 +414,10 @@ service restart. Thread events are authoritative: after reconnect or restart,
 a client reconciles with `get_thread` and `get_events`. Recovery marks
 unfinished work interrupted and never generically replays an uncertain Tool
 effect.
+
+Retained Operations carry the tenant that started them. Poll, stream, cancel,
+and forget require exact tenant equality. A different tenant observes the
+Operation as absent.
 
 If `get_operation_events` returns
 `{"type":"step_invalidated","model_step":N}`, clients must discard provisional
@@ -757,6 +771,22 @@ Model Context block carries `source.type = "invocation"` so gateways keep it
 at ordinary caller/evidence authority rather than treating it as Skill
 instructions.
 
+State event schema 12 adds durable optional tenant ownership to Thread
+creation:
+
+```json
+{
+  "type": "thread_created",
+  "created_at_ms": 1785081600000,
+  "tenant_id": "tenant-a"
+}
+```
+
+The field is absent for an unscoped Thread. It is derived from the trusted
+authority, never from a command field. Forks inherit the caller tenant; an
+archive import binds the new target to the importing tenant. SQLite's nullable
+tenant column is only a validated lookup projection of this event.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -771,7 +801,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v19 value |
+| Boundary | Protocol v20 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -804,7 +834,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"19"` |
+| `unsupported_version` | Request protocol is not exactly `"20"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -823,7 +853,8 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-11 invocation-context evidence, schema-10 Thread-import evidence,
+schema-12 Thread-tenant evidence, schema-11 invocation-context evidence,
+schema-10 Thread-import evidence,
 schema-9 Thread-fork evidence, schema-8
 Thread-name evidence, schema-7 Tool-call batch evidence, schema-6
 Steering evidence, schema-5 Provider Continuation evidence, schema-4

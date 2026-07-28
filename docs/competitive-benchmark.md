@@ -282,7 +282,7 @@ in-place Turn continuation or a descendant-containment proof.
 
 A format-9 Y-Harness driver now executes the same restart boundary through
 real `yh serve` processes, a configured deterministic JSON-command Model,
-stdio MCP, SQLite, protocol-v19 exact-Turn takeover, and a new Tool-free Turn.
+stdio MCP, SQLite, protocol-v20 exact-Turn takeover, and a new Tool-free Turn.
 Restart first preserves the abandoned Turn as `running`, proving recovery was
 not implicit; explicit recovery marks that exact Turn `interrupted`, and the
 oracle remains one invocation/one effect. All three observations remain

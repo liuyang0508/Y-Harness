@@ -176,7 +176,7 @@ service before a Tool result can settle.
 
 The restarted service must first observe the same Turn still `running`; this
 proves restart did not perform unsafe implicit takeover. The controller then
-sends protocol-v19 `recover_thread` with the exact abandoned Turn identity.
+sends protocol-v20 `recover_thread` with the exact abandoned Turn identity.
 The same Turn must become `interrupted` with one Tool call and zero Tool
 results. A separate new Turn must complete with the fixed assistant message
 and no Tool. Fixture inspections after interruption and after the new Turn

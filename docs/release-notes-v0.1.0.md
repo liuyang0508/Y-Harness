@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v19 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v20 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -42,11 +42,18 @@ attribution, source/body SHA-256 provenance, content-free State evidence, and
 no synthetic conversation or branch authority. Direct OpenAI maps only
 digest-pinned Skill Context to provider instructions; other Context remains
 user-level reference data.
+Schema 12 adds durable optional Thread tenant ownership with validated
+Memory/SQLite projections and exact State access fencing. Schema-1 through
+schema-11 Threads migrate as unscoped rather than receiving inferred
+ownership. Forks inherit the trusted tenant; format-2 archive imports rebind a
+new target to the importing tenant.
 Protocol 19 adds permissioned recovery of one exact abandoned Turn without
 automatic replay. The embedded Runtime also carries a validated per-Turn
 Authority Context from a trusted host or protocol authorizer into Memory scope,
-Policy, and Tool execution. Durable tenant ownership is not claimed, and
-tenant-scoped approvals fail closed until a later schema binds tenant evidence.
+Policy, and Tool execution. Protocol 20 applies the same trusted tenant to
+Thread, Turn, recovery, handoff, archive, and retained Operation access.
+Tenant-scoped Approval and Task capabilities remain hidden and fail closed
+until their own durable schemas bind ownership.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the

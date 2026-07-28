@@ -5,7 +5,7 @@ claim.
 
 ## Reference environment
 
-- Date: 2026-07-28
+- Dates: 2026-07-28 through 2026-07-29
 - CPU: Apple M4 Pro (`arm64`)
 - OS: macOS 15.7.3
 - Rust: 1.88.0 (`aarch64-apple-darwin`)
@@ -50,17 +50,19 @@ cargo run --release --bin yh-state-bench
 | 1,000 | signed-External-Skill release recheck, 5 samples | 83.025 ms | 12,045 | 2.905 ms | 5.663 ms | 2.558 ms |
 | 1,000 | authenticated-HTTPS-MCP release recheck, 5 samples | 81.167 ms | 12,320 | 2.984 ms | 5.787 ms | 2.450 ms |
 | 1,000 | configured-command-Model release recheck, 5 samples | 71.841 ms | 13,920 | 2.957 ms | 6.073 ms | 2.454 ms |
+| 1,000 | schema-12 tenant-ownership recheck, 5 samples | 93.103 ms | 10,741 | 2.711 ms | 5.500 ms | 2.410 ms |
 
-At 1,000 events the current path reduced append time by about 85.8% and
-increased throughput by about 7.0×. Full projection remains linear and is still
+At 1,000 events the current path reduced append time by about 83.8% and
+increased throughput by about 6.2×. Full projection remains linear and is still
 performed for authoritative reads and recovery.
 
 The recent safety rows include one additional transactional recovery-accounting
-update per append and validate State through byte-bounded pages. The last seven
-rows recheck the same schema-11 State path after adding attributed per-Turn
-Context evidence; their spread is retained as reference-host variance. They
-remain inside the existing local regression thresholds; historical rows are
-retained to make safety costs and machine variance visible.
+update per append and validate State through byte-bounded pages. Seven rows
+recheck the schema-11 State path after adding attributed per-Turn Context
+evidence. The latest schema-12 row adds one exact indexed tenant-ownership
+check to each protected write. Their spread is retained as reference-host
+variance. They remain inside the existing local regression thresholds;
+historical rows are retained to make safety costs and machine variance visible.
 
 ## Atomic Thread fork workload
 
@@ -80,6 +82,7 @@ stream revalidation, and child projection. It does not replay Tool effects.
 | 2026-07-28 (signed External Skill recheck) | 1,000 | 5 | 9.811 ms |
 | 2026-07-28 (authenticated HTTPS MCP recheck) | 1,000 | 5 | 9.636 ms |
 | 2026-07-28 (configured command Model recheck) | 1,000 | 5 | 11.116 ms |
+| 2026-07-29 (schema 12 tenant ownership) | 1,000 | 5 | 9.175 ms |
 
 This is a local regression baseline, not a claim against another Harness or a
 production latency SLA.
@@ -104,6 +107,7 @@ not include filesystem transfer or JSON file encoding.
 | 2026-07-28 (signed External Skill recheck) | 1,000 | 5 | 4.842 ms | 7.450 ms |
 | 2026-07-28 (authenticated HTTPS MCP recheck) | 1,000 | 5 | 4.723 ms | 7.487 ms |
 | 2026-07-28 (configured command Model recheck) | 1,000 | 5 | 4.858 ms | 8.080 ms |
+| 2026-07-29 (schema 12 tenant ownership) | 1,000 | 5 | 4.462 ms | 7.575 ms |
 
 This is a local regression baseline, not a cross-product claim or SLA.
 
@@ -126,6 +130,7 @@ content-free direct lineage.
 | 2026-07-28 (signed External Skill recheck) | 64 | 1,000 | 5 | 0.282 ms |
 | 2026-07-28 (authenticated HTTPS MCP recheck) | 64 | 1,000 | 5 | 0.271 ms |
 | 2026-07-28 (configured command Model recheck) | 64 | 1,000 | 5 | 0.288 ms |
+| 2026-07-29 (schema 12 tenant ownership) | 64 | 1,000 | 5 | 0.278 ms |
 
 The page is deliberately finite. This measurement does not claim recursive
 ancestor closure or full-history tree projection.
