@@ -62,8 +62,10 @@ cargo audit --deny warnings
 cargo package --locked -p y-harness
 ./scripts/install.sh --root /isolated/prefix
 ./scripts/install-tui.sh --root /isolated/tui-prefix
+cargo build --locked -p y-harness -p y-harness-tui
 python3 scripts/smoke-tui.py
 python3 scripts/smoke-tui.py --configured
+cargo build --locked --release -p y-harness -p y-harness-tui
 python3 scripts/smoke-tui.py --tui target/release/yh-tui --engine target/release/yh
 python3 scripts/smoke-tui.py --configured \
   --tui target/release/yh-tui --engine target/release/yh
@@ -81,10 +83,11 @@ no-default-feature workspace run contains 460 passing tests plus 4 ignored
 manual/environment fixtures. The demo and configured PTY
 smoke gates submit real Turns, create atomic child Threads, verify parent/child
 history plus durable lineage in State, and check alternate-screen and
-bracketed-paste restoration. One additional 64 MiB migration test and one
-126.9 MiB Approval Inbox
-migration test are deliberately manual.
-The 229-file package archive verifies from the current schema-12 candidate
+bracketed-paste restoration. The 64 MiB State migration, 126.9 MiB Approval
+Inbox migration, and near-limit 1,000-Task Graph migration tests are
+deliberately manual.
+The 235-file package archive verifies from the current
+State-12/Approval-3/Task-2/Secret-2/Protocol-23 candidate
 without Cargo's `--allow-dirty` escape hatch.
 Five integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:

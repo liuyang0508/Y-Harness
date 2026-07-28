@@ -12,7 +12,7 @@ not release-ready while any blocking row remains open.
 | Deterministic tests | 380 library, 11 CLI, 24 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 490 total plus 8 explicitly ignored manual/environment fixtures |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, 234-file / 3.2 MiB clean-room crate verification | passing locally with State-12, Approval-3, Task-2, and Protocol-22 coordinates |
+| Distribution package | `cargo package --locked -p y-harness`, 235-file / 3.2 MiB clean-room crate verification (708.9 KiB compressed) | passing locally with State-12, Approval-3, Task-2, Secret-2, and Protocol-23 coordinates |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 289 locked crates | passing |
 | State performance | schema-12 tenant-fenced 1,000 events plus 64-Thread lineage page, 5 samples, SQLite WAL + FULL | 93.103 ms append; 2.711 ms full projection; 9.175 ms atomic fork; 0.278 ms Thread list; 2.410 ms snapshot load |

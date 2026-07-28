@@ -184,6 +184,8 @@ cargo clippy --locked -p y-harness-tui --bin yh-tui -- \
   -D warnings
 cargo test --locked --workspace --all-targets --no-default-features
 cargo test --locked --workspace --all-targets --all-features
+cargo build --locked --bin yh -p y-harness
+cargo build --locked --bin yh-tui -p y-harness-tui
 python3 scripts/smoke-tui.py
 python3 scripts/smoke-tui.py --configured
 cargo run --locked -- eval-smoke
