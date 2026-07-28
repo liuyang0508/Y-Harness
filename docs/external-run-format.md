@@ -206,9 +206,10 @@ Agent-session lifecycle through terminal `agent_settled`. It permits repeated
 `agent_end` events because Pi can automatically retry a failed Model call.
 Turn count, terminal stop reason, reported assistant cost, and observed
 Provider/Model identity are taken only from completed assistant events. Pi
-does not expose distinct product/API durations, a hard monetary ceiling, or a
-built-in sandbox. Disabling Tools also means the adapter does not measure Pi's
-Harness loop effectiveness.
+reports the explicitly requested Provider separately from the combined
+requested Model coordinate. It does not expose distinct product/API durations,
+a hard monetary ceiling, or a built-in sandbox. Disabling Tools also means the
+adapter does not measure Pi's Harness loop effectiveness.
 
 The OpenCode adapter emits format 5 and fixes `claim_eligible: false`. `bare`
 requires an initially empty home, owns its XDG roots and empty authentication
@@ -302,8 +303,11 @@ product evidence.
 
 The Pi adapter is source- and contract-tested against official snapshot
 [`cee5ff7`](https://github.com/earendil-works/pi/tree/cee5ff7520d8828bed9955ef00419e995d1f91e0).
-No real Pi result is checked in yet, so it contributes no live product
-evidence.
+One real released-Pi fixed-output record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-pi-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-pi-fixed-output/).
+It used a deterministic loopback Provider and completed the released CLI's
+JSONL lifecycle. It remains non-comparative, `claim_eligible: false`
+adapter-conformance evidence.
 
 The OpenCode adapter is source- and contract-tested against official snapshot
 [`7534d23`](https://github.com/anomalyco/opencode/tree/7534d23551f665e65080809975b4ca5c7d63807b).

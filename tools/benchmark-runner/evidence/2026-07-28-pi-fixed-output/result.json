@@ -1,0 +1,463 @@
+{
+  "format_version": 4,
+  "adapter": {
+    "name": "pi-jsonl-v1",
+    "version": "0.1.0",
+    "product": "pi",
+    "cli_version": "0.82.1",
+    "adapter_executable_sha256": "4d18cab49047c656a1ada7b1b8a71671f06c7fa2d16b6b5a53376cddb11ced55",
+    "product_executable_sha256": "af302f231437eaf6f37691bce4b34234fcb626bcb5eb3910d4fc3f6519bf78ca"
+  },
+  "coordinate": {
+    "run_id": "pi-0821-deterministic-20260728-001",
+    "benchmark_version": "adapter-conformance-v1",
+    "case_id": "fixed-output",
+    "workspace_snapshot": "empty-workspace-20260728",
+    "started_at_ms": 1785201476181,
+    "host_os": "macos",
+    "host_arch": "aarch64"
+  },
+  "controls": {
+    "track": "adapter_conformance",
+    "claim_eligible": false,
+    "profile": "product",
+    "requested_provider": "yh-loopback",
+    "requested_model": "yh-loopback/local-deterministic",
+    "observed_models": [
+      "yh-loopback/local-deterministic"
+    ],
+    "prompt_sha256": "b91e12b6e19fb864a11b244a5e89f14834f618bd1ca0c784bee55aca2e0ae69b",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "tools": "disabled",
+    "permission_mode": "no_approve",
+    "process_isolation": {
+      "kind": "unrestricted"
+    },
+    "inherited_environment_names": [
+      "PATH",
+      "PI_CODING_AGENT_DIR"
+    ],
+    "timeout_ms": 30000,
+    "requested_max_budget_usd": null,
+    "requested_reasoning_effort": "off",
+    "unsupported_controls": [
+      "adapter conformance is not a Harness-effect or product-quality result",
+      "no cross-product model parity has been established",
+      "Tools are disabled, so Agent-loop effectiveness is not measured",
+      "Pi exposes no documented hard monetary spend ceiling",
+      "Pi provides no built-in product sandbox",
+      "Pi JSONL does not expose distinct product and API durations",
+      "workspace_snapshot is caller-asserted rather than adapter-verified",
+      "environment values, provider routing, and launcher dependencies are not recorded",
+      "ambient product configuration is not eliminated"
+    ]
+  },
+  "execution": {
+    "status": "completed",
+    "settlement": {
+      "exit_code": 0,
+      "wall_time_ms": 391,
+      "product_duration_ms": null,
+      "product_api_duration_ms": null,
+      "num_turns": 1,
+      "actual_cost_usd": 0.0,
+      "result_subtype": "stop",
+      "stdout_bytes": 5087,
+      "stdout_sha256": "7c545d1f5a04a392f587facf6a7003648d07aeb442a4ec614ebfed26dfb8879f",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_result": [
+        {
+          "cwd": "/private/tmp/yh-pi-run.EMswML/workspace",
+          "id": "019fa64c-c39b-73eb-a810-76b1020f33df",
+          "timestamp": "2026-07-28T01:17:56.507Z",
+          "type": "session",
+          "version": 3
+        },
+        {
+          "type": "agent_start"
+        },
+        {
+          "type": "turn_start"
+        },
+        {
+          "message": {
+            "content": [
+              {
+                "text": "Return exactly YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "role": "user",
+            "timestamp": 1785201476524
+          },
+          "type": "message_start"
+        },
+        {
+          "message": {
+            "content": [
+              {
+                "text": "Return exactly YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "role": "user",
+            "timestamp": 1785201476524
+          },
+          "type": "message_end"
+        },
+        {
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 0,
+              "output": 0,
+              "totalTokens": 0
+            }
+          },
+          "type": "message_start"
+        },
+        {
+          "assistantMessageEvent": {
+            "contentIndex": 0,
+            "partial": {
+              "api": "openai-completions",
+              "content": [
+                {
+                  "text": "YH-PI-ADAPTER-OK",
+                  "type": "text"
+                }
+              ],
+              "model": "local-deterministic",
+              "provider": "yh-loopback",
+              "responseId": "chatcmpl-yh-pi",
+              "role": "assistant",
+              "stopReason": "stop",
+              "timestamp": 1785201476550,
+              "usage": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                  "total": 0
+                },
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "totalTokens": 2
+              }
+            },
+            "type": "text_start"
+          },
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 1,
+              "output": 1,
+              "reasoning": 0,
+              "totalTokens": 2
+            }
+          },
+          "type": "message_update"
+        },
+        {
+          "assistantMessageEvent": {
+            "contentIndex": 0,
+            "delta": "YH-PI-ADAPTER-OK",
+            "partial": {
+              "api": "openai-completions",
+              "content": [
+                {
+                  "text": "YH-PI-ADAPTER-OK",
+                  "type": "text"
+                }
+              ],
+              "model": "local-deterministic",
+              "provider": "yh-loopback",
+              "responseId": "chatcmpl-yh-pi",
+              "role": "assistant",
+              "stopReason": "stop",
+              "timestamp": 1785201476550,
+              "usage": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                  "total": 0
+                },
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "totalTokens": 2
+              }
+            },
+            "type": "text_delta"
+          },
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 1,
+              "output": 1,
+              "reasoning": 0,
+              "totalTokens": 2
+            }
+          },
+          "type": "message_update"
+        },
+        {
+          "assistantMessageEvent": {
+            "content": "YH-PI-ADAPTER-OK",
+            "contentIndex": 0,
+            "partial": {
+              "api": "openai-completions",
+              "content": [
+                {
+                  "text": "YH-PI-ADAPTER-OK",
+                  "type": "text"
+                }
+              ],
+              "model": "local-deterministic",
+              "provider": "yh-loopback",
+              "responseId": "chatcmpl-yh-pi",
+              "role": "assistant",
+              "stopReason": "stop",
+              "timestamp": 1785201476550,
+              "usage": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                  "total": 0
+                },
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "totalTokens": 2
+              }
+            },
+            "type": "text_end"
+          },
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 1,
+              "output": 1,
+              "reasoning": 0,
+              "totalTokens": 2
+            }
+          },
+          "type": "message_update"
+        },
+        {
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 1,
+              "output": 1,
+              "reasoning": 0,
+              "totalTokens": 2
+            }
+          },
+          "type": "message_end"
+        },
+        {
+          "message": {
+            "api": "openai-completions",
+            "content": [
+              {
+                "text": "YH-PI-ADAPTER-OK",
+                "type": "text"
+              }
+            ],
+            "model": "local-deterministic",
+            "provider": "yh-loopback",
+            "responseId": "chatcmpl-yh-pi",
+            "role": "assistant",
+            "stopReason": "stop",
+            "timestamp": 1785201476550,
+            "usage": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "cost": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "input": 0,
+                "output": 0,
+                "total": 0
+              },
+              "input": 1,
+              "output": 1,
+              "reasoning": 0,
+              "totalTokens": 2
+            }
+          },
+          "toolResults": [],
+          "type": "turn_end"
+        },
+        {
+          "messages": [
+            {
+              "content": [
+                {
+                  "text": "Return exactly YH-PI-ADAPTER-OK",
+                  "type": "text"
+                }
+              ],
+              "role": "user",
+              "timestamp": 1785201476524
+            },
+            {
+              "api": "openai-completions",
+              "content": [
+                {
+                  "text": "YH-PI-ADAPTER-OK",
+                  "type": "text"
+                }
+              ],
+              "model": "local-deterministic",
+              "provider": "yh-loopback",
+              "responseId": "chatcmpl-yh-pi",
+              "role": "assistant",
+              "stopReason": "stop",
+              "timestamp": 1785201476550,
+              "usage": {
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "cost": {
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "input": 0,
+                  "output": 0,
+                  "total": 0
+                },
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "totalTokens": 2
+              }
+            }
+          ],
+          "type": "agent_end",
+          "willRetry": false
+        },
+        {
+          "type": "agent_settled"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "format_version": 4,
+  "run_id": "pi-0821-deterministic-20260728-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/tmp/yh-pi-0821.ETy9Tw/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+  "expected_cli_version": "0.82.1",
+  "expected_product_executable_sha256": "af302f231437eaf6f37691bce4b34234fcb626bcb5eb3910d4fc3f6519bf78ca",
+  "workspace": "/tmp/yh-pi-run.EMswML/workspace",
+  "workspace_snapshot": "empty-workspace-20260728",
+  "profile": "product",
+  "provider": "yh-loopback",
+  "model": "local-deterministic",
+  "thinking": "off",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-PI-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": ["PATH", "PI_CODING_AGENT_DIR"],
+  "pi_agent_dir": null
+}

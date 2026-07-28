@@ -312,7 +312,9 @@ retries may execute more than one Agent run. Turn count, reported assistant
 cost, stop reason, and observed provider/model identities come only from
 validated Pi events. Pi has no built-in sandbox or documented hard monetary
 ceiling, and Tools are disabled, so this remains adapter-conformance evidence.
-There is no checked-in live Pi result or comparative run.
+A real released-Pi deterministic fixed-output record is checked in under
+[`evidence/2026-07-28-pi-fixed-output`](evidence/2026-07-28-pi-fixed-output).
+It remains `claim_eligible: false`; there is no comparative Pi run.
 
 The OpenCode adapter consumes the released CLI's line-delimited run events:
 

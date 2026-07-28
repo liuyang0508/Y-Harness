@@ -1,0 +1,32 @@
+{
+  "providers": {
+    "yh-loopback": {
+      "baseUrl": "http://127.0.0.1:50391/v1",
+      "api": "openai-completions",
+      "apiKey": "fixture-token",
+      "models": [
+        {
+          "id": "local-deterministic",
+          "name": "Y-Harness deterministic fixture",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 8192,
+          "maxTokens": 256,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}
