@@ -1,0 +1,96 @@
+{
+  "format_version": 6,
+  "adapter": {
+    "name": "hermes-oneshot-usage-v1",
+    "version": "0.1.0",
+    "product": "hermes-agent",
+    "cli_version": "Hermes Agent v0.19.0 (2026.7.20)",
+    "adapter_executable_sha256": "aca3df57053c96fd800e2409eea07bd2f33f705a2613fa9adff4754f298125a2",
+    "product_executable_sha256": "2bec840a476717c67d5ccf5b0fe4d76d63c58825a2523e22057f3e62113d2928"
+  },
+  "coordinate": {
+    "run_id": "hermes-0190-deterministic-20260728-001",
+    "benchmark_version": "adapter-conformance-v1",
+    "case_id": "fixed-output",
+    "workspace_snapshot": "empty-workspace-20260728",
+    "started_at_ms": 1785203446794,
+    "host_os": "macos",
+    "host_arch": "aarch64"
+  },
+  "controls": {
+    "track": "adapter_conformance",
+    "claim_eligible": false,
+    "profile": "bare",
+    "requested_provider": "openrouter",
+    "requested_model": "local-deterministic",
+    "observed_models": [
+      "local-deterministic"
+    ],
+    "prompt_sha256": "5cd163f9734add9dbae7bddd194783db73e32293ee33f11840cb799dbba09ac5",
+    "system_prompt_sha256": "341fccd02124ee1c3f7bc5d5eb47338d1f8d050fb5b0752f539c4bec556d448f",
+    "tools": "disabled",
+    "permission_mode": "yolo_no_tools",
+    "process_isolation": {
+      "kind": "unrestricted"
+    },
+    "inherited_environment_names": [
+      "OPENROUTER_API_KEY",
+      "OPENROUTER_BASE_URL"
+    ],
+    "timeout_ms": 30000,
+    "requested_max_budget_usd": null,
+    "unsupported_controls": [
+      "adapter conformance is not a Harness-effect or product-quality result",
+      "no cross-product model parity has been established",
+      "Tools are disabled, so Agent-loop effectiveness is not measured",
+      "Hermes Agent exposes no documented hard monetary spend ceiling",
+      "the released one-shot CLI exposes no caller-selected provider-call ceiling",
+      "estimated_cost_usd is not promoted to actual_cost_usd",
+      "the requested system prompt is a labeled user-message prefix, not a system-role instruction",
+      "the prompt and requested instruction prefix are visible in operating-system process arguments",
+      "workspace instructions are not proven disabled by the released one-shot path",
+      "the product persists session state inside the isolated Hermes home",
+      "a source-checkout project .env may supply otherwise undeclared environment values",
+      "workspace_snapshot is caller-asserted rather than adapter-verified",
+      "environment values, fallback routing, and Python package dependencies are not recorded",
+      "the executable digest may identify only a Python console launcher, not its installed package graph"
+    ]
+  },
+  "execution": {
+    "status": "completed",
+    "settlement": {
+      "exit_code": 0,
+      "wall_time_ms": 1256,
+      "product_duration_ms": null,
+      "product_api_duration_ms": null,
+      "num_turns": 1,
+      "actual_cost_usd": null,
+      "result_subtype": "completed",
+      "stdout_bytes": 21,
+      "stdout_sha256": "33e18e429711d4df90af8f8550cff8dfb99ecf9457672e422b5cbcc44b679763",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "raw_result": {
+        "response": "YH-HERMES-ADAPTER-OK\n",
+        "usage": {
+          "api_calls": 1,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "completed": true,
+          "cost_source": "none",
+          "cost_status": "unknown",
+          "estimated_cost_usd": 0.0,
+          "failed": false,
+          "input_tokens": 1,
+          "model": "local-deterministic",
+          "output_tokens": 1,
+          "provider": "openrouter",
+          "reasoning_tokens": 0,
+          "service_tier": null,
+          "session_id": "20260728_095047_fbeced",
+          "total_tokens": 2
+        }
+      }
+    }
+  }
+}

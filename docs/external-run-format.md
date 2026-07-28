@@ -242,11 +242,11 @@ The Hermes Agent adapter emits format 6 and fixes `claim_eligible: false`.
 Only `bare` is supported. The caller supplies initially empty, pairwise
 disjoint Hermes-home and usage directories outside the workspace. The adapter
 owns Hermes configuration/safe-mode environment, disables the system managed
-scope, creates an empty private `.env`, selects the static empty
-`context_engine` toolset, and uses the source-pinned 90-call product default as
-a validation ceiling rather than pretending it is caller-selectable. Its
-offline version-probe cache prevents `hermes --version` from checking for
-updates.
+scope, maps platform home discovery to the isolated Hermes home, creates an
+empty private `.env`, selects the static empty `context_engine` toolset, and
+uses the source-pinned 90-call product default as a validation ceiling rather
+than pretending it is caller-selectable. Its offline version-probe cache
+prevents `hermes --version` from checking for updates.
 
 Hermes `0.19.0` has no one-shot stdin or system-prompt control. Format 6
 therefore records that both requested instruction and prompt appear in process
@@ -323,5 +323,9 @@ remains unavailable.
 The Hermes Agent adapter is source- and contract-tested against official
 release `v2026.7.20`, commit
 [`3ef6bbd`](https://github.com/NousResearch/hermes-agent/tree/3ef6bbd201263d354fd83ec55b3c306ded2eb72a).
-No real Hermes result is checked in yet, so it contributes no live product
-evidence.
+One real released-Hermes fixed-output record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-hermes-fixed-output`](../tools/benchmark-runner/evidence/2026-07-28-hermes-fixed-output/).
+It used a locked source install, isolated platform/Hermes home, and
+deterministic loopback Provider. It remains non-comparative,
+`claim_eligible: false` adapter-conformance evidence; estimated cost is not
+promoted to actual cost.

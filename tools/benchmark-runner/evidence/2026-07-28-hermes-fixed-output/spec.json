@@ -1,0 +1,23 @@
+{
+  "format_version": 6,
+  "run_id": "hermes-0190-deterministic-20260728-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "fixed-output",
+  "program": "/tmp/yh-hermes-0190.hE8h30/source/.venv/bin/hermes",
+  "expected_cli_version": "Hermes Agent v0.19.0 (2026.7.20)",
+  "expected_product_executable_sha256": "2bec840a476717c67d5ccf5b0fe4d76d63c58825a2523e22057f3e62113d2928",
+  "workspace": "/tmp/yh-hermes-final.op07ju/workspace",
+  "workspace_snapshot": "empty-workspace-20260728",
+  "profile": "bare",
+  "provider": "openrouter",
+  "model": "local-deterministic",
+  "system_prompt": "Return only the exact text requested by the user.",
+  "prompt": "Return exactly YH-HERMES-ADAPTER-OK",
+  "timeout_ms": 30000,
+  "inherit_environment": [
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_BASE_URL"
+  ],
+  "hermes_home": "/tmp/yh-hermes-final.op07ju/home",
+  "usage_directory": "/tmp/yh-hermes-final.op07ju/usage"
+}

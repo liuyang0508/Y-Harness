@@ -8,7 +8,11 @@ const MAX_HERMES_PROMPT_BYTES: usize = 16_384;
 const MAX_USAGE_BYTES: u64 = 65_536;
 const MAX_API_CALLS: u64 = 90;
 const VERSION_PROBE_REVISION: &str = "yh-bench-offline-version-probe";
-const OWNED_ENVIRONMENT: [&str; 19] = [
+const OWNED_ENVIRONMENT: [&str; 23] = [
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_CONFIG",
@@ -364,14 +368,14 @@ fn prepare_environment(
     environment: &mut BTreeMap<String, String>,
 ) -> AppResult<()> {
     let managed_disabled = hermes_home.join(".yh-managed-disabled");
+    let isolated_home = utf8_path(hermes_home, "hermes_home")?.to_owned();
     for name in OWNED_ENVIRONMENT {
         environment.insert(name.to_owned(), String::new());
     }
     environment.extend([
-        (
-            "HERMES_HOME".to_owned(),
-            utf8_path(hermes_home, "hermes_home")?.to_owned(),
-        ),
+        ("HOME".to_owned(), isolated_home.clone()),
+        ("USERPROFILE".to_owned(), isolated_home.clone()),
+        ("HERMES_HOME".to_owned(), isolated_home),
         (
             "HERMES_MANAGED_DIR".to_owned(),
             utf8_path(&managed_disabled, "managed-disabled path")?.to_owned(),
@@ -764,6 +768,8 @@ mod tests {
         let mut collision = spec.clone();
         collision.inherit_environment.push("HERMES_HOME".to_owned());
         assert!(validate_spec(&collision).is_err());
+        collision.inherit_environment = vec!["HOME".to_owned()];
+        assert!(validate_spec(&collision).is_err());
 
         let mut oversized = spec;
         oversized.prompt = "x".repeat(MAX_HERMES_PROMPT_BYTES + 1);
@@ -772,6 +778,25 @@ mod tests {
         let mut malformed_version = valid_spec();
         malformed_version.expected_cli_version = "0.19.0".to_owned();
         assert!(validate_spec(&malformed_version).is_err());
+    }
+
+    #[test]
+    fn environment_maps_platform_home_to_isolated_hermes_home() {
+        let home = env::temp_dir().join(format!(
+            "yh-hermes-home-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir(&home).expect("create isolated Hermes home");
+        let mut environment = BTreeMap::new();
+
+        prepare_environment(&home, &mut environment).expect("prepare Hermes environment");
+
+        let expected = home.to_str().expect("UTF-8 temporary path");
+        assert_eq!(environment["HOME"], expected);
+        assert_eq!(environment["USERPROFILE"], expected);
+        assert_eq!(environment["HERMES_HOME"], expected);
+        fs::remove_dir_all(home).expect("remove isolated Hermes home");
     }
 
     #[test]
@@ -853,5 +878,65 @@ mod tests {
         assert!(normalized.is_error);
         assert_eq!(normalized.num_turns, 0);
         assert!(normalized.observed_models.is_empty());
+    }
+
+    #[test]
+    fn checked_in_live_evidence_preserves_identity_cost_and_home_boundaries() {
+        let report: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-hermes-fixed-output/result.json"
+        ))
+        .expect("checked-in Hermes report");
+        let request: Value = serde_json::from_slice(include_bytes!(
+            "../evidence/2026-07-28-hermes-fixed-output/provider-request.jsonl"
+        ))
+        .expect("checked-in Hermes Provider request");
+        let provider = include_bytes!("../evidence/2026-07-28-hermes-fixed-output/provider.mjs");
+
+        assert_eq!(report["format_version"], RUN_FORMAT_VERSION);
+        assert_eq!(
+            report["adapter"]["cli_version"],
+            "Hermes Agent v0.19.0 (2026.7.20)"
+        );
+        assert_eq!(report["controls"]["claim_eligible"], false);
+        assert_eq!(report["controls"]["requested_provider"], "openrouter");
+        assert_eq!(
+            report["controls"]["observed_models"],
+            serde_json::json!(["local-deterministic"])
+        );
+        assert_eq!(report["execution"]["status"], "completed");
+        assert_eq!(
+            report["execution"]["settlement"]["actual_cost_usd"],
+            Value::Null
+        );
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"]["response"],
+            "YH-HERMES-ADAPTER-OK\n"
+        );
+        assert_eq!(
+            report["execution"]["settlement"]["raw_result"]["usage"]["estimated_cost_usd"],
+            0.0
+        );
+        assert_eq!(
+            sha256_bytes(provider),
+            "381cc297717dd116160f786298cfe1167322e7d3b24745b667f739311645bee7"
+        );
+
+        assert_eq!(request["path"], "/v1/chat/completions");
+        assert_eq!(request["authorization"], "bearer-present");
+        assert_eq!(request["body"]["model"], "local-deterministic");
+        assert_eq!(request["body"]["stream"], true);
+        assert!(request["body"].get("tools").is_none());
+        assert_eq!(
+            request["body"]["messages"][1]["content"],
+            "[Y-Harness benchmark instruction]\n\
+             Return only the exact text requested by the user.\n\n\
+             [Y-Harness benchmark user request]\n\
+             Return exactly YH-HERMES-ADAPTER-OK"
+        );
+        let system = request["body"]["messages"][0]["content"]
+            .as_str()
+            .expect("Hermes system prompt");
+        assert!(system.contains("User home directory: /private/tmp/yh-hermes-final.op07ju/home"));
+        assert!(!system.contains("/Users/"));
     }
 }

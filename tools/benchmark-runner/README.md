@@ -410,11 +410,12 @@ cargo run --locked -p y-harness-benchmark-runner -- \
 Format 6 supports only `bare`. It requires initially empty, pairwise-disjoint
 Hermes-home and usage directories outside the workspace, clears undeclared
 environment values, disables the system managed-scope overlay, enables safe
-mode, and selects Hermes's static empty `context_engine` toolset. The adapter
-pre-seeds the product's update cache solely for the version probe, so
-`hermes --version` does not perform its normal update network request. The
-usage file is create-exclusive, owner-only on Unix, bounded to 64 KiB, parsed
-strictly, and removed after the run.
+mode, maps platform home discovery to the isolated Hermes home, and selects
+Hermes's static empty `context_engine` toolset. The adapter pre-seeds the
+product's update cache solely for the version probe, so `hermes --version`
+does not perform its normal update network request. The usage file is
+create-exclusive, owner-only on Unix, bounded to 64 KiB, parsed strictly, and
+removed after the run.
 
 `expected_cli_version` is the exact first `--version` line. A packaged install
 normally uses the base line shown above; a source install may append Hermes's
@@ -430,8 +431,10 @@ one-shot path also does not prove that workspace instructions are ignored.
 `actual_cost_usd`. Observed Model identity, Provider, tokens, API-call count,
 and completion flags come only from the validated usage report. A Python
 console-launcher digest may not identify the installed package graph, so that
-limitation is machine-readable too. No live Hermes result or comparative run
-is checked in.
+limitation is machine-readable too. A real released-Hermes deterministic
+fixed-output record is checked in under
+[`evidence/2026-07-28-hermes-fixed-output`](evidence/2026-07-28-hermes-fixed-output).
+It remains `claim_eligible: false`; there is no comparative Hermes run.
 
 Deterministic Tool fault injection has its own dependency and evidence
 boundary in [`y-harness-fault-fixture`](../fault-fixture/README.md).

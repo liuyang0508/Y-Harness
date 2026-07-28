@@ -43,8 +43,9 @@ loop or broad Tool runtime.
   initially empty, pairwise-disjoint Hermes-home and usage directories outside
   the workspace.
 - Own Hermes configuration variables, set `HERMES_HOME`, disable managed
-  scope through a nonexistent explicit directory, enable safe mode, create an
-  empty owner-only `.env`, and select only `context_engine`.
+  scope through a nonexistent explicit directory, map platform home variables
+  to the isolated Hermes home, enable safe mode, create an empty owner-only
+  `.env`, and select only `context_engine`.
 - Prefix the user message with the requested benchmark instruction under an
   explicit label. Record that it has user-message rather than system-role
   authority and that both strings are visible in process arguments. Limit the
@@ -71,7 +72,10 @@ loop or broad Tool runtime.
 
 Y-Harness can now exercise the real released Hermes one-shot boundary and
 distinguish product failure from adapter failure without manufacturing cost or
-identity facts. The adapter is intentionally narrower than Hermes itself.
+identity facts. One released `0.19.0` fixed-output record uses an isolated
+platform home and deterministic loopback Provider. It remains
+`claim_eligible: false`. The adapter is intentionally narrower than Hermes
+itself.
 
 The empty Tool cell cannot establish Hermes Agent-loop effectiveness. The
 one-shot CLI cannot provide prompt secrecy or system-instruction parity, and
@@ -97,11 +101,14 @@ overwriting declared inherited values. No comparative claim follows.
 ## Evidence
 
 - `hermes::tests::bare_profile_rejects_environment_collisions_and_oversized_argv_prompt`
+- `hermes::tests::environment_maps_platform_home_to_isolated_hermes_home`
 - `hermes::tests::command_uses_safe_empty_tools_but_truthfully_places_prompt_in_argv`
 - `hermes::tests::path_boundaries_require_three_disjoint_directories`
 - `hermes::tests::success_preserves_observed_identity_and_estimate_without_promoting_cost`
 - `hermes::tests::usage_rejects_contradictions_missing_fields_and_excessive_calls`
 - `hermes::tests::product_failure_remains_settled_without_inventing_a_turn`
+- `hermes::tests::checked_in_live_evidence_preserves_identity_cost_and_home_boundaries`
+- `tools/benchmark-runner/evidence/2026-07-28-hermes-fixed-output`
 - official Hermes Agent one-shot, usage, parser, toolset, context-engine,
   safe-mode, and version source at `3ef6bbd`
 
