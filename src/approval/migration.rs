@@ -16,8 +16,8 @@ use tokio::task;
 
 use super::{
     APPROVAL_INBOX_SCHEMA_VERSION, APPROVAL_METADATA_TABLE, ApprovalRecord, ApprovalRecordStatus,
-    MAX_APPROVAL_REASON_BYTES, SqliteApprovalInbox, encode_record, metadata_schema_sql,
-    table_exists, validate_current_metadata,
+    MAX_APPROVAL_REASON_BYTES, PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION, SqliteApprovalInbox,
+    encode_record, metadata_schema_sql, table_exists, validate_current_metadata,
 };
 use crate::{
     ApprovalActor, ApprovalDecision, ApprovalId, HarnessError, RiskLevel, ToolAuthorization,
@@ -83,6 +83,16 @@ struct LegacyApprovalRecord {
 }
 
 #[derive(Deserialize)]
+struct SchemaTwoApprovalRecord {
+    schema_version: u32,
+    request: crate::ApprovalRequest,
+    status: ApprovalRecordStatus,
+    revision: u64,
+    requested_at_ms: u64,
+    settled_at_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct LegacyApprovalRequest {
     id: ApprovalId,
     authorization: ToolAuthorization,
@@ -98,12 +108,29 @@ enum LegacyApprovalRecordStatus {
     Orphaned { reason: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationSource {
+    SchemaOne,
+    SchemaTwo,
+}
+
+impl MigrationSource {
+    const fn version(self) -> u32 {
+        match self {
+            Self::SchemaOne => LEGACY_APPROVAL_SCHEMA_VERSION,
+            Self::SchemaTwo => PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION,
+        }
+    }
+}
+
 impl SqliteApprovalInbox {
-    /// Migrates a schema-1 SQLite Approval Inbox after creating or validating
-    /// a complete rollback backup.
+    /// Migrates a schema-1 or schema-2 SQLite Approval Inbox after creating or
+    /// validating a complete rollback backup.
     ///
     /// Every old and new writer must be stopped. Pending legacy requests are
     /// orphaned because their requester identity cannot be reconstructed.
+    /// Schema-2 records remain unscoped because tenant ownership cannot be
+    /// inferred safely from historical Thread or actor data.
     pub async fn migrate(
         path: impl AsRef<Path>,
         backup_path: impl AsRef<Path>,
@@ -133,7 +160,7 @@ fn migrate_sync(
         ));
     }
     let records = record_count(&connection)?;
-    if table_exists(&connection, APPROVAL_METADATA_TABLE)? {
+    let Some(source) = migration_source(&connection)? else {
         validate_current_metadata(&connection)?;
         return Ok(ApprovalMigrationReport {
             status: ApprovalMigrationStatus::AlreadyCurrent,
@@ -145,14 +172,14 @@ fn migrate_sync(
             available_backup_bytes: 0,
             backup_path: None,
         });
-    }
-    let fingerprint = legacy_store_fingerprint(&connection)?;
+    };
+    let fingerprint = source_store_fingerprint(&connection, source)?;
     let (required_backup_bytes, available_backup_bytes) =
         migration_space_preflight(&connection, backup_path)?;
     if stop == MigrationStop::AfterPreflight {
         return Err(injected_stop("after preflight"));
     }
-    create_or_validate_backup(path, backup_path, fingerprint)?;
+    create_or_validate_backup(path, backup_path, source, fingerprint)?;
     if stop == MigrationStop::AfterBackup {
         return Err(injected_stop("after backup"));
     }
@@ -160,20 +187,62 @@ fn migrate_sync(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| HarnessError::Approval(error.to_string()))?;
-    if table_exists(&transaction, APPROVAL_METADATA_TABLE)? {
+    if migration_source(&transaction)? != Some(source) {
         return Err(HarnessError::Approval(
             "SQLite Approval Inbox metadata changed during migration".to_owned(),
         ));
     }
-    if legacy_store_fingerprint(&transaction)? != fingerprint {
+    if source_store_fingerprint(&transaction, source)? != fingerprint {
         return Err(HarnessError::Approval(
             "SQLite Approval Inbox changed after migration backup; stop all writers and retry with a new backup"
                 .to_owned(),
         ));
     }
-    let orphaned_pending_records = migrate_records(&transaction)?;
     transaction
-        .execute_batch(&metadata_schema_sql())
+        .execute("ALTER TABLE approval_records ADD COLUMN tenant_id TEXT", [])
+        .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    let orphaned_pending_records = match source {
+        MigrationSource::SchemaOne => migrate_schema_one_records(&transaction)?,
+        MigrationSource::SchemaTwo => migrate_schema_two_records(&transaction)?,
+    };
+    match source {
+        MigrationSource::SchemaOne => transaction
+            .execute_batch(&metadata_schema_sql())
+            .map_err(|error| HarnessError::Approval(error.to_string()))?,
+        MigrationSource::SchemaTwo => {
+            let updated = transaction
+                .execute(
+                    &format!(
+                        "UPDATE {APPROVAL_METADATA_TABLE}
+                         SET value = ?1
+                         WHERE key = 'record_schema' AND value = ?2"
+                    ),
+                    params![
+                        i64::from(APPROVAL_INBOX_SCHEMA_VERSION),
+                        i64::from(PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION)
+                    ],
+                )
+                .map_err(|error| HarnessError::Approval(error.to_string()))?;
+            if updated != 1 {
+                return Err(HarnessError::Approval(
+                    "SQLite Approval Inbox metadata changed during migration".to_owned(),
+                ));
+            }
+        }
+    }
+    transaction
+        .execute_batch(
+            "
+            DROP INDEX IF EXISTS approval_pending_order;
+            DROP INDEX IF EXISTS approval_turn;
+            CREATE INDEX approval_pending_order
+                ON approval_records(
+                    tenant_id, status, requested_at_ms, approval_id
+                );
+            CREATE INDEX approval_turn
+                ON approval_records(tenant_id, thread_id, turn_id, status);
+            ",
+        )
         .map_err(|error| HarnessError::Approval(error.to_string()))?;
     if stop == MigrationStop::BeforeCommit {
         return Err(injected_stop("before commit"));
@@ -184,7 +253,7 @@ fn migrate_sync(
 
     Ok(ApprovalMigrationReport {
         status: ApprovalMigrationStatus::Migrated,
-        from_record_schema: LEGACY_APPROVAL_SCHEMA_VERSION,
+        from_record_schema: source.version(),
         to_record_schema: APPROVAL_INBOX_SCHEMA_VERSION,
         historical_records: fingerprint.record_count,
         orphaned_pending_records,
@@ -194,7 +263,7 @@ fn migrate_sync(
     })
 }
 
-fn migrate_records(transaction: &Transaction<'_>) -> Result<u64, HarnessError> {
+fn migrate_schema_one_records(transaction: &Transaction<'_>) -> Result<u64, HarnessError> {
     let mut after_id = String::new();
     let mut orphaned = 0_u64;
     loop {
@@ -273,6 +342,78 @@ fn migrate_records(transaction: &Transaction<'_>) -> Result<u64, HarnessError> {
     }
 }
 
+fn migrate_schema_two_records(transaction: &Transaction<'_>) -> Result<u64, HarnessError> {
+    let mut after_id = String::new();
+    loop {
+        let page = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT length(CAST(approval_id AS BLOB)), approval_id,
+                            length(CAST(status AS BLOB)), status, revision,
+                            length(CAST(record_json AS BLOB)), record_json
+                     FROM approval_records
+                     WHERE approval_id > ?1
+                     ORDER BY approval_id
+                     LIMIT ?2",
+                )
+                .map_err(|error| HarnessError::Approval(error.to_string()))?;
+            let rows = statement
+                .query_map(
+                    params![after_id, i64::try_from(MIGRATION_PAGE).unwrap_or(i64::MAX)],
+                    |row| {
+                        Ok((
+                            bounded_text(row, 0, 1, 256, "schema-2 approval identity")?,
+                            bounded_text(row, 2, 3, 8, "schema-2 approval status")?,
+                            row.get::<_, i64>(4)?,
+                            bounded_text(
+                                row,
+                                5,
+                                6,
+                                super::MAX_APPROVAL_RECORD_BYTES,
+                                "schema-2 approval record",
+                            )?,
+                        ))
+                    },
+                )
+                .map_err(|error| HarnessError::Approval(error.to_string()))?;
+            let mut page = Vec::with_capacity(MIGRATION_PAGE);
+            for row in rows {
+                page.push(row.map_err(|error| HarnessError::Approval(error.to_string()))?);
+            }
+            page
+        };
+        if page.is_empty() {
+            return Ok(0);
+        }
+        for (approval_id, indexed_status, indexed_revision, encoded) in page {
+            let record = decode_schema_two_record(&encoded)?;
+            validate_current_indexes(&record, &approval_id, &indexed_status, indexed_revision)?;
+            let encoded_current = encode_record(&record)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE approval_records
+                     SET record_json = ?1
+                     WHERE approval_id = ?2 AND status = ?3 AND revision = ?4
+                           AND record_json = ?5",
+                    params![
+                        encoded_current,
+                        approval_id,
+                        indexed_status,
+                        indexed_revision,
+                        encoded,
+                    ],
+                )
+                .map_err(|error| HarnessError::Approval(error.to_string()))?;
+            if updated != 1 {
+                return Err(HarnessError::Approval(
+                    "schema-2 approval changed during migration".to_owned(),
+                ));
+            }
+            after_id = approval_id;
+        }
+    }
+}
+
 fn convert_record(legacy: LegacyApprovalRecord) -> Result<(ApprovalRecord, bool), HarnessError> {
     let was_pending = matches!(legacy.status, LegacyApprovalRecordStatus::Pending);
     let (status, revision, settled_at_ms) = match legacy.status {
@@ -310,6 +451,7 @@ fn convert_record(legacy: LegacyApprovalRecord) -> Result<(ApprovalRecord, bool)
                 reason: legacy.request.reason,
                 risk: legacy.request.risk,
             },
+            tenant_id: None,
             status,
             revision,
             requested_at_ms: legacy.requested_at_ms,
@@ -317,6 +459,33 @@ fn convert_record(legacy: LegacyApprovalRecord) -> Result<(ApprovalRecord, bool)
         },
         was_pending,
     ))
+}
+
+fn decode_schema_two_record(encoded: &str) -> Result<ApprovalRecord, HarnessError> {
+    if encoded.len() > super::MAX_APPROVAL_RECORD_BYTES {
+        return Err(HarnessError::Approval(format!(
+            "schema-2 approval record exceeds {} bytes",
+            super::MAX_APPROVAL_RECORD_BYTES
+        )));
+    }
+    let record: SchemaTwoApprovalRecord =
+        serde_json::from_str(encoded).map_err(|error| HarnessError::Approval(error.to_string()))?;
+    if record.schema_version != PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION {
+        return Err(HarnessError::Approval(
+            "schema-2 approval has unsupported schema".to_owned(),
+        ));
+    }
+    let current = ApprovalRecord {
+        schema_version: APPROVAL_INBOX_SCHEMA_VERSION,
+        request: record.request,
+        tenant_id: None,
+        status: record.status,
+        revision: record.revision,
+        requested_at_ms: record.requested_at_ms,
+        settled_at_ms: record.settled_at_ms,
+    };
+    encode_record(&current)?;
+    Ok(current)
 }
 
 fn decode_legacy_record(encoded: &str) -> Result<LegacyApprovalRecord, HarnessError> {
@@ -435,6 +604,23 @@ fn validate_legacy_indexes(
     Ok(())
 }
 
+fn validate_current_indexes(
+    record: &ApprovalRecord,
+    approval_id: &str,
+    indexed_status: &str,
+    indexed_revision: i64,
+) -> Result<(), HarnessError> {
+    if record.request.id.as_str() != approval_id
+        || status_name(&record.status) != indexed_status
+        || to_u64(indexed_revision, "schema-2 approval revision")? != record.revision
+    {
+        return Err(HarnessError::Approval(
+            "schema-2 approval indexes do not match its body".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn legacy_status_name(status: &LegacyApprovalRecordStatus) -> &'static str {
     match status {
         LegacyApprovalRecordStatus::Pending => "pending",
@@ -451,7 +637,10 @@ fn status_name(status: &ApprovalRecordStatus) -> &'static str {
     }
 }
 
-fn legacy_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint, HarnessError> {
+fn source_store_fingerprint(
+    connection: &Connection,
+    source: MigrationSource,
+) -> Result<StoreFingerprint, HarnessError> {
     let mut statement = connection
         .prepare(
             "SELECT length(CAST(approval_id AS BLOB)), approval_id,
@@ -476,8 +665,8 @@ fn legacy_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint,
                     row,
                     10,
                     11,
-                    LEGACY_MAX_APPROVAL_RECORD_BYTES,
-                    "legacy approval record",
+                    super::MAX_APPROVAL_RECORD_BYTES,
+                    "source approval record",
                 )?,
             ))
         })
@@ -487,15 +676,33 @@ fn legacy_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint,
     for row in rows {
         let (id, thread, turn, status, revision, requested_at_ms, encoded) =
             row.map_err(|error| HarnessError::Approval(error.to_string()))?;
-        let record = decode_legacy_record(&encoded)?;
-        validate_legacy_indexes(&record, &id, &status, revision)?;
-        if record.request.authorization.thread_id.as_str() != thread
-            || record.request.authorization.turn_id.as_str() != turn
-            || to_u64(requested_at_ms, "legacy approval timestamp")? != record.requested_at_ms
-        {
-            return Err(HarnessError::Approval(
-                "legacy approval indexes do not match its body".to_owned(),
-            ));
+        match source {
+            MigrationSource::SchemaOne => {
+                let record = decode_legacy_record(&encoded)?;
+                validate_legacy_indexes(&record, &id, &status, revision)?;
+                if record.request.authorization.thread_id.as_str() != thread
+                    || record.request.authorization.turn_id.as_str() != turn
+                    || to_u64(requested_at_ms, "legacy approval timestamp")?
+                        != record.requested_at_ms
+                {
+                    return Err(HarnessError::Approval(
+                        "legacy approval indexes do not match its body".to_owned(),
+                    ));
+                }
+            }
+            MigrationSource::SchemaTwo => {
+                let record = decode_schema_two_record(&encoded)?;
+                validate_current_indexes(&record, &id, &status, revision)?;
+                if record.request.authorization.thread_id.as_str() != thread
+                    || record.request.authorization.turn_id.as_str() != turn
+                    || to_u64(requested_at_ms, "schema-2 approval timestamp")?
+                        != record.requested_at_ms
+                {
+                    return Err(HarnessError::Approval(
+                        "schema-2 approval indexes do not match its body".to_owned(),
+                    ));
+                }
+            }
         }
         count = count
             .checked_add(1)
@@ -511,6 +718,41 @@ fn legacy_store_fingerprint(connection: &Connection) -> Result<StoreFingerprint,
         record_count: count,
         records_sha256: hasher.finalize().into(),
     })
+}
+
+fn migration_source(connection: &Connection) -> Result<Option<MigrationSource>, HarnessError> {
+    if !table_exists(connection, APPROVAL_METADATA_TABLE)? {
+        return Ok(Some(MigrationSource::SchemaOne));
+    }
+    let entries: i64 = connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {APPROVAL_METADATA_TABLE}"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    let schema = connection
+        .query_row(
+            &format!("SELECT value FROM {APPROVAL_METADATA_TABLE} WHERE key = 'record_schema'"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    if entries != 1 {
+        return Err(HarnessError::Approval(
+            "unsupported SQLite Approval Inbox metadata".to_owned(),
+        ));
+    }
+    match schema {
+        Some(value) if value == i64::from(APPROVAL_INBOX_SCHEMA_VERSION) => Ok(None),
+        Some(value) if value == i64::from(PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION) => {
+            Ok(Some(MigrationSource::SchemaTwo))
+        }
+        _ => Err(HarnessError::Approval(format!(
+            "unsupported SQLite Approval Inbox metadata; expected record schema {APPROVAL_INBOX_SCHEMA_VERSION} or migratable schema {PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION}"
+        ))),
+    }
 }
 
 fn record_count(connection: &Connection) -> Result<u64, HarnessError> {
@@ -604,10 +846,11 @@ fn migration_space_preflight(
 fn create_or_validate_backup(
     source_path: &Path,
     backup_path: &Path,
+    source_schema: MigrationSource,
     fingerprint: StoreFingerprint,
 ) -> Result<(), HarnessError> {
     if backup_path.exists() {
-        return validate_backup(backup_path, fingerprint);
+        return validate_backup(backup_path, source_schema, fingerprint);
     }
     let partial_path = partial_backup_path(backup_path);
     let source =
@@ -647,7 +890,7 @@ fn create_or_validate_backup(
                  VALUES (1, ?1, ?2, ?3, ?4)"
             ),
             params![
-                i64::from(LEGACY_APPROVAL_SCHEMA_VERSION),
+                i64::from(source_schema.version()),
                 i64::from(APPROVAL_INBOX_SCHEMA_VERSION),
                 to_i64(fingerprint.record_count, "approval count")?,
                 fingerprint_hex(&fingerprint.records_sha256),
@@ -666,10 +909,14 @@ fn create_or_validate_backup(
     sync_parent_directory(backup_path)?;
     fs::remove_file(&partial_path).map_err(|error| HarnessError::Approval(error.to_string()))?;
     sync_parent_directory(backup_path)?;
-    validate_backup(backup_path, fingerprint)
+    validate_backup(backup_path, source_schema, fingerprint)
 }
 
-fn validate_backup(backup_path: &Path, expected: StoreFingerprint) -> Result<(), HarnessError> {
+fn validate_backup(
+    backup_path: &Path,
+    source_schema: MigrationSource,
+    expected: StoreFingerprint,
+) -> Result<(), HarnessError> {
     if !backup_path.is_file() {
         return Err(HarnessError::Approval(
             "SQLite Approval Inbox backup is not a regular file".to_owned(),
@@ -707,11 +954,11 @@ fn validate_backup(backup_path: &Path, expected: StoreFingerprint) -> Result<(),
         .ok_or_else(|| {
             HarnessError::Approval("SQLite Approval Inbox backup has no manifest".to_owned())
         })?;
-    if manifest.0 != i64::from(LEGACY_APPROVAL_SCHEMA_VERSION)
+    if manifest.0 != i64::from(source_schema.version())
         || manifest.1 != i64::from(APPROVAL_INBOX_SCHEMA_VERSION)
         || to_u64(manifest.2, "backup approval count")? != expected.record_count
         || manifest.3 != fingerprint_hex(&expected.records_sha256)
-        || legacy_store_fingerprint(&backup)? != expected
+        || source_store_fingerprint(&backup, source_schema)? != expected
     {
         return Err(HarnessError::Approval(
             "SQLite Approval Inbox backup does not match the source preflight".to_owned(),
@@ -813,7 +1060,8 @@ mod tests {
     use super::{
         APPROVAL_METADATA_TABLE, ApprovalMigrationStatus, BACKUP_MANIFEST_TABLE,
         LEGACY_APPROVAL_SCHEMA_VERSION, LEGACY_MAX_APPROVAL_RECORD_BYTES,
-        LEGACY_PENDING_RECORD_BYTES, MIGRATED_PENDING_REASON, migrate_with_stop,
+        LEGACY_PENDING_RECORD_BYTES, MIGRATED_PENDING_REASON,
+        PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION, migrate_with_stop,
     };
     use crate::{
         ApprovalActor, ApprovalId, ApprovalInbox, ApprovalRecordStatus, SqliteApprovalInbox,
@@ -891,6 +1139,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_preserves_schema_two_records_as_explicitly_unscoped() {
+        let source = fixture_path("schema-two-source");
+        let backup = fixture_path("schema-two-backup");
+        create_schema_two_database(&source);
+
+        let open_error = match SqliteApprovalInbox::open(&source).await {
+            Ok(_) => panic!("schema-2 inbox must require migration"),
+            Err(error) => error,
+        };
+        assert!(open_error.to_string().contains("approval-migrate"));
+
+        let report = SqliteApprovalInbox::migrate(&source, &backup)
+            .await
+            .expect("migrate schema two");
+        assert_eq!(report.status, ApprovalMigrationStatus::Migrated);
+        assert_eq!(
+            report.from_record_schema,
+            PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION
+        );
+        assert_eq!(
+            report.to_record_schema,
+            crate::APPROVAL_INBOX_SCHEMA_VERSION
+        );
+        assert_eq!(report.historical_records, 1);
+        assert_eq!(report.orphaned_pending_records, 0);
+
+        let inbox = SqliteApprovalInbox::open(&source)
+            .await
+            .expect("open migrated schema-two inbox");
+        let record = inbox
+            .get(&ApprovalId::from_string("approval-v2".to_owned()))
+            .await
+            .expect("read migrated approval")
+            .expect("approval");
+        assert!(matches!(record.status, ApprovalRecordStatus::Pending));
+        assert_eq!(record.tenant_id(), None);
+
+        let backup_connection = Connection::open(&backup).expect("open backup");
+        let backup_schema: i64 = backup_connection
+            .query_row(
+                &format!(
+                    "SELECT value FROM {APPROVAL_METADATA_TABLE}
+                     WHERE key = 'record_schema'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("backup schema");
+        assert_eq!(
+            backup_schema,
+            i64::from(PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION)
+        );
+        assert!(!column(&backup_connection, "approval_records", "tenant_id"));
+
+        let source_connection = Connection::open(&source).expect("open source");
+        assert!(column(&source_connection, "approval_records", "tenant_id"));
+        let tenant: Option<String> = source_connection
+            .query_row(
+                "SELECT tenant_id FROM approval_records
+                 WHERE approval_id = 'approval-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tenant projection");
+        assert_eq!(tenant, None);
+        cleanup(&source);
+        cleanup(&backup);
+    }
+
+    #[tokio::test]
     async fn migration_restarts_after_every_mutating_phase() {
         for phase in ["after_preflight", "after_backup", "before_commit"] {
             let source = fixture_path(&format!("{phase}-source"));
@@ -905,6 +1223,30 @@ mod tests {
             SqliteApprovalInbox::open(&source)
                 .await
                 .expect("reopen migrated inbox");
+            cleanup(&source);
+            cleanup(&backup);
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_two_migration_restarts_after_every_mutating_phase() {
+        for phase in ["after_preflight", "after_backup", "before_commit"] {
+            let source = fixture_path(&format!("{phase}-schema-two-source"));
+            let backup = fixture_path(&format!("{phase}-schema-two-backup"));
+            create_schema_two_database(&source);
+            migrate_with_stop(&source, &backup, phase).expect_err("injected stop");
+
+            let report = SqliteApprovalInbox::migrate(&source, &backup)
+                .await
+                .expect("resume schema-two migration");
+            assert_eq!(report.status, ApprovalMigrationStatus::Migrated);
+            assert_eq!(
+                report.from_record_schema,
+                PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION
+            );
+            SqliteApprovalInbox::open(&source)
+                .await
+                .expect("reopen migrated schema-two inbox");
             cleanup(&source);
             cleanup(&backup);
         }
@@ -1126,6 +1468,76 @@ mod tests {
         }
     }
 
+    fn create_schema_two_database(path: &PathBuf) {
+        let connection = Connection::open(path).expect("create schema-two database");
+        connection
+            .execute_batch(&format!(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = FULL;
+                CREATE TABLE approval_records (
+                    approval_id     TEXT PRIMARY KEY,
+                    thread_id       TEXT NOT NULL,
+                    turn_id         TEXT NOT NULL,
+                    status          TEXT NOT NULL
+                                    CHECK(status IN ('pending', 'settled', 'orphaned')),
+                    revision        INTEGER NOT NULL CHECK(revision > 0),
+                    requested_at_ms INTEGER NOT NULL,
+                    record_json     TEXT NOT NULL
+                );
+                CREATE INDEX approval_pending_order
+                    ON approval_records(status, requested_at_ms, approval_id);
+                CREATE INDEX approval_turn
+                    ON approval_records(thread_id, turn_id, status);
+                CREATE TABLE {APPROVAL_METADATA_TABLE} (
+                    key   TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL CHECK(value > 0)
+                );
+                INSERT INTO {APPROVAL_METADATA_TABLE} (key, value)
+                    VALUES ('record_schema', {PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION});
+                "
+            ))
+            .expect("schema-two schema");
+        let record = json!({
+            "schema_version": PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION,
+            "request": {
+                "id": "approval-v2",
+                "requested_by": {
+                    "kind": "authenticated",
+                    "authority": "fixture",
+                    "subject": "requester"
+                },
+                "authorization": {
+                    "thread_id": "thread-v2",
+                    "turn_id": "turn-v2",
+                    "call_id": "call-v2",
+                    "descriptor": {
+                        "name": "deploy",
+                        "description": "deploy one bounded artifact",
+                        "input_schema": {"type": "object"}
+                    },
+                    "origin": {"kind": "built_in"},
+                    "input": {}
+                },
+                "reason": "deployment changes external state",
+                "risk": "high"
+            },
+            "status": {"status": "pending"},
+            "revision": 1,
+            "requested_at_ms": 1,
+            "settled_at_ms": null
+        });
+        connection
+            .execute(
+                "INSERT INTO approval_records
+                    (approval_id, thread_id, turn_id, status, revision,
+                     requested_at_ms, record_json)
+                 VALUES ('approval-v2', 'thread-v2', 'turn-v2', 'pending', 1, 1, ?1)",
+                [serde_json::to_string(&record).expect("encode schema-two record")],
+            )
+            .expect("insert schema-two record");
+    }
+
     fn table(connection: &Connection, name: &str) -> bool {
         connection
             .query_row(
@@ -1136,6 +1548,16 @@ mod tests {
             .optional()
             .expect("query table")
             .is_some()
+    }
+
+    fn column(connection: &Connection, table: &str, column: &str) -> bool {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare columns");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query columns");
+        rows.filter_map(Result::ok).any(|name| name == column)
     }
 
     fn fixture_path(label: &str) -> PathBuf {

@@ -37,7 +37,7 @@ use task::TaskProtocolService;
 pub use task::{TaskGraphSummary, TaskRecordPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "20";
+pub const PROTOCOL_VERSION: &str = "21";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -367,13 +367,10 @@ impl ProtocolCommand {
         }
     }
 
-    fn requires_pending_tenant_partition(&self) -> bool {
+    fn requires_task_tenant_ownership(&self) -> bool {
         matches!(
             self,
-            Self::GetPendingApprovals { .. }
-                | Self::GetApproval { .. }
-                | Self::SettleApproval { .. }
-                | Self::CreateTaskGraph { .. }
+            Self::CreateTaskGraph { .. }
                 | Self::GetTaskGraph { .. }
                 | Self::GetTaskRecords { .. }
                 | Self::CancelTask { .. }
@@ -1145,10 +1142,9 @@ impl ProtocolHandler {
         principal: &ProtocolPrincipal,
         authority: &AuthorityContext,
     ) -> Result<ProtocolResult, HarnessError> {
-        if authority.tenant_id().is_some() && command.requires_pending_tenant_partition() {
+        if authority.tenant_id().is_some() && command.requires_task_tenant_ownership() {
             return Err(HarnessError::Protocol(
-                "tenant-scoped Approval and Task access requires durable tenant ownership"
-                    .to_owned(),
+                "tenant-scoped Task access requires durable tenant ownership".to_owned(),
             ));
         }
         match command {
@@ -1173,7 +1169,7 @@ impl ProtocolHandler {
                 if self.runtime.supports_thread_fork() {
                     capabilities.push("thread.fork".to_owned());
                 }
-                if self.approvals.is_some() && authority.tenant_id().is_none() {
+                if self.approvals.is_some() {
                     capabilities.extend([
                         "approval.get".to_owned(),
                         "approval.pending".to_owned(),
@@ -1609,14 +1605,14 @@ impl ProtocolHandler {
                         "approval limit must be 1-{MAX_APPROVAL_PAGE}"
                     )));
                 }
-                let approvals = self.approval_inbox()?.pending(limit).await?;
+                let approvals = self.approval_inbox()?.pending_as(limit, authority).await?;
                 Ok(ProtocolResult::PendingApprovals { approvals })
             }
             ProtocolCommand::GetApproval { approval_id } => {
                 validate_opaque_id("approval_id", &approval_id)?;
                 let approval = self
                     .approval_inbox()?
-                    .get(&ApprovalId::from_string(approval_id))
+                    .get_as(&ApprovalId::from_string(approval_id), authority)
                     .await?;
                 Ok(ProtocolResult::Approval {
                     approval: approval.map(Box::new),
@@ -1635,11 +1631,11 @@ impl ProtocolHandler {
                 }
                 let approval = self
                     .approval_inbox()?
-                    .settle(
+                    .settle_as(
                         &ApprovalId::from_string(approval_id),
                         expected_revision,
                         decision,
-                        authority.actor().clone(),
+                        authority,
                     )
                     .await?;
                 Ok(ProtocolResult::ApprovalSettled {
@@ -2740,7 +2736,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_one_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2748,14 +2744,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "20",
+                "protocol_version": "21",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "20",
+                "protocol_version": "21",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2764,7 +2760,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "20",
+                "protocol_version": "21",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2786,7 +2782,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "20",
+                "protocol_version": "21",
                 "body": {
                     "status": "success",
                     "result": {
@@ -5009,8 +5005,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_tenant_fencing_hides_threads_operations_and_pending_resources() {
+    async fn protocol_tenant_fencing_hides_threads_operations_approvals_and_tasks() {
         let tenant_a = ProtocolPrincipal::from_mtls_certificate(b"tenant-a-certificate");
+        let tenant_a_approver =
+            ProtocolPrincipal::from_mtls_certificate(b"tenant-a-approver-certificate");
         let tenant_b = ProtocolPrincipal::from_mtls_certificate(b"tenant-b-certificate");
         let authorizer = TenantMapAuthorizer {
             tenants: BTreeMap::from([
@@ -5018,6 +5016,13 @@ mod tests {
                     tenant_a
                         .mtls_sha256()
                         .expect("tenant A fingerprint")
+                        .to_owned(),
+                    "tenant-a".to_owned(),
+                ),
+                (
+                    tenant_a_approver
+                        .mtls_sha256()
+                        .expect("tenant A approver fingerprint")
                         .to_owned(),
                     "tenant-a".to_owned(),
                 ),
@@ -5030,7 +5035,28 @@ mod tests {
                 ),
             ]),
         };
-        let handler = handler(Arc::new(ImmediateModel)).with_authorizer(Arc::new(authorizer));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let mut approval_a = approval_request();
+        approval_a.requested_by = tenant_a.actor_identity();
+        let tenant_a_authority =
+            AuthorityContext::new(tenant_a.actor_identity(), Some("tenant-a".to_owned()))
+                .expect("tenant A authority");
+        let submitted_a = inbox
+            .submit_as(approval_a.clone(), &tenant_a_authority)
+            .await
+            .expect("submit tenant A approval");
+        let mut approval_b = approval_request();
+        approval_b.requested_by = tenant_b.actor_identity();
+        let tenant_b_authority =
+            AuthorityContext::new(tenant_b.actor_identity(), Some("tenant-b".to_owned()))
+                .expect("tenant B authority");
+        inbox
+            .submit_as(approval_b.clone(), &tenant_b_authority)
+            .await
+            .expect("submit tenant B approval");
+        let handler = handler(Arc::new(ImmediateModel))
+            .with_approval_inbox(inbox)
+            .with_authorizer(Arc::new(authorizer));
 
         let initialized = handler
             .handle_as(
@@ -5045,8 +5071,12 @@ mod tests {
                 assert!(
                     capabilities
                         .iter()
-                        .all(|capability| !capability.starts_with("approval.")
-                            && !capability.starts_with("task."))
+                        .any(|capability| capability == "approval.settle")
+                );
+                assert!(
+                    capabilities
+                        .iter()
+                        .all(|capability| !capability.starts_with("task."))
                 );
             }
             other => panic!("unexpected initialize response: {other:?}"),
@@ -5173,8 +5203,65 @@ mod tests {
             .await;
         assert!(matches!(
             pending.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::PendingApprovals { approvals }
+            } if approvals.len() == 1
+                && approvals[0].request.id == approval_a.id
+                && approvals[0].tenant_id() == Some("tenant-a")
+        ));
+        let hidden_approval = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "get-cross-tenant-approval",
+                    ProtocolCommand::GetApproval {
+                        approval_id: approval_a.id.to_string(),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            hidden_approval.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Approval { approval: None }
+            }
+        ));
+        let denied_settlement = handler
+            .handle_as(
+                &tenant_b,
+                request(
+                    "settle-cross-tenant-approval",
+                    ProtocolCommand::SettleApproval {
+                        approval_id: approval_a.id.to_string(),
+                        expected_revision: submitted_a.revision,
+                        decision: ApprovalDecision::Approve,
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            denied_settlement.body,
             ProtocolResponseBody::Error { error }
-                if error.message.contains("durable tenant ownership")
+                if error.message.contains("does not exist")
+        ));
+        let settled = handler
+            .handle_as(
+                &tenant_a_approver,
+                request(
+                    "settle-same-tenant-approval",
+                    ProtocolCommand::SettleApproval {
+                        approval_id: approval_a.id.to_string(),
+                        expected_revision: submitted_a.revision,
+                        decision: ApprovalDecision::Approve,
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            settled.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ApprovalSettled { approval }
+            } if approval.tenant_id() == Some("tenant-a")
         ));
         let task = handler
             .handle_as(

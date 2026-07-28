@@ -196,7 +196,7 @@ async fn approval_migration_cli_orphans_unattributed_pending_requests() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(backup.is_file());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Approval Inbox schema 1 -> 2"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Approval Inbox schema 1 -> 3"));
     let inbox = SqliteApprovalInbox::open(&source)
         .await
         .expect("open migrated inbox");
@@ -210,14 +210,20 @@ async fn approval_migration_cli_orphans_unattributed_pending_requests() {
         ApprovalRecordStatus::Orphaned { .. }
     ));
 
-    let current = working_directory.join("approval-v2.db");
-    rusqlite::Connection::open(&current)
+    let schema_two = working_directory.join("approval-v2.db");
+    let schema_two_backup = working_directory.join("approval-v2.backup.db");
+    rusqlite::Connection::open(&schema_two)
         .expect("create v2 approval database")
         .execute_batch(APPROVAL_V2_FIXTURE)
         .expect("apply approval v2 fixture");
-    SqliteApprovalInbox::open(&current)
+    let report = SqliteApprovalInbox::migrate(&schema_two, &schema_two_backup)
         .await
-        .expect("open explicit v2 fixture");
+        .expect("migrate explicit v2 fixture");
+    assert_eq!(report.from_record_schema, 2);
+    assert_eq!(report.to_record_schema, 3);
+    SqliteApprovalInbox::open(&schema_two)
+        .await
+        .expect("open migrated v2 fixture");
     let _ = fs::remove_dir_all(&working_directory);
 }
 

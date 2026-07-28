@@ -16,16 +16,17 @@ use tokio::{sync::Mutex, task, time};
 pub use migration::{ApprovalMigrationReport, ApprovalMigrationStatus};
 
 use crate::{
-    ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, HarnessError, HarnessFuture,
-    ThreadId, TurnId,
+    ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext, HarnessError,
+    HarnessFuture, ThreadId, TurnId,
     json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
     kernel::{now_ms, validate_capability_name},
     runtime::ApprovalHandler,
-    sqlite::bounded_text,
+    sqlite::{bounded_optional_text, bounded_text},
 };
 
 /// Current durable Approval Inbox record schema.
-pub const APPROVAL_INBOX_SCHEMA_VERSION: u32 = 2;
+pub const APPROVAL_INBOX_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION: u32 = 2;
 // One record must fit comfortably inside the 1 MiB reference-protocol frame
 // together with its response envelope.
 const MAX_APPROVAL_RECORD_BYTES: usize = 525_312;
@@ -71,6 +72,9 @@ pub struct ApprovalRecord {
     pub schema_version: u32,
     /// Fully correlated request submitted by Runtime.
     pub request: ApprovalRequest,
+    /// Immutable tenant boundary bound by the trusted submitting authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tenant_id: Option<String>,
     /// Current durable lifecycle.
     pub status: ApprovalRecordStatus,
     /// Optimistic concurrency revision, beginning at one.
@@ -81,16 +85,60 @@ pub struct ApprovalRecord {
     pub settled_at_ms: Option<u64>,
 }
 
+impl ApprovalRecord {
+    /// Returns the durable tenant owner, or `None` for unscoped records.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+}
+
 /// Durable, revisioned settlement authority for approval requests.
 pub trait ApprovalInbox: Send + Sync {
-    /// Idempotently creates one pending request.
-    fn submit<'a>(&'a self, request: ApprovalRequest) -> HarnessFuture<'a, ApprovalRecord>;
+    /// Idempotently creates one unscoped pending request.
+    fn submit<'a>(&'a self, request: ApprovalRequest) -> HarnessFuture<'a, ApprovalRecord> {
+        Box::pin(async move {
+            let authority = AuthorityContext::new(request.requested_by.clone(), None)?;
+            self.submit_as(request, &authority).await
+        })
+    }
 
-    /// Loads one request by identity.
-    fn get<'a>(&'a self, approval_id: &'a ApprovalId) -> HarnessFuture<'a, Option<ApprovalRecord>>;
+    /// Idempotently creates one request under trusted tenant authority.
+    fn submit_as<'a>(
+        &'a self,
+        request: ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalRecord>;
 
-    /// Returns the oldest pending records within a hard page bound.
-    fn pending<'a>(&'a self, limit: usize) -> HarnessFuture<'a, Vec<ApprovalRecord>>;
+    /// Loads one unscoped request by identity.
+    fn get<'a>(&'a self, approval_id: &'a ApprovalId) -> HarnessFuture<'a, Option<ApprovalRecord>> {
+        Box::pin(async move {
+            self.get_as(approval_id, &AuthorityContext::local_process())
+                .await
+        })
+    }
+
+    /// Loads one request only when its tenant exactly matches the authority.
+    fn get_as<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Option<ApprovalRecord>>;
+
+    /// Returns the oldest unscoped pending records within a hard page bound.
+    fn pending<'a>(&'a self, limit: usize) -> HarnessFuture<'a, Vec<ApprovalRecord>> {
+        Box::pin(async move {
+            self.pending_as(limit, &AuthorityContext::local_process())
+                .await
+        })
+    }
+
+    /// Returns the oldest pending records for the exact tenant boundary.
+    fn pending_as<'a>(
+        &'a self,
+        limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Vec<ApprovalRecord>>;
 
     /// Atomically settles a pending record at the observed revision.
     ///
@@ -102,6 +150,21 @@ pub trait ApprovalInbox: Send + Sync {
         expected_revision: u64,
         decision: ApprovalDecision,
         decided_by: ApprovalActor,
+    ) -> HarnessFuture<'a, ApprovalRecord> {
+        Box::pin(async move {
+            let authority = AuthorityContext::new(decided_by, None)?;
+            self.settle_as(approval_id, expected_revision, decision, &authority)
+                .await
+        })
+    }
+
+    /// Atomically settles a pending record inside the exact tenant boundary.
+    fn settle_as<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        expected_revision: u64,
+        decision: ApprovalDecision,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, ApprovalRecord>;
 
     /// Marks pending requests for an abandoned Turn as non-actionable.
@@ -110,6 +173,25 @@ pub trait ApprovalInbox: Send + Sync {
         thread_id: &'a ThreadId,
         turn_id: &'a TurnId,
         reason: &'a str,
+    ) -> HarnessFuture<'a, usize> {
+        Box::pin(async move {
+            self.orphan_turn_as(
+                thread_id,
+                turn_id,
+                reason,
+                &AuthorityContext::local_process(),
+            )
+            .await
+        })
+    }
+
+    /// Orphans pending requests for one Turn inside the exact tenant boundary.
+    fn orphan_turn_as<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        turn_id: &'a TurnId,
+        reason: &'a str,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, usize>;
 }
 
@@ -128,37 +210,58 @@ impl MemoryApprovalInbox {
 }
 
 impl ApprovalInbox for MemoryApprovalInbox {
-    fn submit<'a>(&'a self, request: ApprovalRequest) -> HarnessFuture<'a, ApprovalRecord> {
+    fn submit_as<'a>(
+        &'a self,
+        request: ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalRecord> {
         Box::pin(async move {
             validate_current_request(&request)?;
+            validate_submission_authority(&request, authority)?;
             let mut records = self.records.lock().await;
             if let Some(existing) = records.get(&request.id) {
-                return matching_request(existing, &request);
+                return matching_request(existing, &request, authority.tenant_id());
             }
-            enforce_turn_capacity(records.values(), &request)?;
-            let record = new_record(request);
+            enforce_turn_capacity(records.values(), &request, authority.tenant_id())?;
+            let record = new_record(request, authority.tenant_id());
             validate_record(&record)?;
             records.insert(record.request.id.clone(), record.clone());
             Ok(record)
         })
     }
 
-    fn get<'a>(&'a self, approval_id: &'a ApprovalId) -> HarnessFuture<'a, Option<ApprovalRecord>> {
+    fn get_as<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Option<ApprovalRecord>> {
         Box::pin(async move {
             validate_identity("approval", approval_id.as_str())?;
-            Ok(self.records.lock().await.get(approval_id).cloned())
+            validate_authority(authority)?;
+            Ok(self
+                .records
+                .lock()
+                .await
+                .get(approval_id)
+                .filter(|record| record.tenant_id() == authority.tenant_id())
+                .cloned())
         })
     }
 
-    fn pending<'a>(&'a self, limit: usize) -> HarnessFuture<'a, Vec<ApprovalRecord>> {
+    fn pending_as<'a>(
+        &'a self,
+        limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Vec<ApprovalRecord>> {
         Box::pin(async move {
             validate_page(limit)?;
+            validate_authority(authority)?;
             let records = self.records.lock().await;
             let mut selected: Vec<&ApprovalRecord> = Vec::with_capacity(limit);
-            for record in records
-                .values()
-                .filter(|record| matches!(record.status, ApprovalRecordStatus::Pending))
-            {
+            for record in records.values().filter(|record| {
+                record.tenant_id() == authority.tenant_id()
+                    && matches!(record.status, ApprovalRecordStatus::Pending)
+            }) {
                 let position = selected
                     .binary_search_by(|existing| {
                         (existing.requested_at_ms, &existing.request.id)
@@ -176,39 +279,50 @@ impl ApprovalInbox for MemoryApprovalInbox {
         })
     }
 
-    fn settle<'a>(
+    fn settle_as<'a>(
         &'a self,
         approval_id: &'a ApprovalId,
         expected_revision: u64,
         decision: ApprovalDecision,
-        decided_by: ApprovalActor,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, ApprovalRecord> {
         Box::pin(async move {
             validate_identity("approval", approval_id.as_str())?;
             validate_decision(&decision)?;
-            validate_current_actor("approval settler", &decided_by)?;
+            validate_authority(authority)?;
             let mut records = self.records.lock().await;
-            let record = records.get_mut(approval_id).ok_or_else(|| {
-                HarnessError::Approval(format!("approval {approval_id} does not exist"))
-            })?;
-            settle_record(record, expected_revision, decision, decided_by)
+            let record = records
+                .get_mut(approval_id)
+                .filter(|record| record.tenant_id() == authority.tenant_id())
+                .ok_or_else(|| {
+                    HarnessError::Approval(format!("approval {approval_id} does not exist"))
+                })?;
+            settle_record(
+                record,
+                expected_revision,
+                decision,
+                authority.actor().clone(),
+            )
         })
     }
 
-    fn orphan_turn<'a>(
+    fn orphan_turn_as<'a>(
         &'a self,
         thread_id: &'a ThreadId,
         turn_id: &'a TurnId,
         reason: &'a str,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, usize> {
         Box::pin(async move {
             validate_identity("thread", thread_id.as_str())?;
             validate_identity("turn", turn_id.as_str())?;
             validate_reason("orphan", reason)?;
+            validate_authority(authority)?;
             let mut records = self.records.lock().await;
             let mut changed = 0_usize;
             for record in records.values_mut().filter(|record| {
-                record.request.authorization.thread_id == *thread_id
+                record.tenant_id() == authority.tenant_id()
+                    && record.request.authorization.thread_id == *thread_id
                     && record.request.authorization.turn_id == *turn_id
                     && matches!(record.status, ApprovalRecordStatus::Pending)
             }) {
@@ -256,6 +370,7 @@ impl SqliteApprovalInbox {
                     PRAGMA synchronous = FULL;
                     CREATE TABLE IF NOT EXISTS approval_records (
                         approval_id    TEXT PRIMARY KEY,
+                        tenant_id      TEXT,
                         thread_id      TEXT NOT NULL,
                         turn_id        TEXT NOT NULL,
                         status         TEXT NOT NULL
@@ -265,9 +380,11 @@ impl SqliteApprovalInbox {
                         record_json    TEXT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS approval_pending_order
-                        ON approval_records(status, requested_at_ms, approval_id);
+                        ON approval_records(
+                            tenant_id, status, requested_at_ms, approval_id
+                        );
                     CREATE INDEX IF NOT EXISTS approval_turn
-                        ON approval_records(thread_id, turn_id, status);
+                        ON approval_records(tenant_id, thread_id, turn_id, status);
                     {}
                     ",
                     metadata_schema_sql()
@@ -301,9 +418,15 @@ impl SqliteApprovalInbox {
 }
 
 impl ApprovalInbox for SqliteApprovalInbox {
-    fn submit<'a>(&'a self, request: ApprovalRequest) -> HarnessFuture<'a, ApprovalRecord> {
+    fn submit_as<'a>(
+        &'a self,
+        request: ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalRecord> {
+        let authority = authority.clone();
         Box::pin(async move {
             validate_current_request(&request)?;
+            validate_submission_authority(&request, &authority)?;
             self.with_connection(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -311,23 +434,30 @@ impl ApprovalInbox for SqliteApprovalInbox {
                 if let Some(indexed) = transaction
                     .query_row(
                         "SELECT length(CAST(status AS BLOB)), status, revision,
+                                length(CAST(tenant_id AS BLOB)), tenant_id,
                                 length(CAST(thread_id AS BLOB)), thread_id,
                                 length(CAST(turn_id AS BLOB)), turn_id,
                                 length(CAST(record_json AS BLOB)), record_json
-                         FROM approval_records WHERE approval_id = ?1",
-                        [request.id.as_str()],
+                         FROM approval_records
+                         WHERE approval_id = ?1 AND tenant_id IS ?2",
+                        params![request.id.as_str(), authority.tenant_id()],
                         read_indexed_record,
                     )
                     .optional()
                     .map_err(|error| HarnessError::Approval(error.to_string()))?
                 {
-                    return matching_request(&decode_indexed_record(indexed)?, &request);
+                    return matching_request(
+                        &decode_indexed_record(indexed)?,
+                        &request,
+                        authority.tenant_id(),
+                    );
                 }
                 let count: i64 = transaction
                     .query_row(
                         "SELECT COUNT(*) FROM approval_records
-                         WHERE thread_id = ?1 AND turn_id = ?2",
+                         WHERE tenant_id IS ?1 AND thread_id = ?2 AND turn_id = ?3",
                         params![
+                            authority.tenant_id(),
                             request.authorization.thread_id.as_str(),
                             request.authorization.turn_id.as_str()
                         ],
@@ -340,16 +470,17 @@ impl ApprovalInbox for SqliteApprovalInbox {
                     )));
                 }
 
-                let record = new_record(request);
+                let record = new_record(request, authority.tenant_id());
                 let encoded = encode_record(&record)?;
                 transaction
                     .execute(
                         "INSERT INTO approval_records
-                            (approval_id, thread_id, turn_id, status, revision,
-                             requested_at_ms, record_json)
-                         VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)",
+                            (approval_id, tenant_id, thread_id, turn_id, status,
+                             revision, requested_at_ms, record_json)
+                         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
                         params![
                             record.request.id.as_str(),
+                            record.tenant_id(),
                             record.request.authorization.thread_id.as_str(),
                             record.request.authorization.turn_id.as_str(),
                             to_sql_u64("approval revision", record.revision)?,
@@ -367,19 +498,27 @@ impl ApprovalInbox for SqliteApprovalInbox {
         })
     }
 
-    fn get<'a>(&'a self, approval_id: &'a ApprovalId) -> HarnessFuture<'a, Option<ApprovalRecord>> {
+    fn get_as<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Option<ApprovalRecord>> {
         let approval_id = approval_id.clone();
+        let authority = authority.clone();
         Box::pin(async move {
             validate_identity("approval", approval_id.as_str())?;
+            validate_authority(&authority)?;
             self.with_connection(move |connection| {
                 connection
                     .query_row(
                         "SELECT length(CAST(status AS BLOB)), status, revision,
+                                length(CAST(tenant_id AS BLOB)), tenant_id,
                                 length(CAST(thread_id AS BLOB)), thread_id,
                                 length(CAST(turn_id AS BLOB)), turn_id,
                                 length(CAST(record_json AS BLOB)), record_json
-                         FROM approval_records WHERE approval_id = ?1",
-                        [approval_id.as_str()],
+                         FROM approval_records
+                         WHERE approval_id = ?1 AND tenant_id IS ?2",
+                        params![approval_id.as_str(), authority.tenant_id()],
                         read_indexed_record,
                     )
                     .optional()
@@ -391,29 +530,39 @@ impl ApprovalInbox for SqliteApprovalInbox {
         })
     }
 
-    fn pending<'a>(&'a self, limit: usize) -> HarnessFuture<'a, Vec<ApprovalRecord>> {
+    fn pending_as<'a>(
+        &'a self,
+        limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Vec<ApprovalRecord>> {
+        let authority = authority.clone();
         Box::pin(async move {
             validate_page(limit)?;
+            validate_authority(&authority)?;
             self.with_connection(move |connection| {
                 let mut statement = connection
                     .prepare(
                         "SELECT length(CAST(status AS BLOB)), status, revision,
+                                length(CAST(tenant_id AS BLOB)), tenant_id,
                                 length(CAST(thread_id AS BLOB)), thread_id,
                                 length(CAST(turn_id AS BLOB)), turn_id,
                                 length(CAST(record_json AS BLOB)), record_json
                          FROM approval_records
-                         WHERE status = 'pending'
+                         WHERE tenant_id IS ?1 AND status = 'pending'
                          ORDER BY requested_at_ms, approval_id
-                         LIMIT ?1",
+                         LIMIT ?2",
                     )
                     .map_err(|error| HarnessError::Approval(error.to_string()))?;
                 let rows = statement
                     .query_map(
-                        [i64::try_from(limit).map_err(|_| {
-                            HarnessError::Approval(
-                                "approval page exceeds SQLite INTEGER".to_owned(),
-                            )
-                        })?],
+                        params![
+                            authority.tenant_id(),
+                            i64::try_from(limit).map_err(|_| {
+                                HarnessError::Approval(
+                                    "approval page exceeds SQLite INTEGER".to_owned(),
+                                )
+                            })?
+                        ],
                         read_indexed_record,
                     )
                     .map_err(|error| HarnessError::Approval(error.to_string()))?;
@@ -434,18 +583,19 @@ impl ApprovalInbox for SqliteApprovalInbox {
         })
     }
 
-    fn settle<'a>(
+    fn settle_as<'a>(
         &'a self,
         approval_id: &'a ApprovalId,
         expected_revision: u64,
         decision: ApprovalDecision,
-        decided_by: ApprovalActor,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, ApprovalRecord> {
         let approval_id = approval_id.clone();
+        let authority = authority.clone();
         Box::pin(async move {
             validate_identity("approval", approval_id.as_str())?;
             validate_decision(&decision)?;
-            validate_current_actor("approval settler", &decided_by)?;
+            validate_authority(&authority)?;
             self.with_connection(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -453,11 +603,13 @@ impl ApprovalInbox for SqliteApprovalInbox {
                 let indexed = transaction
                     .query_row(
                         "SELECT length(CAST(status AS BLOB)), status, revision,
+                                length(CAST(tenant_id AS BLOB)), tenant_id,
                                 length(CAST(thread_id AS BLOB)), thread_id,
                                 length(CAST(turn_id AS BLOB)), turn_id,
                                 length(CAST(record_json AS BLOB)), record_json
-                         FROM approval_records WHERE approval_id = ?1",
-                        [approval_id.as_str()],
+                         FROM approval_records
+                         WHERE approval_id = ?1 AND tenant_id IS ?2",
+                        params![approval_id.as_str(), authority.tenant_id()],
                         read_indexed_record,
                     )
                     .optional()
@@ -466,17 +618,24 @@ impl ApprovalInbox for SqliteApprovalInbox {
                         HarnessError::Approval(format!("approval {approval_id} does not exist"))
                     })?;
                 let mut record = decode_indexed_record(indexed)?;
-                let settled = settle_record(&mut record, expected_revision, decision, decided_by)?;
+                let settled = settle_record(
+                    &mut record,
+                    expected_revision,
+                    decision,
+                    authority.actor().clone(),
+                )?;
                 let encoded = encode_record(&settled)?;
                 let changed = transaction
                     .execute(
                         "UPDATE approval_records
                          SET status = 'settled', revision = ?1, record_json = ?2
-                         WHERE approval_id = ?3 AND revision = ?4 AND status = 'pending'",
+                         WHERE approval_id = ?3 AND tenant_id IS ?4
+                               AND revision = ?5 AND status = 'pending'",
                         params![
                             to_sql_u64("approval revision", settled.revision)?,
                             encoded,
                             approval_id.as_str(),
+                            authority.tenant_id(),
                             to_sql_u64("expected approval revision", expected_revision)?
                         ],
                     )
@@ -497,19 +656,22 @@ impl ApprovalInbox for SqliteApprovalInbox {
         })
     }
 
-    fn orphan_turn<'a>(
+    fn orphan_turn_as<'a>(
         &'a self,
         thread_id: &'a ThreadId,
         turn_id: &'a TurnId,
         reason: &'a str,
+        authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, usize> {
         let thread_id = thread_id.clone();
         let turn_id = turn_id.clone();
         let reason = reason.to_owned();
+        let authority = authority.clone();
         Box::pin(async move {
             validate_identity("thread", thread_id.as_str())?;
             validate_identity("turn", turn_id.as_str())?;
             validate_reason("orphan", &reason)?;
+            validate_authority(&authority)?;
             self.with_connection(move |connection| {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -519,14 +681,16 @@ impl ApprovalInbox for SqliteApprovalInbox {
                         .prepare(
                             "SELECT length(CAST(approval_id AS BLOB)), approval_id
                              FROM approval_records
-                             WHERE thread_id = ?1 AND turn_id = ?2 AND status = 'pending'
+                             WHERE tenant_id IS ?1 AND thread_id = ?2
+                                   AND turn_id = ?3 AND status = 'pending'
                              ORDER BY approval_id
-                             LIMIT ?3",
+                             LIMIT ?4",
                         )
                         .map_err(|error| HarnessError::Approval(error.to_string()))?;
                     let rows = statement
                         .query_map(
                             params![
+                                authority.tenant_id(),
                                 thread_id.as_str(),
                                 turn_id.as_str(),
                                 i64::try_from(MAX_APPROVALS_PER_TURN).unwrap_or(i64::MAX)
@@ -547,11 +711,13 @@ impl ApprovalInbox for SqliteApprovalInbox {
                     let indexed = transaction
                         .query_row(
                             "SELECT length(CAST(status AS BLOB)), status, revision,
+                                    length(CAST(tenant_id AS BLOB)), tenant_id,
                                     length(CAST(thread_id AS BLOB)), thread_id,
                                     length(CAST(turn_id AS BLOB)), turn_id,
                                     length(CAST(record_json AS BLOB)), record_json
-                             FROM approval_records WHERE approval_id = ?1",
-                            [approval_id.as_str()],
+                             FROM approval_records
+                             WHERE approval_id = ?1 AND tenant_id IS ?2",
+                            params![approval_id.as_str(), authority.tenant_id()],
                             read_indexed_record,
                         )
                         .optional()
@@ -568,11 +734,13 @@ impl ApprovalInbox for SqliteApprovalInbox {
                         .execute(
                             "UPDATE approval_records
                              SET status = 'orphaned', revision = ?1, record_json = ?2
-                             WHERE approval_id = ?3 AND status = 'pending'",
+                             WHERE approval_id = ?3 AND tenant_id IS ?4
+                                   AND status = 'pending'",
                             params![
                                 to_sql_u64("approval revision", record.revision)?,
                                 encoded,
-                                record.request.id.as_str()
+                                record.request.id.as_str(),
+                                authority.tenant_id()
                             ],
                         )
                         .map_err(|error| HarnessError::Approval(error.to_string()))?;
@@ -616,18 +784,34 @@ impl InboxApprovalHandler {
 
 impl ApprovalHandler for InboxApprovalHandler {
     fn decide<'a>(&'a self, request: &'a ApprovalRequest) -> HarnessFuture<'a, ApprovalDecision> {
-        let request = request.clone();
         Box::pin(async move {
-            let mut record = self.inbox.submit(request).await?;
+            let authority = AuthorityContext::new(request.requested_by.clone(), None)?;
+            self.decide_as(request, &authority).await
+        })
+    }
+
+    fn decide_as<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalDecision> {
+        let request = request.clone();
+        let authority = authority.clone();
+        Box::pin(async move {
+            let mut record = self.inbox.submit_as(request, &authority).await?;
             loop {
                 match record.status {
                     ApprovalRecordStatus::Pending => {
                         time::sleep(self.poll_interval).await;
-                        record = self.inbox.get(&record.request.id).await?.ok_or_else(|| {
-                            HarnessError::Approval(
-                                "approval disappeared while awaiting settlement".to_owned(),
-                            )
-                        })?;
+                        record = self
+                            .inbox
+                            .get_as(&record.request.id, &authority)
+                            .await?
+                            .ok_or_else(|| {
+                                HarnessError::Approval(
+                                    "approval disappeared while awaiting settlement".to_owned(),
+                                )
+                            })?;
                     }
                     ApprovalRecordStatus::Settled { decision, .. } => return Ok(decision),
                     ApprovalRecordStatus::Orphaned { reason } => {
@@ -647,24 +831,45 @@ impl ApprovalHandler for InboxApprovalHandler {
         reason: &'a str,
     ) -> HarnessFuture<'a, ()> {
         Box::pin(async move {
-            self.inbox.orphan_turn(thread_id, turn_id, reason).await?;
+            self.abandon_turn_as(
+                thread_id,
+                turn_id,
+                reason,
+                &AuthorityContext::local_process(),
+            )
+            .await
+        })
+    }
+
+    fn abandon_turn_as<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        turn_id: &'a TurnId,
+        reason: &'a str,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ()> {
+        Box::pin(async move {
+            self.inbox
+                .orphan_turn_as(thread_id, turn_id, reason, authority)
+                .await?;
             Ok(())
         })
     }
 }
 
-type IndexedRecord = (String, i64, String, String, String);
+type IndexedRecord = (String, i64, Option<String>, String, String, String);
 
 fn read_indexed_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedRecord> {
     Ok((
         bounded_text(row, 0, 1, 8, "stored approval status")?,
         row.get(2)?,
-        bounded_text(row, 3, 4, 256, "stored approval Thread identity")?,
-        bounded_text(row, 5, 6, 256, "stored approval Turn identity")?,
+        bounded_optional_text(row, 3, 4, 128, "stored approval tenant identity")?,
+        bounded_text(row, 5, 6, 256, "stored approval Thread identity")?,
+        bounded_text(row, 7, 8, 256, "stored approval Turn identity")?,
         bounded_text(
             row,
-            7,
-            8,
+            9,
+            10,
             MAX_APPROVAL_RECORD_BYTES,
             "stored approval record",
         )?,
@@ -672,12 +877,13 @@ fn read_indexed_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedRecor
 }
 
 fn decode_indexed_record(indexed: IndexedRecord) -> Result<ApprovalRecord, HarnessError> {
-    let (status, revision, thread_id, turn_id, encoded) = indexed;
+    let (status, revision, tenant_id, thread_id, turn_id, encoded) = indexed;
     let record = decode_record(&encoded)?;
     let revision = u64::try_from(revision)
         .map_err(|_| HarnessError::Approval("invalid stored approval revision".to_owned()))?;
     if status != status_name(&record.status)
         || revision != record.revision
+        || tenant_id.as_deref() != record.tenant_id()
         || thread_id != record.request.authorization.thread_id.as_str()
         || turn_id != record.request.authorization.turn_id.as_str()
     {
@@ -696,10 +902,11 @@ fn status_name(status: &ApprovalRecordStatus) -> &'static str {
     }
 }
 
-fn new_record(request: ApprovalRequest) -> ApprovalRecord {
+fn new_record(request: ApprovalRequest, tenant_id: Option<&str>) -> ApprovalRecord {
     ApprovalRecord {
         schema_version: APPROVAL_INBOX_SCHEMA_VERSION,
         request,
+        tenant_id: tenant_id.map(str::to_owned),
         status: ApprovalRecordStatus::Pending,
         revision: 1,
         requested_at_ms: now_ms(),
@@ -710,8 +917,9 @@ fn new_record(request: ApprovalRequest) -> ApprovalRecord {
 fn matching_request(
     existing: &ApprovalRecord,
     request: &ApprovalRequest,
+    tenant_id: Option<&str>,
 ) -> Result<ApprovalRecord, HarnessError> {
-    if &existing.request == request {
+    if &existing.request == request && existing.tenant_id() == tenant_id {
         Ok(existing.clone())
     } else {
         Err(HarnessError::Approval(format!(
@@ -783,10 +991,12 @@ fn orphan_record(record: &mut ApprovalRecord, reason: &str) -> Result<(), Harnes
 fn enforce_turn_capacity<'a>(
     records: impl Iterator<Item = &'a ApprovalRecord>,
     request: &ApprovalRequest,
+    tenant_id: Option<&str>,
 ) -> Result<(), HarnessError> {
     let count = records
         .filter(|record| {
-            record.request.authorization.thread_id == request.authorization.thread_id
+            record.tenant_id() == tenant_id
+                && record.request.authorization.thread_id == request.authorization.thread_id
                 && record.request.authorization.turn_id == request.authorization.turn_id
         })
         .count();
@@ -827,6 +1037,10 @@ fn validate_record(record: &ApprovalRecord) -> Result<(), HarnessError> {
         ));
     }
     validate_request(&record.request)?;
+    if let Some(tenant_id) = record.tenant_id() {
+        AuthorityContext::validate_tenant(tenant_id)
+            .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    }
     if matches!(
         record.request.requested_by,
         ApprovalActor::UnattributedLegacy
@@ -925,6 +1139,25 @@ fn validate_current_request(request: &ApprovalRequest) -> Result<(), HarnessErro
     validate_current_actor("approval requester", &request.requested_by)
 }
 
+fn validate_authority(authority: &AuthorityContext) -> Result<(), HarnessError> {
+    authority
+        .validate_current("approval authority")
+        .map_err(|error| HarnessError::Approval(error.to_string()))
+}
+
+fn validate_submission_authority(
+    request: &ApprovalRequest,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    validate_authority(authority)?;
+    if &request.requested_by != authority.actor() {
+        return Err(HarnessError::Approval(
+            "approval requester does not match submitting authority".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_record_actor(kind: &str, actor: &ApprovalActor) -> Result<(), HarnessError> {
     actor.validate_shape(kind)
 }
@@ -985,14 +1218,6 @@ pub(super) fn validate_or_bootstrap_store(connection: &Connection) -> Result<(),
         return Ok(());
     }
     if !table_exists(connection, APPROVAL_METADATA_TABLE)? {
-        let records: i64 = connection
-            .query_row("SELECT COUNT(*) FROM approval_records", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| HarnessError::Approval(error.to_string()))?;
-        if records == 0 {
-            return Ok(());
-        }
         return Err(HarnessError::Approval(
             "SQLite Approval Inbox migration required; run `yh approval-migrate <database> <backup>` before opening this store"
                 .to_owned(),
@@ -1030,10 +1255,29 @@ pub(super) fn validate_current_metadata(connection: &Connection) -> Result<(), H
         )
         .optional()
         .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    if entries == 1 && schema == Some(i64::from(PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION)) {
+        return Err(HarnessError::Approval(
+            "SQLite Approval Inbox migration required; run `yh approval-migrate <database> <backup>` before opening this store"
+                .to_owned(),
+        ));
+    }
     if entries != 1 || schema != Some(i64::from(APPROVAL_INBOX_SCHEMA_VERSION)) {
         return Err(HarnessError::Approval(format!(
             "unsupported SQLite Approval Inbox metadata; expected record schema {APPROVAL_INBOX_SCHEMA_VERSION}"
         )));
+    }
+    let tenant_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('approval_records')
+             WHERE name = 'tenant_id' AND type = 'TEXT'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| HarnessError::Approval(error.to_string()))?;
+    if tenant_columns != 1 {
+        return Err(HarnessError::Approval(
+            "SQLite Approval Inbox schema is partial: missing tenant_id projection".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1063,8 +1307,8 @@ mod tests {
     };
     use crate::{
         ApprovalActor, ApprovalDecision, ApprovalHandler, ApprovalId, ApprovalRequest,
-        CapabilityOrigin, HarnessError, RiskLevel, ThreadId, ToolAuthorization, ToolDescriptor,
-        TurnId,
+        AuthorityContext, CapabilityOrigin, HarnessError, RiskLevel, ThreadId, ToolAuthorization,
+        ToolDescriptor, TurnId,
     };
 
     fn approver(subject: &str) -> ApprovalActor {
@@ -1072,6 +1316,10 @@ mod tests {
             authority: "test-authority".to_owned(),
             subject: subject.to_owned(),
         }
+    }
+
+    fn tenant_authority(tenant: &str, subject: &str) -> AuthorityContext {
+        AuthorityContext::new(approver(subject), Some(tenant.to_owned())).expect("tenant authority")
     }
 
     fn request() -> ApprovalRequest {
@@ -1098,13 +1346,13 @@ mod tests {
     fn request_with_pending_record_bytes(target_bytes: usize) -> ApprovalRequest {
         let mut request = request();
         request.authorization.input = json!({"padding": ""});
-        let base = serde_json::to_vec(&super::new_record(request.clone()))
+        let base = serde_json::to_vec(&super::new_record(request.clone(), None))
             .expect("encode base pending record")
             .len();
         let padding = target_bytes.checked_sub(base).expect("base request fits");
         request.authorization.input = json!({"padding": "x".repeat(padding)});
         assert_eq!(
-            serde_json::to_vec(&super::new_record(request.clone()))
+            serde_json::to_vec(&super::new_record(request.clone(), None))
                 .expect("encode maximum pending record")
                 .len(),
             target_bytes
@@ -1205,6 +1453,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_ownership_fences_memory_and_sqlite_approval_access() {
+        let path = temp_database_path();
+        let sqlite = SqliteApprovalInbox::open(&path).await.expect("open inbox");
+        let memory = MemoryApprovalInbox::new();
+        for inbox in [&memory as &dyn ApprovalInbox, &sqlite as &dyn ApprovalInbox] {
+            let requester = tenant_authority("tenant-a", "requester");
+            let other_tenant = tenant_authority("tenant-b", "approver");
+            let approver = tenant_authority("tenant-a", "approver");
+            let mut request = request();
+            request.requested_by = requester.actor().clone();
+
+            let submitted = inbox
+                .submit_as(request.clone(), &requester)
+                .await
+                .expect("submit tenant approval");
+            assert_eq!(submitted.tenant_id(), Some("tenant-a"));
+            assert_eq!(
+                serde_json::to_value(&submitted).expect("encode tenant approval")["tenant_id"],
+                "tenant-a"
+            );
+            assert!(
+                inbox
+                    .get_as(&request.id, &other_tenant)
+                    .await
+                    .expect("cross-tenant read")
+                    .is_none()
+            );
+            assert!(
+                inbox
+                    .get(&request.id)
+                    .await
+                    .expect("unscoped read")
+                    .is_none()
+            );
+            assert!(
+                inbox
+                    .pending_as(1, &other_tenant)
+                    .await
+                    .expect("cross-tenant pending")
+                    .is_empty()
+            );
+            assert_eq!(
+                inbox
+                    .orphan_turn_as(
+                        &request.authorization.thread_id,
+                        &request.authorization.turn_id,
+                        "wrong tenant",
+                        &other_tenant,
+                    )
+                    .await
+                    .expect("cross-tenant orphan"),
+                0
+            );
+            let hidden = inbox
+                .settle_as(
+                    &request.id,
+                    submitted.revision,
+                    ApprovalDecision::Approve,
+                    &other_tenant,
+                )
+                .await
+                .expect_err("cross-tenant settlement");
+            assert!(hidden.to_string().contains("does not exist"));
+
+            let settled = inbox
+                .settle_as(
+                    &request.id,
+                    submitted.revision,
+                    ApprovalDecision::Approve,
+                    &approver,
+                )
+                .await
+                .expect("same-tenant settlement");
+            assert_eq!(settled.tenant_id(), Some("tenant-a"));
+        }
+        drop(sqlite);
+
+        let reopened = SqliteApprovalInbox::open(&path)
+            .await
+            .expect("reopen inbox");
+        let tenant = tenant_authority("tenant-a", "reader");
+        assert_eq!(
+            reopened
+                .pending_as(1, &tenant)
+                .await
+                .expect("reopened pending")
+                .len(),
+            0
+        );
+        drop(reopened);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_approval_tenant_projection_drift() {
+        let path = temp_database_path();
+        let inbox = SqliteApprovalInbox::open(&path).await.expect("open inbox");
+        let requester = tenant_authority("tenant-a", "requester");
+        let other_tenant = tenant_authority("tenant-b", "reader");
+        let mut request = request();
+        request.requested_by = requester.actor().clone();
+        inbox
+            .submit_as(request.clone(), &requester)
+            .await
+            .expect("submit tenant approval");
+        drop(inbox);
+
+        Connection::open(&path)
+            .expect("open corruptible inbox")
+            .execute(
+                "UPDATE approval_records SET tenant_id = 'tenant-b'
+                 WHERE approval_id = ?1",
+                [request.id.as_str()],
+            )
+            .expect("corrupt tenant projection");
+
+        let reopened = SqliteApprovalInbox::open(&path)
+            .await
+            .expect("reopen inbox");
+        let error = reopened
+            .get_as(&request.id, &other_tenant)
+            .await
+            .expect_err("tenant drift");
+        assert!(error.to_string().contains("indexes do not match"));
+        assert!(
+            reopened
+                .get_as(&request.id, &requester)
+                .await
+                .expect("original tenant is hidden")
+                .is_none()
+        );
+        drop(reopened);
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
     async fn current_workflow_rejects_unattributed_legacy_actor() {
         let inbox = MemoryApprovalInbox::new();
         let mut legacy_request = request();
@@ -1273,7 +1657,7 @@ mod tests {
         {
             let mut records = inbox.records.lock().await;
             for requested_at_ms in (0..32).rev() {
-                let mut record = super::new_record(request());
+                let mut record = super::new_record(request(), None);
                 record.requested_at_ms = requested_at_ms;
                 records.insert(record.request.id.clone(), record);
             }
@@ -1299,7 +1683,7 @@ mod tests {
     #[test]
     fn failed_record_transition_never_mutates_its_input() {
         let request = request_with_pending_record_bytes(super::MAX_APPROVAL_RECORD_BYTES);
-        let mut record = super::new_record(request);
+        let mut record = super::new_record(request, None);
         let original = record.clone();
         super::settle_record(
             &mut record,

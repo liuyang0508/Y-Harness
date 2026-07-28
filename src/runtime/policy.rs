@@ -22,6 +22,25 @@ pub trait ApprovalHandler: Send + Sync {
     /// Approves or denies one fully correlated request.
     fn decide<'a>(&'a self, request: &'a ApprovalRequest) -> HarnessFuture<'a, ApprovalDecision>;
 
+    /// Decides one request under trusted tenant authority.
+    ///
+    /// Legacy handlers are safe only for unscoped execution. Tenant-aware
+    /// handlers must override this method and durably preserve the boundary.
+    fn decide_as<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalDecision> {
+        Box::pin(async move {
+            if authority.tenant_id().is_some() {
+                return Err(crate::HarnessError::InvalidConfiguration(
+                    "tenant-scoped approvals require a tenant-aware approval handler".to_owned(),
+                ));
+            }
+            self.decide(request).await
+        })
+    }
+
     /// Marks pending requests from a Turn that can no longer consume settlement.
     fn abandon_turn<'a>(
         &'a self,
@@ -30,6 +49,24 @@ pub trait ApprovalHandler: Send + Sync {
         _reason: &'a str,
     ) -> HarnessFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Marks abandoned requests under trusted tenant authority.
+    fn abandon_turn_as<'a>(
+        &'a self,
+        thread_id: &'a ThreadId,
+        turn_id: &'a TurnId,
+        reason: &'a str,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ()> {
+        Box::pin(async move {
+            if authority.tenant_id().is_some() {
+                return Err(crate::HarnessError::InvalidConfiguration(
+                    "tenant-scoped approvals require a tenant-aware approval handler".to_owned(),
+                ));
+            }
+            self.abandon_turn(thread_id, turn_id, reason).await
+        })
     }
 }
 
@@ -82,5 +119,13 @@ impl ApprovalHandler for DenyAllApprovals {
                 reason: "no approval handler is configured".to_owned(),
             })
         })
+    }
+
+    fn decide_as<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        _authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalDecision> {
+        self.decide(request)
     }
 }

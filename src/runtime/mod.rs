@@ -708,10 +708,11 @@ impl HarnessRuntime {
                 .filter(|turn| turn.status == TurnStatus::Interrupted)
         {
             self.approvals
-                .abandon_turn(
+                .abandon_turn_as(
                     thread_id,
                     &turn.id,
                     "originating Turn was interrupted before approval settlement",
+                    authority,
                 )
                 .await?;
         }
@@ -1336,19 +1337,13 @@ impl HarnessRuntime {
         deadline: Option<Instant>,
     ) -> Result<PreparedExecution, HarnessError> {
         let memory_scope = options.validated_memory_scope()?;
-        if options.authority.tenant_id().is_some() {
-            return Err(HarnessError::State(
-                "tenant-scoped approval recovery requires durable tenant authority evidence"
-                    .to_owned(),
-            ));
-        }
         let thread = self
-            .load_thread(thread_id)
+            .load_thread_as(thread_id, &options.authority)
             .await?
             .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
         let capacity = self
             .state
-            .thread_capacity(thread_id)
+            .thread_capacity_as(thread_id, &options.authority)
             .await?
             .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
         require_runtime_capacity(&capacity)?;
@@ -1476,7 +1471,7 @@ impl HarnessRuntime {
                 ),
                 &options.cancellation,
                 deadline,
-                || self.approvals.decide(&request),
+                || self.approvals.decide_as(&request, &options.authority),
             )
             .await?;
         validate_approval_decision(&approval)?;
@@ -1834,14 +1829,6 @@ impl HarnessRuntime {
                 Err(error)
             }
             PolicyDecision::Ask { reason, risk } => {
-                if options.authority.tenant_id().is_some() {
-                    let error = HarnessError::InvalidConfiguration(
-                        "tenant-scoped approvals require durable tenant authority evidence"
-                            .to_owned(),
-                    );
-                    self.settle_error(turn, &error).await?;
-                    return Err(error);
-                }
                 let request = ApprovalRequest {
                     id: ApprovalId::generate(),
                     requested_by: options.authority.actor().clone(),
@@ -1873,7 +1860,7 @@ impl HarnessRuntime {
                         ),
                         &options.cancellation,
                         deadline,
-                        || self.approvals.decide(&request),
+                        || self.approvals.decide_as(&request, &options.authority),
                     )
                     .await
                 {
@@ -1881,10 +1868,11 @@ impl HarnessRuntime {
                     Err(error) => {
                         let abandonment = self
                             .approvals
-                            .abandon_turn(
+                            .abandon_turn_as(
                                 &turn.thread_id,
                                 &turn.id,
                                 "approval wait ended without a settlement",
+                                &options.authority,
                             )
                             .await;
                         self.settle_error(turn, &error).await?;
@@ -5689,7 +5677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_scoped_approval_fails_before_request_or_tool_execution() {
+    async fn tenant_scoped_approval_is_durable_and_executes_only_after_settlement() {
         let calls = Arc::new(AtomicUsize::new(0));
         let authority = AuthorityContext::new(
             ActorIdentity::Authenticated {
@@ -5699,26 +5687,89 @@ mod tests {
             Some("tenant-a".to_owned()),
         )
         .expect("scoped authority");
-        let runtime = HarnessRuntime::new(
-            Arc::new(EchoModel),
-            registry(calls.clone()),
-            Arc::new(AskPolicy),
-            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+            .expect("approval handler");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                registry(calls.clone()),
+                Arc::new(AskPolicy),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_approval_handler(Arc::new(handler)),
         );
         let thread = runtime.create_thread_as(&authority).await.expect("thread");
-        let error = runtime
-            .run_turn_with_options(
-                &thread.id,
-                "protected",
-                TurnExecutionOptions {
-                    authority,
-                    ..TurnExecutionOptions::default()
-                },
+        let waiter = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            let authority = authority.clone();
+            async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "protected",
+                        TurnExecutionOptions {
+                            authority,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending_as(1, &authority)
+                    .await
+                    .expect("pending approvals")
+                    .pop()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval request timeout");
+        assert_eq!(pending.tenant_id(), Some("tenant-a"));
+        let other_tenant = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "tenant-b-approver".to_owned(),
+            },
+            Some("tenant-b".to_owned()),
+        )
+        .expect("other tenant");
+        assert!(
+            inbox
+                .get_as(&pending.request.id, &other_tenant)
+                .await
+                .expect("cross-tenant approval read")
+                .is_none()
+        );
+        let approver = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "tenant-a-approver".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("same tenant approver");
+        inbox
+            .settle_as(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                &approver,
             )
             .await
-            .expect_err("tenant-scoped approval is not durable yet");
-        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+            .expect("settle tenant approval");
+        waiter
+            .await
+            .expect("join tenant Turn")
+            .expect("complete tenant Turn");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -7340,10 +7391,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_approval_wait_resumes_after_store_reopen() {
+    async fn tenant_scoped_sqlite_approval_wait_resumes_after_store_reopen() {
         let state_path = sqlite_test_path("resume-state");
         let approval_path = sqlite_test_path("resume-approval");
         let calls = Arc::new(AtomicUsize::new(0));
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "requester".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
         let first_state = StateEngine::new(Arc::new(
             SqliteEventStore::open(&state_path)
                 .await
@@ -7367,16 +7426,31 @@ mod tests {
             )
             .with_approval_handler(first_handler.clone()),
         );
-        let thread = first.create_thread().await.expect("create SQLite thread");
+        let thread = first
+            .create_thread_as(&authority)
+            .await
+            .expect("create SQLite thread");
         let first_worker = tokio::spawn({
             let runtime = first.clone();
             let thread_id = thread.id.clone();
-            async move { runtime.run_turn(&thread_id, "resume from SQLite").await }
+            let authority = authority.clone();
+            async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "resume from SQLite",
+                        TurnExecutionOptions {
+                            authority,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
         });
         let pending = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(record) = first_inbox
-                    .pending(1)
+                    .pending_as(1, &authority)
                     .await
                     .expect("poll SQLite approvals")
                     .into_iter()
@@ -7402,15 +7476,20 @@ mod tests {
                 .await
                 .expect("reopen Approval Inbox"),
         );
+        let approver = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "sqlite-approver".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant approver");
         reopened_inbox
-            .settle(
+            .settle_as(
                 &pending.request.id,
                 pending.revision,
                 ApprovalDecision::Approve,
-                ApprovalActor::Authenticated {
-                    authority: "test-operator".to_owned(),
-                    subject: "sqlite-approver".to_owned(),
-                },
+                &approver,
             )
             .await
             .expect("settle reopened approval");
@@ -7429,7 +7508,14 @@ mod tests {
             InboxApprovalHandler::new(reopened_inbox.clone(), Duration::from_millis(10))
                 .expect("reopened approval handler"),
         ))
-        .resume_approval_turn_with_options(&thread.id, &turn_id, TurnExecutionOptions::default())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                authority,
+                ..TurnExecutionOptions::default()
+            },
+        )
         .await
         .expect("resume from reopened SQLite stores");
 
@@ -7568,23 +7654,41 @@ mod tests {
     async fn ask_is_denied_when_no_approval_handler_is_installed() {
         let calls = Arc::new(AtomicUsize::new(0));
         let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "requester".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
         let runtime = HarnessRuntime::new(
             Arc::new(EchoModel),
             registry(calls.clone()),
             Arc::new(AskPolicy),
             state,
         );
-        let thread = runtime.create_thread().await.expect("create thread");
+        let thread = runtime
+            .create_thread_as(&authority)
+            .await
+            .expect("create thread");
 
         let error = runtime
-            .run_turn(&thread.id, "default deny")
+            .run_turn_with_options(
+                &thread.id,
+                "default deny",
+                TurnExecutionOptions {
+                    authority: authority.clone(),
+                    ..TurnExecutionOptions::default()
+                },
+            )
             .await
             .expect_err("ask must not auto-approve");
 
         assert!(matches!(error, HarnessError::ApprovalDenied { .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let projected = runtime
-            .load_thread(&thread.id)
+            .load_thread_as(&thread.id, &authority)
             .await
             .expect("load")
             .expect("thread");
@@ -7603,10 +7707,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_orphans_a_durable_approval_from_an_abandoned_runtime() {
+    async fn tenant_recovery_orphans_only_its_durable_approval() {
         let calls = Arc::new(AtomicUsize::new(0));
         let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
         let inbox = Arc::new(MemoryApprovalInbox::new());
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "requester".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("tenant authority");
         let runtime = Arc::new(
             HarnessRuntime::new(
                 Arc::new(EchoModel),
@@ -7619,17 +7731,32 @@ mod tests {
                     .expect("inbox handler"),
             )),
         );
-        let thread = runtime.create_thread().await.expect("create thread");
+        let thread = runtime
+            .create_thread_as(&authority)
+            .await
+            .expect("create thread");
         let task = tokio::spawn({
             let runtime = runtime.clone();
             let thread_id = thread.id.clone();
-            async move { runtime.run_turn(&thread_id, "wait durably").await }
+            let authority = authority.clone();
+            async move {
+                runtime
+                    .run_turn_with_options(
+                        &thread_id,
+                        "wait durably",
+                        TurnExecutionOptions {
+                            authority,
+                            ..TurnExecutionOptions::default()
+                        },
+                    )
+                    .await
+            }
         });
 
         let pending = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(record) = inbox
-                    .pending(1)
+                    .pending_as(1, &authority)
                     .await
                     .expect("poll durable approval")
                     .into_iter()
@@ -7656,13 +7783,17 @@ mod tests {
                 .expect("recovery handler"),
         ));
         let recovered = recovered_runtime
-            .recover_thread(&thread.id, &pending.request.authorization.turn_id)
+            .recover_thread_as(
+                &thread.id,
+                &pending.request.authorization.turn_id,
+                &authority,
+            )
             .await
             .expect("recover")
             .expect("thread");
         assert_eq!(recovered.turns[0].status, TurnStatus::Interrupted);
         let record = inbox
-            .get(&pending.request.id)
+            .get_as(&pending.request.id, &authority)
             .await
             .expect("read orphan")
             .expect("approval");
