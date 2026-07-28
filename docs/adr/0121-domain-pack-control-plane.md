@@ -64,9 +64,11 @@ file would make a client or mutable file authoritative.
   preserve the corresponding component inventory for the execution lifetime.
 - Store schema 1 is a single-host control-plane baseline, not a multi-node
   consensus system.
-- Protocol/CLI/service integration, role claims, registries, canary rollout,
-  quotas, retention, durable Workflow waits, and domain-specific suites remain
-  separate future work.
+- Protocol/CLI/service integration, external identity claims, registries,
+  canary rollout, quotas, retention, durable Workflow waits, and
+  domain-specific suites remain separate future work. ADR 0124 adds an
+  optional exact-actor/tenant RBAC adapter without moving authorization into
+  persistence or Core.
 
 ## Rejected alternatives
 

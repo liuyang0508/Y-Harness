@@ -569,13 +569,17 @@ revision CAS in memory or SQLite. Activation requires an exact installed
 inventory; execution binding rechecks the active release, complete inventory
 digest, and activation revision so extension drift fails closed. Domain
 behavior does not enter the Agent Loop, and the current Engine service does not
-implicitly activate Packs. An embedding control service must authorize each
-control-plane action and retain the returned binding while assembling an
-execution. The returned Domain Pack proof converts directly into the generic
-Engine binding; the Engine remains unaware of Domain Pack lifecycle rules.
+implicitly activate Packs. `AuthorizedDomainPackStore` denies every read or
+transition before persistence unless a pluggable authorizer allows the exact
+actor, tenant, action, and Pack. The bounded reference RBAC policy has no
+wildcards or tenant fallback; an embedding service may replace it with
+external IAM. The returned Domain Pack proof converts directly into the
+generic Engine binding; the Engine remains unaware of Domain Pack lifecycle
+rules.
 See the [Domain Pack governance guide](docs/domain-pack-governance.md),
 [ADR 0121](docs/adr/0121-domain-pack-control-plane.md), and
-[ADR 0122](docs/adr/0122-durable-turn-execution-binding.md).
+[ADR 0122](docs/adr/0122-durable-turn-execution-binding.md), and
+[ADR 0124](docs/adr/0124-exact-domain-pack-role-authorization.md).
 
 Completion verifiers are registered through a typed, collision-safe registry.
 All must pass before an assistant candidate completes the Turn. Retryable

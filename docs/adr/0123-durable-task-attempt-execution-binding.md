@@ -53,9 +53,10 @@ settlement.
   mutation.
 - Protocol v25 changes the advertised Task schema coordinate. Trusted binding
   authorship and detailed binding-evidence inspection remain embedded-only.
-- This does not implement remote control-plane activation, role authorization,
-  canary rollout, Workflow timers, multi-node consensus, or Artifact blob
-  authorization.
+- This Task-binding decision does not implement remote control-plane
+  activation, canary rollout, Workflow timers, multi-node consensus, or
+  Artifact blob authorization. ADR 0124 separately adds optional Domain Pack
+  role authorization without changing Task schema or Protocol authorship.
 
 ## Rejected alternatives
 

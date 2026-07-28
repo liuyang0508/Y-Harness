@@ -59,6 +59,33 @@ All records are partitioned by the trusted optional tenant from
 `AuthorityContext`; public methods accept no caller-authored tenant selector.
 The same Pack name and version may safely exist in different tenants.
 
+## Authorization
+
+Attribution is not permission. `AuthorizedDomainPackStore` wraps any
+`DomainPackStore` and authorizes every read and lifecycle transition before
+the persistence implementation is called. Its `DomainPackAuthorizer` port is
+synchronous and non-blocking; a denial or authorizer panic fails closed
+without reading or mutating Pack state.
+
+`DomainPackRoleAuthorizer` is the bounded reference policy. Grants match one
+exact authenticated actor and one exact optional tenant—there are no wildcard,
+cross-tenant fallback, or implicit local-process privileges. Its roles are:
+
+| Role | Exact actions |
+|---|---|
+| `auditor` | inspect release and activation |
+| `installer` | install |
+| `evaluator` | evaluate |
+| `approver` | approve |
+| `operator` | activate, deactivate, rollback |
+| `executor` | bind |
+| `administrator` | all current actions |
+
+Roles control permission, while the store retains lifecycle truth. In
+particular, even an administrator cannot approve a release evaluated by the
+same actor. An embedding service can replace the reference RBAC policy with an
+external IAM or policy engine without changing storage or Core.
+
 ## Execution binding
 
 Activation-time verification alone is vulnerable to component drift before
@@ -95,13 +122,15 @@ Domain Pack database exists. A partial or unknown schema fails closed.
 ## Host responsibilities and current limits
 
 `AuthorityContext` supplies trusted identity and tenant attribution; it does
-not itself grant a role. The embedding control service must authorize each
-install, evaluate, approve, activate, deactivate, rollback, and bind action
-through its Policy boundary. It must also produce truthful component
-inventories and keep installed components immutable for the binding lifetime.
+not itself grant a role or authenticate caller-authored strings. The embedding
+control service must authenticate the actor and tenant, then use
+`AuthorizedDomainPackStore` with the reference RBAC authorizer or its own
+`DomainPackAuthorizer`. It must also produce truthful component inventories
+and keep installed components immutable for the binding lifetime.
 
 The current package is a Rust library, not a Protocol v25 command, CLI, remote
-control-plane service, registry, or automatic config mutator. It does not
+control-plane service, identity provider, registry, or automatic config
+mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, Workflow
 timers, Human Handoff, or domain-specific Evaluation content.
 

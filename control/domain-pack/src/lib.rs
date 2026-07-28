@@ -7,9 +7,14 @@
 
 #![warn(missing_docs)]
 
+mod authorization;
 mod model;
 mod store;
 
+pub use authorization::{
+    AuthorizedDomainPackStore, DenyDomainPackAuthorizer, DomainPackAction, DomainPackAuthorization,
+    DomainPackAuthorizer, DomainPackRole, DomainPackRoleAuthorizer, DomainPackRoleGrant,
+};
 pub use model::{
     DOMAIN_PACK_FORMAT_VERSION, DomainPackComponentKind, DomainPackComponentPin,
     DomainPackInventory, DomainPackReleaseId, DomainPackSnapshot, VerifiedDomainPack,

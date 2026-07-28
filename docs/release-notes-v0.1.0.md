@@ -83,10 +83,13 @@ The optional `y-harness-domain-pack` crate remains above Core and outside
 Protocol v25. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
-bounded rollback, and execution-time inventory/revision binding. Its proof
-converts into the generic Engine Turn binding. The embedding
-control service remains responsible for role authorization and component
-locking; no business workflow is added to the Agent Loop.
+bounded rollback, and execution-time inventory/revision binding. Its
+fail-closed store adapter authorizes every read and transition before
+persistence; the bounded reference RBAC policy matches exact actor, tenant,
+and action without wildcard or fallback, while external authorizers remain
+pluggable. Its proof converts into the generic Engine Turn binding. The
+embedding control service remains responsible for authentication and
+component locking; no business workflow is added to the Agent Loop.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the

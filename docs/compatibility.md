@@ -191,6 +191,12 @@ advertises Task schema 3. Schema-1/schema-2 SQLite stores require the explicit
 backup-first migration; schema-2 ownership is preserved without inventing
 historical attempt evidence. See
 [ADR 0123](adr/0123-durable-task-attempt-execution-binding.md).
+The optional Domain Pack crate adds an authorization port, exact action and
+request types, bounded reference roles, an exact actor/tenant grant model, an
+authorized Store adapter, and a `Forbidden` error. These are additive Rust
+control-plane APIs. They do not alter Pack format/store schema 1, State schema
+13, Task schema 3, or Protocol v25. See
+[ADR 0124](adr/0124-exact-domain-pack-role-authorization.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an

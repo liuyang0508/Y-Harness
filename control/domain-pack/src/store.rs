@@ -52,6 +52,13 @@ pub enum DomainPackError {
         /// Revision found atomically by the store.
         actual: u64,
     },
+    /// Trusted control-plane authorization denied one exact action.
+    Forbidden {
+        /// Stable action name.
+        action: &'static str,
+        /// Bounded Pack identity.
+        pack: String,
+    },
     /// Durable storage failed without exposing provider-controlled details.
     Storage(String),
 }
@@ -69,6 +76,12 @@ impl fmt::Display for DomainPackError {
                 formatter,
                 "Domain Pack conflict on {pack}: expected revision {expected}, found {actual}"
             ),
+            Self::Forbidden { action, pack } => {
+                write!(
+                    formatter,
+                    "Domain Pack action {action} is forbidden for {pack}"
+                )
+            }
             Self::Storage(message) => write!(formatter, "Domain Pack storage error: {message}"),
         }
     }
@@ -1258,7 +1271,7 @@ fn validate_optional_tenant(tenant: Option<&str>) -> Result<(), DomainPackError>
     authority_from_parts(ActorIdentity::LocalProcess, tenant.map(str::to_owned)).map(|_| ())
 }
 
-fn validate_pack_name(name: &str) -> Result<(), DomainPackError> {
+pub(crate) fn validate_pack_name(name: &str) -> Result<(), DomainPackError> {
     let valid = !name.is_empty()
         && name.len() <= 128
         && name

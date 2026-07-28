@@ -1,10 +1,11 @@
-use std::error::Error;
+use std::{collections::BTreeSet, error::Error};
 
 use semver::Version;
 use y_harness::{ActorIdentity, AuthorityContext};
 use y_harness_domain_pack::{
-    DomainPackComponentKind, DomainPackComponentPin, DomainPackInventory, DomainPackReleaseId,
-    DomainPackSnapshot, DomainPackStore, MemoryDomainPackStore,
+    AuthorizedDomainPackStore, DomainPackComponentKind, DomainPackComponentPin,
+    DomainPackInventory, DomainPackReleaseId, DomainPackRole, DomainPackRoleAuthorizer,
+    DomainPackRoleGrant, DomainPackSnapshot, DomainPackStore, MemoryDomainPackStore,
 };
 
 #[tokio::main]
@@ -39,7 +40,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let inventory = DomainPackInventory::new(snapshot.components.clone())?;
     let verified = snapshot.verify(&inventory)?;
     let release = snapshot.release.clone();
-    let store = MemoryDomainPackStore::new();
+    let store = AuthorizedDomainPackStore::new(
+        MemoryDomainPackStore::new(),
+        DomainPackRoleAuthorizer::new(vec![
+            grant("installer", DomainPackRole::Installer)?,
+            grant("evaluator", DomainPackRole::Evaluator)?,
+            grant("approver", DomainPackRole::Approver)?,
+            grant("operator", DomainPackRole::Operator)?,
+            grant("executor", DomainPackRole::Executor)?,
+        ])?,
+    );
 
     store.install(snapshot, &authority("installer")?).await?;
     store
@@ -76,12 +86,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn authority(subject: &str) -> Result<AuthorityContext, Box<dyn Error>> {
     Ok(AuthorityContext::new(
-        ActorIdentity::Authenticated {
-            authority: "example".to_owned(),
-            subject: subject.to_owned(),
-        },
+        actor(subject),
         Some("tenant-a".to_owned()),
     )?)
+}
+
+fn grant(subject: &str, role: DomainPackRole) -> Result<DomainPackRoleGrant, Box<dyn Error>> {
+    Ok(DomainPackRoleGrant::new(
+        actor(subject),
+        Some("tenant-a".to_owned()),
+        BTreeSet::from([role]),
+    )?)
+}
+
+fn actor(subject: &str) -> ActorIdentity {
+    ActorIdentity::Authenticated {
+        authority: "example".to_owned(),
+        subject: subject.to_owned(),
+    }
 }
 
 fn pin(
