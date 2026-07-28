@@ -83,7 +83,7 @@ history plus durable lineage in State, and check alternate-screen and
 bracketed-paste restoration. One additional 64 MiB migration test and one
 126.9 MiB Approval Inbox
 migration test are deliberately manual.
-The 224-file package archive verifies from the committed clean-tree candidate
+The 228-file package archive verifies from the committed clean-tree candidate
 without Cargo's `--allow-dirty` escape hatch.
 Five integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:
