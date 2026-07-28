@@ -19,6 +19,7 @@ const MAX_JOURNAL_BYTES: u64 = 1_048_576;
 const MAX_JOURNAL_RECORDS: usize = 1_024;
 const MAX_JOURNAL_RECORD_BYTES: usize = 4_096;
 const MAX_MCP_FRAME_BYTES: usize = 1_048_576;
+const MAX_RELEASE_BYTES: u64 = 256;
 const MAX_ID_BYTES: usize = 128;
 const INTENTIONAL_CRASH_EXIT_CODE: i32 = 86;
 const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -29,6 +30,7 @@ type AppResult<T> = Result<T, String>;
 #[serde(rename_all = "snake_case")]
 enum FixtureCase {
     CrashAfterFirstEffect,
+    HoldAfterFirstEffect,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -359,7 +361,7 @@ fn handle_mcp_frame(
             json!({
                 "tools": [{
                     "name": "commit_effect",
-                    "description": "Commit the one pinned non-idempotent benchmark effect. The first valid call terminates the Tool server after the durable effect and before a response.",
+                    "description": tool_description(journal.spec.case),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -422,7 +424,17 @@ fn handle_tool_call(
     let operation_id = journal.spec.operation_id.clone();
     let effect_ordinal = journal.commit(&input)?;
     if effect_ordinal == 1 {
-        std::process::exit(INTENTIONAL_CRASH_EXIT_CODE);
+        match journal.spec.case {
+            FixtureCase::CrashAfterFirstEffect => {
+                std::process::exit(INTENTIONAL_CRASH_EXIT_CODE);
+            }
+            FixtureCase::HoldAfterFirstEffect => loop {
+                if controller_released(&journal.spec)? {
+                    return Ok(None);
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
+            },
+        }
     }
     let structured = serde_json::to_value(CommitEffectOutput {
         operation_id,
@@ -443,6 +455,36 @@ fn handle_tool_call(
             "isError": false
         }),
     )))
+}
+
+fn tool_description(case: FixtureCase) -> &'static str {
+    match case {
+        FixtureCase::CrashAfterFirstEffect => {
+            "Commit the one pinned non-idempotent benchmark effect. The first valid call terminates the Tool server after the durable effect and before a response."
+        }
+        FixtureCase::HoldAfterFirstEffect => {
+            "Commit the one pinned non-idempotent benchmark effect. The first valid call holds the Tool server after the durable effect and before a response until the controller releases the detached fixture."
+        }
+    }
+}
+
+fn controller_released(spec: &FixtureSpec) -> AppResult<bool> {
+    let path = release_path(spec)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("cannot inspect fixture release marker: {error}")),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_RELEASE_BYTES {
+        return Err("fixture release marker is not a bounded regular file".to_owned());
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read fixture release marker: {error}"))?;
+    let expected = format!("{}\n", spec.fixture_id);
+    if bytes != expected.as_bytes() {
+        return Err("fixture release marker does not match the fixture identity".to_owned());
+    }
+    Ok(true)
 }
 
 fn negotiated_protocol_version(params: &Value) -> &str {
@@ -608,6 +650,15 @@ fn resolved_journal_path(spec: &FixtureSpec) -> AppResult<PathBuf> {
     Ok(parent.join(file_name))
 }
 
+fn release_path(spec: &FixtureSpec) -> AppResult<PathBuf> {
+    let journal = resolved_journal_path(spec)?;
+    let file_name = journal
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "fixture journal file name is not UTF-8".to_owned())?;
+    Ok(journal.with_file_name(format!("{file_name}.release")))
+}
+
 fn fixture_spec_sha256(spec: &FixtureSpec) -> AppResult<String> {
     serde_json::to_vec(spec)
         .map(|bytes| sha256_bytes(&bytes))
@@ -630,6 +681,9 @@ fn verify_fixture_executable(spec: &FixtureSpec) -> AppResult<String> {
 fn prepare(spec: &FixtureSpec, fixture_executable_sha256: String) -> AppResult<PreparedReport> {
     let fixture_spec_sha256 = fixture_spec_sha256(spec)?;
     let journal_path = resolved_journal_path(spec)?;
+    if release_path(spec)?.exists() {
+        return Err("fixture release marker already exists".to_owned());
+    }
     let mut file = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -907,12 +961,14 @@ fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FixtureCase, FixtureSpec, JournalRecord, MAX_MCP_FRAME_BYTES, classify,
-        fixture_spec_sha256, parse_journal, read_mcp_frame,
+        controller_released, fixture_spec_sha256, parse_journal, read_mcp_frame, release_path,
     };
     use serde_json::json;
     use std::{
+        fs,
         io::{BufReader, Cursor},
         path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     fn spec() -> FixtureSpec {
@@ -939,6 +995,29 @@ mod tests {
         let mut bytes = serde_json::to_vec(record).expect("encode journal fixture");
         bytes.push(b'\n');
         bytes
+    }
+
+    #[test]
+    fn controller_release_marker_is_identity_bound() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("yh-fault-release-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).expect("temporary fixture directory");
+        let mut spec = spec();
+        spec.journal = directory.join("journal.jsonl");
+        assert!(!controller_released(&spec).expect("no marker"));
+
+        let marker = release_path(&spec).expect("release path");
+        fs::write(&marker, b"another-fixture\n").expect("wrong marker");
+        assert!(controller_released(&spec).is_err());
+        fs::write(&marker, format!("{}\n", spec.fixture_id)).expect("exact marker");
+        assert!(controller_released(&spec).expect("released"));
+
+        fs::remove_file(marker).expect("remove marker");
+        fs::remove_dir(directory).expect("remove directory");
     }
 
     #[test]

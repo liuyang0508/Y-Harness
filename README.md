@@ -194,9 +194,9 @@ The controlled same-model and product-default rules required for any
 “outperforms” claim live in the
 [competitive Harness benchmark](docs/competitive-benchmark.md).
 Checked released-product evidence currently includes one Claude Code
-fixed-output probe and one Codex `0.145.0` CF-003 uncertain-effect probe. Both
-are explicitly claim-ineligible; neither is presented as a cross-product
-comparison.
+fixed-output probe plus Codex `0.145.0` single-process and same-Thread restart
+CF-003 probes. All are explicitly claim-ineligible; none is presented as a
+cross-product comparison.
 Current proof and open blockers are tracked in
 [Release readiness](docs/release-readiness.md). Exact pre-1.0 wire, persistence,
 API, and migration rules live in the

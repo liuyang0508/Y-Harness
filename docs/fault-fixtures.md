@@ -19,7 +19,15 @@ ordered actions:
    ordinal, then call `sync_data`;
 2. append `effect_committed` with the same identity, then call `sync_data`;
 3. terminate the fixture process with exit code 86 without returning an MCP
-   Tool result.
+Tool result.
+
+The companion `hold_after_first_effect` case uses the same synchronized
+journal contract but withholds the first Tool result until it sees an
+identity-bound controller release marker. This creates a deterministic window
+in which a product process can be cancelled after the effect but before a Tool
+output is recorded. The release marker is bounded, must contain the exact
+fixture identity, is create-new in the driver, and is not evidence that the
+product cleaned up every descendant.
 
 The Tool schema declares `readOnlyHint: false`, `destructiveHint: true`,
 `idempotentHint: false`, and `openWorldHint: false`. The fixture implements
@@ -77,7 +85,17 @@ exercised and that Codex built-in Tools remained advertised. The record is
 preserved under
 [`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe/).
 
-This first fixture still does not run product restarts, kill a Harness process at
-every State settlement boundary, or cover timeout, oversized result, malformed
-protocol, descendant cleanup, or sandbox escape. Those remain separate
-versioned cases; they must not be inferred from CF-003.
+A released Codex `0.145.0` format-8 run also cancels the first product process
+at the held effect boundary and resumes the exact persisted Thread in a second
+process. The resume Provider observes the source-defined synthetic `aborted`
+output, selects no Tool, and both fixture inspections retain one invocation
+and one effect. Codex re-groups its MCP child, so this run uses and records the
+controller release marker instead of claiming complete descendant cleanup.
+The record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart/).
+
+CF-003 still does not kill a Harness process at every State settlement
+boundary or cover timeout, oversized result, malformed protocol, descendant
+containment, sandbox escape, or other products. The Codex restart starts a new
+Turn on the same Thread rather than continuing the interrupted Turn in place.
+Those boundaries must not be inferred from this case.

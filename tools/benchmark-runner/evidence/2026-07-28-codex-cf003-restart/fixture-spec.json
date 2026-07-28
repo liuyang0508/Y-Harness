@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "fixture_id": "cf003-restart-codex-0145-20260728-003",
+  "case": "hold_after_first_effect",
+  "expected_fixture_executable_sha256": "07c72801a3f6298dd69a8e7334b7b0b14aeac42ac78ad8ed2538f7bffbf5ec22",
+  "journal": "/tmp/yh-codex-cf003-restart-20260728.SPM6Iz/controller/journal.jsonl",
+  "operation_id": "effect-codex-restart-0145-003",
+  "expected_payload_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

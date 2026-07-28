@@ -133,6 +133,46 @@ Tools, outer unrestricted process isolation, absent binary-to-source
 reproducibility, and unexercised product restart/resume remain explicit;
 `claim_eligible` is always false.
 
+The companion format-8 driver exercises a real process restart:
+
+```json
+{
+  "format_version": 8,
+  "run_id": "codex-cf003-restart-001",
+  "benchmark_version": "fault-conformance-v1",
+  "case_id": "cf-003-restart-after-uncertain-effect",
+  "program": "/absolute/path/to/codex",
+  "expected_cli_version": "codex-cli 0.145.0",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "fixture_program": "/absolute/path/to/yh-fault-fixture",
+  "fixture_spec": "/absolute/path/to/fixture-spec.json",
+  "expected_fixture_spec_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/empty/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "codex_home": "/absolute/empty/codex-home",
+  "model": "gpt-5.4",
+  "timeout_ms": 30000,
+  "effect_wait_timeout_ms": 10000
+}
+```
+
+```bash
+cargo run --locked --release -p y-harness-benchmark-runner -- \
+  codex-cf003-restart /absolute/path/to/spec.json > external-run.json
+```
+
+The first process persists a Thread and unresolved function call, enters the
+`hold_after_first_effect` fixture, and is controller-cancelled only after the
+one-effect journal boundary is synchronized. Codex re-groups its MCP child, so
+the controller writes an identity-bound release marker and waits for that
+detached fixture rather than claiming full process-tree cleanup. The second
+process executes `codex exec resume` for the exact rollout Thread. Its Provider
+requires Codex's source-defined synthetic `aborted` function output and returns
+a fixed message without selecting another Tool. Passing requires the same
+Thread, an appended rollout, zero resumed MCP calls, and one effect before and
+after resume. This is a new Turn on a resumed Thread, not continuation of the
+interrupted Turn; format 8 remains non-comparative and claim-ineligible.
+
 The Grok Build adapter consumes the official headless JSON surface:
 
 ```json

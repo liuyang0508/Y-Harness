@@ -19,23 +19,26 @@ turning it into a comparative score. They are produced by the independent
   semantics; and
 - format 7 is a separate Codex CF-003 fault-conformance envelope. It correlates
   a deterministic local Responses Provider, released-product JSONL, and the
-  independent MCP effect oracle without turning them into a score.
+  independent MCP effect oracle without turning them into a score; and
+- format 8 adds a controller-cancelled Codex process, exact persisted rollout
+  identity, same-Thread `exec resume`, source-defined synthetic `aborted`
+  output, and before/after no-replay observations.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, `6`, or `7`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1`, `2`, `3`, `4`, `5`, `6`, `7`, or `8`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/provider/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
 | `execution` | Exactly one `completed`, `product_error`, or `adapter_error` settlement. |
 
-The table's execution variants describe formats 1–6. Format 7 keeps the same
-adapter, coordinate, and non-claim control principles but has a fault-specific
+The table's execution variants describe formats 1–6. Formats 7 and 8 keep the
+same adapter, coordinate, and non-claim control principles but have fault-specific
 execution object: bounded process evidence, strict Codex JSONL, deterministic
 Provider request summaries, and a separately validated fixture observation.
-Its `passed` field means only that this one pre-registered fault experiment
+Their `passed` field means only that the pre-registered fault experiment
 satisfied all four contracts.
 
 `completed` and `product_error` contain the same `settlement` shape:
@@ -125,6 +128,26 @@ Format 7 remains `claim_eligible: false`. Codex built-in Tools are still
 advertised, the deterministic Provider does not measure reasoning quality, the
 released binary has not been reproducibly derived from the analyzed source,
 and product restart/resume is not exercised.
+
+Format 8 retains the same pinned Codex and fixture coordinates but removes
+`--ephemeral`. The first product process is cancelled after the controller
+observes the exact synchronized effect boundary and before any Tool output is
+persisted. The controller then discovers one bounded, symlink-free rollout
+under the owned `CODEX_HOME`, validates its `session_meta` Thread UUID, exact
+function call, and absent output, and resumes that Thread in a second process.
+The resume Provider requires the original call, exact synthetic
+`function_call_output: "aborted"`, and the new user Turn before returning a
+fixed assistant message without selecting a Tool.
+
+Passing format 8 additionally requires the resumed JSONL Thread ID to match,
+the same rollout file to grow and change digest, zero resumed MCP Tool calls,
+and both independent fixture inspections to retain one invocation and one
+effect. Codex places its MCP child in another process group, so the report
+records a controller-owned identity-bound release marker and verified fixture
+settlement rather than claiming complete descendant cleanup. Recovery starts a
+new Turn on the same Thread; it does not resume the interrupted Turn's stack.
+The deterministic Provider, binary/source, built-in Tool, containment, and
+claim-eligibility limitations remain explicit.
 
 The Grok Build adapter emits format 3 and also fixes
 `claim_eligible: false`. `bare` runs inject empty exact `HOME`, `USERPROFILE`,
@@ -231,6 +254,13 @@ One real released-product CF-003 record is preserved under
 [`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-probe/).
 It passed the narrow no-replay oracle and remains non-comparative,
 `claim_eligible: false` evidence.
+
+The source-pinned format-8 driver uses the same official source coordinate.
+One real released-product restart record is preserved under
+[`tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart`](../tools/benchmark-runner/evidence/2026-07-28-codex-cf003-restart/).
+It passed the same-Thread, synthetic-abort, and one-effect/no-replay gates,
+while explicitly recording detached-fixture release and new-Turn recovery.
+It remains non-comparative, `claim_eligible: false` evidence.
 
 The Grok Build adapter is source- and contract-tested against official snapshot
 [`47348d1`](https://github.com/xai-org/grok-build/tree/47348d13ec4508dcfe440e34c6d511bb02998fb2).

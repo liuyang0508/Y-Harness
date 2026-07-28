@@ -1,0 +1,18 @@
+{
+  "format_version": 8,
+  "run_id": "codex-cf003-restart-20260728-003",
+  "benchmark_version": "fault-conformance-v1",
+  "case_id": "cf-003-restart-after-uncertain-effect",
+  "program": "/Users/liuyang/.local/bin/codex",
+  "expected_cli_version": "codex-cli 0.145.0",
+  "expected_product_executable_sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "fixture_program": "/Users/liuyang/Desktop/AIAgent/Y-Harness/target/release/yh-fault-fixture",
+  "fixture_spec": "/tmp/yh-codex-cf003-restart-20260728.SPM6Iz/controller/fixture-spec.json",
+  "expected_fixture_spec_sha256": "9dd99e7a7b38ec0c42e18ca3c3360eb05fbc8e5d3ee613f072ce715d3d78cd66",
+  "workspace": "/tmp/yh-codex-cf003-restart-20260728.SPM6Iz/workspace",
+  "workspace_snapshot": "empty-directory-v1",
+  "codex_home": "/tmp/yh-codex-cf003-restart-20260728.SPM6Iz/codex-home",
+  "model": "gpt-5.4",
+  "timeout_ms": 30000,
+  "effect_wait_timeout_ms": 10000
+}

@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use y_harness::{
-    CancellationToken, ExecutionPhase, LocalProcessBroker, ProcessBroker, ProcessIsolation,
-    ProcessOutput, ProcessRequest,
+    CancellationToken, ExecutionPhase, HarnessError, LocalProcessBroker, ProcessBroker,
+    ProcessIsolation, ProcessOutput, ProcessRequest,
 };
 
 const CLAUDE_RUN_FORMAT_VERSION: u32 = 1;
@@ -143,6 +143,7 @@ enum RunExecution {
 enum BenchmarkReport {
     External(Box<ExternalRunReport>),
     CodexFault(Box<codex_fault::Report>),
+    CodexRestartFault(Box<codex_fault::RestartReport>),
 }
 
 #[derive(Serialize)]
@@ -228,6 +229,11 @@ async fn run() -> AppResult<BenchmarkReport> {
         "codex-cf003" => codex_fault::execute(codex_fault::read_spec(&spec_path)?)
             .await
             .map(|report| BenchmarkReport::CodexFault(Box::new(report))),
+        "codex-cf003-restart" => {
+            codex_fault::execute_restart(codex_fault::read_restart_spec(&spec_path)?)
+                .await
+                .map(|report| BenchmarkReport::CodexRestartFault(Box::new(report)))
+        }
         "grok-build" => grok_build::execute(grok_build::read_spec(&spec_path)?)
             .await
             .map(|report| BenchmarkReport::External(Box::new(report))),
@@ -245,8 +251,7 @@ async fn run() -> AppResult<BenchmarkReport> {
 }
 
 fn usage() -> String {
-    "usage: yh-bench <claude-code|codex|codex-cf003|grok-build|hermes|opencode|pi> <run-spec.json>"
-        .to_owned()
+    "usage: yh-bench <claude-code|codex|codex-cf003|codex-cf003-restart|grok-build|hermes|opencode|pi> <run-spec.json>".to_owned()
 }
 
 fn read_spec_bytes(path: &Path) -> AppResult<Vec<u8>> {

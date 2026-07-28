@@ -96,9 +96,13 @@ argv prompt exposure and missing system-role/workspace-rule parity remain
 explicit limitations. Dedicated format 7 drives released Codex `0.145.0`
 through a source-pinned deferred Tool-search and MCP crash-after-effect path,
 then validates the durable fixture journal independently. Its checked CF-003
-record is non-comparative and claim-ineligible: product restart/resume,
-binary-to-source equivalence, and same-Model parity remain unproven. No
-OpenCode or Hermes live/comparative result is claimed.
+record is non-comparative and claim-ineligible. Format 8 additionally cancels
+the product after the held effect, resumes the exact persisted Thread,
+requires Codex's synthetic `aborted` Tool output, and proves that the durable
+effect remains singular. It records Codex's detached MCP child release and
+new-Turn recovery instead of claiming descendant cleanup or in-place Turn
+continuation. Binary-to-source equivalence and same-Model parity remain
+unproven. No OpenCode or Hermes live/comparative result is claimed.
 
 ## Start
 
