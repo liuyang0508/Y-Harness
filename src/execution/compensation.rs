@@ -46,6 +46,8 @@ pub struct CompensationContext {
     pub compensation_turn_id: TurnId,
     /// Correlation identity of the compensation Tool call.
     pub compensation_call_id: String,
+    /// Trusted identity and tenant boundary for this compensation attempt.
+    pub authority: crate::AuthorityContext,
     /// Turn containing the original effect.
     pub target_turn_id: TurnId,
     /// Correlation identity of the original Tool call.
@@ -175,6 +177,7 @@ impl Tool for CompensationTool {
                     thread_id: context.thread_id,
                     compensation_turn_id: context.turn_id,
                     compensation_call_id: context.call_id,
+                    authority: context.authority,
                     target_turn_id: request.target_turn_id,
                     target_call_id: request.target_call_id,
                     target_tool: self.compensation.target_tool.clone(),
@@ -774,6 +777,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     turn_id: first_turn.id.clone(),
                     call_id: "refund-1".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )
@@ -799,6 +803,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     turn_id: retry_turn.id.clone(),
                     call_id: "refund-2".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )
@@ -835,6 +840,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     turn_id: malformed_approval_turn.id.clone(),
                     call_id: "refund-malformed-approval".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )
@@ -896,6 +902,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     turn_id: misordered_turn.id.clone(),
                     call_id: "refund-misordered".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )
@@ -930,6 +937,7 @@ mod tests {
                     thread_id: thread.id,
                     turn_id: conflict_turn.id,
                     call_id: "refund-3".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )

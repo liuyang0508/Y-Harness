@@ -3,15 +3,18 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ApprovalDecision, ApprovalRequest, HarnessFuture, PolicyDecision, ThreadId, ToolAuthorization,
-    TurnId,
+    ApprovalDecision, ApprovalRequest, AuthorityContext, HarnessFuture, PolicyDecision, ThreadId,
+    ToolAuthorization, TurnId,
 };
 
 /// Authorization boundary evaluated before tool execution.
 pub trait PolicyEngine: Send + Sync {
     /// Returns allow, deny, or ask for one proposed tool call.
-    fn authorize<'a>(&'a self, request: &'a ToolAuthorization)
-    -> HarnessFuture<'a, PolicyDecision>;
+    fn authorize<'a>(
+        &'a self,
+        request: &'a ToolAuthorization,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, PolicyDecision>;
 }
 
 /// Settlement boundary for policy decisions that require approval.
@@ -55,6 +58,7 @@ impl PolicyEngine for AllowListPolicy {
     fn authorize<'a>(
         &'a self,
         request: &'a ToolAuthorization,
+        _authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, PolicyDecision> {
         Box::pin(async move {
             if self.allowed.contains(&request.descriptor.name) {

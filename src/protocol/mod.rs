@@ -22,8 +22,8 @@ use tokio::{
 
 use crate::isolation::isolate_future;
 use crate::{
-    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId,
-    ApprovalInbox, ApprovalRecord, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
+    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalDecision, ApprovalId, ApprovalInbox,
+    ApprovalRecord, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
     HarnessError, HarnessRuntime, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope,
     ModelEventSink, ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
@@ -414,8 +414,8 @@ impl ProtocolPrincipal {
         }
     }
 
-    fn approval_actor(&self) -> ApprovalActor {
-        self.actor_identity()
+    fn authority_context(&self) -> Result<AuthorityContext, HarnessError> {
+        AuthorityContext::new(self.actor_identity(), None)
     }
 
     fn task_worker_identity(&self) -> String {
@@ -433,6 +433,17 @@ impl ProtocolPrincipal {
 pub trait ProtocolAuthorizer: Send + Sync {
     /// Returns whether one authenticated principal has one exact permission.
     fn allows(&self, principal: &ProtocolPrincipal, permission: &str) -> bool;
+
+    /// Resolves the trusted Runtime authority for one transport principal.
+    ///
+    /// Implementations may map a certificate identity to a user and tenant.
+    /// The default preserves the transport identity without a tenant scope.
+    fn authority_context(
+        &self,
+        principal: &ProtocolPrincipal,
+    ) -> Result<AuthorityContext, HarnessError> {
+        principal.authority_context()
+    }
 }
 
 struct LocalProcessAuthorizer;
@@ -1080,8 +1091,14 @@ impl ProtocolHandler {
                 }),
             );
         }
-        let result = match isolate_future(|| self.handle_command(request.command, principal), None)
-        {
+        let authority = match self.resolve_authority(principal) {
+            Ok(authority) => authority,
+            Err(error) => return error_response(id, protocol_error(error)),
+        };
+        let result = match isolate_future(
+            || self.handle_command(request.command, principal, &authority),
+            None,
+        ) {
             Ok(command) => match command.await {
                 Ok(result) => result,
                 Err(()) => Err(HarnessError::Execution(
@@ -1106,6 +1123,7 @@ impl ProtocolHandler {
         &self,
         command: ProtocolCommand,
         principal: &ProtocolPrincipal,
+        authority: &AuthorityContext,
     ) -> Result<ProtocolResult, HarnessError> {
         match command {
             ProtocolCommand::Initialize {} => {
@@ -1344,14 +1362,14 @@ impl ProtocolHandler {
                 let operations = self.operations.clone();
                 let lifecycle = self.lifecycle.clone();
                 let operation_for_task = operation_id.clone();
-                let approval_requester = principal.approval_actor();
+                let authority = authority.clone();
                 let worker = tokio::spawn(async move {
                     runtime
                         .run_turn_with_options(
                             &thread_id,
                             prompt,
                             TurnExecutionOptions {
-                                approval_requester,
+                                authority,
                                 memory_scope,
                                 context,
                                 timeout: timeout_ms.map(Duration::from_millis),
@@ -1413,7 +1431,7 @@ impl ProtocolHandler {
                         &ThreadId::from_string(thread_id),
                         &TurnId::from_string(expected_turn_id),
                         content,
-                        principal.actor_identity(),
+                        authority.actor().clone(),
                     )
                     .await?;
                 Ok(ProtocolResult::TurnSteered {
@@ -1565,7 +1583,7 @@ impl ProtocolHandler {
                         &ApprovalId::from_string(approval_id),
                         expected_revision,
                         decision,
-                        principal.approval_actor(),
+                        authority.actor().clone(),
                     )
                     .await?;
                 Ok(ProtocolResult::ApprovalSettled {
@@ -1821,6 +1839,20 @@ impl ProtocolHandler {
             self.authorizer.allows(principal, permission)
         }))
         .unwrap_or(false)
+    }
+
+    fn resolve_authority(
+        &self,
+        principal: &ProtocolPrincipal,
+    ) -> Result<AuthorityContext, HarnessError> {
+        let authority = catch_unwind(AssertUnwindSafe(|| {
+            self.authorizer.authority_context(principal)
+        }))
+        .map_err(|_| {
+            HarnessError::Execution("protocol authority resolution failed".to_owned())
+        })??;
+        authority.validate_current("protocol authority")?;
+        Ok(authority)
     }
 
     async fn bounded_event_page(
@@ -2266,9 +2298,9 @@ mod tests {
     };
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
-        ApprovalRecordStatus, ApprovalRequest, CapabilityOrigin, EventStore, HarnessFuture,
-        HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
-        MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
+        ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin, EventStore,
+        HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind,
+        LanguageModel, MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
         ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelResponse, ModelStream,
         ModelStreamEvent, OperationId, PendingEvent, PolicyDecision, PolicyEngine, RiskLevel,
         SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine, StateEvent, StateSnapshot,
@@ -2376,6 +2408,7 @@ mod tests {
         fn authorize<'a>(
             &'a self,
             _request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, PolicyDecision> {
             Box::pin(async {
                 Ok(PolicyDecision::Ask {
@@ -2421,6 +2454,38 @@ mod tests {
     impl ProtocolAuthorizer for PanickingAuthorizer {
         fn allows(&self, _principal: &ProtocolPrincipal, _permission: &str) -> bool {
             panic!("authorization fixture panic")
+        }
+    }
+
+    struct ScopedAuthorizer {
+        authority: AuthorityContext,
+    }
+
+    impl ProtocolAuthorizer for ScopedAuthorizer {
+        fn allows(&self, _principal: &ProtocolPrincipal, _permission: &str) -> bool {
+            true
+        }
+
+        fn authority_context(
+            &self,
+            _principal: &ProtocolPrincipal,
+        ) -> Result<AuthorityContext, HarnessError> {
+            Ok(self.authority.clone())
+        }
+    }
+
+    struct PanickingAuthorityResolver;
+
+    impl ProtocolAuthorizer for PanickingAuthorityResolver {
+        fn allows(&self, _principal: &ProtocolPrincipal, _permission: &str) -> bool {
+            true
+        }
+
+        fn authority_context(
+            &self,
+            _principal: &ProtocolPrincipal,
+        ) -> Result<AuthorityContext, HarnessError> {
+            panic!("authority resolver fixture panic")
         }
     }
 
@@ -4595,7 +4660,7 @@ mod tests {
         let requester = ProtocolPrincipal::from_mtls_certificate(b"requester-certificate");
         let approver = ProtocolPrincipal::from_mtls_certificate(b"approver-certificate");
         let mut approval = approval_request();
-        approval.requested_by = requester.approval_actor();
+        approval.requested_by = requester.actor_identity();
         let inbox = Arc::new(MemoryApprovalInbox::new());
         let submitted = inbox.submit(approval.clone()).await.expect("submit");
         let authorizer = FingerprintProtocolAuthorizer::allow_all([
@@ -4646,13 +4711,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_turn_carries_transport_identity_into_durable_approval_request() {
+    async fn start_turn_carries_resolved_actor_into_durable_attribution() {
         let principal = ProtocolPrincipal::from_mtls_certificate(b"turn-requester-certificate");
-        let authorizer = FingerprintProtocolAuthorizer::allow_all([principal
-            .mtls_sha256()
-            .expect("fingerprint")
-            .to_owned()])
-        .expect("authorizer");
+        let authority = AuthorityContext::new(
+            ApprovalActor::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-42".to_owned(),
+            },
+            None,
+        )
+        .expect("scoped authority");
+        let authorizer = ScopedAuthorizer {
+            authority: authority.clone(),
+        };
         let inbox = Arc::new(MemoryApprovalInbox::new());
         let approval_handler = InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
             .expect("approval handler");
@@ -4720,7 +4791,7 @@ mod tests {
         })
         .await
         .expect("approval request timeout");
-        assert_eq!(record.request.requested_by, principal.approval_actor());
+        assert_eq!(record.request.requested_by, authority.actor().clone());
         let projected = runtime
             .load_thread(&thread_id)
             .await
@@ -4730,7 +4801,7 @@ mod tests {
             matches!(
                 &item.kind,
                 crate::ItemKind::InvocationContext { submitted_by, .. }
-                    if submitted_by == &principal.approval_actor()
+                    if submitted_by == authority.actor()
             )
         }));
 
@@ -4804,6 +4875,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn protocol_authorizer_can_resolve_a_scoped_runtime_authority() {
+        let expected = AuthorityContext::new(
+            ApprovalActor::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-42".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("scoped authority");
+        let handler =
+            handler(Arc::new(ImmediateModel)).with_authorizer(Arc::new(ScopedAuthorizer {
+                authority: expected.clone(),
+            }));
+        let principal = ProtocolPrincipal::from_mtls_certificate(b"mapped-certificate");
+        assert_eq!(
+            handler.resolve_authority(&principal).expect("authority"),
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn authorization_panic_fails_closed_before_command_execution() {
         let handler =
@@ -4815,6 +4907,20 @@ mod tests {
         assert!(matches!(
             response.body,
             ProtocolResponseBody::Error { error } if error.code == "forbidden"
+        ));
+    }
+
+    #[tokio::test]
+    async fn authority_resolution_panic_fails_closed_before_command_execution() {
+        let handler =
+            handler(Arc::new(ImmediateModel)).with_authorizer(Arc::new(PanickingAuthorityResolver));
+        let response = handler
+            .handle(request("create", ProtocolCommand::CreateThread {}))
+            .await;
+
+        assert!(matches!(
+            response.body,
+            ProtocolResponseBody::Error { error } if error.code == "runtime_error"
         ));
     }
 

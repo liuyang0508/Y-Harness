@@ -8,7 +8,7 @@ product clients:
 ```text
 embedded host ───────────────────────────── Core API
                                                    \
-TUI · Desktop · Web · IM · SDK ─ versioned protocol ─ Runtime ─ Core
+CLI · TUI · GUI · LUI · VUI · IDE · API ─ protocol ─ Runtime ─ Core
         independent optional products
 ```
 
@@ -16,6 +16,12 @@ The service mode must not implement a second agent loop. It hosts the same
 Core and translates protocol commands and events. Product clients never import
 provider implementations, open Runtime storage, or become authoritative state
 owners.
+
+GUI may target Web, Desktop, or Mobile; Conversational/LUI may target Web Chat,
+Desktop Chat, or IM. Voice/VUI, IDE extensions, SDKs, APIs, and Webhooks remain
+independent adapters over the same contract. The governance and Domain Pack
+boundary is specified in
+[`enterprise-governance.md`](enterprise-governance.md).
 
 This shape is derived from a primary-source comparison of Pi Agent Harness,
 Claude Code, Codex, Hermes Agent, and OpenCode. The observations, decisions,
@@ -313,6 +319,10 @@ direction:
   fingerprint principal, checks exact per-command grants before execution,
   filters advertised capabilities, and trusts only local-process callers by
   default;
+- a validated per-Turn Authority Context resolved by the existing protocol
+  authorizer, with panic-isolated fail-closed mapping, trusted tenant-to-Memory
+  scope binding, and the same actor/tenant authority passed to Policy and Tool
+  execution without caller-authored identity fields;
 - a thin engine CLI with strict project initialization, diagnostic, migration,
   deterministic demo, persistent stdio service and isolated configured
   Evaluation commands, explicitly launched shell-free JSON Models, Tools,
@@ -322,7 +332,7 @@ direction:
   Skills, and Agent Memory Hub Context assembly;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v18, with bounded recent-Thread navigation, authoritative Thread projection,
+  v19, with bounded recent-Thread navigation, authoritative Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
@@ -355,9 +365,9 @@ balancing/circuit breaking, additional direct vendor model adapters,
 Linux/Windows
 sandbox brokers, Skill catalogs/private registry authentication and append-only
 transparency-log consistency,
-streaming large-dataset Evaluation reports, and certificate subject/SAN
-identity, tenant/role attribution, revocation, and policy hot reload remain
-explicit subsequent slices.
+streaming large-dataset Evaluation reports, certificate subject/SAN identity,
+durable tenant ownership/fencing, role and delegation claims, revocation, and
+policy hot reload remain explicit subsequent slices.
 
 ## Client protocol boundary
 

@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v18 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v19 service, thin engine CLI,
 an independently installable full-screen TUI, durable SQLite
 State/Approval/Task coordination, governed extension contracts, evaluation
 gates, and executable examples.
@@ -42,6 +42,11 @@ attribution, source/body SHA-256 provenance, content-free State evidence, and
 no synthetic conversation or branch authority. Direct OpenAI maps only
 digest-pinned Skill Context to provider instructions; other Context remains
 user-level reference data.
+Protocol 19 adds permissioned recovery of one exact abandoned Turn without
+automatic replay. The embedded Runtime also carries a validated per-Turn
+Authority Context from a trusted host or protocol authorizer into Memory scope,
+Policy, and Tool execution. Durable tenant ownership is not claimed, and
+tenant-scoped approvals fail closed until a later schema binds tenant evidence.
 An additive format-1 `ThreadHandoffRequest` prepares a bounded source-only
 whole-Turn delta against another terminal Thread and binds the exact summarizer
 input to both Thread identities. Summary synthesis remains host-selected; the

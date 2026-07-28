@@ -5,18 +5,18 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::{
-    ApprovalActor, CancellationToken, ExecutionPhase, HarnessError, MemoryScope, ModelEventSink,
-    TurnContextInput, isolation::isolate_future,
+    ActorIdentity, AuthorityContext, CancellationToken, ExecutionPhase, HarnessError, MemoryScope,
+    ModelEventSink, TurnContextInput, isolation::isolate_future,
 };
 
 /// Caller-controlled isolation, cancellation, and deadline for one Turn.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TurnExecutionOptions {
-    /// Identity attributed to approval requests created by this Turn.
+    /// Trusted identity and optional tenant boundary for this Turn.
     ///
-    /// Embedding hosts must derive authenticated actors from their trusted
-    /// caller boundary rather than accepting arbitrary display names.
-    pub approval_requester: ApprovalActor,
+    /// Embedding hosts must derive this from their authenticated caller
+    /// boundary rather than accepting request-authored identity claims.
+    pub authority: AuthorityContext,
     /// Scope applied to long-term memory operations.
     pub memory_scope: MemoryScope,
     /// Bounded non-authoritative reference context supplied for this Turn.
@@ -32,16 +32,30 @@ pub struct TurnExecutionOptions {
     pub model_event_sink: Option<Arc<dyn ModelEventSink>>,
 }
 
-impl Default for TurnExecutionOptions {
-    fn default() -> Self {
-        Self {
-            approval_requester: ApprovalActor::LocalProcess,
-            memory_scope: MemoryScope::default(),
-            context: Vec::new(),
-            timeout: None,
-            cancellation: CancellationToken::new(),
-            model_event_sink: None,
+impl TurnExecutionOptions {
+    pub(super) fn validated_memory_scope(&self) -> Result<MemoryScope, HarnessError> {
+        self.authority.validate_current("Turn authority")?;
+        let mut scope = self.memory_scope.clone();
+        if let Some(tenant_id) = scope.tenant_id.as_deref() {
+            AuthorityContext::validate_tenant(tenant_id)?;
         }
+        match (self.authority.tenant_id(), scope.tenant_id.as_deref()) {
+            (Some(authority), Some(requested)) if authority != requested => {
+                return Err(HarnessError::InvalidConfiguration(
+                    "memory tenant does not match the trusted Turn authority".to_owned(),
+                ));
+            }
+            (Some(authority), None) => scope.tenant_id = Some(authority.to_owned()),
+            (None, Some(_))
+                if matches!(self.authority.actor(), ActorIdentity::Authenticated { .. }) =>
+            {
+                return Err(HarnessError::InvalidConfiguration(
+                    "an unscoped authenticated actor cannot select a memory tenant".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(scope)
     }
 }
 
@@ -215,10 +229,13 @@ mod tests {
     };
 
     use super::{
-        controlled, controlled_with_settlement_cancellation, controlled_with_settlement_grace,
-        deadline,
+        TurnExecutionOptions, controlled, controlled_with_settlement_cancellation,
+        controlled_with_settlement_grace, deadline,
     };
-    use crate::{CancellationToken, ExecutionPhase, HarnessError};
+    use crate::{
+        ActorIdentity, AuthorityContext, CancellationToken, ExecutionPhase, HarnessError,
+        MemoryScope,
+    };
 
     struct PanickingFuture;
 
@@ -227,6 +244,96 @@ mod tests {
     struct CancellationObservingFuture {
         cancellation: CancellationToken,
         dropped_after_cancellation: Arc<AtomicBool>,
+    }
+
+    fn remote_authority(tenant_id: Option<&str>) -> AuthorityContext {
+        AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-auth".to_owned(),
+                subject: "user-1".to_owned(),
+            },
+            tenant_id.map(str::to_owned),
+        )
+        .expect("valid authority")
+    }
+
+    #[test]
+    fn trusted_tenant_is_injected_and_cannot_be_overridden() {
+        let options = TurnExecutionOptions {
+            authority: remote_authority(Some("tenant-a")),
+            ..TurnExecutionOptions::default()
+        };
+        assert_eq!(
+            options
+                .validated_memory_scope()
+                .expect("derived scope")
+                .tenant_id
+                .as_deref(),
+            Some("tenant-a")
+        );
+
+        let mismatch = TurnExecutionOptions {
+            authority: remote_authority(Some("tenant-a")),
+            memory_scope: MemoryScope {
+                tenant_id: Some("tenant-b".to_owned()),
+                ..MemoryScope::default()
+            },
+            ..TurnExecutionOptions::default()
+        };
+        assert!(matches!(
+            mismatch.validated_memory_scope(),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn unscoped_remote_actor_cannot_select_a_memory_tenant() {
+        let options = TurnExecutionOptions {
+            authority: remote_authority(None),
+            memory_scope: MemoryScope {
+                tenant_id: Some("tenant-a".to_owned()),
+                ..MemoryScope::default()
+            },
+            ..TurnExecutionOptions::default()
+        };
+        assert!(matches!(
+            options.validated_memory_scope(),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn trusted_local_process_retains_explicit_embedded_scope() {
+        let options = TurnExecutionOptions {
+            memory_scope: MemoryScope {
+                tenant_id: Some("tenant-a".to_owned()),
+                ..MemoryScope::default()
+            },
+            ..TurnExecutionOptions::default()
+        };
+        assert_eq!(
+            options
+                .validated_memory_scope()
+                .expect("trusted embedded scope")
+                .tenant_id
+                .as_deref(),
+            Some("tenant-a")
+        );
+    }
+
+    #[test]
+    fn embedded_memory_tenant_still_requires_a_canonical_identity() {
+        let options = TurnExecutionOptions {
+            memory_scope: MemoryScope {
+                tenant_id: Some("../tenant".to_owned()),
+                ..MemoryScope::default()
+            },
+            ..TurnExecutionOptions::default()
+        };
+        assert!(matches!(
+            options.validated_memory_scope(),
+            Err(HarnessError::InvalidConfiguration(_))
+        ));
     }
 
     impl Future for PanickingFuture {

@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v18 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v19 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -75,7 +75,7 @@ See the [Chinese quick start](docs/quickstart.zh-CN.md), the
 ## Product boundary
 
 ```text
-optional products: TUI · Desktop · Web · IM · SDK hosts
+optional products: CLI · TUI · GUI · LUI · VUI · IDE · API/SDK/Webhook
                            │
                     versioned protocol
                            │
@@ -95,7 +95,7 @@ and two non-runtime benchmark tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v18 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v19 |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
 
@@ -650,7 +650,7 @@ remaining capacity are inspectable, while the persisted v1 JSON shape stays
 unchanged and the Coordinator still performs an exact final encoding check.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v18 preserves the 2 MiB request and 16 MiB response ceilings,
+protocol. Protocol v19 preserves Protocol v18's 2 MiB request and 16 MiB response ceilings,
 byte-authoritative Thread capacity, Token Counter and Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
 schema-4 Policy-to-Tool-origin provenance, schema-5 Provider Continuation, and
@@ -660,7 +660,8 @@ Thread forks with immutable direct lineage, schema-10 integrity-bound Thread
 import provenance, and schema-11 attributed invocation Context. Protocol 16
 added lineage to bounded content-free Thread summaries without changing State
 schema; Protocol 17 admitted import provenance, and Protocol 18 adds optional
-bounded `start_turn.context`. Steering requires the exact
+bounded `start_turn.context`. Protocol 19 adds explicit permissioned recovery
+of one exact abandoned Turn without automatic replay. Steering requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
@@ -698,8 +699,11 @@ files; TLS handshakes, connections, idle time, frames per session, and shutdown
 are bounded. The client leaf certificate becomes a SHA-256 principal, and an
 exact allow-list gates every protocol capability before execution;
 `Initialize` advertises only granted capabilities. Subject/SAN identity,
-tenant/role mapping, revocation, and hot policy reload are intentionally not
-yet claimed.
+durable tenant/role isolation, revocation, and hot policy reload are
+intentionally not yet claimed. A host authorizer may resolve a transport
+principal to a validated per-Turn actor/tenant Authority Context, but current
+tenant binding covers Memory, Policy, and Tool execution rather than durable
+Thread ownership.
 
 Streaming model providers can emit provisional text through a kernel-owned
 failure-isolated handle. Deltas and total Turn output are byte-bounded; protocol
@@ -750,7 +754,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v18. The Sessions panel shows direct fork ancestry from
+through Protocol v19. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

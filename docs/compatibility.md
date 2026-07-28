@@ -123,6 +123,16 @@ source-compatible, while stateful implementations should override it for
 session cleanup. These changes do not alter State, Client Protocol, service
 configuration, or MCP wire coordinates. See
 [ADR 0115](adr/0115-bounded-mcp-tool-cancellation-settlement.md).
+The public pre-1.0 `TurnExecutionOptions` replaces its approval-only actor
+field with `AuthorityContext`; `PolicyEngine::authorize` receives that trusted
+authority, and `ToolContext` carries it into execution. Existing custom Policy
+implementations and direct options/context struct literals require source
+updates. `ProtocolAuthorizer` gains a defaulted resolver, so existing
+implementations preserve their transport actor without a tenant. No
+caller-authored identity field, State event, Approval record, Client Protocol,
+or service configuration coordinate changes. Tenant-scoped approvals fail
+closed until a later durable schema binds their tenant evidence. See
+[ADR 0116](adr/0116-trusted-turn-authority-context.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
 grants no Tool authority. `data_directory`, project Skill package files, and an

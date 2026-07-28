@@ -205,6 +205,13 @@ than `before_sequence`.
 }
 ```
 
+For the trusted local-process boundary, `tenant_id` remains an explicit
+embedding-host scope. For an authenticated remote principal, the protocol
+authorizer must resolve the trusted tenant: Runtime injects an omitted matching
+tenant, rejects a mismatch, and rejects tenant selection by an unscoped
+authenticated actor before creating Turn State. This is Memory-scope binding,
+not evidence that Thread or other durable resources are tenant-partitioned.
+
 `prompt` must contain 1–1,048,576 UTF-8 bytes after rejecting all-whitespace
 input. `timeout_ms`, when present, must be greater than zero and fit the host
 Runtime clock. A timeout is a total external-work deadline, not a guarantee
@@ -764,7 +771,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v18 value |
+| Boundary | Protocol v19 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |

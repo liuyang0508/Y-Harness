@@ -9,7 +9,7 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 344 library, 10 CLI, 23 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 6 fault-fixture tests | passing locally: 451 total plus 7 explicitly ignored fixtures |
+| Deterministic tests | 360 library, 11 CLI, 23 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 469 total plus 7 explicitly ignored fixtures |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
 | Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
 | Distribution package | `cargo package --locked -p y-harness`, 224-file clean-room crate verification | passing locally from the committed clean tree |
@@ -136,6 +136,12 @@ boundary remain explicit.
   people, tenant/role policy, proving that two certificates belong to
   independent humans, signed decision receipts, retention, notifications, and
   lease/fenced remote continuation are not implemented.
+- A trusted per-Turn Authority Context can map a transport principal to an actor
+  and tenant, binds remote Memory scope, and reaches Policy and Tool execution.
+  Tenant-scoped approvals fail closed because durable approval evidence does
+  not yet bind tenant authority. Threads, State reads, Approval records, Tasks,
+  Secrets, Artifacts, and recovery are not tenant-partitioned, so this is not a
+  multi-tenant isolation claim.
 - Publisher and transparency-log keys now support live validity and immutable
   revocation, and signed receipts bind log/entry/time metadata to the exact
   package and publisher signature. Exact pin-bound public HTTPS acquisition is

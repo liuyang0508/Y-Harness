@@ -1897,6 +1897,7 @@ mod tests {
                     thread_id: ThreadId::from_static("thread-test"),
                     turn_id: TurnId::from_static("turn-test"),
                     call_id: "call-test".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )
@@ -2216,6 +2217,7 @@ mod tests {
                     thread_id: ThreadId::from_static("thread-test"),
                     turn_id: TurnId::from_static("turn-test"),
                     call_id: "call-test".to_owned(),
+                    authority: crate::AuthorityContext::local_process(),
                     cancellation: CancellationToken::new(),
                 },
             )

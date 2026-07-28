@@ -524,6 +524,68 @@ impl ActorIdentity {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Trusted execution identity and optional tenant boundary for one operation.
+///
+/// Embedding hosts and protocol authorizers must construct this value only
+/// after authenticating the caller. The Runtime validates it before creating
+/// Turn State, but constructing a value does not itself authenticate it.
+pub struct AuthorityContext {
+    /// Authenticated actor attributed to governed actions.
+    actor: ActorIdentity,
+    /// Optional case-sensitive tenant isolation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+}
+
+impl AuthorityContext {
+    /// Creates and validates one authority context.
+    pub fn new(actor: ActorIdentity, tenant_id: Option<String>) -> Result<Self, HarnessError> {
+        let context = Self { actor, tenant_id };
+        context.validate_current("authority context")?;
+        Ok(context)
+    }
+
+    /// Returns trusted local-process authority without a tenant boundary.
+    #[must_use]
+    pub fn local_process() -> Self {
+        Self {
+            actor: ActorIdentity::LocalProcess,
+            tenant_id: None,
+        }
+    }
+
+    /// Returns the authenticated actor.
+    #[must_use]
+    pub fn actor(&self) -> &ActorIdentity {
+        &self.actor
+    }
+
+    /// Returns the optional tenant isolation identity.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub(crate) fn validate_current(&self, kind: &str) -> Result<(), HarnessError> {
+        self.actor.validate_current(kind)?;
+        if let Some(tenant_id) = &self.tenant_id {
+            validate_tenant_id(tenant_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_tenant(value: &str) -> Result<(), HarnessError> {
+        validate_tenant_id(value)
+    }
+}
+
+impl Default for AuthorityContext {
+    fn default() -> Self {
+        Self::local_process()
+    }
+}
+
 /// Backwards-compatible name for the actor participating in an approval flow.
 ///
 /// Approval is one use of the shared authenticated actor identity; Turn input
@@ -534,6 +596,21 @@ pub type ApprovalActor = ActorIdentity;
 fn validate_actor_identity(kind: &str, field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         return Err(format!("{kind} {field} must be 1-256 non-control bytes"));
+    }
+    Ok(())
+}
+
+fn validate_tenant_id(value: &str) -> Result<(), HarnessError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(HarnessError::InvalidConfiguration(
+            "tenant identity must be 1-128 case-sensitive ASCII letters, digits, '.', '_', '-' or ':'"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -643,6 +720,8 @@ pub struct ToolContext {
     pub turn_id: TurnId,
     /// Tool-call correlation ID.
     pub call_id: String,
+    /// Trusted identity and tenant boundary for this Tool call.
+    pub authority: AuthorityContext,
     /// Per-call stop signal derived from owning Turn cancellation and deadline.
     pub cancellation: CancellationToken,
 }

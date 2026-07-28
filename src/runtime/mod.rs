@@ -24,10 +24,10 @@ pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngin
 pub use crate::kernel::{LanguageModel, Tool};
 
 use crate::{
-    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, ContextBlock, ContextEngine,
-    ContextSource, ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemKind,
-    MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput,
-    ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext, ContextBlock,
+    ContextEngine, ContextSource, ExecutionPhase, HarnessError, InvocationContextEvidence, Item,
+    ItemKind, MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation,
+    ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
     ModelToolCall, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
     StateCapacity, StateEngine, SteeringId, StoredEvent, Thread, ThreadArchive, ThreadId,
     ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
@@ -672,9 +672,7 @@ impl HarnessRuntime {
         options: TurnExecutionOptions,
     ) -> Result<TurnOutcome, HarnessError> {
         self.models.validate()?;
-        options
-            .approval_requester
-            .validate_current("approval requester")?;
+        let memory_scope = options.validated_memory_scope()?;
         validate_turn_context_inputs(&options.context)?;
         let deadline = deadline(options.timeout)?;
         let _active = self.claim_thread(thread_id)?;
@@ -773,7 +771,7 @@ impl HarnessRuntime {
                         ),
                         &options.cancellation,
                         deadline,
-                        || self.context.compile(&prompt, options.memory_scope.clone()),
+                        || self.context.compile(&prompt, memory_scope.clone()),
                     )
                     .await
                 {
@@ -808,7 +806,7 @@ impl HarnessRuntime {
                 }
                 let invocation_record = invocation_context_record(
                     &compilation.blocks,
-                    options.approval_requester.clone(),
+                    options.authority.actor().clone(),
                 );
                 if let Some(record) = invocation_record {
                     self.record(&mut turn, record).await?;
@@ -1172,6 +1170,13 @@ impl HarnessRuntime {
         options: &TurnExecutionOptions,
         deadline: Option<Instant>,
     ) -> Result<PreparedExecution, HarnessError> {
+        let memory_scope = options.validated_memory_scope()?;
+        if options.authority.tenant_id().is_some() {
+            return Err(HarnessError::State(
+                "tenant-scoped approval recovery requires durable tenant authority evidence"
+                    .to_owned(),
+            ));
+        }
         let thread = self
             .load_thread(thread_id)
             .await?
@@ -1200,7 +1205,7 @@ impl HarnessRuntime {
                 "thread projection contains multiple running turns".to_owned(),
             ));
         }
-        let evidence = approval_resume_evidence(&turn, &options.approval_requester)?;
+        let evidence = approval_resume_evidence(&turn, options.authority.actor())?;
         if !self
             .models
             .contains(&evidence.model_id, &evidence.model_origin)
@@ -1256,7 +1261,7 @@ impl HarnessRuntime {
                 ),
                 &options.cancellation,
                 deadline,
-                || self.context.compile(&prompt, options.memory_scope.clone()),
+                || self.context.compile(&prompt, memory_scope.clone()),
             )
             .await?;
         let compilation = self
@@ -1384,6 +1389,7 @@ impl HarnessRuntime {
             self.observability.clone(),
             turn.thread_id.clone(),
             turn.id.clone(),
+            options.authority.clone(),
             options.cancellation.clone(),
             deadline,
         )
@@ -1506,6 +1512,7 @@ impl HarnessRuntime {
             let observability = self.observability.clone();
             let thread_id = turn.thread_id.clone();
             let turn_id = turn.id.clone();
+            let authority = options.authority.clone();
             let cancellation = options.cancellation.clone();
             tasks.spawn(async move {
                 let result = match semaphore.acquire_owned().await {
@@ -1515,6 +1522,7 @@ impl HarnessRuntime {
                             observability,
                             thread_id,
                             turn_id,
+                            authority,
                             cancellation,
                             deadline,
                         )
@@ -1626,7 +1634,7 @@ impl HarnessRuntime {
                 ),
                 &options.cancellation,
                 deadline,
-                || self.policy.authorize(&authorization),
+                || self.policy.authorize(&authorization, &options.authority),
             )
             .await
         {
@@ -1661,9 +1669,17 @@ impl HarnessRuntime {
                 Err(error)
             }
             PolicyDecision::Ask { reason, risk } => {
+                if options.authority.tenant_id().is_some() {
+                    let error = HarnessError::InvalidConfiguration(
+                        "tenant-scoped approvals require durable tenant authority evidence"
+                            .to_owned(),
+                    );
+                    self.settle_error(turn, &error).await?;
+                    return Err(error);
+                }
                 let request = ApprovalRequest {
                     id: ApprovalId::generate(),
-                    requested_by: options.approval_requester.clone(),
+                    requested_by: options.authority.actor().clone(),
                     authorization,
                     reason,
                     risk,
@@ -3560,6 +3576,7 @@ async fn invoke_tool_capability(
     observability: Observability,
     thread_id: ThreadId,
     turn_id: TurnId,
+    authority: AuthorityContext,
     cancellation: crate::CancellationToken,
     deadline: Option<Instant>,
 ) -> Result<ToolCallSettlement, HarnessError> {
@@ -3578,6 +3595,7 @@ async fn invoke_tool_capability(
         thread_id: thread_id.clone(),
         turn_id: turn_id.clone(),
         call_id: call_id.clone(),
+        authority,
         cancellation: capability_cancellation.clone(),
     };
     let started = Instant::now();
@@ -3755,12 +3773,12 @@ mod tests {
     };
     use crate::{
         ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus,
-        ApprovalRequest, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
-        ContextEngine, ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
-        ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
-        ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
-        ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler, ItemKind,
-        MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
+        ApprovalRequest, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
+        CapabilityOrigin, ContextEngine, ContextSource, ConversationCompactionConfig,
+        ConversationCompactionRequest, ConversationCompactionResponse, ConversationCompactor,
+        ConversationCompactorDescriptor, ConversationCompactorRegistry, ConversationContextConfig,
+        EventId, EventStore, ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler,
+        ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
         MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
         MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
         MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
@@ -3780,6 +3798,14 @@ mod tests {
 
     struct DriftedEchoTool {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct AuthorityProbeTool {
+        observed: Arc<Mutex<Option<AuthorityContext>>>,
+    }
+
+    struct AuthorityRecordingPolicy {
+        observed: Arc<Mutex<Option<AuthorityContext>>>,
     }
 
     fn sqlite_test_path(label: &str) -> std::path::PathBuf {
@@ -4048,6 +4074,46 @@ mod tests {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(input)
+            })
+        }
+    }
+
+    impl Tool for AuthorityProbeTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Records the trusted Tool authority".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                *self
+                    .observed
+                    .lock()
+                    .map_err(|_| HarnessError::Tool("authority recorder poisoned".to_owned()))? =
+                    Some(context.authority);
+                Ok(input)
+            })
+        }
+    }
+
+    impl PolicyEngine for AuthorityRecordingPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _request: &'a ToolAuthorization,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async move {
+                *self
+                    .observed
+                    .lock()
+                    .map_err(|_| HarnessError::PolicyDenied {
+                        tool: "echo".to_owned(),
+                        reason: "authority recorder poisoned".to_owned(),
+                    })? = Some(authority.clone());
+                Ok(PolicyDecision::Allow)
             })
         }
     }
@@ -4529,6 +4595,7 @@ mod tests {
         fn authorize<'a>(
             &'a self,
             _request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, PolicyDecision> {
             Box::pin(async move {
                 self.entered.notify_one();
@@ -5155,6 +5222,7 @@ mod tests {
         fn authorize<'a>(
             &'a self,
             _request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, PolicyDecision> {
             Box::pin(async { Err(HarnessError::Policy("provider unavailable".to_owned())) })
         }
@@ -5166,6 +5234,7 @@ mod tests {
         fn authorize<'a>(
             &'a self,
             request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, PolicyDecision> {
             Box::pin(async move {
                 assert_eq!(request.descriptor.name, "echo");
@@ -5184,6 +5253,7 @@ mod tests {
         fn authorize<'a>(
             &'a self,
             request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
         ) -> HarnessFuture<'a, PolicyDecision> {
             Box::pin(async move {
                 match request.call_id.as_str() {
@@ -5345,6 +5415,95 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[tokio::test]
+    async fn trusted_authority_reaches_policy_and_tool_execution() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-42".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("scoped authority");
+        let observed_policy = Arc::new(Mutex::new(None));
+        let observed_tool = Arc::new(Mutex::new(None));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(AuthorityProbeTool {
+                    observed: observed_tool.clone(),
+                }),
+            )
+            .expect("probe Tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AuthorityRecordingPolicy {
+                observed: observed_policy.clone(),
+            }),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+        runtime
+            .run_turn_with_options(
+                &thread.id,
+                "hello",
+                TurnExecutionOptions {
+                    authority: authority.clone(),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect("Turn");
+        assert_eq!(
+            observed_policy
+                .lock()
+                .expect("observed Policy authority")
+                .as_ref(),
+            Some(&authority)
+        );
+        assert_eq!(
+            observed_tool
+                .lock()
+                .expect("observed Tool authority")
+                .as_ref(),
+            Some(&authority)
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_scoped_approval_fails_before_request_or_tool_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("thread");
+        let error = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "protected",
+                TurnExecutionOptions {
+                    authority: AuthorityContext::new(
+                        ActorIdentity::Authenticated {
+                            authority: "enterprise-identity".to_owned(),
+                            subject: "operator-42".to_owned(),
+                        },
+                        Some("tenant-a".to_owned()),
+                    )
+                    .expect("scoped authority"),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("tenant-scoped approval is not durable yet");
+        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -6762,10 +6921,14 @@ mod tests {
             &thread.id,
             &turn_id,
             TurnExecutionOptions {
-                approval_requester: ApprovalActor::Authenticated {
-                    authority: "different-authority".to_owned(),
-                    subject: "different-requester".to_owned(),
-                },
+                authority: crate::AuthorityContext::new(
+                    ApprovalActor::Authenticated {
+                        authority: "different-authority".to_owned(),
+                        subject: "different-requester".to_owned(),
+                    },
+                    None,
+                )
+                .expect("different authority"),
                 context: vec![turn_context.clone()],
                 ..TurnExecutionOptions::default()
             },
@@ -9800,7 +9963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_approval_requester_is_rejected_before_turn_creation() {
+    async fn invalid_authority_is_rejected_before_turn_creation() {
         let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
         let runtime = HarnessRuntime::new(
             Arc::new(UsageModel),
@@ -9814,10 +9977,14 @@ mod tests {
                 &thread.id,
                 "valid prompt",
                 TurnExecutionOptions {
-                    approval_requester: ApprovalActor::Authenticated {
-                        authority: " ".to_owned(),
-                        subject: "operator".to_owned(),
-                    },
+                    authority: serde_json::from_value(serde_json::json!({
+                        "actor": {
+                            "kind": "authenticated",
+                            "authority": " ",
+                            "subject": "operator"
+                        }
+                    }))
+                    .expect("shape-only decode"),
                     ..TurnExecutionOptions::default()
                 },
             )

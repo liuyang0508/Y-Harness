@@ -62,8 +62,8 @@ pub use execution::{
 };
 pub use kernel::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
-    CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId, EventId, ExecutionPhase,
-    HarnessError, HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
+    AuthorityContext, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId, EventId,
+    ExecutionPhase, HarnessError, HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
     MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
     MAX_TOOL_CALLS_PER_BATCH, MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, MemoryContextRecordStatus,
     ModelContinuation, ModelEventSink, ModelOutput, ModelProviderFailure, ModelProviderFailureKind,

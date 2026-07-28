@@ -159,7 +159,7 @@ impl EvaluationTarget for HarnessRuntime {
                 &thread.id,
                 case.prompt,
                 TurnExecutionOptions {
-                    approval_requester: crate::ApprovalActor::LocalProcess,
+                    authority: crate::AuthorityContext::local_process(),
                     memory_scope: case.memory_scope,
                     context: Vec::new(),
                     timeout: None,
