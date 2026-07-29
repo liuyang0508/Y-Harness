@@ -88,9 +88,9 @@ history plus durable lineage in State, and check alternate-screen and
 bracketed-paste restoration. The 64 MiB State migration, 126.9 MiB Approval
 Inbox migration, and near-limit 1,000-Task Graph migration tests are
 deliberately manual.
-The Core package is remeasured from the final clean commit. The current
-State-14/Approval-3/Task-3/Secret-2/Protocol-26 candidate is never verified
-with Cargo's `--allow-dirty` escape hatch.
+The 242-file / 3.4 MiB Core package (745.4 KiB compressed) verifies from the
+current State-14/Approval-3/Task-3/Secret-2/Protocol-26 candidate; Cargo's
+`--allow-dirty` escape hatch is not used.
 Five integration tests are ignored by the ordinary suite unless their explicit
 external fixtures are configured:
 Agent Memory Hub, ordinary and streaming HTTPS model gateway, direct OpenAI,
