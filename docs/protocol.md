@@ -693,6 +693,13 @@ those effects explicitly through Workflow waits, Policy, Channel gateways, and
 Connectors. `LocalProcess` is trusted process attribution, not proof of an
 individual human.
 
+Temporal Driver API 1 is an embedded host API, not a Protocol v28 command or
+capability. A host may invoke one bounded tick with trusted authority and time
+to discover due Workflow waits and expired Handoff claims, then reuse the
+existing fenced domain commands. The reference `yh serve` process does not
+start that polling lifecycle, and protocol clients cannot submit temporal
+application time or cursors.
+
 ## Paging
 
 `get_operation_events` returns:

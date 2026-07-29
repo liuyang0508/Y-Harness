@@ -106,7 +106,14 @@ immutable transitions, tenant-partitioned Memory/SQLite coordination, and
 projection validation survive restart. The reference service persists the
 aggregate in `human-handoffs.db`. This lifecycle does not implicitly approve a
 decision, pause a Turn, route a channel, wake a Workflow, execute business
-actions, scan expired leases, or prove that `LocalProcess` is a human.
+actions, run a resident expiry loop, or prove that `LocalProcess` is a human.
+Embedded Temporal Driver API 1 composes optional Workflow and Handoff Engines
+behind one bounded host-driven tick. It uses trusted host time and authority,
+tenant-local 1–256-record identity scans, disposable cursors, deterministic
+actor-and-fence command identities, and the existing CAS transitions to settle
+each attempt as applied, duplicate, fenced, or failed. It starts no background
+task, adds no scheduler database, and does not change Protocol 28, service
+configuration, or durable schemas.
 The optional `y-harness-domain-pack` crate remains above Core and outside
 Protocol v28. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
@@ -232,6 +239,7 @@ yh serve
 - Task Coordinator schema: `3`
 - Workflow Coordinator schema: `1`
 - Human Handoff Coordinator schema: `1`
+- Temporal Driver API: `1` (embedded only)
 - Secret Provider API: `2`
 - Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`

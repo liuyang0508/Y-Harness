@@ -12,13 +12,17 @@ use serde::Serialize;
 use tokio::{sync::Mutex, task};
 
 use super::{
-    MAX_WORKFLOW_JSON_BYTES, WorkflowApplyOutcome, WorkflowCommand, WorkflowCreateRequest,
-    WorkflowRun, validate_identity,
+    MAX_WORKFLOW_IDEMPOTENCY_BYTES, MAX_WORKFLOW_JSON_BYTES, WorkflowApplyOutcome, WorkflowCommand,
+    WorkflowCreateRequest, WorkflowRun, WorkflowStatus, WorkflowWait, validate_identity,
 };
-use crate::{AuthorityContext, HarnessError, HarnessFuture, WorkflowRunId, sqlite::bounded_text};
+use crate::{
+    AuthorityContext, HarnessError, HarnessFuture, WorkflowRunId, WorkflowWaitId,
+    sqlite::bounded_text,
+};
 
 /// Current durable Workflow Run schema.
 pub const WORKFLOW_RUN_SCHEMA_VERSION: u32 = 1;
+const MAX_WORKFLOW_SCAN_PAGE: usize = 256;
 
 /// Immutable revisioned Workflow Run projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -63,6 +67,39 @@ pub struct WorkflowCommandResult {
     pub snapshot: WorkflowRunSnapshot,
     /// Whether the command changed the durable revision.
     pub outcome: WorkflowApplyOutcome,
+}
+
+/// One due Workflow wait discovered from authoritative Run state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDueWait {
+    /// Stable Run identity.
+    pub run_id: WorkflowRunId,
+    /// Immutable tenant boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Revision observed with the wait.
+    pub revision: u64,
+    /// Exact current wait fence.
+    pub wait_id: WorkflowWaitId,
+    /// Inclusive server-clock wake boundary.
+    pub due_at_ms: u64,
+}
+
+/// One bounded identity-ordered scan page over Workflow Runs.
+///
+/// `scanned` counts every visited Run, including records that are not due.
+/// The cursor therefore makes progress through sparse due workloads without
+/// requiring an authoritative secondary scheduler database.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDueScanPage {
+    /// Due waits among the visited Runs.
+    pub due: Vec<WorkflowDueWait>,
+    /// Last visited Run identity.
+    pub next_after_run_id: Option<WorkflowRunId>,
+    /// Whether another Run remains in this tenant's current scan.
+    pub has_more: bool,
+    /// Number of authoritative Runs visited.
+    pub scanned: usize,
 }
 
 /// Atomic persistence and command boundary for durable Workflow Runs.
@@ -111,6 +148,42 @@ pub trait WorkflowCoordinator: Send + Sync {
         run_id: &'a WorkflowRunId,
         authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, Option<WorkflowRunSnapshot>>;
+
+    /// Scans one bounded unscoped Run page for waits due at `at_ms`.
+    fn scan_due<'a>(
+        &'a self,
+        at_ms: u64,
+        after_run_id: Option<&'a WorkflowRunId>,
+        scan_limit: usize,
+    ) -> HarnessFuture<'a, WorkflowDueScanPage> {
+        Box::pin(async move {
+            self.scan_due_as(
+                at_ms,
+                after_run_id,
+                scan_limit,
+                &AuthorityContext::local_process(),
+            )
+            .await
+        })
+    }
+
+    /// Scans one bounded identity-ordered Run page inside the exact tenant.
+    ///
+    /// The default keeps existing custom coordinators source-compatible while
+    /// failing closed until they implement temporal discovery.
+    fn scan_due_as<'a>(
+        &'a self,
+        _at_ms: u64,
+        _after_run_id: Option<&'a WorkflowRunId>,
+        _scan_limit: usize,
+        _authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, WorkflowDueScanPage> {
+        Box::pin(async {
+            Err(HarnessError::Workflow(
+                "Workflow Coordinator does not support temporal discovery".to_owned(),
+            ))
+        })
+    }
 
     /// Applies one idempotent command to an unscoped Run.
     fn apply<'a>(
@@ -206,6 +279,36 @@ impl WorkflowCoordinator for MemoryWorkflowCoordinator {
                 .await
                 .get(&storage_key(run_id, authority.tenant_id()))
                 .cloned())
+        })
+    }
+
+    fn scan_due_as<'a>(
+        &'a self,
+        at_ms: u64,
+        after_run_id: Option<&'a WorkflowRunId>,
+        scan_limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, WorkflowDueScanPage> {
+        Box::pin(async move {
+            validate_due_scan(at_ms, after_run_id, scan_limit, authority)?;
+            let runs = self.runs.lock().await;
+            let tenant = tenant_storage_key(authority.tenant_id()).to_owned();
+            let range_start = (
+                tenant.clone(),
+                after_run_id
+                    .cloned()
+                    .unwrap_or_else(|| WorkflowRunId::from_string(String::new())),
+            );
+            let mut visited = runs
+                .range(range_start..)
+                .take_while(|((stored_tenant, _), _)| stored_tenant == &tenant)
+                .filter(|((_, run_id), _)| {
+                    after_run_id.is_none_or(|after| run_id.as_str() > after.as_str())
+                })
+                .take(scan_limit.saturating_add(1))
+                .map(|(_, snapshot)| snapshot.clone())
+                .collect::<Vec<_>>();
+            Ok(page_from_scan(&mut visited, scan_limit, at_ms))
         })
     }
 
@@ -366,6 +469,84 @@ impl WorkflowCoordinator for SqliteWorkflowCoordinator {
             .await
             .map_err(|error| {
                 HarnessError::Workflow(format!("Workflow load task failed: {error}"))
+            })?
+        })
+    }
+
+    fn scan_due_as<'a>(
+        &'a self,
+        at_ms: u64,
+        after_run_id: Option<&'a WorkflowRunId>,
+        scan_limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, WorkflowDueScanPage> {
+        let connection = self.connection.clone();
+        let after_run_id = after_run_id.cloned();
+        let authority = authority.clone();
+        Box::pin(async move {
+            validate_due_scan(at_ms, after_run_id.as_ref(), scan_limit, &authority)?;
+            task::spawn_blocking(move || {
+                let connection = connection
+                    .lock()
+                    .map_err(|_| HarnessError::Workflow("Workflow lock poisoned".to_owned()))?;
+                let fetch = scan_limit.checked_add(1).ok_or_else(|| {
+                    HarnessError::Workflow("Workflow scan limit overflow".to_owned())
+                })?;
+                let mut statement = connection
+                    .prepare(
+                        "SELECT length(CAST(run_id AS BLOB)), run_id,
+                                schema_version, revision,
+                                length(CAST(run_json AS BLOB)), run_json
+                         FROM workflow_runs
+                         WHERE tenant_id = ?1 AND run_id > ?2
+                         ORDER BY run_id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            tenant_storage_key(authority.tenant_id()),
+                            after_run_id.as_ref().map_or("", |id| id.as_str()),
+                            i64::try_from(fetch).map_err(|_| {
+                                HarnessError::Workflow(
+                                    "Workflow scan limit exceeds SQLite".to_owned(),
+                                )
+                            })?
+                        ],
+                        |row| {
+                            Ok((
+                                bounded_text(
+                                    row,
+                                    0,
+                                    1,
+                                    MAX_WORKFLOW_IDEMPOTENCY_BYTES,
+                                    "Workflow Run identity",
+                                )?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                bounded_text(row, 4, 5, MAX_WORKFLOW_JSON_BYTES, "Workflow Run")?,
+                            ))
+                        },
+                    )
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                let mut visited = Vec::with_capacity(rows.len());
+                for (run_id, schema, revision, encoded) in rows {
+                    visited.push(decode_snapshot(
+                        WorkflowRunId::from_string(run_id),
+                        authority.tenant_id(),
+                        schema,
+                        revision,
+                        encoded,
+                    )?);
+                }
+                Ok(page_from_scan(&mut visited, scan_limit, at_ms))
+            })
+            .await
+            .map_err(|error| {
+                HarnessError::Workflow(format!("Workflow scan task failed: {error}"))
             })?
         })
     }
@@ -565,6 +746,16 @@ fn load_snapshot(
     let Some((schema_version, revision, encoded)) = row else {
         return Ok(None);
     };
+    decode_snapshot(run_id.clone(), tenant_id, schema_version, revision, encoded).map(Some)
+}
+
+fn decode_snapshot(
+    run_id: WorkflowRunId,
+    tenant_id: Option<&str>,
+    schema_version: i64,
+    revision: i64,
+    encoded: String,
+) -> Result<WorkflowRunSnapshot, HarnessError> {
     if schema_version != i64::from(WORKFLOW_RUN_SCHEMA_VERSION) {
         return Err(HarnessError::Workflow(format!(
             "Workflow Run {run_id} uses unsupported schema {schema_version}"
@@ -576,12 +767,62 @@ fn load_snapshot(
     let run: WorkflowRun = serde_json::from_str(&encoded)
         .map_err(|error| HarnessError::Workflow(format!("decode Workflow Run: {error}")))?;
     run.validate()?;
-    Ok(Some(WorkflowRunSnapshot {
-        id: run_id.clone(),
+    Ok(WorkflowRunSnapshot {
+        id: run_id,
         tenant_id: tenant_id.map(str::to_owned),
         revision,
         run,
-    }))
+    })
+}
+
+fn page_from_scan(
+    visited: &mut Vec<WorkflowRunSnapshot>,
+    scan_limit: usize,
+    at_ms: u64,
+) -> WorkflowDueScanPage {
+    let has_more = visited.len() > scan_limit;
+    visited.truncate(scan_limit);
+    let next_after_run_id = visited.last().map(|snapshot| snapshot.id.clone());
+    let mut due = Vec::new();
+    for snapshot in visited.iter() {
+        let Some((wait_id, due_at_ms)) = due_wait(snapshot.run.status()) else {
+            continue;
+        };
+        if due_at_ms <= at_ms {
+            due.push(WorkflowDueWait {
+                run_id: snapshot.id.clone(),
+                tenant_id: snapshot.tenant_id.clone(),
+                revision: snapshot.revision,
+                wait_id: wait_id.clone(),
+                due_at_ms,
+            });
+        }
+    }
+    WorkflowDueScanPage {
+        due,
+        next_after_run_id,
+        has_more,
+        scanned: visited.len(),
+    }
+}
+
+fn due_wait(status: &WorkflowStatus) -> Option<(&WorkflowWaitId, u64)> {
+    let WorkflowStatus::Waiting { wait } = status else {
+        return None;
+    };
+    match wait {
+        WorkflowWait::Signal {
+            id,
+            expires_at_ms: Some(due_at_ms),
+            ..
+        }
+        | WorkflowWait::Timer { id, due_at_ms }
+        | WorkflowWait::Retry { id, due_at_ms, .. } => Some((id, *due_at_ms)),
+        WorkflowWait::Signal {
+            expires_at_ms: None,
+            ..
+        } => None,
+    }
 }
 
 fn encode_run(run: &WorkflowRun) -> Result<String, HarnessError> {
@@ -602,6 +843,29 @@ fn validate_run_access(
 ) -> Result<(), HarnessError> {
     authority.validate_current("Workflow Coordinator authority")?;
     validate_identity("Workflow Run", run_id.as_str())
+}
+
+fn validate_due_scan(
+    at_ms: u64,
+    after_run_id: Option<&WorkflowRunId>,
+    scan_limit: usize,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    authority.validate_current("Workflow temporal scan authority")?;
+    if at_ms == 0 {
+        return Err(HarnessError::Workflow(
+            "Workflow temporal scan time must be positive".to_owned(),
+        ));
+    }
+    if let Some(run_id) = after_run_id {
+        validate_identity("Workflow scan cursor", run_id.as_str())?;
+    }
+    if !(1..=MAX_WORKFLOW_SCAN_PAGE).contains(&scan_limit) {
+        return Err(HarnessError::Workflow(format!(
+            "Workflow scan limit must be 1-{MAX_WORKFLOW_SCAN_PAGE}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_expected_revision(revision: u64) -> Result<(), HarnessError> {
@@ -686,6 +950,56 @@ mod tests {
                 due_at_ms: 100,
             },
         }
+    }
+
+    #[test]
+    fn due_wait_covers_every_time_owned_wait_variant() {
+        let signal = WorkflowStatus::Waiting {
+            wait: WorkflowWait::Signal {
+                id: WorkflowWaitId::from_static("signal"),
+                name: "event.ready".to_owned(),
+                source: "connector".to_owned(),
+                expires_at_ms: Some(101),
+            },
+        };
+        let signal_without_timeout = WorkflowStatus::Waiting {
+            wait: WorkflowWait::Signal {
+                id: WorkflowWaitId::from_static("signal-open"),
+                name: "event.open".to_owned(),
+                source: "connector".to_owned(),
+                expires_at_ms: None,
+            },
+        };
+        let timer = WorkflowStatus::Waiting {
+            wait: WorkflowWait::Timer {
+                id: WorkflowWaitId::from_static("timer"),
+                due_at_ms: 102,
+            },
+        };
+        let retry = WorkflowStatus::Waiting {
+            wait: WorkflowWait::Retry {
+                id: WorkflowWaitId::from_static("retry"),
+                activity: "connector.fetch".to_owned(),
+                attempt: 2,
+                due_at_ms: 103,
+                idempotency_key: "effect-1".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            due_wait(&signal).map(|(id, due)| (id.as_str(), due)),
+            Some(("signal", 101))
+        );
+        assert_eq!(due_wait(&signal_without_timeout), None);
+        assert_eq!(
+            due_wait(&timer).map(|(id, due)| (id.as_str(), due)),
+            Some(("timer", 102))
+        );
+        assert_eq!(
+            due_wait(&retry).map(|(id, due)| (id.as_str(), due)),
+            Some(("retry", 103))
+        );
+        assert_eq!(due_wait(&WorkflowStatus::Running), None);
     }
 
     fn tenant(id: &str) -> AuthorityContext {
@@ -789,6 +1103,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_due_scan_advances_across_sparse_identity_pages() {
+        let coordinator = MemoryWorkflowCoordinator::new();
+        let authority = tenant("alpha");
+        for id in ["a-running", "b-due", "c-future"] {
+            coordinator
+                .create_as(
+                    WorkflowRunId::from_string(id.to_owned()),
+                    create(),
+                    10,
+                    &authority,
+                )
+                .await
+                .expect("create");
+        }
+        for (id, due_at_ms) in [("b-due", 100), ("c-future", 200)] {
+            coordinator
+                .apply_as(
+                    &WorkflowRunId::from_string(id.to_owned()),
+                    1,
+                    WorkflowCommand {
+                        id: WorkflowCommandId::from_string(format!("wait-{id}")),
+                        kind: WorkflowCommandKind::WaitUntil {
+                            wait_id: WorkflowWaitId::from_string(format!("wait-{id}")),
+                            due_at_ms,
+                        },
+                    },
+                    20,
+                    &authority,
+                )
+                .await
+                .expect("wait");
+        }
+
+        let first = coordinator
+            .scan_due_as(100, None, 1, &authority)
+            .await
+            .expect("first");
+        assert_eq!(first.scanned, 1);
+        assert!(first.due.is_empty());
+        assert!(first.has_more);
+        assert_eq!(
+            first.next_after_run_id.as_ref().map(WorkflowRunId::as_str),
+            Some("a-running")
+        );
+        let second = coordinator
+            .scan_due_as(100, first.next_after_run_id.as_ref(), 1, &authority)
+            .await
+            .expect("second");
+        assert_eq!(second.due.len(), 1);
+        assert_eq!(second.due[0].run_id.as_str(), "b-due");
+        assert_eq!(second.due[0].revision, 2);
+        assert_eq!(second.due[0].due_at_ms, 100);
+        assert!(second.has_more);
+        let third = coordinator
+            .scan_due_as(100, second.next_after_run_id.as_ref(), 1, &authority)
+            .await
+            .expect("third");
+        assert!(third.due.is_empty());
+        assert!(!third.has_more);
+    }
+
+    #[tokio::test]
     async fn sqlite_coordinator_reopens_exact_state_and_duplicate_commands() {
         let path = temp_path("reopen");
         let run_id = WorkflowRunId::from_static("run");
@@ -817,6 +1193,71 @@ mod tests {
             assert_eq!(duplicate.outcome, WorkflowApplyOutcome::Duplicate);
             assert_eq!(duplicate.snapshot.revision(), 2);
         }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_due_scan_reopens_with_memory_equivalent_boundaries() {
+        let path = temp_path("due-scan");
+        let authority = tenant("alpha");
+        {
+            let coordinator = SqliteWorkflowCoordinator::open(&path).await.expect("open");
+            for id in ["a-due", "b-future"] {
+                let run_id = WorkflowRunId::from_string(id.to_owned());
+                coordinator
+                    .create_as(run_id.clone(), create(), 10, &authority)
+                    .await
+                    .expect("create");
+                coordinator
+                    .apply_as(
+                        &run_id,
+                        1,
+                        WorkflowCommand {
+                            id: WorkflowCommandId::from_string(format!("wait-{id}")),
+                            kind: WorkflowCommandKind::WaitUntil {
+                                wait_id: WorkflowWaitId::from_string(format!("wait-{id}")),
+                                due_at_ms: if id == "a-due" { 100 } else { 200 },
+                            },
+                        },
+                        20,
+                        &authority,
+                    )
+                    .await
+                    .expect("wait");
+            }
+        }
+        let coordinator = SqliteWorkflowCoordinator::open(&path)
+            .await
+            .expect("reopen");
+        let page = coordinator
+            .scan_due_as(100, None, 2, &authority)
+            .await
+            .expect("scan");
+        assert_eq!(page.scanned, 2);
+        assert_eq!(page.due.len(), 1);
+        assert_eq!(page.due[0].run_id.as_str(), "a-due");
+        assert!(!page.has_more);
+        {
+            let connection = Connection::open(&path).expect("tamper fixture");
+            connection
+                .execute(
+                    "UPDATE workflow_runs SET run_id = ?1 WHERE run_id = 'b-future'",
+                    params!["x".repeat(MAX_WORKFLOW_IDEMPOTENCY_BYTES + 1)],
+                )
+                .expect("tamper identity");
+        }
+        let error = coordinator
+            .scan_due_as(100, None, 2, &authority)
+            .await
+            .expect_err("oversized identity");
+        assert!(
+            error
+                .to_string()
+                .contains("Workflow Run identity exceeds 256 bytes")
+        );
+        drop(coordinator);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));

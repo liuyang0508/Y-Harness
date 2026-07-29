@@ -14,7 +14,8 @@ use crate::{
 
 pub use coordinator::{
     MemoryWorkflowCoordinator, SqliteWorkflowCoordinator, WORKFLOW_RUN_SCHEMA_VERSION,
-    WorkflowCommandResult, WorkflowCoordinator, WorkflowRunSnapshot,
+    WorkflowCommandResult, WorkflowCoordinator, WorkflowDueScanPage, WorkflowDueWait,
+    WorkflowRunSnapshot,
 };
 pub use engine::WorkflowEngine;
 

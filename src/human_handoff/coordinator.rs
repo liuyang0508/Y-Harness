@@ -13,13 +13,15 @@ use tokio::{sync::Mutex, task};
 
 use super::{
     HumanHandoff, HumanHandoffApplyOutcome, HumanHandoffCommand, HumanHandoffCreateRequest,
-    HumanHandoffStatus, MAX_HANDOFF_JSON_BYTES, validate_identity,
+    HumanHandoffStatus, MAX_HANDOFF_IDENTITY_BYTES, MAX_HANDOFF_JSON_BYTES,
+    MAX_HANDOFF_QUEUE_BYTES, validate_identity,
 };
 use crate::{AuthorityContext, HarnessError, HarnessFuture, HumanHandoffId, sqlite::bounded_text};
 
 /// Current durable Human Handoff store schema.
 pub const HUMAN_HANDOFF_SCHEMA_VERSION: u32 = 1;
 const MAX_HANDOFF_PAGE: usize = 256;
+const MAX_HANDOFF_STATUS_BYTES: usize = 9;
 
 /// Stable queue cursor in priority-descending, request-time, identity order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +89,38 @@ pub struct HumanHandoffCommandResult {
     pub snapshot: HumanHandoffSnapshot,
     /// Whether the command changed the durable revision.
     pub outcome: HumanHandoffApplyOutcome,
+}
+
+/// One expired claim discovered from authoritative Human Handoff state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HumanHandoffDueClaim {
+    /// Stable case identity.
+    pub handoff_id: HumanHandoffId,
+    /// Immutable tenant boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Revision observed with the claim.
+    pub revision: u64,
+    /// Exact current ownership fence.
+    pub claim_id: crate::HumanHandoffClaimId,
+    /// Exclusive server-clock expiration boundary.
+    pub expires_at_ms: u64,
+}
+
+/// One bounded identity-ordered scan page over Human Handoffs.
+///
+/// `scanned` counts all visited cases so sparse expired claims cannot prevent
+/// cursor progress.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HumanHandoffDueScanPage {
+    /// Expired claims among the visited cases.
+    pub due: Vec<HumanHandoffDueClaim>,
+    /// Last visited case identity.
+    pub next_after_handoff_id: Option<HumanHandoffId>,
+    /// Whether another case remains in this tenant's current scan.
+    pub has_more: bool,
+    /// Number of authoritative cases visited.
+    pub scanned: usize,
 }
 
 /// Atomic persistence, queue discovery, and command boundary.
@@ -157,6 +191,42 @@ pub trait HumanHandoffCoordinator: Send + Sync {
         limit: usize,
         authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, HumanHandoffPage>;
+
+    /// Scans one bounded unscoped case page for claims expired at `at_ms`.
+    fn scan_due<'a>(
+        &'a self,
+        at_ms: u64,
+        after_handoff_id: Option<&'a HumanHandoffId>,
+        scan_limit: usize,
+    ) -> HarnessFuture<'a, HumanHandoffDueScanPage> {
+        Box::pin(async move {
+            self.scan_due_as(
+                at_ms,
+                after_handoff_id,
+                scan_limit,
+                &AuthorityContext::local_process(),
+            )
+            .await
+        })
+    }
+
+    /// Scans one bounded identity-ordered case page in the exact tenant.
+    ///
+    /// Existing custom coordinators remain source-compatible and fail closed
+    /// until they implement temporal discovery.
+    fn scan_due_as<'a>(
+        &'a self,
+        _at_ms: u64,
+        _after_handoff_id: Option<&'a HumanHandoffId>,
+        _scan_limit: usize,
+        _authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, HumanHandoffDueScanPage> {
+        Box::pin(async {
+            Err(HarnessError::HumanHandoff(
+                "Human Handoff Coordinator does not support temporal discovery".to_owned(),
+            ))
+        })
+    }
 
     /// Applies one idempotent command to an unscoped case.
     fn apply<'a>(
@@ -279,6 +349,36 @@ impl HumanHandoffCoordinator for MemoryHumanHandoffCoordinator {
                 .collect::<Vec<_>>();
             candidates.sort_by(queue_order);
             page_from_candidates(candidates, limit)
+        })
+    }
+
+    fn scan_due_as<'a>(
+        &'a self,
+        at_ms: u64,
+        after_handoff_id: Option<&'a HumanHandoffId>,
+        scan_limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, HumanHandoffDueScanPage> {
+        Box::pin(async move {
+            validate_due_scan(at_ms, after_handoff_id, scan_limit, authority)?;
+            let handoffs = self.handoffs.lock().await;
+            let tenant = tenant_storage_key(authority.tenant_id()).to_owned();
+            let range_start = (
+                tenant.clone(),
+                after_handoff_id
+                    .cloned()
+                    .unwrap_or_else(|| HumanHandoffId::from_string(String::new())),
+            );
+            let mut visited = handoffs
+                .range(range_start..)
+                .take_while(|((stored_tenant, _), _)| stored_tenant == &tenant)
+                .filter(|((_, handoff_id), _)| {
+                    after_handoff_id.is_none_or(|after| handoff_id.as_str() > after.as_str())
+                })
+                .take(scan_limit.saturating_add(1))
+                .map(|(_, snapshot)| snapshot.clone())
+                .collect::<Vec<_>>();
+            Ok(due_page_from_scan(&mut visited, scan_limit, at_ms))
         })
     }
 
@@ -497,8 +597,11 @@ impl HumanHandoffCoordinator for SqliteHumanHandoffCoordinator {
                     };
                 let mut statement = connection
                     .prepare(
-                        "SELECT handoff_id, schema_version, revision, queue, priority,
-                                requested_at_ms, status,
+                        "SELECT length(CAST(handoff_id AS BLOB)), handoff_id,
+                                schema_version, revision,
+                                length(CAST(queue AS BLOB)), queue,
+                                priority, requested_at_ms,
+                                length(CAST(status AS BLOB)), status,
                                 length(CAST(handoff_json AS BLOB)), handoff_json
                          FROM human_handoffs
                          WHERE tenant_id = ?1 AND queue = ?2 AND status = 'queued'
@@ -528,14 +631,32 @@ impl HumanHandoffCoordinator for SqliteHumanHandoffCoordinator {
                         ],
                         |row| {
                             Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
+                                bounded_text(
+                                    row,
+                                    0,
+                                    1,
+                                    MAX_HANDOFF_IDENTITY_BYTES,
+                                    "Human Handoff identity",
+                                )?,
                                 row.get::<_, i64>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, i64>(4)?,
-                                row.get::<_, i64>(5)?,
-                                row.get::<_, String>(6)?,
-                                bounded_text(row, 7, 8, MAX_HANDOFF_JSON_BYTES, "Human Handoff")?,
+                                row.get::<_, i64>(3)?,
+                                bounded_text(
+                                    row,
+                                    4,
+                                    5,
+                                    MAX_HANDOFF_QUEUE_BYTES,
+                                    "Human Handoff queue",
+                                )?,
+                                row.get::<_, i64>(6)?,
+                                row.get::<_, i64>(7)?,
+                                bounded_text(
+                                    row,
+                                    8,
+                                    9,
+                                    MAX_HANDOFF_STATUS_BYTES,
+                                    "Human Handoff status",
+                                )?,
+                                bounded_text(row, 10, 11, MAX_HANDOFF_JSON_BYTES, "Human Handoff")?,
                             ))
                         },
                     )
@@ -564,6 +685,107 @@ impl HumanHandoffCoordinator for SqliteHumanHandoffCoordinator {
             .await
             .map_err(|error| {
                 HarnessError::HumanHandoff(format!("Human Handoff list task failed: {error}"))
+            })?
+        })
+    }
+
+    fn scan_due_as<'a>(
+        &'a self,
+        at_ms: u64,
+        after_handoff_id: Option<&'a HumanHandoffId>,
+        scan_limit: usize,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, HumanHandoffDueScanPage> {
+        let connection = self.connection.clone();
+        let after_handoff_id = after_handoff_id.cloned();
+        let authority = authority.clone();
+        Box::pin(async move {
+            validate_due_scan(at_ms, after_handoff_id.as_ref(), scan_limit, &authority)?;
+            task::spawn_blocking(move || {
+                let connection = connection.lock().map_err(|_| {
+                    HarnessError::HumanHandoff("Human Handoff lock poisoned".to_owned())
+                })?;
+                let fetch = scan_limit.checked_add(1).ok_or_else(|| {
+                    HarnessError::HumanHandoff("Human Handoff scan limit overflow".to_owned())
+                })?;
+                let mut statement = connection
+                    .prepare(
+                        "SELECT length(CAST(handoff_id AS BLOB)), handoff_id,
+                                schema_version, revision,
+                                length(CAST(queue AS BLOB)), queue,
+                                priority, requested_at_ms,
+                                length(CAST(status AS BLOB)), status,
+                                length(CAST(handoff_json AS BLOB)), handoff_json
+                         FROM human_handoffs
+                         WHERE tenant_id = ?1 AND handoff_id > ?2
+                         ORDER BY handoff_id ASC
+                         LIMIT ?3",
+                    )
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            tenant_storage_key(authority.tenant_id()),
+                            after_handoff_id.as_ref().map_or("", |id| id.as_str()),
+                            i64::try_from(fetch).map_err(|_| {
+                                HarnessError::HumanHandoff(
+                                    "Human Handoff scan limit exceeds SQLite".to_owned(),
+                                )
+                            })?
+                        ],
+                        |row| {
+                            Ok((
+                                bounded_text(
+                                    row,
+                                    0,
+                                    1,
+                                    MAX_HANDOFF_IDENTITY_BYTES,
+                                    "Human Handoff identity",
+                                )?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                bounded_text(
+                                    row,
+                                    4,
+                                    5,
+                                    MAX_HANDOFF_QUEUE_BYTES,
+                                    "Human Handoff queue",
+                                )?,
+                                row.get::<_, i64>(6)?,
+                                row.get::<_, i64>(7)?,
+                                bounded_text(
+                                    row,
+                                    8,
+                                    9,
+                                    MAX_HANDOFF_STATUS_BYTES,
+                                    "Human Handoff status",
+                                )?,
+                                bounded_text(row, 10, 11, MAX_HANDOFF_JSON_BYTES, "Human Handoff")?,
+                            ))
+                        },
+                    )
+                    .map_err(sql_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                let mut visited = Vec::with_capacity(rows.len());
+                for (id, schema, revision, queue, priority, requested_at, status, encoded) in rows {
+                    visited.push(decode_snapshot(
+                        HumanHandoffId::from_string(id),
+                        authority.tenant_id(),
+                        schema,
+                        revision,
+                        queue,
+                        priority,
+                        requested_at,
+                        status,
+                        encoded,
+                    )?);
+                }
+                Ok(due_page_from_scan(&mut visited, scan_limit, at_ms))
+            })
+            .await
+            .map_err(|error| {
+                HarnessError::HumanHandoff(format!("Human Handoff scan task failed: {error}"))
             })?
         })
     }
@@ -734,14 +956,22 @@ fn validate_store(connection: &Connection) -> Result<(), HarnessError> {
         .query_row(
             "SELECT COUNT(*) FROM human_handoffs
              WHERE schema_version != ?1 OR revision <= 0
-                OR length(tenant_id) > 128
-                OR length(handoff_id) = 0 OR length(handoff_id) > 256
-                OR length(queue) = 0 OR length(queue) > 256
+                OR length(CAST(tenant_id AS BLOB)) > 128
+                OR length(CAST(handoff_id AS BLOB)) = 0
+                OR length(CAST(handoff_id AS BLOB)) > ?2
+                OR length(CAST(queue AS BLOB)) = 0
+                OR length(CAST(queue AS BLOB)) > ?3
                 OR priority < 0 OR priority > 255 OR requested_at_ms <= 0
                 OR status NOT IN ('queued', 'claimed', 'resolved', 'cancelled')
-                OR length(CAST(handoff_json AS BLOB)) > ?2",
+                OR length(CAST(handoff_json AS BLOB)) > ?4",
             params![
                 HUMAN_HANDOFF_SCHEMA_VERSION,
+                i64::try_from(MAX_HANDOFF_IDENTITY_BYTES).map_err(|_| {
+                    HarnessError::HumanHandoff("Human Handoff identity size overflow".to_owned())
+                })?,
+                i64::try_from(MAX_HANDOFF_QUEUE_BYTES).map_err(|_| {
+                    HarnessError::HumanHandoff("Human Handoff queue size overflow".to_owned())
+                })?,
                 i64::try_from(MAX_HANDOFF_JSON_BYTES).map_err(|_| {
                     HarnessError::HumanHandoff("Human Handoff size overflow".to_owned())
                 })?
@@ -764,7 +994,10 @@ fn load_snapshot(
 ) -> Result<Option<HumanHandoffSnapshot>, HarnessError> {
     let row = connection
         .query_row(
-            "SELECT schema_version, revision, queue, priority, requested_at_ms, status,
+            "SELECT schema_version, revision,
+                    length(CAST(queue AS BLOB)), queue,
+                    priority, requested_at_ms,
+                    length(CAST(status AS BLOB)), status,
                     length(CAST(handoff_json AS BLOB)), handoff_json
              FROM human_handoffs WHERE tenant_id = ?1 AND handoff_id = ?2",
             params![tenant_storage_key(tenant_id), handoff_id.as_str()],
@@ -772,11 +1005,11 @@ fn load_snapshot(
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    bounded_text(row, 2, 3, MAX_HANDOFF_QUEUE_BYTES, "Human Handoff queue")?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    bounded_text(row, 6, 7, MAX_HANDOFF_JSON_BYTES, "Human Handoff")?,
+                    row.get::<_, i64>(5)?,
+                    bounded_text(row, 6, 7, MAX_HANDOFF_STATUS_BYTES, "Human Handoff status")?,
+                    bounded_text(row, 8, 9, MAX_HANDOFF_JSON_BYTES, "Human Handoff")?,
                 ))
             },
         )
@@ -886,6 +1119,25 @@ fn validate_list(
     Ok(())
 }
 
+fn validate_due_scan(
+    at_ms: u64,
+    after_handoff_id: Option<&HumanHandoffId>,
+    scan_limit: usize,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    authority.validate_current("Human Handoff temporal scan authority")?;
+    super::validate_application_time(at_ms)?;
+    if let Some(handoff_id) = after_handoff_id {
+        validate_identity("Human Handoff scan cursor", handoff_id.as_str())?;
+    }
+    if !(1..=MAX_HANDOFF_PAGE).contains(&scan_limit) {
+        return Err(HarnessError::HumanHandoff(format!(
+            "Human Handoff scan limit must be 1-{MAX_HANDOFF_PAGE}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_expected_revision(revision: u64) -> Result<(), HarnessError> {
     if revision == 0 {
         Err(HarnessError::HumanHandoff(
@@ -893,6 +1145,37 @@ fn validate_expected_revision(revision: u64) -> Result<(), HarnessError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn due_page_from_scan(
+    visited: &mut Vec<HumanHandoffSnapshot>,
+    scan_limit: usize,
+    at_ms: u64,
+) -> HumanHandoffDueScanPage {
+    let has_more = visited.len() > scan_limit;
+    visited.truncate(scan_limit);
+    let next_after_handoff_id = visited.last().map(|snapshot| snapshot.id.clone());
+    let due = visited
+        .iter()
+        .filter_map(|snapshot| {
+            let HumanHandoffStatus::Claimed { claim } = snapshot.handoff.status() else {
+                return None;
+            };
+            (claim.expires_at_ms <= at_ms).then(|| HumanHandoffDueClaim {
+                handoff_id: snapshot.id.clone(),
+                tenant_id: snapshot.tenant_id.clone(),
+                revision: snapshot.revision,
+                claim_id: claim.id.clone(),
+                expires_at_ms: claim.expires_at_ms,
+            })
+        })
+        .collect();
+    HumanHandoffDueScanPage {
+        due,
+        next_after_handoff_id,
+        has_more,
+        scanned: visited.len(),
     }
 }
 
@@ -1112,6 +1395,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_due_scan_advances_across_sparse_identity_pages() {
+        let coordinator = MemoryHumanHandoffCoordinator::new();
+        let authority = tenant("alpha", "alice");
+        for id in ["a-queued", "b-expired", "c-live"] {
+            coordinator
+                .create_as(
+                    HumanHandoffId::from_string(id.to_owned()),
+                    create(&format!("create-{id}"), 1),
+                    10,
+                    &authority,
+                )
+                .await
+                .expect("create");
+        }
+        for id in ["b-expired", "c-live"] {
+            coordinator
+                .apply_as(
+                    &HumanHandoffId::from_string(id.to_owned()),
+                    1,
+                    HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_string(format!("claim-{id}")),
+                        kind: HumanHandoffCommandKind::Claim {
+                            claim_id: HumanHandoffClaimId::from_string(format!("claim-{id}")),
+                            lease_duration_ms: if id == "b-expired" { 1_000 } else { 2_000 },
+                        },
+                    },
+                    20,
+                    &authority,
+                )
+                .await
+                .expect("claim");
+        }
+
+        let first = coordinator
+            .scan_due_as(1_020, None, 1, &authority)
+            .await
+            .expect("first");
+        assert_eq!(first.scanned, 1);
+        assert!(first.due.is_empty());
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .next_after_handoff_id
+                .as_ref()
+                .map(HumanHandoffId::as_str),
+            Some("a-queued")
+        );
+        let second = coordinator
+            .scan_due_as(1_020, first.next_after_handoff_id.as_ref(), 1, &authority)
+            .await
+            .expect("second");
+        assert_eq!(second.due.len(), 1);
+        assert_eq!(second.due[0].handoff_id.as_str(), "b-expired");
+        assert_eq!(second.due[0].revision, 2);
+        assert_eq!(second.due[0].expires_at_ms, 1_020);
+        assert!(second.has_more);
+        let third = coordinator
+            .scan_due_as(1_020, second.next_after_handoff_id.as_ref(), 1, &authority)
+            .await
+            .expect("third");
+        assert!(third.due.is_empty());
+        assert!(!third.has_more);
+    }
+
+    #[tokio::test]
     async fn sqlite_queue_matches_priority_cursor_and_status_contract() {
         let path = temp_path("queue");
         let coordinator = SqliteHumanHandoffCoordinator::open(&path)
@@ -1153,6 +1501,78 @@ mod tests {
         assert_eq!(second.handoffs[0].id().as_str(), "low");
         assert!(!second.has_more);
 
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_due_scan_reopens_with_memory_equivalent_boundaries() {
+        let path = temp_path("due-scan");
+        let authority = tenant("alpha", "alice");
+        {
+            let coordinator = SqliteHumanHandoffCoordinator::open(&path)
+                .await
+                .expect("open");
+            for id in ["a-expired", "b-live"] {
+                let handoff_id = HumanHandoffId::from_string(id.to_owned());
+                coordinator
+                    .create_as(
+                        handoff_id.clone(),
+                        create(&format!("create-{id}"), 1),
+                        10,
+                        &authority,
+                    )
+                    .await
+                    .expect("create");
+                coordinator
+                    .apply_as(
+                        &handoff_id,
+                        1,
+                        HumanHandoffCommand {
+                            id: HumanHandoffCommandId::from_string(format!("claim-{id}")),
+                            kind: HumanHandoffCommandKind::Claim {
+                                claim_id: HumanHandoffClaimId::from_string(format!("claim-{id}")),
+                                lease_duration_ms: if id == "a-expired" { 1_000 } else { 2_000 },
+                            },
+                        },
+                        20,
+                        &authority,
+                    )
+                    .await
+                    .expect("claim");
+            }
+        }
+        let coordinator = SqliteHumanHandoffCoordinator::open(&path)
+            .await
+            .expect("reopen");
+        let page = coordinator
+            .scan_due_as(1_020, None, 2, &authority)
+            .await
+            .expect("scan");
+        assert_eq!(page.scanned, 2);
+        assert_eq!(page.due.len(), 1);
+        assert_eq!(page.due[0].handoff_id.as_str(), "a-expired");
+        assert!(!page.has_more);
+        {
+            let connection = Connection::open(&path).expect("tamper fixture");
+            connection
+                .execute(
+                    "UPDATE human_handoffs SET queue = ?1 WHERE handoff_id = 'b-live'",
+                    params!["q".repeat(MAX_HANDOFF_QUEUE_BYTES + 1)],
+                )
+                .expect("tamper queue");
+        }
+        let error = coordinator
+            .scan_due_as(1_020, None, 2, &authority)
+            .await
+            .expect_err("oversized queue");
+        assert!(
+            error
+                .to_string()
+                .contains("Human Handoff queue exceeds 64 bytes")
+        );
         drop(coordinator);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

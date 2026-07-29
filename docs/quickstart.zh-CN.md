@@ -119,7 +119,9 @@ printf '%s\n' \
 五个 SQLite 权威库均使用 WAL、`synchronous=FULL` 和精确 schema
 校验。服务重启后 Thread、Task Graph、Workflow Run 与 Human Handoff
 均可恢复。Human Handoff 只记录人工所有权生命周期；它不会隐式暂停
-Turn、路由 IM、唤醒 Workflow 或执行业务操作。
+Turn、路由 IM、唤醒 Workflow 或执行业务操作。库级 Temporal Driver
+可以由嵌入宿主显式调用来推进到期 Workflow 等待和过期 Claim，但当前
+`yh serve` 不会自行启动后台轮询。
 
 从旧版 Task Graph schema 1 升级时，先停止所有服务并执行：
 

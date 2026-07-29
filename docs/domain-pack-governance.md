@@ -132,10 +132,11 @@ The current package is a Rust library, not a Protocol v28 command, CLI, remote
 control-plane service, identity provider, registry, or automatic config
 mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, background
-Workflow timer polling, automatic Human Handoff routing/expiry, or
-domain-specific Evaluation content. The generic Engine can persist a Human
-Handoff independently; a Domain Pack does not acquire ownership or channel
-authority merely by referencing that capability.
+Workflow/Handoff polling, automatic Human Handoff routing, or domain-specific
+Evaluation content. Generic Temporal Driver API 1 can advance due Workflow
+waits and expired Handoff claims when an embedding host invokes it, but a
+Domain Pack neither activates that driver nor acquires scheduling, ownership,
+or channel authority merely by referencing those capabilities.
 
 Task `Artifact` reference metadata is a separate boundary. It inherits the
 tenant of its durable Task Graph, but Y-Harness does not yet store or authorize

@@ -50,6 +50,8 @@ printf '%s\n' \
 - [ ] Human Handoff 只能引用同租户的既有 Thread 或 Workflow Run；
       Claim/续租/释放/结算要求精确 revision、当前 actor 与 claim fence，
       同一 command ID 被其他 actor 或不同内容复用时失败。
+- [ ] 嵌入宿主可用同一租户 Authority 与可信时间调用有限 Temporal tick，
+      推进到期 Workflow 等待和过期 Claim；Core 不会自行启动后台轮询。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
       `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
       或新的 running Turn 时均不修改 State。

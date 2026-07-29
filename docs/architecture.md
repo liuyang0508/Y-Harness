@@ -315,6 +315,13 @@ direction:
   transitions, Memory/SQLite parity, projection validation, and restart
   recovery without implicitly pausing, routing, approving, or executing the
   subject;
+- embedded Temporal Driver API 1 with host-supplied time, optional
+  Workflow/Handoff composition, 1–256-record tenant-local identity scans per
+  source, disposable cursors, fail-closed extension-page revalidation,
+  deterministic actor-and-fence command identity, exact-boundary advancement
+  through existing CAS commands, and independent
+  applied/duplicate/fenced/failed settlement; it starts no background task and
+  introduces no scheduler database or second time authority;
 - a public bounded Task Orchestrator that executes host-provided sub-Agent
   capabilities, advances dependencies, isolates timeout/panic failure, cancels
   fenced workers, and settles only an exact current lease;
@@ -435,9 +442,9 @@ transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
 multi-principal reference-service tenant routing, general Secret-manager
 integration, tenant-partitioned MCP sessions, external Artifact storage and
-authorization, background Workflow timer polling, automatic effect-safe Task
-retry, durable compensation planning, automatic Human Handoff lease scanning,
-channel routing and outbox delivery, Domain Pack
+authorization, a reference-service/background Temporal polling lifecycle,
+automatic effect-safe Task retry, durable compensation planning, automatic
+Human Handoff channel routing and outbox delivery, Domain Pack
 service/protocol integration, role and delegation claims, revocation, and
 policy hot reload remain explicit subsequent slices.
 Task Artifact reference metadata is already part of its tenant-fenced Task

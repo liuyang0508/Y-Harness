@@ -1753,6 +1753,8 @@ pub enum HarnessError {
         /// Revision found atomically by the coordinator.
         actual: u64,
     },
+    /// Temporal Driver request, discovery, or bounded maintenance failure.
+    Temporal(String),
     /// Tool execution failure.
     Tool(String),
     /// External process broker, isolation, or I/O failure.
@@ -1881,6 +1883,7 @@ impl Display for HarnessError {
                 formatter,
                 "human handoff conflict on {handoff_id}: expected revision {expected}, found {actual}"
             ),
+            Self::Temporal(message) => write!(formatter, "temporal driver error: {message}"),
             Self::Tool(message) => write!(formatter, "tool error: {message}"),
             Self::Execution(message) => write!(formatter, "execution error: {message}"),
             Self::Secret(message) => write!(formatter, "secret error: {message}"),

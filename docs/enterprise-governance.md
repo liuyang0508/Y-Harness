@@ -38,8 +38,8 @@ reason to duplicate Runtime or State.
 | optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, schema-14 Runtime-bound Connector evidence, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
-| durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits and safe-boundary definition migration | background timer service, automatic Task retry, or durable compensation plan |
-| schema-1 Human Handoff with same-tenant subject validation, priority queue, actor-bound commands, finite lease, unique claim fence, and Memory/SQLite CAS | automatic channel routing, Turn suspension, Workflow wakeup, background lease expiry, outbox delivery, or proof that a local-process actor is a person |
+| durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits, safe-boundary definition migration, and a bounded host-driven due-wait tick | a resident timer service, automatic Task execution/retry, or durable compensation plan |
+| schema-1 Human Handoff with same-tenant subject validation, priority queue, actor-bound commands, finite lease, unique claim fence, Memory/SQLite CAS, and bounded host-driven claim expiry | automatic channel routing, Turn suspension, Workflow wakeup, a resident expiry service, outbox delivery, or proof that a local-process actor is a person |
 | durable Approval Inbox | ownership transfer; approval authorizes a decision but does not claim conversational work |
 | digest-bound Thread handoff input | human ownership; the format prepares bounded summarizer input only |
 | reproducible Evaluation runner and digest-bound Pack evaluation evidence | domain-specific suites, canary evidence, or automatic promotion policy |
@@ -117,8 +117,17 @@ digests, projection validation, and tenant-partitioned Memory/SQLite storage
 make uncertain retries and competing operators explicit. The reference
 service stores Handoffs independently in `human-handoffs.db`. It deliberately
 does not route a channel, pause a Turn, wake a Workflow, execute business
-actions, scan expired leases, or claim that `LocalProcess` authenticates a
-human.
+actions, run a resident expiry loop, or claim that `LocalProcess`
+authenticates a human.
+
+ADR 0129 adds embedded Temporal Driver API 1. An embedding host supplies one
+trusted authority and Unix time to a bounded tick. The driver scans
+authoritative Workflow and Handoff rows by tenant-local identity, computes all
+command identities before mutation, and advances due fences only through the
+existing CAS commands. Cursors are disposable; losing one restarts discovery
+without losing durable time state. The driver owns no scheduler database,
+background lifecycle, Task execution, channel route, or outbox. The current
+reference service does not invoke it automatically.
 
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
@@ -148,7 +157,8 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, background timer
-polling, automatic effect-safe Task retry, Workflow compensation planning,
-automatic Human Handoff routing/expiry/outbox delivery, quota, retention,
-canary rollout, and multi-node control-plane availability remain open.
+Secret-manager integration, tenant-partitioned MCP sessions, a
+reference-service Temporal polling lifecycle, automatic effect-safe Task
+retry, Workflow compensation planning, automatic Human Handoff channel
+routing/outbox delivery, quota, retention, canary rollout, and multi-node
+control-plane availability remain open.

@@ -15,8 +15,8 @@ use crate::{
 
 pub use coordinator::{
     HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandResult, HumanHandoffCoordinator,
-    HumanHandoffCursor, HumanHandoffPage, HumanHandoffSnapshot, MemoryHumanHandoffCoordinator,
-    SqliteHumanHandoffCoordinator,
+    HumanHandoffCursor, HumanHandoffDueClaim, HumanHandoffDueScanPage, HumanHandoffPage,
+    HumanHandoffSnapshot, MemoryHumanHandoffCoordinator, SqliteHumanHandoffCoordinator,
 };
 pub use engine::{HumanHandoffEngine, HumanHandoffSubjectResolver};
 
@@ -24,6 +24,8 @@ const MAX_HANDOFF_TRANSITIONS: usize = 4_096;
 const MAX_HANDOFF_JSON_BYTES: usize = 16_777_216;
 const MAX_HANDOFF_COMMAND_JSON_BYTES: usize = 131_072;
 const MAX_HANDOFF_TEXT_BYTES: usize = 65_536;
+const MAX_HANDOFF_IDENTITY_BYTES: usize = 256;
+const MAX_HANDOFF_QUEUE_BYTES: usize = 64;
 const MIN_HANDOFF_LEASE_MS: u64 = 1_000;
 const MAX_HANDOFF_LEASE_MS: u64 = 604_800_000;
 
@@ -1051,9 +1053,12 @@ fn validate_text(kind: &str, value: &str) -> Result<(), HarnessError> {
 }
 
 fn validate_identity(kind: &str, value: &str) -> Result<(), HarnessError> {
-    if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+    if value.trim().is_empty()
+        || value.len() > MAX_HANDOFF_IDENTITY_BYTES
+        || value.chars().any(char::is_control)
+    {
         return Err(HarnessError::HumanHandoff(format!(
-            "{kind} must be 1-256 non-control bytes"
+            "{kind} must be 1-{MAX_HANDOFF_IDENTITY_BYTES} non-control bytes"
         )));
     }
     Ok(())

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::{
     AuthorityContext, HarnessError, TaskCoordinator, TaskStatus, WorkflowCommand,
-    WorkflowCommandKind, WorkflowCoordinator, WorkflowCreateRequest, WorkflowRunId,
-    WorkflowRunSnapshot,
+    WorkflowCommandKind, WorkflowCoordinator, WorkflowCreateRequest, WorkflowDueScanPage,
+    WorkflowRunId, WorkflowRunSnapshot,
 };
 
 use super::WorkflowCommandResult;
@@ -86,6 +86,35 @@ impl WorkflowEngine {
         authority: &AuthorityContext,
     ) -> Result<Option<WorkflowRunSnapshot>, HarnessError> {
         self.workflows.load_as(run_id, authority).await
+    }
+
+    /// Scans one bounded unscoped page for due waits.
+    pub async fn scan_due(
+        &self,
+        at_ms: u64,
+        after_run_id: Option<&WorkflowRunId>,
+        scan_limit: usize,
+    ) -> Result<WorkflowDueScanPage, HarnessError> {
+        self.scan_due_as(
+            at_ms,
+            after_run_id,
+            scan_limit,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Scans one bounded page for due waits in the exact tenant boundary.
+    pub async fn scan_due_as(
+        &self,
+        at_ms: u64,
+        after_run_id: Option<&WorkflowRunId>,
+        scan_limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<WorkflowDueScanPage, HarnessError> {
+        self.workflows
+            .scan_due_as(at_ms, after_run_id, scan_limit, authority)
+            .await
     }
 
     /// Applies one command to an unscoped Run.

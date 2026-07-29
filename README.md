@@ -804,6 +804,21 @@ business action, prove that `LocalProcess` is a person, or provide a background
 expiry worker. See
 [ADR 0128](docs/adr/0128-durable-lease-fenced-human-handoff.md).
 
+Temporal Driver API 1 optionally composes those two time-owned aggregates.
+One host-driven `tick` scans at most 256 authoritative Workflow Runs and 256
+Human Handoffs, then advances exact due wait/claim fences through the existing
+CAS commands. Coordinator pages are revalidated before mutation. Its identity
+cursor is disposable: losing it repeats a bounded part of the sweep but cannot
+lose a durable timer or expiration. Core starts no interval task and owns no
+second scheduler database; the hosting product still owns wall-clock source,
+polling interval, shutdown, and failure observation. See
+[ADR 0129](docs/adr/0129-host-driven-bounded-temporal-driver.md) and the
+[`temporal_driver`](examples/temporal_driver.rs) public-API example:
+
+```bash
+cargo run --locked --example temporal_driver
+```
+
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v28 preserves Protocol v27's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and

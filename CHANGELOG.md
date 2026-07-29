@@ -4,6 +4,12 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added embedded Temporal Driver API 1 with host-supplied time, bounded
+  tenant-local identity scans over authoritative Workflow/Handoff aggregates,
+  disposable cursors, fail-closed extension-page validation, deterministic
+  actor-and-fence command identities, exact-boundary wake/expiry, and
+  content-free applied/duplicate/fenced/failed settlement; no background
+  thread, second scheduler database, Protocol, or durable-schema change;
 - added independent Human Handoff schema 1 and Protocol v28 for durable
   ownership transfer over existing same-tenant Threads or Workflow Runs:
   actor-and-content-bound idempotency, revision CAS, stable priority queue,

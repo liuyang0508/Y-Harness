@@ -6,8 +6,8 @@ use crate::{AuthorityContext, HarnessError, HarnessFuture, HumanHandoffId};
 
 use super::{
     HumanHandoffCommand, HumanHandoffCommandResult, HumanHandoffCoordinator,
-    HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffPage, HumanHandoffSnapshot,
-    HumanHandoffSubject,
+    HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffDueScanPage, HumanHandoffPage,
+    HumanHandoffSnapshot, HumanHandoffSubject,
 };
 
 /// Trusted subject-existence boundary used before a Human Handoff is created.
@@ -114,6 +114,35 @@ impl HumanHandoffEngine {
     ) -> Result<HumanHandoffPage, HarnessError> {
         self.coordinator
             .list_queued_as(queue, after, limit, authority)
+            .await
+    }
+
+    /// Scans one bounded unscoped page for expired claims.
+    pub async fn scan_due(
+        &self,
+        at_ms: u64,
+        after_handoff_id: Option<&HumanHandoffId>,
+        scan_limit: usize,
+    ) -> Result<HumanHandoffDueScanPage, HarnessError> {
+        self.scan_due_as(
+            at_ms,
+            after_handoff_id,
+            scan_limit,
+            &AuthorityContext::local_process(),
+        )
+        .await
+    }
+
+    /// Scans one bounded page for expired claims in the exact tenant boundary.
+    pub async fn scan_due_as(
+        &self,
+        at_ms: u64,
+        after_handoff_id: Option<&HumanHandoffId>,
+        scan_limit: usize,
+        authority: &AuthorityContext,
+    ) -> Result<HumanHandoffDueScanPage, HarnessError> {
+        self.coordinator
+            .scan_due_as(at_ms, after_handoff_id, scan_limit, authority)
             .await
     }
 

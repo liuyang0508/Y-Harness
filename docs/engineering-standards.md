@@ -495,6 +495,24 @@ schema must not advance.
   a channel, wake a Workflow, authorize a business action, or prove that a
   local-process identity is a human. Those effects require explicit adapters
   and their own Policy/evidence.
+- Temporal advancement is host-driven. Core starts no timer thread, invents no
+  clock, and owns no scheduler database; the host supplies one positive Unix
+  time and trusted authority to each bounded tick.
+- A Temporal tick scans every configured source before its first mutation,
+  visits 1–256 authoritative identities per source, and computes every stable
+  actor-and-fence command identity before applying effects. Source failures
+  before that boundary abort the tick without mutation.
+- Coordinator scan pages are extension output, not implicit truth. The driver
+  revalidates count bounds, cursor progress, ordered identities, exact tenant,
+  positive revisions, fence identities, and current eligibility before any
+  mutation. Malformed pages fail the complete tick closed.
+- Temporal cursors are disposable identity-sweep hints, never durable
+  scheduling truth. Workflow waits and Handoff claims remain authoritative;
+  losing a cursor may repeat scans but cannot lose due work.
+- Each due fence settles independently as applied, duplicate, fenced, or
+  failed through the existing aggregate CAS command. One failure never
+  rewrites an earlier committed transition, and a stale poller never retries a
+  semantic mutation blindly.
 - The Task Graph domain, not only its store, owns aggregate durable capacity.
   Construction and deserialization establish a conservative charge; every
   status/message mutation preflights its complete delta and publishes only a

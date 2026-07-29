@@ -25,6 +25,7 @@ mod secret;
 mod skill;
 mod sqlite;
 mod state;
+mod temporal;
 mod transport;
 mod verification;
 mod workflow;
@@ -65,10 +66,10 @@ pub use execution::{
 pub use human_handoff::{
     HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoff, HumanHandoffApplyOutcome, HumanHandoffClaim,
     HumanHandoffCommand, HumanHandoffCommandKind, HumanHandoffCommandResult,
-    HumanHandoffCoordinator, HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffEngine,
-    HumanHandoffPage, HumanHandoffSnapshot, HumanHandoffStatus, HumanHandoffSubject,
-    HumanHandoffSubjectResolver, HumanHandoffTransition, HumanHandoffTransitionKind,
-    MemoryHumanHandoffCoordinator, SqliteHumanHandoffCoordinator,
+    HumanHandoffCoordinator, HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffDueClaim,
+    HumanHandoffDueScanPage, HumanHandoffEngine, HumanHandoffPage, HumanHandoffSnapshot,
+    HumanHandoffStatus, HumanHandoffSubject, HumanHandoffSubjectResolver, HumanHandoffTransition,
+    HumanHandoffTransitionKind, MemoryHumanHandoffCoordinator, SqliteHumanHandoffCoordinator,
 };
 pub use kernel::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
@@ -155,6 +156,11 @@ pub use state::{
     StateMigrationReport, StateMigrationStatus, StateSnapshot, THREAD_ARCHIVE_FORMAT_VERSION,
     ThreadArchive, ThreadSummary, ThreadSummaryPage, decode_thread_archive, encode_thread_archive,
 };
+pub use temporal::{
+    TEMPORAL_DRIVER_API_VERSION, TemporalAttempt, TemporalAttemptOutcome, TemporalDriver,
+    TemporalScanProgress, TemporalTarget, TemporalTickCursor, TemporalTickReport,
+    TemporalTickRequest,
+};
 #[cfg(feature = "https-mcp")]
 pub use transport::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
 pub use transport::{
@@ -169,9 +175,9 @@ pub use verification::{
 pub use workflow::{
     MemoryWorkflowCoordinator, SqliteWorkflowCoordinator, WORKFLOW_RUN_SCHEMA_VERSION,
     WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandKind, WorkflowCommandResult,
-    WorkflowCoordinator, WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRun,
-    WorkflowRunSnapshot, WorkflowStatus, WorkflowTransition, WorkflowTransitionKind, WorkflowWait,
-    WorkflowWakeReason,
+    WorkflowCoordinator, WorkflowCreateRequest, WorkflowDefinition, WorkflowDueScanPage,
+    WorkflowDueWait, WorkflowEngine, WorkflowRun, WorkflowRunSnapshot, WorkflowStatus,
+    WorkflowTransition, WorkflowTransitionKind, WorkflowWait, WorkflowWakeReason,
 };
 
 /// Exact HTTPS JSON model-gateway contract version.

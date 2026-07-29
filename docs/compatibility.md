@@ -18,6 +18,7 @@ upgrade support that has not been tested.
 | Task Coordinator | `3` | per-graph SQLite schema column |
 | Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
 | Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
+| Temporal Driver API | `1` | exact embedded Rust API; not a durable or client-protocol coordinate |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
@@ -31,9 +32,10 @@ upgrade support that has not been tested.
 
 `Initialize` advertises the engine version and Runtime-facing durable/API
 coordinates above, including the Workspace Provider API implemented by
-orchestration hosts. Evaluation artifacts remain self-described and are not a
-client-protocol surface. Capabilities are separately negotiated; a disabled
-capability is not implied by its schema coordinate.
+orchestration hosts. The embedded-only Temporal Driver API and self-described
+Evaluation artifacts are not client-protocol surfaces. Capabilities are
+separately negotiated; a disabled capability is not implied by its schema
+coordinate.
 
 Service configuration schema 1 is bounded to 65,536 bytes, rejects unknown
 fields, and keeps credentials as environment-backed secret references. Its
@@ -219,6 +221,19 @@ legacy migration or mixed-version writer support exists. Protocol permissions
 are command-specific; composing the schema coordinate alone does not enable
 the surface. See
 [ADR 0128](adr/0128-durable-lease-fenced-human-handoff.md).
+Temporal Driver API 1 additively composes any installed Workflow and Human
+Handoff Engines behind one bounded host-invoked tick. The host supplies trusted
+Unix time and exact authority; each source visits at most 1–256 authoritative
+tenant-local identities, returns a disposable continuation, and applies only
+the existing revision- and fence-checked `wake_due` or `expire_claim`
+commands. Custom coordinators remain source-compatible because their additive
+due-scan methods fail closed by default; implemented pages are revalidated for
+bounds, cursor progress, ordering, tenant, revision, fence, and eligibility
+before mutation. The public pre-1.0 `HarnessError` enum adds `Temporal`, so
+exhaustive external matches require a source update.
+This API adds no background task, scheduler database, service-configuration
+field, durable schema, `Initialize` coordinate, or Protocol v28 command. See
+[ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from
