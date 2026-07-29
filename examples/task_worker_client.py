@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free Protocol v25 Task worker lifecycle example."""
+"""Dependency-free Protocol v26 Task worker lifecycle example."""
 
 import json
 import os
@@ -17,7 +17,7 @@ class Client:
         self.sequence += 1
         request = {
             "id": f"worker-{self.sequence}",
-            "protocol_version": "25",
+            "protocol_version": "26",
             "command": {"method": method, **fields},
         }
         self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")

@@ -1,6 +1,7 @@
 //! Stable identities and serializable state/model contracts owned by the kernel.
 
 use std::{
+    collections::BTreeSet,
     error::Error,
     fmt::{self, Display},
     future::Future,
@@ -23,6 +24,11 @@ pub const MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES: usize = 4_096;
 pub const MAX_MODEL_PROVIDER_RETRY_AFTER_MS: u64 = 86_400_000;
 /// Maximum Tool calls accepted from one Model response.
 pub const MAX_TOOL_CALLS_PER_BATCH: usize = 64;
+/// Maximum Connector evidence records accepted from one successful Tool call.
+pub const MAX_CONNECTOR_EVIDENCE_PER_RESULT: usize = 64;
+const MAX_CONNECTOR_RESOURCE_BYTES: usize = 2_048;
+const MAX_CONNECTOR_VERSION_BYTES: usize = 512;
+const MAX_CONNECTOR_IDEMPOTENCY_KEY_BYTES: usize = 512;
 
 fn validate_portable_coordinate(kind: &str, value: &str) -> Result<(), HarnessError> {
     let valid = !value.is_empty()
@@ -365,6 +371,189 @@ impl ExecutionBinding {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Source-system facts reported by one evidence-aware Connector Tool.
+///
+/// This claim is not authority by itself. Runtime binds it to the registered
+/// Tool, trusted execution authority, and exact Tool output before State may
+/// persist it.
+pub struct ConnectorEvidenceClaim {
+    source: String,
+    resource: String,
+    version: String,
+    observed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    valid_until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
+}
+
+impl ConnectorEvidenceClaim {
+    /// Creates and validates one bounded Connector-reported source claim.
+    pub fn new(
+        source: impl Into<String>,
+        resource: impl Into<String>,
+        version: impl Into<String>,
+        observed_at_ms: u64,
+        valid_until_ms: Option<u64>,
+        idempotency_key: Option<String>,
+    ) -> Result<Self, HarnessError> {
+        let claim = Self {
+            source: source.into(),
+            resource: resource.into(),
+            version: version.into(),
+            observed_at_ms,
+            valid_until_ms,
+            idempotency_key,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    /// Returns the stable source-system coordinate.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Returns the opaque source-system resource locator.
+    #[must_use]
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Returns the exact source-reported version or revision.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns when the Connector observed the source fact.
+    #[must_use]
+    pub fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+
+    /// Returns the optional source-declared freshness boundary.
+    #[must_use]
+    pub fn valid_until_ms(&self) -> Option<u64> {
+        self.valid_until_ms
+    }
+
+    /// Returns the optional source-system idempotency identity.
+    #[must_use]
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HarnessError> {
+        validate_portable_coordinate("Connector evidence source", &self.source)?;
+        validate_connector_text(
+            "Connector evidence resource",
+            &self.resource,
+            MAX_CONNECTOR_RESOURCE_BYTES,
+        )?;
+        validate_connector_text(
+            "Connector evidence version",
+            &self.version,
+            MAX_CONNECTOR_VERSION_BYTES,
+        )?;
+        if self.observed_at_ms == 0
+            || self
+                .valid_until_ms
+                .is_some_and(|valid_until_ms| valid_until_ms < self.observed_at_ms)
+        {
+            return Err(HarnessError::InvalidConfiguration(
+                "Connector evidence requires a non-zero observation time and a non-decreasing freshness boundary"
+                    .to_owned(),
+            ));
+        }
+        if let Some(idempotency_key) = &self.idempotency_key {
+            validate_connector_text(
+                "Connector evidence idempotency key",
+                idempotency_key,
+                MAX_CONNECTOR_IDEMPOTENCY_KEY_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Durable Connector claim bound by Runtime to execution and output identity.
+pub struct ConnectorEvidence {
+    connector: String,
+    connector_origin: crate::CapabilityOrigin,
+    authority: AuthorityContext,
+    output_sha256: String,
+    claim: ConnectorEvidenceClaim,
+}
+
+impl ConnectorEvidence {
+    pub(crate) fn bind(
+        connector: String,
+        connector_origin: crate::CapabilityOrigin,
+        authority: AuthorityContext,
+        output_sha256: String,
+        claim: ConnectorEvidenceClaim,
+    ) -> Result<Self, HarnessError> {
+        let evidence = Self {
+            connector,
+            connector_origin,
+            authority,
+            output_sha256,
+            claim,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Returns the exact registered Connector Tool identity.
+    #[must_use]
+    pub fn connector(&self) -> &str {
+        &self.connector
+    }
+
+    /// Returns the registered Connector Tool trust origin.
+    #[must_use]
+    pub fn connector_origin(&self) -> &crate::CapabilityOrigin {
+        &self.connector_origin
+    }
+
+    /// Returns the trusted actor and tenant that executed the Connector.
+    #[must_use]
+    pub fn authority(&self) -> &AuthorityContext {
+        &self.authority
+    }
+
+    /// Returns the SHA-256 of the exact structured Tool output.
+    #[must_use]
+    pub fn output_sha256(&self) -> &str {
+        &self.output_sha256
+    }
+
+    /// Returns the source-system claim supplied by the Connector.
+    #[must_use]
+    pub fn claim(&self) -> &ConnectorEvidenceClaim {
+        &self.claim
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HarnessError> {
+        crate::kernel::validate_capability_name("Connector Tool", &self.connector)?;
+        crate::kernel::validate_capability_origin(&self.connector_origin)?;
+        self.authority
+            .validate_current("Connector evidence authority")?;
+        if !is_lower_sha256(&self.output_sha256) {
+            return Err(HarnessError::InvalidConfiguration(
+                "Connector evidence output digest must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        self.claim.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// Runtime item payloads recorded in ordered state.
@@ -487,6 +676,9 @@ pub enum ItemKind {
         output: Value,
         /// Whether the tool execution failed.
         is_error: bool,
+        /// Runtime-bound source-system evidence, absent for ordinary Tools and errors.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connector_evidence: Vec<ConnectorEvidence>,
     },
     /// Evidence describing compiled long-term memory context.
     MemoryContext {
@@ -857,6 +1049,87 @@ pub struct ModelToolCall {
     pub name: String,
     /// Proposed JSON input.
     pub input: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+/// Successful in-process Tool output with optional Connector-reported claims.
+pub struct ToolExecutionResult {
+    output: Value,
+    connector_evidence: Vec<ConnectorEvidenceClaim>,
+}
+
+impl ToolExecutionResult {
+    /// Creates an ordinary successful Tool result without authority claims.
+    #[must_use]
+    pub fn new(output: Value) -> Self {
+        Self {
+            output,
+            connector_evidence: Vec::new(),
+        }
+    }
+
+    /// Creates a successful Connector result after validating bounded claims.
+    pub fn with_connector_evidence(
+        output: Value,
+        connector_evidence: Vec<ConnectorEvidenceClaim>,
+    ) -> Result<Self, HarnessError> {
+        validate_connector_claims(&connector_evidence)?;
+        Ok(Self {
+            output,
+            connector_evidence,
+        })
+    }
+
+    /// Returns the structured Tool output.
+    #[must_use]
+    pub fn output(&self) -> &Value {
+        &self.output
+    }
+
+    /// Returns Connector-reported claims before Runtime authority binding.
+    #[must_use]
+    pub fn connector_evidence(&self) -> &[ConnectorEvidenceClaim] {
+        &self.connector_evidence
+    }
+
+    pub(crate) fn into_parts(self) -> (Value, Vec<ConnectorEvidenceClaim>) {
+        (self.output, self.connector_evidence)
+    }
+}
+
+fn validate_connector_claims(claims: &[ConnectorEvidenceClaim]) -> Result<(), HarnessError> {
+    if claims.len() > MAX_CONNECTOR_EVIDENCE_PER_RESULT {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "Tool result exceeds {MAX_CONNECTOR_EVIDENCE_PER_RESULT} Connector evidence records"
+        )));
+    }
+    let mut identities = BTreeSet::new();
+    for claim in claims {
+        claim.validate()?;
+        if !identities.insert((
+            claim.source.as_str(),
+            claim.resource.as_str(),
+            claim.version.as_str(),
+        )) {
+            return Err(HarnessError::InvalidConfiguration(
+                "Tool result contains duplicate Connector evidence".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_text(kind: &str, value: &str, maximum: usize) -> Result<(), HarnessError> {
+    if value.is_empty()
+        || value.len() > maximum
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "{kind} must be 1-{maximum} trimmed non-control bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1618,11 +1891,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ActorIdentity, AuthorityContext, ExecutionBinding, HarnessError,
-        MAX_MODEL_CONTINUATION_BYTES, MAX_MODEL_CONTINUATION_ITEMS,
-        MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
-        ModelContinuation, ModelProviderFailure, ModelProviderFailureKind, ModelRequest,
-        ModelUsage, ThreadId, TurnId,
+        ActorIdentity, AuthorityContext, ConnectorEvidenceClaim, ExecutionBinding, HarnessError,
+        MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_CONTINUATION_BYTES,
+        MAX_MODEL_CONTINUATION_ITEMS, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
+        MAX_MODEL_PROVIDER_RETRY_AFTER_MS, ModelContinuation, ModelProviderFailure,
+        ModelProviderFailureKind, ModelRequest, ModelUsage, ThreadId, ToolExecutionResult, TurnId,
     };
 
     #[test]
@@ -1671,6 +1944,60 @@ mod tests {
             .expect("object")
             .insert("ignored".to_owned(), json!(true));
         assert!(serde_json::from_value::<ExecutionBinding>(encoded).is_err());
+    }
+
+    #[test]
+    fn connector_claims_are_bounded_unique_and_strict() {
+        let claim = ConnectorEvidenceClaim::new(
+            "crm",
+            "contacts/customer-42",
+            "revision-7",
+            1,
+            Some(2),
+            Some("read-customer-42-revision-7".to_owned()),
+        )
+        .expect("claim");
+        assert_eq!(claim.source(), "crm");
+        assert!(
+            ToolExecutionResult::with_connector_evidence(
+                json!({"status": "active"}),
+                vec![claim.clone(), claim],
+            )
+            .is_err()
+        );
+        assert!(
+            ToolExecutionResult::with_connector_evidence(
+                json!({}),
+                (0..=MAX_CONNECTOR_EVIDENCE_PER_RESULT)
+                    .map(|index| {
+                        ConnectorEvidenceClaim::new(
+                            "crm",
+                            format!("contacts/{index}"),
+                            "revision-7",
+                            1,
+                            None,
+                            None,
+                        )
+                        .expect("bounded claim")
+                    })
+                    .collect(),
+            )
+            .is_err()
+        );
+        assert!(
+            ConnectorEvidenceClaim::new("crm", "contacts/42", "revision-7", 2, Some(1), None)
+                .is_err()
+        );
+        let mut encoded = serde_json::to_value(
+            ConnectorEvidenceClaim::new("crm", "contacts/42", "revision-7", 1, None, None)
+                .expect("claim"),
+        )
+        .expect("encode");
+        encoded
+            .as_object_mut()
+            .expect("object")
+            .insert("authoritative".to_owned(), json!(true));
+        assert!(serde_json::from_value::<ConnectorEvidenceClaim>(encoded).is_err());
     }
 
     #[test]

@@ -838,7 +838,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v25.",
+            "Approvals and Tasks are accessed exclusively through Protocol v26.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -1084,7 +1084,7 @@ mod tests {
         assert!(!screen.contains("never-render-this-ciphertext"));
         assert!(screen.contains("STEERING QUEUED"));
         assert!(screen.contains("Prefer the durable boundary"));
-        assert!(screen.contains("Keep clients behind Protocol v25"));
+        assert!(screen.contains("Keep clients behind Protocol v26"));
         assert!(screen.contains("Harness design"));
         assert!(screen.contains("Activity"));
         Ok(())

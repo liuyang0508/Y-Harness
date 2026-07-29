@@ -4,6 +4,11 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added State/snapshot schema 14 and Thread archive format 4 with bounded
+  Runtime-bound Connector evidence: registered Tool/origin, trusted
+  actor/tenant, exact output SHA-256, atomic ToolResult persistence,
+  recovery-time provenance validation, Model-hidden projection, backup-first
+  schema-1 through schema-13 migration, and Protocol v26;
 - added Task Graph schema 3 with append-only tenant-exact execution-binding
   evidence per Task attempt, trusted Orchestrator authority, persistence before
   Workspace/executor entry, retry anti-downgrade, exact claim propagation,

@@ -27,13 +27,16 @@ use crate::{
     AuthorityContext, Checkpoint, CheckpointId, EventId, HarnessError, HarnessFuture, Item, ItemId,
     ItemKind, NewStreamEvent, PendingEvent, StateEvent, StoredEvent, Thread, ThreadId,
     ThreadImportOrigin, ThreadLineage, Turn, TurnId, TurnStatus,
-    json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
+    json::{
+        BoundedJsonError, bounded_serialized_sha256, bounded_serialized_size, to_bounded_json_vec,
+        validate_value_shape,
+    },
     kernel::validate_capability_name,
     sqlite::{bounded_optional_text, bounded_text},
 };
 
 /// Current append-only State event schema.
-pub const STATE_EVENT_SCHEMA_VERSION: u32 = 13;
+pub const STATE_EVENT_SCHEMA_VERSION: u32 = 14;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -62,9 +65,9 @@ const STATE_RECOVERY_CAPACITY_CRITICAL_AT: u64 = STATE_THREAD_RECOVERY_BYTE_LIMI
 const SNAPSHOT_TAIL_PAGE: usize = 1_000;
 const MAX_SNAPSHOT_MAINTENANCE_CONCURRENCY: usize = 64;
 /// Current disposable State snapshot schema.
-pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 13;
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 14;
 /// Current portable Thread archive format.
-pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 3;
+pub const THREAD_ARCHIVE_FORMAT_VERSION: u32 = 4;
 /// Maximum accepted encoded Thread archive.
 pub const MAX_THREAD_ARCHIVE_BYTES: usize = 75_497_472;
 const MAX_STEERING_CONTENT_BYTES: usize = 1_048_576;
@@ -2177,7 +2180,7 @@ impl StateEngine {
             ));
         }
         let source = validate_thread_archive(archive)?;
-        validate_import_execution_bindings(&source, authority)?;
+        validate_import_authority_bindings(&source, authority)?;
         let origin = ThreadImportOrigin {
             source_thread_id: archive.source_thread_id.clone(),
             source_stream_version: archive.source_stream_version,
@@ -2425,10 +2428,16 @@ impl StateEngine {
         self.require_thread_access(&turn.thread_id, authority)
             .await?;
         if matches!(
-            item.kind,
+            &item.kind,
             ItemKind::ExecutionBinding { .. }
                 | ItemKind::SteeringQueued { .. }
                 | ItemKind::SteeringApplied { .. }
+        ) || matches!(
+            &item.kind,
+            ItemKind::ToolResult {
+                connector_evidence,
+                ..
+            } if !connector_evidence.is_empty()
         ) {
             let thread = self
                 .load_thread_as(&turn.thread_id, authority)
@@ -2444,6 +2453,11 @@ impl StateEngine {
                 }
                 ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
                     validate_steering_append(&thread, &turn.id, &item)?;
+                }
+                ItemKind::ToolResult {
+                    connector_evidence, ..
+                } if !connector_evidence.is_empty() => {
+                    validate_connector_evidence_append(&thread, &turn.id, &item, authority)?;
                 }
                 _ => {}
             }
@@ -3301,11 +3315,11 @@ fn validate_existing_import(
     Ok(())
 }
 
-fn validate_import_execution_bindings(
+fn validate_import_authority_bindings(
     source: &Thread,
     authority: &AuthorityContext,
 ) -> Result<(), HarnessError> {
-    if source
+    let execution_tenant_differs = source
         .turns
         .iter()
         .flat_map(|turn| &turn.items)
@@ -3316,10 +3330,26 @@ fn validate_import_execution_bindings(
                 None
             }
         })
-        .any(|binding| binding.tenant_id() != authority.tenant_id())
-    {
+        .any(|binding| binding.tenant_id() != authority.tenant_id());
+    let evidence_tenant_differs = source
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| {
+            if let ItemKind::ToolResult {
+                connector_evidence, ..
+            } = &item.kind
+            {
+                Some(connector_evidence)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .any(|evidence| evidence.authority().tenant_id() != authority.tenant_id());
+    if execution_tenant_differs || evidence_tenant_differs {
         return Err(HarnessError::State(
-            "cannot rebind a Thread archive containing tenant-bound execution evidence".to_owned(),
+            "cannot rebind a Thread archive containing tenant-bound authority evidence".to_owned(),
         ));
     }
     Ok(())
@@ -3665,6 +3695,7 @@ fn apply_events(thread: &mut Option<Thread>, events: &[StoredEvent]) -> Result<(
     }
     if let Some(thread) = thread {
         validate_execution_binding_projection(thread)?;
+        validate_connector_evidence_projection(thread)?;
         validate_steering_projection(thread)?;
         validate_tool_call_batch_projection(thread)?;
     }
@@ -3988,6 +4019,7 @@ fn validate_projected_thread(
     validate_steering_projection(thread)?;
     validate_tool_call_batch_projection(thread)?;
     validate_execution_binding_projection(thread)?;
+    validate_connector_evidence_projection(thread)?;
 
     let mut checkpoint_ids = BTreeSet::new();
     for checkpoint in &thread.checkpoints {
@@ -4354,6 +4386,14 @@ fn validate_state_item(item: &Item) -> Result<(), HarnessError> {
                 .validate()
                 .map_err(|error| HarnessError::State(error.to_string()))?;
         }
+        crate::ItemKind::ToolResult {
+            output,
+            is_error,
+            connector_evidence,
+            ..
+        } => {
+            validate_connector_evidence_records(output, *is_error, connector_evidence)?;
+        }
         crate::ItemKind::ConversationSummary {
             compactor,
             covered_turns,
@@ -4539,6 +4579,13 @@ fn validate_state_item_schema(kind: &ItemKind, schema_version: u32) -> Result<()
                 )));
             }
         }
+        ItemKind::ToolResult {
+            connector_evidence, ..
+        } if !connector_evidence.is_empty() && schema_version < 14 => {
+            return Err(HarnessError::State(format!(
+                "schema-{schema_version} cannot contain Connector evidence"
+            )));
+        }
         ItemKind::SteeringQueued { .. } | ItemKind::SteeringApplied { .. } => {
             if schema_version < 6 {
                 return Err(HarnessError::State(format!(
@@ -4631,6 +4678,259 @@ fn validate_execution_binding_projection(thread: &Thread) -> Result<(), HarnessE
         }
     }
     Ok(())
+}
+
+fn validate_connector_evidence_records(
+    output: &serde_json::Value,
+    is_error: bool,
+    evidence: &[crate::ConnectorEvidence],
+) -> Result<(), HarnessError> {
+    if evidence.is_empty() {
+        return Ok(());
+    }
+    if is_error {
+        return Err(HarnessError::State(
+            "failed Tool result cannot retain Connector evidence".to_owned(),
+        ));
+    }
+    if evidence.len() > crate::MAX_CONNECTOR_EVIDENCE_PER_RESULT {
+        return Err(HarnessError::State(format!(
+            "Tool result exceeds {} Connector evidence records",
+            crate::MAX_CONNECTOR_EVIDENCE_PER_RESULT
+        )));
+    }
+    let output_sha256 =
+        bounded_serialized_sha256(output, MAX_STATE_EVENT_BYTES).map_err(|error| {
+            state_json_error("Connector evidence output", MAX_STATE_EVENT_BYTES, error)
+        })?;
+    let mut claims = BTreeSet::new();
+    for record in evidence {
+        record
+            .validate()
+            .map_err(|error| HarnessError::State(error.to_string()))?;
+        if record.output_sha256() != output_sha256 {
+            return Err(HarnessError::State(
+                "Connector evidence digest differs from its Tool output".to_owned(),
+            ));
+        }
+        let claim = record.claim();
+        if !claims.insert((claim.source(), claim.resource(), claim.version())) {
+            return Err(HarnessError::State(
+                "Tool result contains duplicate Connector evidence".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_evidence_projection(thread: &Thread) -> Result<(), HarnessError> {
+    for turn in &thread.turns {
+        let mut provenance = BTreeMap::new();
+        for item in &turn.items {
+            record_connector_execution_provenance(&mut provenance, item);
+            let ItemKind::ToolResult {
+                call_id,
+                connector_evidence,
+                ..
+            } = &item.kind
+            else {
+                continue;
+            };
+            if connector_evidence.is_empty() {
+                continue;
+            }
+            validate_connector_evidence_provenance(
+                thread.tenant_id(),
+                call_id,
+                connector_evidence,
+                provenance.get(call_id.as_str()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ConnectorAuthorization {
+    #[default]
+    Missing,
+    Allowed,
+    Denied,
+    AskPending,
+    AskApproved,
+}
+
+#[derive(Default)]
+struct ConnectorExecutionProvenance<'a> {
+    connector: Option<&'a str>,
+    origin: Option<&'a crate::CapabilityOrigin>,
+    authorization: ConnectorAuthorization,
+    pending_approval: Option<&'a crate::ApprovalId>,
+    call_ambiguous: bool,
+    policy_ambiguous: bool,
+    approval_invalid: bool,
+}
+
+fn record_connector_execution_provenance<'a>(
+    provenance: &mut BTreeMap<&'a str, ConnectorExecutionProvenance<'a>>,
+    item: &'a Item,
+) {
+    match &item.kind {
+        ItemKind::ToolCall { call_id, name, .. } => {
+            let entry = provenance.entry(call_id.as_str()).or_default();
+            if entry.connector.replace(name.as_str()).is_some() {
+                entry.call_ambiguous = true;
+            }
+        }
+        ItemKind::PolicyDecision {
+            call_id,
+            tool_origin: Some(origin),
+            decision,
+        } => {
+            let entry = provenance.entry(call_id.as_str()).or_default();
+            if entry.origin.replace(origin).is_some() {
+                entry.policy_ambiguous = true;
+            }
+            entry.authorization = match decision {
+                crate::PolicyDecision::Allow => ConnectorAuthorization::Allowed,
+                crate::PolicyDecision::Deny { .. } => ConnectorAuthorization::Denied,
+                crate::PolicyDecision::Ask { .. } => ConnectorAuthorization::AskPending,
+            };
+        }
+        ItemKind::ApprovalRequested {
+            approval_id,
+            call_id,
+            tool,
+            tool_origin,
+            ..
+        } => {
+            let entry = provenance.entry(call_id.as_str()).or_default();
+            let valid = entry.authorization == ConnectorAuthorization::AskPending
+                && entry.pending_approval.is_none()
+                && entry.connector == Some(tool.as_str())
+                && entry.origin == tool_origin.as_ref();
+            if valid {
+                entry.pending_approval = Some(approval_id);
+            } else {
+                entry.approval_invalid = true;
+            }
+        }
+        ItemKind::ApprovalDecision {
+            approval_id,
+            call_id,
+            decision,
+        } => {
+            let entry = provenance.entry(call_id.as_str()).or_default();
+            if entry.authorization == ConnectorAuthorization::AskPending
+                && entry.pending_approval == Some(approval_id)
+            {
+                entry.authorization = match decision {
+                    crate::ApprovalDecision::Approve => ConnectorAuthorization::AskApproved,
+                    crate::ApprovalDecision::Deny { .. } => ConnectorAuthorization::Denied,
+                };
+            } else {
+                entry.approval_invalid = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_connector_evidence_provenance(
+    thread_tenant_id: Option<&str>,
+    call_id: &str,
+    evidence: &[crate::ConnectorEvidence],
+    provenance: Option<&ConnectorExecutionProvenance<'_>>,
+) -> Result<(), HarnessError> {
+    let Some(provenance) = provenance else {
+        return Err(HarnessError::State(format!(
+            "Connector evidence references unknown Tool call {call_id}"
+        )));
+    };
+    let Some(connector) = provenance.connector else {
+        return Err(HarnessError::State(format!(
+            "Connector evidence references unknown Tool call {call_id}"
+        )));
+    };
+    if provenance.call_ambiguous {
+        return Err(HarnessError::State(format!(
+            "Connector evidence Tool call {call_id} is ambiguous"
+        )));
+    }
+    let Some(origin) = provenance.origin else {
+        return Err(HarnessError::State(format!(
+            "Connector evidence lacks Policy origin for Tool call {call_id}"
+        )));
+    };
+    if provenance.policy_ambiguous {
+        return Err(HarnessError::State(format!(
+            "Connector evidence Policy origin for Tool call {call_id} is ambiguous"
+        )));
+    }
+    if provenance.approval_invalid
+        || !matches!(
+            provenance.authorization,
+            ConnectorAuthorization::Allowed | ConnectorAuthorization::AskApproved
+        )
+    {
+        return Err(HarnessError::State(format!(
+            "Connector evidence Tool call {call_id} lacks an authorized execution path"
+        )));
+    }
+    for record in evidence {
+        if record.connector() != connector
+            || record.connector_origin() != origin
+            || record.authority().tenant_id() != thread_tenant_id
+        {
+            return Err(HarnessError::State(format!(
+                "Connector evidence for Tool call {call_id} differs from registered execution provenance"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_evidence_append(
+    thread: &Thread,
+    turn_id: &TurnId,
+    item: &Item,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    let turn = thread
+        .turns
+        .iter()
+        .find(|turn| &turn.id == turn_id)
+        .ok_or_else(|| {
+            HarnessError::State(format!(
+                "Connector evidence references unknown turn {turn_id}"
+            ))
+        })?;
+    let ItemKind::ToolResult {
+        call_id,
+        connector_evidence,
+        ..
+    } = &item.kind
+    else {
+        return Ok(());
+    };
+    if connector_evidence
+        .iter()
+        .any(|record| record.authority() != authority)
+    {
+        return Err(HarnessError::State(format!(
+            "turn {turn_id} Connector evidence authority differs from trusted append authority"
+        )));
+    }
+    let mut provenance = BTreeMap::new();
+    for prior in &turn.items {
+        record_connector_execution_provenance(&mut provenance, prior);
+    }
+    validate_connector_evidence_provenance(
+        thread.tenant_id(),
+        call_id,
+        connector_evidence,
+        provenance.get(call_id.as_str()),
+    )
 }
 
 fn validate_execution_binding_append(
@@ -5202,11 +5502,30 @@ mod tests {
         SqliteEventStore, StateCapacityLevel, StateEngine, StateSnapshot,
     };
     use crate::{
-        ActorIdentity, AuthorityContext, CapabilityOrigin, EventId, HarnessError, HarnessFuture,
-        InvocationContextEvidence, Item, ItemKind, ModelContinuation, NewStreamEvent, PendingEvent,
+        ActorIdentity, AuthorityContext, CapabilityOrigin, ConnectorEvidence,
+        ConnectorEvidenceClaim, EventId, HarnessError, HarnessFuture, InvocationContextEvidence,
+        Item, ItemKind, ModelContinuation, NewStreamEvent, PendingEvent, PolicyDecision,
         StateEvent, SteeringId, StoredEvent, ThreadId, ThreadImportOrigin, ThreadLineage,
         ToolCallBatch, ToolCallBatchId, TurnId, TurnStatus, kernel::now_ms,
     };
+
+    fn connector_evidence(
+        connector: &str,
+        origin: CapabilityOrigin,
+        authority: AuthorityContext,
+        output: &serde_json::Value,
+    ) -> ConnectorEvidence {
+        ConnectorEvidence::bind(
+            connector.to_owned(),
+            origin,
+            authority,
+            crate::json::bounded_serialized_sha256(output, super::MAX_STATE_EVENT_BYTES)
+                .expect("output digest"),
+            ConnectorEvidenceClaim::new("crm", "contacts/customer-42", "revision-7", 1, None, None)
+                .expect("claim"),
+        )
+        .expect("bound evidence")
+    }
 
     struct LyingAppendStore;
 
@@ -5556,6 +5875,7 @@ mod tests {
                     call_id: "deep-call".to_owned(),
                     output: nested,
                     is_error: false,
+                    connector_evidence: Vec::new(),
                 }),
             )
             .await
@@ -7286,6 +7606,7 @@ mod tests {
                 call_id: "call".to_owned(),
                 output: json!({"ok": true}),
                 is_error: false,
+                connector_evidence: Vec::new(),
             }),
         };
         let encoded = serde_json::to_string(&event).expect("serialize");
@@ -7343,6 +7664,343 @@ mod tests {
         let error = super::validate_stored_event(&stored)
             .expect_err("schema-12 cannot claim execution binding evidence");
         assert!(error.to_string().contains("schema-12"));
+    }
+
+    #[test]
+    fn connector_evidence_requires_schema_fourteen_and_exact_output() {
+        let output = json!({"status": "active"});
+        let mut stored = StoredEvent {
+            schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+            sequence: 3,
+            event_id: EventId::from_static("event-connector-evidence"),
+            thread_id: ThreadId::from_static("thread-connector-evidence"),
+            recorded_at_ms: 1,
+            event: StateEvent::ItemAppended {
+                turn_id: TurnId::from_static("turn-connector-evidence"),
+                item: Item::new(ItemKind::ToolResult {
+                    call_id: "call-connector".to_owned(),
+                    output: output.clone(),
+                    is_error: false,
+                    connector_evidence: vec![connector_evidence(
+                        "crm.read",
+                        CapabilityOrigin::BuiltIn,
+                        AuthorityContext::local_process(),
+                        &output,
+                    )],
+                }),
+            },
+        };
+        super::validate_stored_event(&stored).expect("schema-14 Connector evidence");
+        stored.schema_version = 13;
+        let error = super::validate_stored_event(&stored)
+            .expect_err("schema-13 cannot claim Connector evidence");
+        assert!(error.to_string().contains("schema-13"));
+
+        stored.schema_version = super::STATE_EVENT_SCHEMA_VERSION;
+        {
+            let StateEvent::ItemAppended { item, .. } = &mut stored.event else {
+                unreachable!()
+            };
+            let ItemKind::ToolResult { output, .. } = &mut item.kind else {
+                unreachable!()
+            };
+            *output = json!({"status": "tampered"});
+        }
+        let error =
+            super::validate_stored_event(&stored).expect_err("output digest tampering must fail");
+        assert!(error.to_string().contains("digest differs"));
+
+        {
+            let StateEvent::ItemAppended { item, .. } = &mut stored.event else {
+                unreachable!()
+            };
+            let ItemKind::ToolResult {
+                output, is_error, ..
+            } = &mut item.kind
+            else {
+                unreachable!()
+            };
+            *output = json!({"status": "active"});
+            *is_error = true;
+        }
+        let error = super::validate_stored_event(&stored)
+            .expect_err("failed Tool result cannot retain evidence");
+        assert!(error.to_string().contains("failed Tool result"));
+    }
+
+    #[test]
+    fn connector_evidence_projection_rejects_registered_origin_tampering() {
+        let thread_id = ThreadId::from_static("thread-connector-projection");
+        let turn_id = TurnId::from_static("turn-connector-projection");
+        let output = json!({"status": "active"});
+        let mut events = vec![
+            StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                event_id: EventId::from_static("event-connector-created"),
+                thread_id: thread_id.clone(),
+                recorded_at_ms: 1,
+                event: StateEvent::ThreadCreated {
+                    created_at_ms: 1,
+                    tenant_id: None,
+                },
+            },
+            StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                event_id: EventId::from_static("event-connector-turn"),
+                thread_id: thread_id.clone(),
+                recorded_at_ms: 2,
+                event: StateEvent::TurnStarted {
+                    turn_id: turn_id.clone(),
+                },
+            },
+            StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence: 3,
+                event_id: EventId::from_static("event-connector-call"),
+                thread_id: thread_id.clone(),
+                recorded_at_ms: 3,
+                event: StateEvent::ItemAppended {
+                    turn_id: turn_id.clone(),
+                    item: Item::new(ItemKind::ToolCall {
+                        model_id: None,
+                        model_origin: None,
+                        call_id: "call-connector".to_owned(),
+                        name: "crm.read".to_owned(),
+                        input: json!({}),
+                        batch: None,
+                    }),
+                },
+            },
+            StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence: 4,
+                event_id: EventId::from_static("event-connector-policy"),
+                thread_id: thread_id.clone(),
+                recorded_at_ms: 4,
+                event: StateEvent::ItemAppended {
+                    turn_id: turn_id.clone(),
+                    item: Item::new(ItemKind::PolicyDecision {
+                        call_id: "call-connector".to_owned(),
+                        tool_origin: Some(CapabilityOrigin::BuiltIn),
+                        decision: PolicyDecision::Allow,
+                    }),
+                },
+            },
+            StoredEvent {
+                schema_version: super::STATE_EVENT_SCHEMA_VERSION,
+                sequence: 5,
+                event_id: EventId::from_static("event-connector-result"),
+                thread_id,
+                recorded_at_ms: 5,
+                event: StateEvent::ItemAppended {
+                    turn_id,
+                    item: Item::new(ItemKind::ToolResult {
+                        call_id: "call-connector".to_owned(),
+                        output: output.clone(),
+                        is_error: false,
+                        connector_evidence: vec![connector_evidence(
+                            "crm.read",
+                            CapabilityOrigin::External {
+                                id: "tampered-origin".to_owned(),
+                            },
+                            AuthorityContext::local_process(),
+                            &output,
+                        )],
+                    }),
+                },
+            },
+        ];
+
+        let error = super::project_events(&events).expect_err("origin tampering must fail");
+        assert!(error.to_string().contains("execution provenance"));
+
+        let StateEvent::ItemAppended { item, .. } = &mut events[4].event else {
+            unreachable!()
+        };
+        let ItemKind::ToolResult {
+            connector_evidence: records,
+            ..
+        } = &mut item.kind
+        else {
+            unreachable!()
+        };
+        *records = vec![connector_evidence(
+            "crm.read",
+            CapabilityOrigin::BuiltIn,
+            AuthorityContext::local_process(),
+            &output,
+        )];
+        let StateEvent::ItemAppended { item, .. } = &mut events[3].event else {
+            unreachable!()
+        };
+        let ItemKind::PolicyDecision { decision, .. } = &mut item.kind else {
+            unreachable!()
+        };
+        *decision = PolicyDecision::Deny {
+            reason: "not authorized".to_owned(),
+        };
+        let error = super::project_events(&events).expect_err("denied execution must fail");
+        assert!(error.to_string().contains("authorized execution path"));
+    }
+
+    #[tokio::test]
+    async fn connector_evidence_append_requires_exact_trusted_authority() {
+        let bound_authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-a".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("bound authority");
+        let append_authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-b".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("append authority");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let thread = state
+            .create_thread_as(&bound_authority)
+            .await
+            .expect("thread");
+        let turn = state
+            .start_turn_as(&thread.id, &bound_authority)
+            .await
+            .expect("turn");
+        state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::ToolCall {
+                    model_id: None,
+                    model_origin: None,
+                    call_id: "call-connector".to_owned(),
+                    name: "crm.read".to_owned(),
+                    input: json!({}),
+                    batch: None,
+                }),
+                &bound_authority,
+            )
+            .await
+            .expect("call");
+        state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::PolicyDecision {
+                    call_id: "call-connector".to_owned(),
+                    tool_origin: Some(CapabilityOrigin::BuiltIn),
+                    decision: PolicyDecision::Allow,
+                }),
+                &bound_authority,
+            )
+            .await
+            .expect("policy");
+        let output = json!({"status": "active"});
+        let error = state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::ToolResult {
+                    call_id: "call-connector".to_owned(),
+                    output: output.clone(),
+                    is_error: false,
+                    connector_evidence: vec![connector_evidence(
+                        "crm.read",
+                        CapabilityOrigin::BuiltIn,
+                        bound_authority,
+                        &output,
+                    )],
+                }),
+                &append_authority,
+            )
+            .await
+            .expect_err("authority substitution must fail");
+        assert!(error.to_string().contains("trusted append authority"));
+    }
+
+    #[tokio::test]
+    async fn connector_evidence_survives_sqlite_snapshot_and_reopen() {
+        let path = temp_database_path();
+        let thread_id;
+        let output = json!({"status": "active"});
+        {
+            let state = StateEngine::new(Arc::new(
+                SqliteEventStore::open(&path).await.expect("open database"),
+            ));
+            let thread = state.create_thread().await.expect("thread");
+            thread_id = thread.id.clone();
+            let turn = state.start_turn(&thread.id).await.expect("turn");
+            state
+                .append_item(
+                    &turn,
+                    Item::new(ItemKind::ToolCall {
+                        model_id: None,
+                        model_origin: None,
+                        call_id: "call-connector".to_owned(),
+                        name: "crm.read".to_owned(),
+                        input: json!({}),
+                        batch: None,
+                    }),
+                )
+                .await
+                .expect("call");
+            state
+                .append_item(
+                    &turn,
+                    Item::new(ItemKind::PolicyDecision {
+                        call_id: "call-connector".to_owned(),
+                        tool_origin: Some(CapabilityOrigin::BuiltIn),
+                        decision: PolicyDecision::Allow,
+                    }),
+                )
+                .await
+                .expect("policy");
+            state
+                .append_item(
+                    &turn,
+                    Item::new(ItemKind::ToolResult {
+                        call_id: "call-connector".to_owned(),
+                        output: output.clone(),
+                        is_error: false,
+                        connector_evidence: vec![connector_evidence(
+                            "crm.read",
+                            CapabilityOrigin::BuiltIn,
+                            AuthorityContext::local_process(),
+                            &output,
+                        )],
+                    }),
+                )
+                .await
+                .expect("result");
+            state
+                .finish_turn(&turn, TurnStatus::Completed)
+                .await
+                .expect("finish");
+            state.create_snapshot(&thread.id).await.expect("snapshot");
+        }
+
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path)
+                .await
+                .expect("reopen database"),
+        ));
+        let recovered = state
+            .load_thread(&thread_id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert!(matches!(
+            &recovered.turns[0].items[2].kind,
+            ItemKind::ToolResult {
+                connector_evidence,
+                ..
+            } if connector_evidence.len() == 1
+                && connector_evidence[0].claim().version() == "revision-7"
+        ));
+        remove_database_files(&path);
     }
 
     #[test]

@@ -1473,6 +1473,7 @@ mod tests {
                     call_id: "call-deep".to_owned(),
                     output: deeply_nested,
                     is_error: false,
+                    connector_evidence: Vec::new(),
                 })],
             },
             final_text: "untrusted target output".to_owned(),

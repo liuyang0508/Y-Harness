@@ -24,10 +24,11 @@ pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngin
 pub use crate::kernel::{LanguageModel, Tool};
 
 use crate::{
-    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext, ContextBlock,
-    ContextEngine, ContextSource, ExecutionPhase, HarnessError, InvocationContextEvidence, Item,
-    ItemKind, MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation,
-    ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
+    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext,
+    CapabilityOrigin, ConnectorEvidence, ContextBlock, ContextEngine, ContextSource,
+    ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemKind,
+    MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput,
+    ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
     ModelToolCall, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
     StateCapacity, StateEngine, SteeringId, StoredEvent, Thread, ThreadArchive, ThreadId,
     ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
@@ -148,10 +149,12 @@ struct ToolCallSettlement {
     call_id: String,
     output: Value,
     is_error: bool,
+    connector_evidence: Vec<ConnectorEvidence>,
 }
 
 struct ToolCapabilityInvocation {
     tool: Arc<dyn Tool>,
+    origin: CapabilityOrigin,
     cancellation_settlement_timeout: Duration,
     call: ModelToolCall,
 }
@@ -1557,6 +1560,7 @@ impl HarnessRuntime {
         match invoke_tool_capability(
             ToolCapabilityInvocation {
                 tool: registered.tool.clone(),
+                origin: registered.origin.clone(),
                 cancellation_settlement_timeout: registered.cancellation_settlement_timeout,
                 call,
             },
@@ -1674,6 +1678,7 @@ impl HarnessRuntime {
                 index,
                 ToolCapabilityInvocation {
                     tool: registered.tool.clone(),
+                    origin: registered.origin.clone(),
                     cancellation_settlement_timeout: registered.cancellation_settlement_timeout,
                     call,
                 },
@@ -1772,6 +1777,7 @@ impl HarnessRuntime {
                 call_id: settlement.call_id,
                 output: settlement.output,
                 is_error: settlement.is_error,
+                connector_evidence: settlement.connector_evidence,
             },
         )
         .await
@@ -2372,6 +2378,7 @@ impl HarnessRuntime {
                             "error": "tool call superseded by user steering before execution"
                         }),
                         is_error: true,
+                        connector_evidence: Vec::new(),
                     },
                     &control.authority,
                 )
@@ -3826,6 +3833,7 @@ async fn invoke_tool_capability(
 ) -> Result<ToolCallSettlement, HarnessError> {
     let ToolCapabilityInvocation {
         tool,
+        origin,
         cancellation_settlement_timeout,
         call,
     } = invocation;
@@ -3839,7 +3847,7 @@ async fn invoke_tool_capability(
         thread_id: thread_id.clone(),
         turn_id: turn_id.clone(),
         call_id: call_id.clone(),
-        authority,
+        authority: authority.clone(),
         cancellation: capability_cancellation.clone(),
     };
     let started = Instant::now();
@@ -3849,14 +3857,14 @@ async fn invoke_tool_capability(
         deadline,
         ExecutionPhase::Tool,
         cancellation_settlement_timeout,
-        || tool.execute(input, context),
+        || tool.execute_with_evidence(input, context),
     )
     .await;
     observability.emit(&PhaseObservation {
         thread_id,
         turn_id,
         phase: ExecutionPhase::Tool,
-        capability: name,
+        capability: name.clone(),
         duration_micros: elapsed_micros(started),
         outcome: observation_outcome(&result),
         model_usage: None,
@@ -3869,20 +3877,42 @@ async fn invoke_tool_capability(
         stream_events_dropped: 0,
     });
     match result {
-        Ok(output) => {
-            let (output, is_error) = match validate_tool_output(&output) {
-                Ok(()) => (output, false),
+        Ok(result) => {
+            let (output, claims) = result.into_parts();
+            let (output, is_error, connector_evidence) = match validate_tool_output(&output) {
+                Ok(()) => {
+                    let output_sha256 =
+                        crate::json::bounded_serialized_sha256(&output, MAX_TOOL_OUTPUT_BYTES)
+                            .map_err(|_| {
+                                HarnessError::Tool("cannot digest validated Tool output".to_owned())
+                            })?;
+                    let evidence = claims
+                        .into_iter()
+                        .map(|claim| {
+                            ConnectorEvidence::bind(
+                                name.clone(),
+                                origin.clone(),
+                                authority.clone(),
+                                output_sha256.clone(),
+                                claim,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (output, false, evidence)
+                }
                 Err(error) => (
                     serde_json::json!({
                         "error": bounded_runtime_error(&error.to_string())
                     }),
                     true,
+                    Vec::new(),
                 ),
             };
             Ok(ToolCallSettlement {
                 call_id,
                 output,
                 is_error,
+                connector_evidence,
             })
         }
         Err(error @ (HarnessError::Cancelled { .. } | HarnessError::TimedOut { .. })) => Err(error),
@@ -3892,6 +3922,7 @@ async fn invoke_tool_capability(
                 "error": bounded_runtime_error(&error.to_string())
             }),
             is_error: true,
+            connector_evidence: Vec::new(),
         }),
     }
 }
@@ -4018,23 +4049,23 @@ mod tests {
     use crate::{
         ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus,
         ApprovalRequest, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-        CapabilityOrigin, ContextEngine, ContextSource, ConversationCompactionConfig,
-        ConversationCompactionRequest, ConversationCompactionResponse, ConversationCompactor,
-        ConversationCompactorDescriptor, ConversationCompactorRegistry, ConversationContextConfig,
-        EventId, EventStore, ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture,
-        InboxApprovalHandler, ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox,
-        MemoryContextConfig, MemoryContextPack, MemoryContextRecordStatus, MemoryEventStore,
-        MemoryFailureMode, MemoryOperation, MemoryProvider, MemoryProviderDescriptor,
-        MemoryReference, MemoryRegistry, MemorySearchRequest, MemorySearchResponse, MemoryView,
-        ModelContinuation, ModelEventSink, ModelOutput, ModelProviderFailure,
-        ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
-        ModelStreamEvent, ModelToolCall, ModelUsage, Observability, ObservationOutcome,
-        PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox, SqliteEventStore,
-        StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
+        CapabilityOrigin, ConnectorEvidenceClaim, ContextEngine, ContextSource,
+        ConversationCompactionConfig, ConversationCompactionRequest,
+        ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
+        ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
+        ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler,
+        ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
+        MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
+        MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
+        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
+        ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
+        ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, Observability,
+        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox,
+        SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
         ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution, ToolContext,
-        ToolDescriptor, ToolRegistry, TraceCollector, TurnContextInput, TurnStatus, TurnStopReason,
-        VerificationOutcome, VerificationRegistry, VerificationRequest, Verifier,
-        VerifierDescriptor,
+        ToolDescriptor, ToolExecutionResult, ToolRegistry, TraceCollector, TurnContextInput,
+        TurnStatus, TurnStopReason, VerificationOutcome, VerificationRegistry, VerificationRequest,
+        Verifier, VerifierDescriptor,
     };
 
     struct EchoTool {
@@ -4048,6 +4079,8 @@ mod tests {
     struct AuthorityProbeTool {
         observed: Arc<Mutex<Option<AuthorityContext>>>,
     }
+
+    struct EvidenceConnectorTool;
 
     struct AuthorityRecordingPolicy {
         observed: Arc<Mutex<Option<AuthorityContext>>>,
@@ -4344,6 +4377,45 @@ mod tests {
                     .map_err(|_| HarnessError::Tool("authority recorder poisoned".to_owned()))? =
                     Some(context.authority);
                 Ok(input)
+            })
+        }
+    }
+
+    impl Tool for EvidenceConnectorTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "echo".to_owned(),
+                description: "Returns one source-bound Connector fact".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn execute<'a>(&'a self, input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move { Ok(input) })
+        }
+
+        fn execute_with_evidence<'a>(
+            &'a self,
+            input: Value,
+            _context: ToolContext,
+        ) -> HarnessFuture<'a, ToolExecutionResult> {
+            Box::pin(async move {
+                let output = json!({"record": input, "status": "active"});
+                ToolExecutionResult::with_connector_evidence(
+                    output,
+                    vec![
+                        ConnectorEvidenceClaim::new(
+                            "crm",
+                            "contacts/customer-42",
+                            "revision-7",
+                            1,
+                            Some(10_000),
+                            Some("read-customer-42-revision-7".to_owned()),
+                        )
+                        .map_err(|error| HarnessError::Tool(error.to_string()))?,
+                    ],
+                )
+                .map_err(|error| HarnessError::Tool(error.to_string()))
             })
         }
     }
@@ -5682,6 +5754,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_evidence_is_runtime_bound_atomic_model_hidden_and_archive_safe() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "enterprise-identity".to_owned(),
+                subject: "operator-42".to_owned(),
+            },
+            Some("tenant-a".to_owned()),
+        )
+        .expect("scoped authority");
+        let origin = CapabilityOrigin::External {
+            id: "connector.crm".to_owned(),
+        };
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(origin.clone(), Arc::new(EvidenceConnectorTool))
+            .expect("Connector Tool");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            state.clone(),
+        );
+        let thread = runtime.create_thread_as(&authority).await.expect("thread");
+
+        let outcome = runtime
+            .run_turn_with_options(
+                &thread.id,
+                "hello",
+                TurnExecutionOptions {
+                    authority: authority.clone(),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect("evidence-aware Turn");
+        let (output, evidence) = outcome
+            .turn
+            .items
+            .iter()
+            .find_map(|item| {
+                if let ItemKind::ToolResult {
+                    output,
+                    connector_evidence,
+                    ..
+                } = &item.kind
+                {
+                    Some((output, connector_evidence))
+                } else {
+                    None
+                }
+            })
+            .expect("Tool result");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].connector(), "echo");
+        assert_eq!(evidence[0].connector_origin(), &origin);
+        assert_eq!(evidence[0].authority(), &authority);
+        assert_eq!(
+            evidence[0].output_sha256(),
+            crate::json::bounded_serialized_sha256(output, super::MAX_TOOL_OUTPUT_BYTES)
+                .expect("output digest")
+        );
+        assert_eq!(evidence[0].claim().source(), "crm");
+        assert!(
+            crate::context::model_visible_items(&outcome.turn.items)
+                .iter()
+                .filter_map(|item| {
+                    if let ItemKind::ToolResult {
+                        connector_evidence, ..
+                    } = &item.kind
+                    {
+                        Some(connector_evidence)
+                    } else {
+                        None
+                    }
+                })
+                .all(Vec::is_empty)
+        );
+
+        let events = state
+            .events_as(&thread.id, &authority)
+            .await
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    StateEvent::ItemAppended {
+                        item: crate::Item {
+                            kind: ItemKind::ToolResult {
+                                connector_evidence,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    } if connector_evidence.len() == 1
+                ))
+                .count(),
+            1,
+            "Tool output and Connector evidence must share one atomic event"
+        );
+
+        let archive = state
+            .export_thread_as(&thread.id, &authority)
+            .await
+            .expect("archive");
+        state
+            .import_thread_as(
+                &archive,
+                ThreadId::from_static("connector-import-same-tenant"),
+                &authority,
+            )
+            .await
+            .expect("same-tenant import");
+        let other_tenant =
+            AuthorityContext::new(authority.actor().clone(), Some("tenant-b".to_owned()))
+                .expect("other tenant");
+        let error = state
+            .import_thread_as(
+                &archive,
+                ThreadId::from_static("connector-import-other-tenant"),
+                &other_tenant,
+            )
+            .await
+            .expect_err("tenant rebinding must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("tenant-bound authority evidence")
+        );
+    }
+
+    #[tokio::test]
     async fn trusted_authority_reaches_policy_and_tool_execution() {
         let authority = AuthorityContext::new(
             ActorIdentity::Authenticated {
@@ -6403,6 +6610,7 @@ mod tests {
                 call_id: "tampered-call".to_owned(),
                 output: json!({"ok": true}),
                 is_error: false,
+                connector_evidence: Vec::new(),
             }),
         ];
 
@@ -6438,6 +6646,7 @@ mod tests {
                 call_id: "completed-call".to_owned(),
                 output: json!({"ok": true}),
                 is_error: false,
+                connector_evidence: Vec::new(),
             }),
             crate::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("test/continuation-model".to_owned()),

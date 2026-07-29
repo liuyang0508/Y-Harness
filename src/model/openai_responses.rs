@@ -311,6 +311,7 @@ fn build_request_body(
                 call_id,
                 output,
                 is_error,
+                ..
             } => {
                 input.push(json!({
                     "type": "function_call_output",
@@ -959,6 +960,7 @@ mod tests {
                     call_id: "call-1".to_owned(),
                     output: json!({"temperature": 31}),
                     is_error: false,
+                    connector_evidence: Vec::new(),
                 }),
             ],
             context: vec![ContextBlock {

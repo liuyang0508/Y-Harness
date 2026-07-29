@@ -163,6 +163,7 @@ fn state_contract_holds(sample: &EvaluationSample, outcome: &y_harness::TurnOutc
                 call_id,
                 output,
                 is_error,
+                ..
             } if !is_error && output == &expected_tool_payload => {
                 result.push((position, call_id.as_str()));
             }

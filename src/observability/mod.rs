@@ -474,6 +474,7 @@ mod tests {
                     call_id: "call-deep".to_owned(),
                     output: deeply_nested,
                     is_error: false,
+                    connector_evidence: Vec::new(),
                 }),
             },
         };

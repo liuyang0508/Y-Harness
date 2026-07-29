@@ -849,11 +849,25 @@ fn model_visible_item(item: &Item) -> Option<Item> {
                 content: content.clone(),
             },
         }),
+        ItemKind::ToolResult {
+            call_id,
+            output,
+            is_error,
+            ..
+        } => Some(Item {
+            id: item.id.clone(),
+            created_at_ms: item.created_at_ms,
+            kind: ItemKind::ToolResult {
+                call_id: call_id.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+                connector_evidence: Vec::new(),
+            },
+        }),
         ItemKind::UserMessage { .. }
         | ItemKind::AssistantMessage { .. }
         | ItemKind::ProviderContinuation { .. }
         | ItemKind::ToolCall { .. }
-        | ItemKind::ToolResult { .. }
         | ItemKind::VerificationResult { .. } => Some(item.clone()),
         ItemKind::ExecutionBinding { .. }
         | ItemKind::SteeringQueued { .. }
@@ -1587,6 +1601,7 @@ mod tests {
             call_id: "call-deep".to_owned(),
             output: deeply_nested,
             is_error: false,
+            connector_evidence: Vec::new(),
         }));
         thread.turns.push(turn);
 

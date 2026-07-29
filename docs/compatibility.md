@@ -11,16 +11,16 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"25"` | exact `Initialize` request/response |
-| State events | `13` | per-event durable envelope; reads schemas 1 through 13 |
-| State snapshots | `13` | cache body; incompatible caches are discarded |
+| Client protocol | `"26"` | exact `Initialize` request/response |
+| State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
+| State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
-| Task Coordinator | `2` | per-graph SQLite schema column |
+| Task Coordinator | `3` | per-graph SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
 | Thread handoff request format | `1` | canonical bounded summarizer-input envelope |
-| Thread archive format | `3` | exact bounded archive root plus digest |
+| Thread archive format | `4` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `2` | exact descriptor registration and trusted-authority resolution |
@@ -185,6 +185,16 @@ migrate existing unscoped State, Approval, or Task ownership; such records
 remain inaccessible under the exact tenant fence. No durable, Protocol,
 Model-Gateway, archive, or service-schema coordinate advances. See
 [ADR 0125](adr/0125-fixed-tenant-reference-service-authority.md).
+The additive `Tool::execute_with_evidence` compatibility method lets an
+in-process Connector return bounded source-system claims while ordinary Tools
+retain their existing implementation. Runtime binds each claim to the exact
+registered Tool/origin, trusted actor/tenant, and output SHA-256; State schema
+14 stores it atomically with `ToolResult`, revalidates its execution chain, and
+excludes it from Model Context. Failed results cannot retain evidence. Thread
+archive format 4 preserves the record and refuses cross-tenant authority
+rebinding. Protocol v26 advertises State/snapshot schema 14 but exposes no
+Connector-evidence authoring command. See
+[ADR 0126](adr/0126-runtime-bound-connector-evidence.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from
@@ -206,7 +216,7 @@ The optional Domain Pack crate adds an authorization port, exact action and
 request types, bounded reference roles, an exact actor/tenant grant model, an
 authorized Store adapter, and a `Forbidden` error. These are additive Rust
 control-plane APIs. They do not alter Pack format/store schema 1, State schema
-13, Task schema 3, or Protocol v25. See
+14, Task schema 3, or Protocol v26. See
 [ADR 0124](adr/0124-exact-domain-pack-role-authorization.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
@@ -260,6 +270,15 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `26` preserves protocol-v25 commands, framing, authority,
+permissions, request/response ceilings, and Task Graph schema 3. It advances
+advertised State event/snapshot coordinates to 14. Thread archive format
+independently advances to 4. Connector evidence is durable output produced
+only by an in-process evidence-aware Tool and bound by Runtime; protocol
+callers can observe it but cannot author it. Protocol-v25 clients must fail
+exact initialization rather than assume schema-13 projections can preserve
+schema-14 Items.
 
 Client protocol `24` preserves protocol-v23 commands, framing, authority,
 permissions, and request/response ceilings. It advances advertised State event
@@ -431,6 +450,14 @@ most one binding, and Runtime excludes it from Model Context. Schema-13
 readers accept immutable schema-1 through schema-12 history after explicit
 migration, and the schema-13 writer emits only schema 13.
 
+State event schema `14` adds bounded Connector evidence to a successful
+`ToolResult`. Runtime—not the Connector—binds registered Tool identity/origin,
+trusted actor/tenant, and the exact output SHA-256. State validates the claim
+shape, digest, tenant, and preceding ToolCall/Policy origin during append and
+every projection. Schema-14 readers accept immutable schema-1 through
+schema-13 history after explicit migration, and the schema-14 writer emits
+only schema 14.
+
 State event schema `12` adds optional tenant ownership to the authoritative
 `thread_created` event. SQLite persists a nullable same-transaction
 `streams.tenant_id` lookup projection and validates it against the journal on
@@ -571,12 +598,12 @@ does not change client protocol or durable data.
 
 ## Migration discipline
 
-State schemas 1 through 12 are supported migration sources. Populated SQLite
+State schemas 1 through 13 are supported migration sources. Populated SQLite
 stores at any of those coordinates require the explicit backup-first command
-below before a schema-13 Runtime can open them:
+below before a schema-14 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v13.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
@@ -586,16 +613,16 @@ Thread-tenant projection without inferring legacy ownership, drops disposable
 old snapshots, and advances
 event/snapshot writer metadata in one immediate transaction. Historical event
 JSON and schema labels are never rewritten. An interrupted schema-1 through
-schema-12 run can reuse its validated backup.
+schema-13 run can reuse its validated backup.
 
-The schema-13 reader/new writer decision is asymmetric:
+The schema-14 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1 through schema-12 events remain readable;
-- old reader + new writer: unsupported and fails on schema-13 metadata or
+  schema-1 through schema-13 events remain readable;
+- old reader + new writer: unsupported and fails on schema-14 metadata or
   events;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-13 event
+- downgrade: supported only by restoring the backup before any schema-14 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -642,6 +669,8 @@ API 2, in-process Model authority, MCP session fencing, and Protocol v23, plus
 execution evidence, archive format 3, and Protocol v24, plus
 [ADR 0123](adr/0123-durable-task-attempt-execution-binding.md) for Task Graph
 schema 3 governed attempt evidence and Protocol v25.
+See [ADR 0126](adr/0126-runtime-bound-connector-evidence.md) for schema-14
+Runtime-bound Connector evidence, archive format 4, and Protocol v26.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -702,8 +731,8 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 13 reads
-immutable schema-1 through schema-12 history after explicit store migration.
+durable schema support windows are declared per release. State schema 14 reads
+immutable schema-1 through schema-13 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
 reads schema 1 and schema 2. Task coordination reads only schema 2 in normal
 operation; `task-migrate` alone reads schema 1 and the earlier unversioned

@@ -875,6 +875,7 @@ fn legacy_snapshot_schema(event_schema: u32) -> Option<u32> {
         10 => Some(10),
         11 => Some(11),
         12 => Some(12),
+        13 => Some(13),
         _ => None,
     }
 }
@@ -1123,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn migration_advances_metadata_schemas_without_rewriting_history() {
         for legacy_schema in [
-            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32,
+            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32, 12_u32, 13_u32,
         ] {
             let source = fixture_path(&format!("source-v{legacy_schema}"));
             let backup = fixture_path(&format!("backup-v{legacy_schema}"));
@@ -1226,7 +1227,7 @@ mod tests {
     #[test]
     fn metadata_migration_restarts_after_every_phase() {
         for legacy_schema in [
-            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32,
+            2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 8_u32, 9_u32, 10_u32, 11_u32, 12_u32, 13_u32,
         ] {
             for phase in ["after_preflight", "after_backup", "before_commit"] {
                 let source = fixture_path(&format!("v{legacy_schema}-{phase}"));
@@ -1606,6 +1607,11 @@ mod tests {
             connection
                 .execute("ALTER TABLE streams ADD COLUMN name TEXT", [])
                 .expect("add schema-8 Thread name projection");
+        }
+        if event_schema >= 12 {
+            connection
+                .execute("ALTER TABLE streams ADD COLUMN tenant_id TEXT", [])
+                .expect("add schema-12 Thread tenant projection");
         }
         connection
             .execute_batch(&format!(

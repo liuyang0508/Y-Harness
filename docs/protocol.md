@@ -1,10 +1,10 @@
-# Client protocol v25
+# Client protocol v26
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"25"` is exact. Every request carries that value, and a peer
+Protocol version `"26"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "25",
+  "protocol_version": "26",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "25",
+  "protocol_version": "26",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "25",
+  "protocol_version": "26",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "25",
+  "protocol_version": "26",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "25",
+  "protocol_version": "26",
   "body": {
     "status": "success",
     "result": {
@@ -134,8 +134,8 @@ The result type is `initialized`:
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 13,
-        "state_snapshot_schema": 13,
+        "state_event_schema": 14,
+        "state_snapshot_schema": 14,
         "approval_inbox_schema": 3,
         "task_graph_schema": 3,
         "memory_api": 1,
@@ -830,6 +830,44 @@ Only a trusted embedded host can supply this input through
 most one binding, requires its tenant to equal the Thread tenant, excludes it
 from Model Context, and preserves it as observable audit evidence.
 
+State event schema 14 adds optional Runtime-bound Connector evidence inside
+the same atomic `tool_result` Item:
+
+```json
+{
+  "type": "tool_result",
+  "call_id": "call-42",
+  "output": {"status": "active"},
+  "is_error": false,
+  "connector_evidence": [{
+    "connector": "crm.read",
+    "connector_origin": {"type": "external", "id": "connector.crm"},
+    "authority": {
+      "actor": {
+        "kind": "authenticated",
+        "authority": "enterprise-identity",
+        "subject": "operator-42"
+      },
+      "tenant_id": "tenant-a"
+    },
+    "output_sha256": "lowercase-64-character-sha256",
+    "claim": {
+      "source": "crm",
+      "resource": "contacts/customer-42",
+      "version": "revision-7",
+      "observed_at_ms": 1785081600000
+    }
+  }]
+}
+```
+
+Only an in-process evidence-aware Connector Tool can return the bounded
+`claim`; Runtime binds every other field from trusted execution state. State
+revalidates output digest, tenant, Tool identity, and Policy origin. Failed
+Tool results cannot retain evidence. Protocol clients may observe these
+records through ordinary State projections but cannot author or elevate them,
+and Model requests receive the Tool output with `connector_evidence` removed.
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -844,7 +882,7 @@ defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v25 value |
+| Boundary | Protocol v26 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -877,7 +915,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"25"` |
+| `unsupported_version` | Request protocol is not exactly `"26"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -896,7 +934,8 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
-schema-13 execution-binding evidence, schema-12 Thread-tenant evidence,
+schema-14 Connector evidence, schema-13 execution-binding evidence,
+schema-12 Thread-tenant evidence,
 schema-11 invocation-context evidence,
 schema-10 Thread-import evidence,
 schema-9 Thread-fork evidence, schema-8

@@ -37,7 +37,7 @@ pub use task::{TaskGraphSummary, TaskRecordPage};
 use task::{TaskProtocolService, TaskWorkerAccess};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "25";
+pub const PROTOCOL_VERSION: &str = "26";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -2342,16 +2342,17 @@ mod tests {
     };
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
-        ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin, EventStore,
-        ExecutionBinding, HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item,
-        ItemId, ItemKind, LanguageModel, MemoryApprovalInbox, MemoryEventStore, MemoryScope,
-        MemoryTaskCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
-        ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
-        PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
-        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
-        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
-        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkspaceMode,
+        ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin,
+        ConnectorEvidence, ConnectorEvidenceClaim, EventStore, ExecutionBinding, HarnessError,
+        HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
+        MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
+        ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelResponse, ModelStream,
+        ModelStreamEvent, OperationId, PendingEvent, PolicyDecision, PolicyEngine, RiskLevel,
+        SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine, StateEvent, StateSnapshot,
+        StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId,
+        TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool, ToolAuthorization, ToolCallBatch,
+        ToolCallBatchId, ToolContext, ToolDescriptor, ToolRegistry, TurnContextInput, TurnId,
+        TurnStatus, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2727,7 +2728,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_five_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_six_wire_envelopes_state_provenance_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2735,14 +2736,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "25",
+                "protocol_version": "26",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "25",
+                "protocol_version": "26",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2751,7 +2752,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "25",
+                "protocol_version": "26",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2773,7 +2774,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "25",
+                "protocol_version": "26",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2813,6 +2814,52 @@ mod tests {
                 }
             })
         );
+        let connector_output = json!({"status": "active"});
+        let connector_digest = crate::json::bounded_serialized_sha256(&connector_output, 1_048_576)
+            .expect("Connector output digest");
+        let connector_evidence = ConnectorEvidence::bind(
+            "crm.read".to_owned(),
+            CapabilityOrigin::External {
+                id: "connector.crm".to_owned(),
+            },
+            AuthorityContext::local_process(),
+            connector_digest.clone(),
+            ConnectorEvidenceClaim::new("crm", "contacts/customer-42", "revision-7", 1, None, None)
+                .expect("Connector claim"),
+        )
+        .expect("bound Connector evidence");
+        assert_eq!(
+            serde_json::to_value(ItemKind::ToolResult {
+                call_id: "call-42".to_owned(),
+                output: connector_output,
+                is_error: false,
+                connector_evidence: vec![connector_evidence],
+            })
+            .expect("encode schema-14 Connector evidence"),
+            json!({
+                "type": "tool_result",
+                "call_id": "call-42",
+                "output": {"status": "active"},
+                "is_error": false,
+                "connector_evidence": [{
+                    "connector": "crm.read",
+                    "connector_origin": {
+                        "kind": "external",
+                        "id": "connector.crm"
+                    },
+                    "authority": {
+                        "actor": {"kind": "local_process"}
+                    },
+                    "output_sha256": connector_digest,
+                    "claim": {
+                        "source": "crm",
+                        "resource": "contacts/customer-42",
+                        "version": "revision-7",
+                        "observed_at_ms": 1
+                    }
+                }]
+            })
+        );
         let binding = ExecutionBinding::new(
             "domain-pack",
             "course-assistant",
@@ -2837,7 +2884,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "25",
+                "protocol_version": "26",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",

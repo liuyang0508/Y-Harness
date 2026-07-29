@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     CancellationToken, HarnessFuture, ModelOutput, ModelRequest, ModelResponse, ModelStreamEvent,
-    ToolContext, ToolDescriptor,
+    ToolContext, ToolDescriptor, ToolExecutionResult,
 };
 
 const MAX_STREAM_DELTA_BYTES: usize = 4_096;
@@ -297,6 +297,23 @@ pub trait Tool: Send + Sync {
 
     /// Executes one authorized call.
     fn execute<'a>(&'a self, input: Value, context: ToolContext) -> HarnessFuture<'a, Value>;
+
+    /// Executes one authorized call with optional source-system evidence.
+    ///
+    /// Ordinary Tools inherit the compatibility path. Connector Tools may
+    /// override this method, but Runtime—not the Tool—binds every claim to the
+    /// registered Tool origin, trusted authority, and exact output digest.
+    fn execute_with_evidence<'a>(
+        &'a self,
+        input: Value,
+        context: ToolContext,
+    ) -> HarnessFuture<'a, ToolExecutionResult> {
+        Box::pin(async move {
+            self.execute(input, context)
+                .await
+                .map(ToolExecutionResult::new)
+        })
+    }
 }
 
 #[cfg(test)]

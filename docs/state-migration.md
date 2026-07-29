@@ -1,7 +1,7 @@
 # SQLite State migration runbook
 
-This runbook applies to schema-1 through schema-12 State stores moving to
-schema 13.
+This runbook applies to schema-1 through schema-13 State stores moving to
+schema 14.
 It is deliberately offline and backup-first.
 
 ## Preconditions
@@ -19,12 +19,12 @@ It is deliberately offline and backup-first.
 Run:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v13.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
 ```
 
 Success reports the source and destination event coordinates, immutable
 historical event count, preflight space values, and the rollback backup path.
-Normal runtime open refuses a populated schema-1 through schema-12 database
+Normal runtime open refuses a populated schema-1 through schema-13 database
 until this command succeeds.
 
 ## What the command changes
@@ -40,8 +40,8 @@ adds the nullable `streams.name` projection column. It adds nullable
 `streams.tenant_id` to every schema-1 through schema-11 source. Existing
 Threads remain explicitly unscoped; migration never infers ownership.
 Schema-8 and newer names are validated against the journal before migration.
-New events and snapshots use schema 13; schema-13 readers continue to validate
-immutable schema-1 through schema-12 events. Schema-12 sources already contain
+New events and snapshots use schema 14; schema-14 readers continue to validate
+immutable schema-1 through schema-13 events. Schema-12 and schema-13 sources already contain
 the tenant projection, so migration advances metadata and discards disposable
 snapshots without altering authoritative history. Snapshots are rebuildable
 caches, not authoritative history.
@@ -62,10 +62,10 @@ interruption:
 - rerunning after success reports `AlreadyCurrent` and performs no new write.
 
 A hard interruption can leave a file named like
-`state-pre-v13.rollback.db.partial-<id>`. It is not the final backup. Remove
+`state-pre-v14.rollback.db.partial-<id>`. It is not the final backup. Remove
 orphan partials only after verifying that no migration process is active and
 that either the final backup is valid or the source is still at its untouched
-schema-1 through schema-12 coordinate.
+schema-1 through schema-13 coordinate.
 
 ## Restore and downgrade boundary
 
@@ -83,13 +83,13 @@ Before restoring:
    permissions.
 5. Start only the reader/writer version appropriate for the restored schema.
 
-Rollback is supported only before any schema-13 event has been committed. Once
-a schema-13 event exists, restoring the pre-v13 backup discards newer
+Rollback is supported only before any schema-14 event has been committed. Once
+a schema-14 event exists, restoring the pre-v14 backup discards newer
 authoritative history and is therefore not a supported downgrade.
 
 ## Mixed-version rule
 
 There is no rolling-upgrade window. A new reader can read schema-1 through
-schema-12 history only after explicit migration. An old reader/writer is
-unsupported against the migrated source and must fail on schema-13 metadata or
+schema-13 history only after explicit migration. An old reader/writer is
+unsupported against the migrated source and must fail on schema-14 metadata or
 events. Never run old and new writers concurrently against one database.

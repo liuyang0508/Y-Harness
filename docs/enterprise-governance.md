@@ -35,7 +35,7 @@ reason to duplicate Runtime or State.
 
 | Existing primitive | It does not yet prove |
 |---|---|
-| optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
+| optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, schema-14 Runtime-bound Connector evidence, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
 | durable Task DAG and fenced workers | event/timer/human-wait Workflow |
@@ -115,7 +115,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v25 client
+Domain Pack lifecycle remains deliberately outside Core and the v26 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid

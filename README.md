@@ -59,7 +59,7 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v25 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v26 JSONL service over stdin/stdout. It
 persists State, approvals, and Task coordination under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
@@ -95,7 +95,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v25 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v26 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -220,7 +220,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v25 specification](docs/protocol.md).
+[client protocol v26 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -378,16 +378,16 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-13 writer
+introduced bounded content-free evidence, and the current schema-14 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1 through schema-12 SQLite
+Populated schema-1 through schema-13 SQLite
 databases require an offline, backup-first migration before the current
 Runtime opens them:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v13.rollback.db
+cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -466,10 +466,10 @@ yh thread import <archive> <target-thread-id> [config]
 
 Export never overwrites its destination, import rejects altered or oversized
 archives before mutation, and a running Turn is not exportable. The current
-archive root is format 3 so older readers cannot silently discard schema-13
-execution-binding evidence. A tenant-bound execution history can be imported
-only into the same tenant; unbound histories retain the existing explicit
-target-tenant rebind behavior. See
+archive root is format 4 so older readers cannot silently discard schema-14
+Connector evidence. Tenant-bound execution or Connector evidence can be
+imported only into the same tenant; unbound histories retain the existing
+explicit target-tenant rebind behavior. See
 [ADR 0095](docs/adr/0095-portable-integrity-bound-thread-archives.md).
 
 State schema 11 adds optional per-Turn reference Context without adding another
@@ -499,6 +499,17 @@ exact tenant before execution. Runtime records it once, excludes it from Model
 Context, preserves it through SQLite snapshots and archives, and requires an
 exact match on approval restart. Protocol clients cannot author this trusted
 field. See [ADR 0122](docs/adr/0122-durable-turn-execution-binding.md).
+
+State schema 14 adds optional Connector evidence to the same atomic
+`ToolResult` event. A Connector may report bounded source, resource, revision,
+observation/freshness, and idempotency claims, but those claims are not
+authority by themselves. Runtime binds them to the exact registered Tool
+identity and origin, trusted actor/tenant, and SHA-256 of the exact output.
+State revalidates the digest and ToolCall→Policy→ToolResult provenance on
+append, recovery, snapshot, and archive import. Failed results retain no
+evidence, and model-visible replay strips it to prevent privileged metadata
+from becoming instructions. See
+[ADR 0126](docs/adr/0126-runtime-bound-connector-evidence.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
 longest identical Turn prefix and selects a bounded newest source-only delta.
@@ -769,7 +780,7 @@ expiry, retry, and settlement; reads validate every representation before
 returning data.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v25 preserves Protocol v24's 2 MiB request and 16 MiB
+protocol. Protocol v26 preserves Protocol v25's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -795,7 +806,10 @@ bindings. Protocol 25 advertises Task Graph schema 3; a trusted embedded
 Orchestrator commits exact Task/lease/attempt/worker binding evidence before
 Workspace or executor entry, retains it after retry and settlement, and
 rejects an unbound retry after governance begins. Protocol workers cannot
-author that evidence or take over a bound Task. Steering
+author that evidence or take over a bound Task. Protocol 26 advertises State
+and snapshot schema 14; Thread archive format 4 advances independently for
+Runtime-bound Connector evidence. Protocol clients can observe the durable
+record but cannot author or elevate a Tool into a trusted Connector. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -895,7 +909,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v25. The Sessions panel shows direct fork ancestry from
+through Protocol v26. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

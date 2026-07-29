@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v25 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v26 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -83,8 +83,16 @@ Workspace or executor entry, survives retry and settlement, and is
 tenant-exact. Once a Task enters bound mode, an unbound retry fails closed.
 Schema-1/schema-2 stores migrate backup-first; schema-2 tenant ownership is
 preserved and old rows cannot claim new evidence.
+State/snapshot schema 14 and Protocol 26 add optional Runtime-bound Connector
+evidence. Evidence-aware in-process Tools report only bounded source claims;
+Runtime supplies registered Tool/origin, trusted actor/tenant, and the exact
+output SHA-256. State stores output and evidence atomically, revalidates the
+ToolCall→Policy→ToolResult chain, strips evidence from Model Context, and
+rejects failed-result, digest, origin, authority, and cross-tenant archive
+tampering. Ordinary Tool, MCP, and JSON-command adapters retain their
+non-authoritative compatibility path. Thread archive format advances to 4.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v25. Format/store schema 1 pins immutable component snapshots and a
+Protocol v26. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its

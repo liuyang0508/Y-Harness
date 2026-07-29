@@ -511,6 +511,7 @@ fn unique_tool_result<'a>(
             call_id: candidate,
             output,
             is_error,
+            ..
         } = &item.kind
             && candidate == call_id
         {
@@ -649,6 +650,7 @@ mod tests {
                     call_id: call_id.to_owned(),
                     output,
                     is_error,
+                    connector_evidence: Vec::new(),
                 }),
             )
             .await
