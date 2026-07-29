@@ -52,6 +52,8 @@ printf '%s\n' \
       同一 command ID 被其他 actor 或不同内容复用时失败。
 - [ ] 嵌入宿主可用同一租户 Authority 与可信时间调用有限 Temporal tick，
       推进到期 Workflow 等待和过期 Claim；Core 不会自行启动后台轮询。
+- [ ] `yh serve` 未配置 `temporal` 时不轮询；显式配置后使用同一固定
+      Authority，限制 cadence/scan、跳过漏拍，并在 stdio 关闭时先停止。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
       `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
       或新的 running Turn 时均不修改 State。

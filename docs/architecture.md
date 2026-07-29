@@ -322,6 +322,11 @@ direction:
   through existing CAS commands, and independent
   applied/duplicate/fenced/failed settlement; it starts no background task and
   introduces no scheduler database or second time authority;
+- an opt-in reference-service Temporal lifecycle that supplies the fixed
+  service Authority and Unix time, bounds cadence and scan size, skips missed
+  ticks, retains only a disposable process cursor, emits bounded health
+  transitions, and stops before Protocol/MCP shutdown while leaving Core
+  task-free;
 - a public bounded Task Orchestrator that executes host-provided sub-Agent
   capabilities, advances dependencies, isolates timeout/panic failure, cancels
   fenced workers, and settles only an exact current lease;
@@ -442,11 +447,10 @@ transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
 multi-principal reference-service tenant routing, general Secret-manager
 integration, tenant-partitioned MCP sessions, external Artifact storage and
-authorization, a reference-service/background Temporal polling lifecycle,
-automatic effect-safe Task retry, durable compensation planning, automatic
-Human Handoff channel routing and outbox delivery, Domain Pack
-service/protocol integration, role and delegation claims, revocation, and
-policy hot reload remain explicit subsequent slices.
+authorization, automatic effect-safe Task retry, durable compensation
+planning, automatic Human Handoff channel routing and outbox delivery, Domain
+Pack service/protocol integration, role and delegation claims, revocation,
+and policy hot reload remain explicit subsequent slices.
 Task Artifact reference metadata is already part of its tenant-fenced Task
 Graph; this does not authorize or store the referenced external content.
 

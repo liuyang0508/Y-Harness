@@ -14,6 +14,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::io::{self as tokio_io, BufReader as TokioBufReader, BufWriter as TokioBufWriter};
 use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, AgentMemoryHubProvider, AllowListPolicy,
     ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
@@ -35,11 +36,11 @@ use y_harness::{
     SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
     SqliteApprovalInbox, SqliteEventStore, SqliteHumanHandoffCoordinator, SqliteTaskCoordinator,
     SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
-    StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
+    StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, TemporalDriver, ThreadId,
     ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
     VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
     WorkflowEngine, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
-    serve_stdio,
+    serve_jsonl,
 };
 
 #[cfg(feature = "https-model")]
@@ -58,7 +59,10 @@ use y_harness::{
 #[cfg(feature = "https-skill")]
 use y_harness::{HttpsSkillSource, HttpsSkillSourceConfig};
 
-use super::{CliResult, DemoModel, EchoTool};
+use super::{
+    CliResult, DemoModel, EchoTool,
+    temporal_service::{self, ServiceTemporalConfig},
+};
 
 const CONFIG_FILE: &str = "y-harness.json";
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -67,6 +71,7 @@ const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 16_777_216;
 const MAX_PROJECT_SKILL_FILES: usize = 4_096;
 const MAX_PINNED_COMMAND_BYTES: u64 = 268_435_456;
 const MAX_EVALUATION_ARTIFACT_BYTES: u64 = 16_777_216;
+const OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "https-mcp", feature = "https-model"))]
 const MAX_CA_BYTES: u64 = 1_048_576;
 
@@ -103,6 +108,8 @@ struct ServiceConfig {
     skills: Option<ServiceSkillsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evaluation: Option<ServiceEvaluationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporal: Option<ServiceTemporalConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -126,6 +133,7 @@ impl Default for ServiceConfig {
             conversation: None,
             skills: None,
             evaluation: None,
+            temporal: None,
         }
     }
 }
@@ -988,6 +996,14 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         );
         println!("conversation compactor: disabled");
     }
+    if let Some(temporal) = &loaded.config.temporal {
+        println!(
+            "temporal: enabled ({} ms / {} identities per source)",
+            temporal.poll_interval_ms, temporal.scan_limit
+        );
+    } else {
+        println!("temporal: disabled");
+    }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
         "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
@@ -1099,16 +1115,54 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
             workflows: workflow_engine.clone(),
         }),
     );
+    let temporal_service = loaded
+        .config
+        .temporal
+        .as_ref()
+        .cloned()
+        .map(|config| {
+            temporal_service::start(
+                TemporalDriver::new()
+                    .with_workflow_engine(workflow_engine.clone())
+                    .with_human_handoff_engine(handoff_engine.clone()),
+                authority.clone(),
+                config,
+            )
+        })
+        .transpose()?;
     let handler = ProtocolHandler::new(runtime)
         .with_approval_inbox(approval_port)
         .with_task_coordinator(task_port)
         .with_workflow_engine(workflow_engine)
         .with_human_handoff_engine(handoff_engine)
         .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
-    let served = serve_stdio(handler).await;
-    let shutdown = shutdown_mcp_clients(&mcp_clients).await;
+    let served = serve_jsonl(
+        &handler,
+        TokioBufReader::new(tokio_io::stdin()),
+        TokioBufWriter::new(tokio_io::stdout()),
+    )
+    .await;
+    let temporal_shutdown = match temporal_service {
+        Some(temporal_service) => temporal_service.shutdown().await,
+        None => Ok(()),
+    };
+    let protocol_shutdown = shutdown_protocol_handler(&handler).await;
+    let mcp_shutdown = shutdown_mcp_clients(&mcp_clients).await;
     served?;
-    shutdown
+    temporal_shutdown?;
+    protocol_shutdown?;
+    mcp_shutdown
+}
+
+async fn shutdown_protocol_handler(handler: &ProtocolHandler) -> Result<(), HarnessError> {
+    let report = handler.shutdown(OPERATION_SHUTDOWN_TIMEOUT).await?;
+    if report.remaining_operations > 0 || !report.background_work_drained {
+        return Err(HarnessError::Protocol(format!(
+            "stdio shutdown incomplete: {} Operations remain; background drained={}",
+            report.remaining_operations, report.background_work_drained
+        )));
+    }
+    Ok(())
 }
 
 /// Runs one configured Evaluation suite and exact baseline without opening service State.
@@ -2508,6 +2562,9 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
             format!("max_model_attempts_per_step must be 1-{MAX_MODEL_ATTEMPTS_PER_STEP}").into(),
         );
     }
+    if let Some(temporal) = &config.temporal {
+        temporal.validate()?;
+    }
     configured_authority(&config)?;
     let root = path
         .parent()
@@ -3023,6 +3080,44 @@ mod tests {
         fs::remove_dir_all(root).expect("remove config fixture");
     }
 
+    #[test]
+    fn config_rejects_temporal_bounds_before_service_assembly() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "y-harness-temporal-config-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create Temporal config fixture");
+        let path = root.join("y-harness.json");
+        fs::write(
+            &path,
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "model": {"type": "demo"},
+              "temporal": {
+                "poll_interval_ms": 99,
+                "scan_limit": 257
+              }
+            }"#,
+        )
+        .expect("write invalid Temporal config");
+
+        let error = load_config(path.to_str().expect("UTF-8 fixture path"))
+            .err()
+            .expect("reject invalid Temporal bounds");
+
+        assert!(
+            error
+                .to_string()
+                .contains("temporal.poll_interval_ms must be 100-86400000")
+        );
+        fs::remove_dir_all(root).expect("remove Temporal config fixture");
+    }
+
     #[tokio::test]
     async fn configured_json_tool_preserves_explicit_parallel_safety() {
         let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
@@ -3203,6 +3298,16 @@ mod tests {
             "../../config/y-harness.eval.example.json"
         ))
         .expect("JSON command Evaluation Grader example config");
+        let temporal = serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.temporal.example.json"
+        ))
+        .expect("Temporal service example config");
+        temporal
+            .temporal
+            .as_ref()
+            .expect("Temporal example enables polling")
+            .validate()
+            .expect("valid Temporal example bounds");
         let suite: EvaluationSuite =
             serde_json::from_str(include_str!("../../evals/configured-example-suite.json"))
                 .expect("configured Evaluation example suite");

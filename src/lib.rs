@@ -157,8 +157,8 @@ pub use state::{
     ThreadArchive, ThreadSummary, ThreadSummaryPage, decode_thread_archive, encode_thread_archive,
 };
 pub use temporal::{
-    TEMPORAL_DRIVER_API_VERSION, TemporalAttempt, TemporalAttemptOutcome, TemporalDriver,
-    TemporalScanProgress, TemporalTarget, TemporalTickCursor, TemporalTickReport,
+    MAX_TEMPORAL_SCAN_LIMIT, TEMPORAL_DRIVER_API_VERSION, TemporalAttempt, TemporalAttemptOutcome,
+    TemporalDriver, TemporalScanProgress, TemporalTarget, TemporalTickCursor, TemporalTickReport,
     TemporalTickRequest,
 };
 #[cfg(feature = "https-mcp")]

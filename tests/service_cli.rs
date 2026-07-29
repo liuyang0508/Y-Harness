@@ -21,9 +21,11 @@ use y_harness::{
     ProtocolCommand, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
     SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
     SignedSkillPackage, SkillPackage, SkillSignature, SkillTransparencyReceipt, SqliteEventStore,
-    StateEngine, TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskGraphId, TaskId, ThreadId,
-    TurnStatus, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommandId, WorkflowCreateRequest,
-    WorkflowDefinition, WorkflowRunId, WorkspaceMode, decode_thread_archive,
+    SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine, TASK_GRAPH_SCHEMA_VERSION,
+    TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskId, ThreadId, TurnStatus,
+    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommand, WorkflowCommandId, WorkflowCommandKind,
+    WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRunId, WorkflowStatus,
+    WorkflowTransitionKind, WorkflowWaitId, WorkspaceMode, decode_thread_archive,
 };
 #[cfg(unix)]
 use y_harness::{CapabilityOrigin, OperationStatus};
@@ -86,8 +88,180 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("skills: 0"));
     assert!(report.contains("conversation: 32 Turns / 65536 tokens / 65536 bytes"));
     assert!(report.contains("conversation compactor: disabled"));
+    assert!(report.contains("temporal: disabled"));
     assert!(report.contains("status: ok"));
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
+    let project = isolated_project("temporal-service");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(
+        initialized.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let config_path = project.join("y-harness.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).expect("read initialized Temporal config"))
+            .expect("decode initialized Temporal config");
+    config["temporal"] = serde_json::json!({
+        "poll_interval_ms": 100,
+        "scan_limit": 16
+    });
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("encode Temporal config"),
+    )
+    .expect("write Temporal config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run Temporal doctor");
+    assert!(
+        doctor.status.success(),
+        "Temporal doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .expect("UTF-8 Temporal doctor")
+            .contains("temporal: enabled (100 ms / 16 identities per source)")
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build Temporal test Runtime");
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .expect("Unix milliseconds");
+    let workflow = runtime.block_on(async {
+        let tasks = Arc::new(
+            SqliteTaskCoordinator::open(project.join(".y-harness/tasks.db"))
+                .await
+                .expect("open Task Coordinator"),
+        );
+        let graph_id = TaskGraphId::from_static("temporal-service-graph");
+        tasks
+            .create(
+                graph_id.clone(),
+                TaskGraph::new(vec![TaskDefinition {
+                    id: TaskId::from_static("work"),
+                    description: "durable Temporal service fixture".to_owned(),
+                    dependencies: Default::default(),
+                    priority: 0,
+                    workspace: WorkspaceMode::None,
+                }])
+                .expect("build Task Graph"),
+            )
+            .await
+            .expect("create Task Graph");
+        let workflows = Arc::new(
+            SqliteWorkflowCoordinator::open(project.join(".y-harness/workflows.db"))
+                .await
+                .expect("open Workflow Coordinator"),
+        );
+        let workflow = WorkflowEngine::new(workflows, tasks);
+        let run_id = WorkflowRunId::from_static("temporal-service-run");
+        workflow
+            .create(
+                run_id.clone(),
+                WorkflowCreateRequest {
+                    command_id: WorkflowCommandId::from_static("create"),
+                    definition: WorkflowDefinition {
+                        name: "test.temporal-service".to_owned(),
+                        version: Version::new(1, 0, 0),
+                        content_sha256: "a".repeat(64),
+                    },
+                    task_graph_id: graph_id,
+                },
+                now_ms,
+            )
+            .await
+            .expect("create Workflow Run");
+        workflow
+            .apply(
+                &run_id,
+                1,
+                WorkflowCommand {
+                    id: WorkflowCommandId::from_static("wait"),
+                    kind: WorkflowCommandKind::WaitUntil {
+                        wait_id: WorkflowWaitId::from_static("timer"),
+                        due_at_ms: now_ms + 250,
+                    },
+                },
+                now_ms + 1,
+            )
+            .await
+            .expect("start durable wait");
+        (workflow, run_id)
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Temporal service");
+    let input = child.stdin.take().expect("Temporal service stdin");
+    let (workflow, run_id) = workflow;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = workflow
+                    .load(&run_id)
+                    .await
+                    .expect("load Workflow Run")
+                    .expect("Workflow Run exists");
+                if matches!(run.run().status(), WorkflowStatus::Running)
+                    && matches!(
+                        run.run()
+                            .transitions()
+                            .last()
+                            .map(|transition| &transition.kind),
+                        Some(WorkflowTransitionKind::WaitDue { .. })
+                    )
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Temporal service advances due Workflow");
+    });
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle Temporal service");
+    assert!(
+        settled.status.success(),
+        "Temporal service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    assert!(
+        settled.stdout.is_empty(),
+        "idle Temporal service must preserve protocol stdout purity"
+    );
+    assert!(
+        settled.stderr.is_empty(),
+        "healthy Temporal service emitted diagnostics: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    fs::remove_dir_all(project).expect("remove Temporal service fixture");
 }
 
 #[test]

@@ -229,11 +229,16 @@ the existing revision- and fence-checked `wake_due` or `expire_claim`
 commands. Custom coordinators remain source-compatible because their additive
 due-scan methods fail closed by default; implemented pages are revalidated for
 bounds, cursor progress, ordering, tenant, revision, fence, and eligibility
-before mutation. The public pre-1.0 `HarnessError` enum adds `Temporal`, so
-exhaustive external matches require a source update.
-This API adds no background task, scheduler database, service-configuration
-field, durable schema, `Initialize` coordinate, or Protocol v28 command. See
+before mutation. `MAX_TEMPORAL_SCAN_LIMIT` exposes the same 256-record bound to
+hosts. The public pre-1.0 `HarnessError` enum adds `Temporal`, so exhaustive
+external matches require a source update.
+This API adds no Core background task, scheduler database, durable schema,
+`Initialize` coordinate, or Protocol v28 command. Reference-service config
+schema 1 now accepts an optional strict `temporal` host policy; omission
+preserves disabled behavior. See
 [ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
+Reference-host lifecycle semantics are specified by
+[ADR 0130](adr/0130-optional-reference-service-temporal-lifecycle.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from

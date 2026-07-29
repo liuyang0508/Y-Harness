@@ -697,8 +697,10 @@ Temporal Driver API 1 is an embedded host API, not a Protocol v28 command or
 capability. A host may invoke one bounded tick with trusted authority and time
 to discover due Workflow waits and expired Handoff claims, then reuse the
 existing fenced domain commands. The reference `yh serve` process does not
-start that polling lifecycle, and protocol clients cannot submit temporal
-application time or cursors.
+start that polling lifecycle by default. An operator may explicitly enable its
+host-owned loop through service config without adding a Protocol capability;
+protocol clients still cannot submit temporal application time, cadence, or
+cursors.
 
 ## Paging
 

@@ -117,8 +117,8 @@ digests, projection validation, and tenant-partitioned Memory/SQLite storage
 make uncertain retries and competing operators explicit. The reference
 service stores Handoffs independently in `human-handoffs.db`. It deliberately
 does not route a channel, pause a Turn, wake a Workflow, execute business
-actions, run a resident expiry loop, or claim that `LocalProcess`
-authenticates a human.
+actions, or claim that `LocalProcess` authenticates a human. The optional
+reference-host Temporal loop can only expire the existing claim fence.
 
 ADR 0129 adds embedded Temporal Driver API 1. An embedding host supplies one
 trusted authority and Unix time to a bounded tick. The driver scans
@@ -126,8 +126,15 @@ authoritative Workflow and Handoff rows by tenant-local identity, computes all
 command identities before mutation, and advances due fences only through the
 existing CAS commands. Cursors are disposable; losing one restarts discovery
 without losing durable time state. The driver owns no scheduler database,
-background lifecycle, Task execution, channel route, or outbox. The current
-reference service does not invoke it automatically.
+background lifecycle, Task execution, channel route, or outbox.
+
+ADR 0130 adds the host lifecycle without weakening that Core boundary.
+Reference-service config schema 1 accepts an optional strict `temporal`
+policy; omission stays disabled. When enabled, the service supplies its fixed
+Authority and wall clock, skips missed cadence ticks, retains only a
+process-local cursor, emits bounded degraded/recovered diagnostics, and stops
+maintenance before Protocol Operations and MCP clients. Protocol callers
+cannot choose time, cursor, or cadence.
 
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
@@ -157,8 +164,7 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, a
-reference-service Temporal polling lifecycle, automatic effect-safe Task
-retry, Workflow compensation planning, automatic Human Handoff channel
-routing/outbox delivery, quota, retention, canary rollout, and multi-node
-control-plane availability remain open.
+Secret-manager integration, tenant-partitioned MCP sessions, automatic
+effect-safe Task retry, Workflow compensation planning, automatic
+Human Handoff channel routing/outbox delivery, quota, retention, canary
+rollout, and multi-node control-plane availability remain open.

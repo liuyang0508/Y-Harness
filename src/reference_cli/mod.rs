@@ -2,6 +2,7 @@
 
 mod eval_smoke;
 mod service;
+mod temporal_service;
 
 use std::{error::Error, path::PathBuf, sync::Arc};
 

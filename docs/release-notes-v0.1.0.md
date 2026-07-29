@@ -104,16 +104,19 @@ queue leads to a finite authenticated-owner claim with a unique fence.
 Actor-and-content-bound command identities, revision CAS, exact expiry,
 immutable transitions, tenant-partitioned Memory/SQLite coordination, and
 projection validation survive restart. The reference service persists the
-aggregate in `human-handoffs.db`. This lifecycle does not implicitly approve a
-decision, pause a Turn, route a channel, wake a Workflow, execute business
-actions, run a resident expiry loop, or prove that `LocalProcess` is a human.
+aggregate in `human-handoffs.db`. The aggregate itself does not implicitly
+approve a decision, pause a Turn, route a channel, wake a Workflow, execute
+business actions, own a polling loop, or prove that `LocalProcess` is a human.
 Embedded Temporal Driver API 1 composes optional Workflow and Handoff Engines
 behind one bounded host-driven tick. It uses trusted host time and authority,
 tenant-local 1–256-record identity scans, disposable cursors, deterministic
 actor-and-fence command identities, and the existing CAS transitions to settle
 each attempt as applied, duplicate, fenced, or failed. It starts no background
-task, adds no scheduler database, and does not change Protocol 28, service
-configuration, or durable schemas.
+task and adds no scheduler database. Reference-service config schema 1
+additively accepts an optional `temporal` policy. Omission remains disabled;
+opt-in polling uses the fixed service Authority, skip-missed cadence, bounded
+health diagnostics, and Temporal-before-Protocol-before-MCP shutdown. It does
+not change Protocol 28 or durable schemas.
 The optional `y-harness-domain-pack` crate remains above Core and outside
 Protocol v28. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent

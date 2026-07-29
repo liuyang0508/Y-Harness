@@ -105,6 +105,9 @@ This slice does not:
 Those capabilities may compose around the deterministic tick, but they do not
 enter the semantic Core implicitly.
 
+ADR 0130 subsequently adds an explicitly configured lifecycle to the
+reference host while preserving this Core decision.
+
 ## Rejected alternatives
 
 - Spawn a Core-owned interval: hidden lifetime and shutdown policy violate the

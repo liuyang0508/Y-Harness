@@ -786,9 +786,10 @@ revision-CAS commands, exact command-content idempotency, fenced signal/timer
 waits, explicit retry waits, safe-boundary definition migration, and bounded
 immutable transition evidence. Memory and SQLite coordinators have equivalent
 contracts, and successful Run completion requires every linked Task to be
-durably complete. The reference service persists Runs in `workflows.db`.
-Background timer polling, automatic effect-safe retry, compensation planning,
-and automatic Human Handoff routing remain separate future services. See
+durably complete. The reference service persists Runs in `workflows.db`; its
+explicitly enabled Temporal lifecycle can wake due waits without executing the
+next business step. Automatic effect-safe retry, compensation planning, and
+automatic Human Handoff routing remain separate future services. See
 [ADR 0127](docs/adr/0127-durable-fenced-workflow-runs.md).
 
 Human ownership transfer is a separate durable aggregate rather than an
@@ -800,8 +801,8 @@ revision-CAS commands bound to the trusted actor and complete typed payload.
 Memory and SQLite implementations share the same queue/cursor contract; the
 reference service persists them in `human-handoffs.db`. Creating a Handoff
 does not pause a Turn, route an IM conversation, wake a Workflow, authorize a
-business action, prove that `LocalProcess` is a person, or provide a background
-expiry worker. See
+business action, or prove that `LocalProcess` is a person. An expired claim can
+be returned to the queue by the same optional Temporal host lifecycle. See
 [ADR 0128](docs/adr/0128-durable-lease-fenced-human-handoff.md).
 
 Temporal Driver API 1 optionally composes those two time-owned aggregates.
@@ -810,9 +811,26 @@ Human Handoffs, then advances exact due wait/claim fences through the existing
 CAS commands. Coordinator pages are revalidated before mutation. Its identity
 cursor is disposable: losing it repeats a bounded part of the sweep but cannot
 lose a durable timer or expiration. Core starts no interval task and owns no
-second scheduler database; the hosting product still owns wall-clock source,
-polling interval, shutdown, and failure observation. See
-[ADR 0129](docs/adr/0129-host-driven-bounded-temporal-driver.md) and the
+second scheduler database. The embedding product still owns wall-clock source,
+polling interval, shutdown, and failure observation. The reference `yh serve`
+host takes that responsibility only when the strict `temporal` object is
+present:
+
+```json
+{
+  "temporal": {
+    "poll_interval_ms": 1000,
+    "scan_limit": 64
+  }
+}
+```
+
+Omission keeps polling disabled. Enabled service polling uses the same fixed
+Authority as Protocol commands, skips missed cadence ticks, emits only bounded
+health transitions to stderr, and stops before Protocol/MCP shutdown. It does
+not execute Tasks, route Handoffs, or add a Protocol command. See
+[ADR 0129](docs/adr/0129-host-driven-bounded-temporal-driver.md),
+[ADR 0130](docs/adr/0130-optional-reference-service-temporal-lifecycle.md), and the
 [`temporal_driver`](examples/temporal_driver.rs) public-API example:
 
 ```bash

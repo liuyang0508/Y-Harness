@@ -18,8 +18,9 @@ use crate::{
 
 /// Exact embedded Temporal Driver API coordinate.
 pub const TEMPORAL_DRIVER_API_VERSION: u32 = 1;
+/// Maximum authoritative identities visited per configured source and tick.
+pub const MAX_TEMPORAL_SCAN_LIMIT: usize = 256;
 
-const MAX_TEMPORAL_SCAN_LIMIT: usize = 256;
 const MAX_TEMPORAL_IDENTITY_BYTES: usize = 256;
 
 /// Disposable scan position supplied to a later bounded tick.

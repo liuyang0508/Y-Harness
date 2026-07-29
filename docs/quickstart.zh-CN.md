@@ -119,9 +119,25 @@ printf '%s\n' \
 五个 SQLite 权威库均使用 WAL、`synchronous=FULL` 和精确 schema
 校验。服务重启后 Thread、Task Graph、Workflow Run 与 Human Handoff
 均可恢复。Human Handoff 只记录人工所有权生命周期；它不会隐式暂停
-Turn、路由 IM、唤醒 Workflow 或执行业务操作。库级 Temporal Driver
-可以由嵌入宿主显式调用来推进到期 Workflow 等待和过期 Claim，但当前
-`yh serve` 不会自行启动后台轮询。
+Turn、路由 IM、唤醒对话或执行业务操作。库级 Temporal Driver 可以由
+嵌入宿主显式调用来推进到期 Workflow 等待和过期 Claim。Reference
+Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式加入：
+
+```json
+{
+  "temporal": {
+    "poll_interval_ms": 1000,
+    "scan_limit": 64
+  }
+}
+```
+
+`poll_interval_ms` 允许 100–86,400,000，`scan_limit` 允许 1–256，
+且是“每个事实源、每个 tick”的上限。启用后服务使用与 Protocol 相同
+的固定 Authority，漏掉的节拍不会补跑；关闭 stdin 时先停止轮询，再
+清理 Protocol Operation 和 MCP。它只推进已有 CAS 状态，不会自动
+执行 Task、Tool、补偿或消息路由。可直接复制
+`config/y-harness.temporal.example.json` 并用 `yh doctor` 检查。
 
 从旧版 Task Graph schema 1 升级时，先停止所有服务并执行：
 

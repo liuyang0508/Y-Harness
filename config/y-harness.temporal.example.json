@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo"
+  },
+  "temporal": {
+    "poll_interval_ms": 1000,
+    "scan_limit": 64
+  }
+}
