@@ -38,9 +38,10 @@ reason to duplicate Runtime or State.
 | optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, schema-14 Runtime-bound Connector evidence, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
-| durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits and safe-boundary definition migration | background timer service, automatic Task retry, durable compensation plan, or Human Handoff |
-| durable Approval Inbox | ownership transfer or Human Handoff |
-| digest-bound Thread handoff input | Human Handoff |
+| durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits and safe-boundary definition migration | background timer service, automatic Task retry, or durable compensation plan |
+| schema-1 Human Handoff with same-tenant subject validation, priority queue, actor-bound commands, finite lease, unique claim fence, and Memory/SQLite CAS | automatic channel routing, Turn suspension, Workflow wakeup, background lease expiry, outbox delivery, or proof that a local-process actor is a person |
+| durable Approval Inbox | ownership transfer; approval authorizes a decision but does not claim conversational work |
+| digest-bound Thread handoff input | human ownership; the format prepares bounded summarizer input only |
 | reproducible Evaluation runner and digest-bound Pack evaluation evidence | domain-specific suites, canary evidence, or automatic promotion policy |
 | SQLite recovery and multi-process CAS | multi-node high availability |
 
@@ -64,6 +65,8 @@ reason to duplicate Runtime or State.
    - Add durable signals, timers, waits, retries, compensation, and migration
      above the existing Task execution layer.
    - Model approval and ownership transfer as different state machines.
+   - Keep channel routing, artificial work suspension, and business actions
+     behind explicit host adapters rather than implicit Handoff side effects.
 5. **Evaluation and promotion**
    - Gate Pack releases with Core conformance, domain scenarios, fault and
      recovery tests, tenant-isolation tests, approval, canary, and rollback.
@@ -105,6 +108,18 @@ digests; allows same-name monotonic definition migration only at a durable
 wait; and exposes the tenant-fenced lifecycle through Protocol v27. The
 reference service stores Runs independently in `workflows.db`.
 
+ADR 0128 adds a separate Human Handoff aggregate and Protocol v28 surface.
+Creation verifies an existing same-tenant Thread or Workflow Run; queue reads
+are bounded and stable; claims are owned by the trusted actor, expire at an
+exclusive server-time boundary, and use a never-reused claim identity.
+Revision CAS, actor-and-content-bound command identities, immutable transition
+digests, projection validation, and tenant-partitioned Memory/SQLite storage
+make uncertain retries and competing operators explicit. The reference
+service stores Handoffs independently in `human-handoffs.db`. It deliberately
+does not route a channel, pause a Turn, wake a Workflow, execute business
+actions, scan expired leases, or claim that `LocalProcess` authenticates a
+human.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -122,7 +137,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v27 client
+Domain Pack lifecycle remains deliberately outside Core and the v28 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid
@@ -135,5 +150,5 @@ tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
 Secret-manager integration, tenant-partitioned MCP sessions, background timer
 polling, automatic effect-safe Task retry, Workflow compensation planning,
-Human Handoff, quota, retention, canary rollout, and multi-node control-plane
-availability remain open.
+automatic Human Handoff routing/expiry/outbox delivery, quota, retention,
+canary rollout, and multi-node control-plane availability remain open.

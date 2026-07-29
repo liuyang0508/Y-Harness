@@ -1,10 +1,10 @@
-# Client protocol v27
+# Client protocol v28
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"27"` is exact. Every request carries that value, and a peer
+Protocol version `"28"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "27",
+  "protocol_version": "28",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "27",
+  "protocol_version": "28",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "27",
+  "protocol_version": "28",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "27",
+  "protocol_version": "28",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "27",
+  "protocol_version": "28",
   "body": {
     "status": "success",
     "result": {
@@ -139,6 +139,7 @@ The result type is `initialized`:
         "approval_inbox_schema": 3,
         "task_graph_schema": 3,
         "workflow_run_schema": 1,
+        "human_handoff_schema": 1,
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
@@ -156,13 +157,16 @@ The result type is `initialized`:
 principal. Approval permissions appear only when a durable Approval Inbox is
 configured; Task permissions appear only when a durable Task Coordinator is
 configured; Workflow permissions appear only when a Workflow Engine is
-configured over that Task Coordinator and a durable Workflow Coordinator. A
+configured over that Task Coordinator and a durable Workflow Coordinator;
+Human Handoff permissions appear only when a Human Handoff Engine is
+configured with durable coordination and authoritative subject resolution. A
 client must not infer a permission from a compatibility coordinate.
 
 For a tenant-scoped authority, Approval and Task permissions are available
 when their durable stores are configured. Approval list/get/settlement and
-the complete Task Graph/worker and Workflow lifecycle are fenced by the exact
-transport-resolved tenant; commands contain no tenant selector.
+the complete Task Graph/worker, Workflow, and Human Handoff lifecycle are
+fenced by the exact transport-resolved tenant; commands contain no tenant
+selector.
 
 Secret Provider API 2 receives that same trusted authority inside the Engine.
 Legacy Secret Providers remain usable for unscoped operations and fail closed
@@ -213,6 +217,11 @@ than `before_sequence`.
 | `get_workflow_run` | `run_id` | `workflow.run.get` | `workflow_run` |
 | `get_workflow_transitions` | `run_id`, optional `after_sequence`, optional `limit` | `workflow.run.get` | `workflow_transitions` |
 | `apply_workflow_command` | `run_id`, `expected_revision`, `command` | command-specific Workflow permission | `workflow_command_applied` |
+| `create_human_handoff` | `handoff_id`, `request` | `human_handoff.create` | `human_handoff_created` |
+| `get_human_handoff` | `handoff_id` | `human_handoff.get` | `human_handoff` |
+| `list_queued_human_handoffs` | `queue`, optional `after`, optional `limit` | `human_handoff.queue.list` | `human_handoff_queue` |
+| `get_human_handoff_transitions` | `handoff_id`, optional `after_sequence`, optional `limit` | `human_handoff.get` | `human_handoff_transitions` |
+| `apply_human_handoff_command` | `handoff_id`, `expected_revision`, `command` | command-specific Human Handoff permission | `human_handoff_command_applied` |
 
 `memory_scope` has this shape and defaults to an empty scope:
 
@@ -614,6 +623,76 @@ an exclusive cursor. Signal records contain routing identity only—there is no
 arbitrary business payload. A woken Run retrieves authoritative business
 facts through governed Connectors.
 
+## Human Handoff lifecycle
+
+Human Handoff is an optional ownership state machine, distinct from Approval,
+Workflow, and Thread-handoff Context. It appears only when the host composes a
+durable Human Handoff Coordinator with an authoritative subject resolver.
+
+`create_human_handoff` uses a caller-chosen `handoff_id` and this request:
+
+```json
+{
+  "command_id": "escalate-order-42",
+  "subject": {
+    "kind": "workflow_run",
+    "run_id": "order-workflow-42"
+  },
+  "queue": "support.primary",
+  "reason_code": "agent.escalation",
+  "priority": 7
+}
+```
+
+A subject is either one exact same-tenant `thread` or `workflow_run`. The host
+must resolve it through authoritative State before creation. Queue and reason
+codes use capability-name syntax; priority is 0–255. Creation identity and
+content are bound to the trusted creating actor, so another actor cannot
+silently adopt the retry key.
+
+Cases are `queued`, `claimed`, `resolved`, or `cancelled`.
+`apply_human_handoff_command` requires the positive revision observed by the
+caller plus one stable command `id`. Supported actions are:
+
+- `claim`: a new `claim_id` and a 1,000–604,800,000 millisecond lease;
+- `renew_claim`: the exact current `claim_id` and a duration that extends the
+  current exclusive expiration;
+- `release_claim`: the exact current `claim_id` and content-free
+  `reason_code`;
+- `expire_claim`: the exact claim after its server-clock expiration;
+- `resolve`: the exact current claim, content-free `outcome_code`, and bounded
+  summary;
+- `cancel`: a content-free `reason_code` for any nonterminal case.
+
+The trusted transport actor becomes claim owner; actor and application time
+are never request fields. Renew, release, and resolve require that same actor,
+exact claim fence, and an unexpired lease. At the exact expiration boundary,
+expiration wins. Release or expiration returns the case to its existing queue,
+where a later claim must use a new fence.
+
+Create, get, queue list, claim/release, renewal, expired-claim management,
+resolution, and cancellation use the exact permissions
+`human_handoff.create`, `human_handoff.get`,
+`human_handoff.queue.list`, `human_handoff.claim`,
+`human_handoff.claim.renew`, `human_handoff.queue.manage`,
+`human_handoff.resolve`, and `human_handoff.cancel`.
+
+Command SHA-256 binds actor plus complete typed content. Exact replay is
+idempotent before revision comparison; actor/content collision fails closed.
+A new command with a stale revision returns retryable
+`human_handoff_conflict`.
+
+`list_queued_human_handoffs` returns only queued cases in priority-descending,
+request-time-ascending, identity-ascending order. Its exclusive cursor carries
+all three coordinates. `get_human_handoff_transitions` exposes bounded
+immutable ownership evidence.
+
+Creating or claiming a case does not automatically pause a Turn, reroute a
+Channel, mutate Workflow, or authorize a business action. Products compose
+those effects explicitly through Workflow waits, Policy, Channel gateways, and
+Connectors. `LocalProcess` is trusted process attribution, not proof of an
+individual human.
+
 ## Paging
 
 `get_operation_events` returns:
@@ -660,6 +739,10 @@ the domain page is capped at 2,097,152 encoded bytes.
 The default/max Workflow transition page is 16/64 and is capped at 4,194,304
 encoded bytes. Its sequence cursor is local to one durable Run.
 
+The default/max Human Handoff queue and transition page is 16/64; each is
+capped at 4,194,304 encoded bytes. The queue cursor is stable across claimed
+or resolved removals because it contains priority, request time, and identity.
+
 ## Domain payloads
 
 The protocol serializes the same public domain records used by an embedded
@@ -687,6 +770,11 @@ host:
   revision, tenant, transition count, and materialization charge;
 - a Workflow transition carries sequence, command identity and digest,
   trusted actor, server application time, and one typed lifecycle event.
+- a Human Handoff summary carries subject, queue, reason, priority, request
+  time, tenant, revision, lifecycle, transition count, and materialization
+  charge;
+- a Human Handoff transition carries sequence, actor-bound command identity
+  and digest, trusted actor, server application time, and one ownership event.
 
 State event schema 4 binds every `policy_decision` to the exact trust-bearing
 origin of the registered Tool evaluated by Policy:
@@ -956,13 +1044,14 @@ The exact current definitions are the serialized public contracts in
 [`state/mod.rs`](../src/state/mod.rs), and
 [`approval/mod.rs`](../src/approval/mod.rs), and
 [`orchestration/mod.rs`](../src/orchestration/mod.rs), and
-[`workflow/mod.rs`](../src/workflow/mod.rs). A change that alters a domain
+[`workflow/mod.rs`](../src/workflow/mod.rs), and
+[`human_handoff/mod.rs`](../src/human_handoff/mod.rs). A change that alters a domain
 record observable through this protocol requires the compatibility action
 defined in [`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v27 value |
+| Boundary | Protocol v28 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -983,6 +1072,10 @@ defined in [`compatibility.md`](compatibility.md).
 | Workflow Run | 4,096 transitions and 16,777,216 encoded bytes |
 | Workflow command | 131,072 encoded bytes |
 | Workflow-transition page | 16 default; 64 maximum and 4,194,304 encoded bytes |
+| Human Handoff | 4,096 transitions and 16,777,216 encoded bytes |
+| Human Handoff command | 131,072 actor-bound encoded bytes |
+| Human Handoff claim | 1,000–604,800,000 milliseconds; exclusive server-clock expiration |
+| Human Handoff queue/transition page | 16 default; 64 maximum and 4,194,304 encoded bytes |
 | Client-safe error | 4,096 Unicode scalar values plus optional ellipsis |
 | Host shutdown drain | 30 seconds default; 1 hour configurable maximum |
 
@@ -998,7 +1091,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"27"` |
+| `unsupported_version` | Request protocol is not exactly `"28"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -1006,6 +1099,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `state_conflict` | Authoritative State compare-and-swap lost |
 | `orchestration_conflict` | Task Coordinator revision/fencing conflict |
 | `workflow_conflict` | Workflow Run revision conflict |
+| `human_handoff_conflict` | Human Handoff revision conflict |
 | `approval_conflict` | Approval revision or settlement conflict |
 | `runtime_error` | Other bounded provider or Runtime failure |
 
@@ -1020,6 +1114,7 @@ Tool-effect status is uncertain.
 The protocol module contains wire-shape regression tests for both envelopes,
 schema-14 Connector evidence, schema-13 execution-binding evidence,
 schema-1 Workflow lifecycle and command-digest evidence,
+schema-1 Human Handoff ownership, claim fencing, actor-bound command evidence,
 schema-12 Thread-tenant evidence,
 schema-11 invocation-context evidence,
 schema-10 Thread-import evidence,
@@ -1036,6 +1131,14 @@ prove append-only Task-attempt binding, retry anti-downgrade, pre-executor
 binding, exact-tenant persistence, schema-1/schema-2 migration restart,
 evidence-smuggling rejection, reopen behavior, and tenant-projection drift
 rejection.
+
+Human Handoff domain, Coordinator, Protocol, and service tests prove
+owner/claim fencing, exact expiration precedence, renew/release/requeue/resolve
+transitions, actor/content idempotency collision, projection/digest tamper
+rejection, priority/cursor queue order, exact-tenant isolation,
+cross-connection claim CAS, partial-store rejection, conditional capabilities,
+command-specific permissions, restart recovery, and retryable stale-revision
+mapping.
 Process tests additionally prove stdout purity, one response per request,
 and asynchronous Turn control. The independent `y-harness-tui` package has
 TestBackend rendering tests and a real-PTY smoke gate against `yh serve-demo`;

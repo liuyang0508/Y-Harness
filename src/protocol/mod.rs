@@ -1,5 +1,6 @@
 //! Versioned runtime commands, asynchronous operations, and bounded JSONL stdio.
 
+mod human_handoff;
 mod task;
 mod workflow;
 
@@ -25,7 +26,9 @@ use crate::isolation::isolate_future;
 use crate::{
     APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalDecision, ApprovalId, ApprovalInbox,
     ApprovalRecord, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-    HarnessError, HarnessRuntime, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope,
+    HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessRuntime, HumanHandoffApplyOutcome,
+    HumanHandoffCommand, HumanHandoffCommandKind, HumanHandoffCreateRequest, HumanHandoffCursor,
+    HumanHandoffEngine, HumanHandoffId, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope,
     ModelEventSink, ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
     StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
@@ -35,13 +38,15 @@ use crate::{
     WorkflowCommand, WorkflowCommandKind, WorkflowCreateRequest, WorkflowEngine, WorkflowRunId,
 };
 
+use human_handoff::HumanHandoffProtocolService;
+pub use human_handoff::{HumanHandoffQueuePage, HumanHandoffSummary, HumanHandoffTransitionPage};
 pub use task::{TaskGraphSummary, TaskRecordPage};
 use task::{TaskProtocolService, TaskWorkerAccess};
 use workflow::WorkflowProtocolService;
 pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "27";
+pub const PROTOCOL_VERSION: &str = "28";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -65,12 +70,13 @@ const DEFAULT_TASK_RECORD_PAGE: usize = 16;
 const DEFAULT_TASK_CLAIM_MAXIMUM: usize = 1;
 const DEFAULT_TASK_MESSAGE_PAGE: usize = 32;
 const DEFAULT_WORKFLOW_TRANSITION_PAGE: usize = 16;
+const DEFAULT_HANDOFF_PAGE: usize = 16;
 const MAX_PROTOCOL_PRINCIPALS: usize = 4_096;
 const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 32] = [
+const PROTOCOL_PERMISSIONS: [&str; 40] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -103,6 +109,14 @@ const PROTOCOL_PERMISSIONS: [&str; 32] = [
     "workflow.run.mutate",
     "workflow.signal.deliver",
     "workflow.timer.wake",
+    "human_handoff.create",
+    "human_handoff.get",
+    "human_handoff.queue.list",
+    "human_handoff.claim",
+    "human_handoff.claim.renew",
+    "human_handoff.queue.manage",
+    "human_handoff.resolve",
+    "human_handoff.cancel",
 ];
 
 /// One correlated protocol request.
@@ -372,6 +386,45 @@ pub enum ProtocolCommand {
         /// Retry-stable typed command.
         command: WorkflowCommand,
     },
+    /// Creates one durable Human Handoff for an existing Engine subject.
+    CreateHumanHandoff {
+        /// Stable case identity and retry key.
+        handoff_id: String,
+        /// Exact subject, queue, and creation command.
+        request: HumanHandoffCreateRequest,
+    },
+    /// Reads one bounded current Human Handoff projection.
+    GetHumanHandoff {
+        /// Stable case identity.
+        handoff_id: String,
+    },
+    /// Lists queued Human Handoffs in stable scheduling order.
+    ListQueuedHumanHandoffs {
+        /// Exact operator queue.
+        queue: String,
+        /// Optional exclusive stable cursor.
+        after: Option<HumanHandoffCursor>,
+        /// Maximum number of cases to return.
+        limit: Option<usize>,
+    },
+    /// Reads a bounded immutable Human Handoff transition page.
+    GetHumanHandoffTransitions {
+        /// Stable case identity.
+        handoff_id: String,
+        /// Returns transitions strictly after this sequence.
+        after_sequence: Option<u64>,
+        /// Maximum number of transitions to return.
+        limit: Option<usize>,
+    },
+    /// Applies one actor-bound ownership lifecycle command.
+    ApplyHumanHandoffCommand {
+        /// Stable case identity.
+        handoff_id: String,
+        /// Exact revision observed before a new mutation.
+        expected_revision: u64,
+        /// Retry-stable typed command.
+        command: HumanHandoffCommand,
+    },
 }
 
 impl ProtocolCommand {
@@ -410,6 +463,19 @@ impl ProtocolCommand {
                 WorkflowCommandKind::DeliverSignal { .. } => "workflow.signal.deliver",
                 WorkflowCommandKind::WakeDue { .. } => "workflow.timer.wake",
                 _ => "workflow.run.mutate",
+            },
+            Self::CreateHumanHandoff { .. } => "human_handoff.create",
+            Self::GetHumanHandoff { .. } | Self::GetHumanHandoffTransitions { .. } => {
+                "human_handoff.get"
+            }
+            Self::ListQueuedHumanHandoffs { .. } => "human_handoff.queue.list",
+            Self::ApplyHumanHandoffCommand { command, .. } => match &command.kind {
+                HumanHandoffCommandKind::Claim { .. }
+                | HumanHandoffCommandKind::ReleaseClaim { .. } => "human_handoff.claim",
+                HumanHandoffCommandKind::RenewClaim { .. } => "human_handoff.claim.renew",
+                HumanHandoffCommandKind::ExpireClaim { .. } => "human_handoff.queue.manage",
+                HumanHandoffCommandKind::Resolve { .. } => "human_handoff.resolve",
+                HumanHandoffCommandKind::Cancel { .. } => "human_handoff.cancel",
             },
         }
     }
@@ -823,6 +889,33 @@ pub enum ProtocolResult {
         /// Whether this request changed the durable revision.
         outcome: WorkflowApplyOutcome,
     },
+    /// Newly created or idempotently recognized Human Handoff.
+    HumanHandoffCreated {
+        /// Bounded current case projection.
+        handoff: HumanHandoffSummary,
+    },
+    /// Loaded Human Handoff projection or explicit absence.
+    HumanHandoff {
+        /// Bounded current case projection when found.
+        handoff: Option<HumanHandoffSummary>,
+    },
+    /// Bounded queued Human Handoff page.
+    HumanHandoffQueue {
+        /// Stable scheduling page and continuation cursor.
+        page: HumanHandoffQueuePage,
+    },
+    /// Bounded immutable Human Handoff transition page.
+    HumanHandoffTransitions {
+        /// Sequence-ordered transitions and continuation cursor.
+        page: HumanHandoffTransitionPage,
+    },
+    /// Successful new or duplicate Human Handoff command settlement.
+    HumanHandoffCommandApplied {
+        /// Current bounded case projection.
+        handoff: HumanHandoffSummary,
+        /// Whether this request changed the durable revision.
+        outcome: HumanHandoffApplyOutcome,
+    },
 }
 
 /// Pollable asynchronous Turn state.
@@ -895,6 +988,8 @@ pub struct CompatibilityManifest {
     pub task_graph_schema: u32,
     /// Durable Workflow Run schema accepted and written.
     pub workflow_run_schema: u32,
+    /// Durable Human Handoff schema accepted and written.
+    pub human_handoff_schema: u32,
     /// Exact Memory Provider API version.
     pub memory_api: u32,
     /// Exact provider-specific Token Counter API version.
@@ -1029,6 +1124,7 @@ pub struct ProtocolHandler {
     approvals: Option<Arc<dyn ApprovalInbox>>,
     tasks: Option<TaskProtocolService>,
     workflows: Option<WorkflowProtocolService>,
+    human_handoffs: Option<HumanHandoffProtocolService>,
     authorizer: Arc<dyn ProtocolAuthorizer>,
     operations: Arc<Mutex<BTreeMap<OperationId, ManagedOperation>>>,
     lifecycle: Arc<OperationLifecycle>,
@@ -1044,6 +1140,7 @@ impl ProtocolHandler {
             approvals: None,
             tasks: None,
             workflows: None,
+            human_handoffs: None,
             authorizer: Arc::new(LocalProcessAuthorizer),
             operations: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle: Arc::new(OperationLifecycle::new()),
@@ -1069,6 +1166,13 @@ impl ProtocolHandler {
     #[must_use]
     pub fn with_workflow_engine(mut self, engine: WorkflowEngine) -> Self {
         self.workflows = Some(WorkflowProtocolService::new(engine));
+        self
+    }
+
+    /// Exposes durable Human Handoff queue and ownership coordination.
+    #[must_use]
+    pub fn with_human_handoff_engine(mut self, engine: HumanHandoffEngine) -> Self {
+        self.human_handoffs = Some(HumanHandoffProtocolService::new(engine));
         self
     }
 
@@ -1257,6 +1361,18 @@ impl ProtocolHandler {
                         "workflow.timer.wake".to_owned(),
                     ]);
                 }
+                if self.human_handoffs.is_some() {
+                    capabilities.extend([
+                        "human_handoff.cancel".to_owned(),
+                        "human_handoff.claim".to_owned(),
+                        "human_handoff.claim.renew".to_owned(),
+                        "human_handoff.create".to_owned(),
+                        "human_handoff.get".to_owned(),
+                        "human_handoff.queue.list".to_owned(),
+                        "human_handoff.queue.manage".to_owned(),
+                        "human_handoff.resolve".to_owned(),
+                    ]);
+                }
                 capabilities.sort();
                 capabilities.retain(|permission| self.is_allowed(principal, permission));
                 Ok(ProtocolResult::Initialized {
@@ -1269,6 +1385,7 @@ impl ProtocolHandler {
                         approval_inbox_schema: APPROVAL_INBOX_SCHEMA_VERSION,
                         task_graph_schema: TASK_GRAPH_SCHEMA_VERSION,
                         workflow_run_schema: WORKFLOW_RUN_SCHEMA_VERSION,
+                        human_handoff_schema: HUMAN_HANDOFF_SCHEMA_VERSION,
                         memory_api: MEMORY_API_VERSION,
                         token_counter_api: TOKEN_COUNTER_API_VERSION,
                         conversation_compactor_api: CONVERSATION_COMPACTOR_API_VERSION,
@@ -1988,6 +2105,75 @@ impl ProtocolHandler {
                     .await?;
                 Ok(ProtocolResult::WorkflowCommandApplied { run, outcome })
             }
+            ProtocolCommand::CreateHumanHandoff {
+                handoff_id,
+                request,
+            } => {
+                validate_opaque_id("handoff_id", &handoff_id)?;
+                let handoff = self
+                    .human_handoff_service()?
+                    .create(HumanHandoffId::from_string(handoff_id), request, authority)
+                    .await?;
+                Ok(ProtocolResult::HumanHandoffCreated { handoff })
+            }
+            ProtocolCommand::GetHumanHandoff { handoff_id } => {
+                validate_opaque_id("handoff_id", &handoff_id)?;
+                let handoff = self
+                    .human_handoff_service()?
+                    .summary(&HumanHandoffId::from_string(handoff_id), authority)
+                    .await?;
+                Ok(ProtocolResult::HumanHandoff { handoff })
+            }
+            ProtocolCommand::ListQueuedHumanHandoffs {
+                queue,
+                after,
+                limit,
+            } => {
+                let page = self
+                    .human_handoff_service()?
+                    .list_queued(
+                        &queue,
+                        after.as_ref(),
+                        limit.unwrap_or(DEFAULT_HANDOFF_PAGE),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::HumanHandoffQueue { page })
+            }
+            ProtocolCommand::GetHumanHandoffTransitions {
+                handoff_id,
+                after_sequence,
+                limit,
+            } => {
+                validate_opaque_id("handoff_id", &handoff_id)?;
+                let page = self
+                    .human_handoff_service()?
+                    .transitions(
+                        &HumanHandoffId::from_string(handoff_id),
+                        after_sequence.unwrap_or(0),
+                        limit.unwrap_or(DEFAULT_HANDOFF_PAGE),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::HumanHandoffTransitions { page })
+            }
+            ProtocolCommand::ApplyHumanHandoffCommand {
+                handoff_id,
+                expected_revision,
+                command,
+            } => {
+                validate_opaque_id("handoff_id", &handoff_id)?;
+                let (handoff, outcome) = self
+                    .human_handoff_service()?
+                    .apply(
+                        &HumanHandoffId::from_string(handoff_id),
+                        expected_revision,
+                        command,
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::HumanHandoffCommandApplied { handoff, outcome })
+            }
         }
     }
 
@@ -2017,6 +2203,12 @@ impl ProtocolHandler {
     fn workflow_service(&self) -> Result<&WorkflowProtocolService, HarnessError> {
         self.workflows.as_ref().ok_or_else(|| {
             HarnessError::Protocol("durable Workflow Engine is not configured".to_owned())
+        })
+    }
+
+    fn human_handoff_service(&self) -> Result<&HumanHandoffProtocolService, HarnessError> {
+        self.human_handoffs.as_ref().ok_or_else(|| {
+            HarnessError::Protocol("durable Human Handoff Engine is not configured".to_owned())
         })
     }
 
@@ -2428,6 +2620,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
             | HarnessError::StateConflict { .. }
             | HarnessError::OrchestrationConflict { .. }
             | HarnessError::WorkflowConflict { .. }
+            | HarnessError::HumanHandoffConflict { .. }
             | HarnessError::ApprovalConflict { .. }
             | HarnessError::Mcp(_)
     );
@@ -2437,6 +2630,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
             HarnessError::StateConflict { .. } => "state_conflict",
             HarnessError::OrchestrationConflict { .. } => "orchestration_conflict",
             HarnessError::WorkflowConflict { .. } => "workflow_conflict",
+            HarnessError::HumanHandoffConflict { .. } => "human_handoff_conflict",
             HarnessError::ApprovalConflict { .. } => "approval_conflict",
             HarnessError::ProtocolDenied { .. } => "forbidden",
             HarnessError::Protocol(_) => "invalid_request",
@@ -2493,17 +2687,20 @@ mod tests {
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
         ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin,
         ConnectorEvidence, ConnectorEvidenceClaim, EventStore, ExecutionBinding, HarnessError,
-        HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
-        MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
-        MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
-        ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
-        PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
-        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
-        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
-        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome, WorkflowCommand,
-        WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest, WorkflowDefinition,
-        WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
+        HarnessFuture, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffClaimId,
+        HumanHandoffCommand, HumanHandoffCommandId, HumanHandoffCommandKind,
+        HumanHandoffCreateRequest, HumanHandoffEngine, HumanHandoffSubject,
+        HumanHandoffSubjectResolver, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
+        MemoryApprovalInbox, MemoryEventStore, MemoryHumanHandoffCoordinator, MemoryScope,
+        MemoryTaskCoordinator, MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink,
+        ModelOutput, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, OperationId,
+        PendingEvent, PolicyDecision, PolicyEngine, RiskLevel, SnapshotMaintenanceConfig,
+        StateCapacityLevel, StateEngine, StateEvent, StateSnapshot, StoredEvent, TaskCompletion,
+        TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread,
+        ThreadId, Tool, ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext,
+        ToolDescriptor, ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome,
+        WorkflowCommand, WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest,
+        WorkflowDefinition, WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2519,6 +2716,18 @@ mod tests {
                     content: "done".to_owned(),
                 })
             })
+        }
+    }
+
+    struct ExistingHumanHandoffSubject;
+
+    impl HumanHandoffSubjectResolver for ExistingHumanHandoffSubject {
+        fn exists<'a>(
+            &'a self,
+            _subject: &'a HumanHandoffSubject,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, bool> {
+            Box::pin(async { Ok(true) })
         }
     }
 
@@ -2879,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_seven_wire_envelopes_workflow_and_permissions_are_stable() {
+    fn protocol_twenty_eight_wire_envelopes_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2887,14 +3096,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "27",
+                "protocol_version": "28",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "27",
+                "protocol_version": "28",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2903,7 +3112,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "27",
+                "protocol_version": "28",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2925,7 +3134,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "27",
+                "protocol_version": "28",
                 "body": {
                     "status": "success",
                     "result": {
@@ -3035,7 +3244,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "27",
+                "protocol_version": "28",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",
@@ -3595,6 +3804,136 @@ mod tests {
                 },
                 "apply_workflow_command",
                 "workflow.run.mutate",
+            ),
+            (
+                ProtocolCommand::CreateHumanHandoff {
+                    handoff_id: "handoff".to_owned(),
+                    request: HumanHandoffCreateRequest {
+                        command_id: HumanHandoffCommandId::from_static("create-handoff"),
+                        subject: HumanHandoffSubject::Thread {
+                            thread_id: ThreadId::from_static("thread-fixture"),
+                        },
+                        queue: "support.primary".to_owned(),
+                        reason_code: "agent.escalation".to_owned(),
+                        priority: 7,
+                    },
+                },
+                "create_human_handoff",
+                "human_handoff.create",
+            ),
+            (
+                ProtocolCommand::GetHumanHandoff {
+                    handoff_id: "handoff".to_owned(),
+                },
+                "get_human_handoff",
+                "human_handoff.get",
+            ),
+            (
+                ProtocolCommand::ListQueuedHumanHandoffs {
+                    queue: "support.primary".to_owned(),
+                    after: None,
+                    limit: Some(8),
+                },
+                "list_queued_human_handoffs",
+                "human_handoff.queue.list",
+            ),
+            (
+                ProtocolCommand::GetHumanHandoffTransitions {
+                    handoff_id: "handoff".to_owned(),
+                    after_sequence: Some(1),
+                    limit: Some(8),
+                },
+                "get_human_handoff_transitions",
+                "human_handoff.get",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 1,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("claim-handoff"),
+                        kind: HumanHandoffCommandKind::Claim {
+                            claim_id: HumanHandoffClaimId::from_static("claim"),
+                            lease_duration_ms: 1_000,
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.claim",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 2,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("renew-handoff"),
+                        kind: HumanHandoffCommandKind::RenewClaim {
+                            claim_id: HumanHandoffClaimId::from_static("claim"),
+                            lease_duration_ms: 2_000,
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.claim.renew",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 2,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("release-handoff"),
+                        kind: HumanHandoffCommandKind::ReleaseClaim {
+                            claim_id: HumanHandoffClaimId::from_static("claim"),
+                            reason_code: "operator.unavailable".to_owned(),
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.claim",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 2,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("expire-handoff"),
+                        kind: HumanHandoffCommandKind::ExpireClaim {
+                            claim_id: HumanHandoffClaimId::from_static("claim"),
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.queue.manage",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 2,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("resolve-handoff"),
+                        kind: HumanHandoffCommandKind::Resolve {
+                            claim_id: HumanHandoffClaimId::from_static("claim"),
+                            outcome_code: "handled".to_owned(),
+                            summary: "done".to_owned(),
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.resolve",
+            ),
+            (
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 1,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("cancel-handoff"),
+                        kind: HumanHandoffCommandKind::Cancel {
+                            reason_code: "request.withdrawn".to_owned(),
+                        },
+                    },
+                },
+                "apply_human_handoff_command",
+                "human_handoff.cancel",
             ),
         ];
         for (command, method, permission) in commands {
@@ -4215,6 +4554,187 @@ mod tests {
             transitions.body,
             ProtocolResponseBody::Success {
                 result: ProtocolResult::WorkflowTransitions {
+                    ref page
+                }
+            } if page.transitions.len() == 2
+                && page.next_after_sequence == Some(2)
+                && !page.has_more
+        ));
+    }
+
+    #[tokio::test]
+    async fn human_handoff_protocol_is_conditional_actor_bound_and_revision_fenced() {
+        let unconfigured = handler(Arc::new(ImmediateModel))
+            .handle(request("init-plain", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            unconfigured.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ..
+                }
+            } if !capabilities
+                .iter()
+                .any(|capability| capability.starts_with("human_handoff."))
+        ));
+
+        let engine = HumanHandoffEngine::new(
+            Arc::new(MemoryHumanHandoffCoordinator::new()),
+            Arc::new(ExistingHumanHandoffSubject),
+        );
+        let configured = handler(Arc::new(ImmediateModel)).with_human_handoff_engine(engine);
+        let initialized = configured
+            .handle(request("init-handoff", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ref compatibility,
+                    ..
+                }
+            } if capabilities
+                .iter()
+                .filter(|capability| capability.starts_with("human_handoff."))
+                .count() == 8
+                && compatibility.human_handoff_schema == 1
+        ));
+
+        let created = configured
+            .handle(request(
+                "create-handoff",
+                ProtocolCommand::CreateHumanHandoff {
+                    handoff_id: "handoff".to_owned(),
+                    request: HumanHandoffCreateRequest {
+                        command_id: HumanHandoffCommandId::from_static("create"),
+                        subject: HumanHandoffSubject::Thread {
+                            thread_id: ThreadId::from_static("thread"),
+                        },
+                        queue: "support.primary".to_owned(),
+                        reason_code: "agent.escalation".to_owned(),
+                        priority: 9,
+                    },
+                },
+            ))
+            .await;
+        assert!(matches!(
+            created.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::HumanHandoffCreated {
+                    ref handoff
+                }
+            } if handoff.revision == 1
+                && handoff.queue == "support.primary"
+                && matches!(handoff.status, crate::HumanHandoffStatus::Queued)
+        ));
+
+        let queued = configured
+            .handle(request(
+                "list-handoff",
+                ProtocolCommand::ListQueuedHumanHandoffs {
+                    queue: "support.primary".to_owned(),
+                    after: None,
+                    limit: Some(8),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            queued.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::HumanHandoffQueue {
+                    ref page
+                }
+            } if page.handoffs.len() == 1 && !page.has_more
+        ));
+
+        let claim = HumanHandoffCommand {
+            id: HumanHandoffCommandId::from_static("claim"),
+            kind: HumanHandoffCommandKind::Claim {
+                claim_id: HumanHandoffClaimId::from_static("claim"),
+                lease_duration_ms: 60_000,
+            },
+        };
+        let claimed = configured
+            .handle(request(
+                "claim-handoff",
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 1,
+                    command: claim.clone(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            claimed.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::HumanHandoffCommandApplied {
+                    ref handoff,
+                    outcome: HumanHandoffApplyOutcome::Applied,
+                }
+            } if handoff.revision == 2
+        ));
+        let replay = configured
+            .handle(request(
+                "replay-handoff",
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 1,
+                    command: claim,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            replay.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::HumanHandoffCommandApplied {
+                    ref handoff,
+                    outcome: HumanHandoffApplyOutcome::Duplicate,
+                }
+            } if handoff.revision == 2
+        ));
+
+        let stale = configured
+            .handle(request(
+                "stale-handoff",
+                ProtocolCommand::ApplyHumanHandoffCommand {
+                    handoff_id: "handoff".to_owned(),
+                    expected_revision: 1,
+                    command: HumanHandoffCommand {
+                        id: HumanHandoffCommandId::from_static("stale-cancel"),
+                        kind: HumanHandoffCommandKind::Cancel {
+                            reason_code: "request.withdrawn".to_owned(),
+                        },
+                    },
+                },
+            ))
+            .await;
+        assert!(matches!(
+            stale.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: true,
+                    ..
+                }
+            } if code == "human_handoff_conflict"
+        ));
+
+        let transitions = configured
+            .handle(request(
+                "handoff-transitions",
+                ProtocolCommand::GetHumanHandoffTransitions {
+                    handoff_id: "handoff".to_owned(),
+                    after_sequence: None,
+                    limit: Some(8),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            transitions.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::HumanHandoffTransitions {
                     ref page
                 }
             } if page.transitions.len() == 2

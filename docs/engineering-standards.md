@@ -479,15 +479,31 @@ schema must not advance.
   moves monotonically to a new name-compatible version/digest, and preserves
   immutable prior transition evidence. A successful Workflow terminal command
   requires every linked Task to be durably complete.
+- Human Handoff is an independent ownership aggregate, not an Approval,
+  Workflow status, Thread summary, or channel router. Creation must resolve
+  the exact same-tenant Thread or Workflow Run before persistence.
+- Human Handoff commands carry a positive observed revision and a stable
+  identity bound to both the trusted actor and complete typed payload. Exact
+  replay is idempotent; actor/content collision or stale mutation fails closed.
+- A Human Handoff claim has one authenticated owner, a finite exclusive
+  expiration, and a never-reused claim fence. Renewal, release, and resolution
+  require the exact active owner/fence; expiry wins at the boundary.
+- Human Handoff queue order is priority descending, request time ascending,
+  then identity ascending. Every cursor contains all ordering fields, and
+  Memory/SQLite implementations must return the same queued-only projection.
+- Creating or claiming a Human Handoff does not implicitly pause a Turn, route
+  a channel, wake a Workflow, authorize a business action, or prove that a
+  local-process identity is a human. Those effects require explicit adapters
+  and their own Policy/evidence.
 - The Task Graph domain, not only its store, owns aggregate durable capacity.
   Construction and deserialization establish a conservative charge; every
   status/message mutation preflights its complete delta and publishes only a
   persistable result. The Coordinator retains an exact final encoding check.
 - Process-shared SQLite coordination is not described as multi-node consensus
   or distributed high availability.
-- Approval, Task Graph, and Workflow SQLite reads apply their declared payload
-  and identity bounds before text materialization; index/body and aggregate
-  invariants are still revalidated after decoding.
+- Approval, Task Graph, Workflow, and Human Handoff SQLite reads apply their
+  declared payload and identity bounds before text materialization; index/body
+  and aggregate invariants are still revalidated after decoding.
 - Every State transition uses an Event Store compare-and-append against the
   observed stream version and recovery charge. Both metadata values and the
   event must change atomically; a stale writer must fail closed.

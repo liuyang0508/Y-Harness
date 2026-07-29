@@ -21,17 +21,19 @@ use y_harness::{
     ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
     DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION, EvaluationBaseline, EvaluationCase,
     EvaluationEngine, EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor,
-    GraderRegistry, HarnessError, HarnessFuture, HarnessRuntime, InboxApprovalHandler,
-    JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandGrader,
-    JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
-    JsonProcessConfig, LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP,
-    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
-    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
-    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
-    ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
-    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
-    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator,
+    GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
+    HumanHandoffCoordinator, HumanHandoffEngine, HumanHandoffSubject, HumanHandoffSubjectResolver,
+    InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
+    JsonCommandGrader, JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool,
+    JsonCommandVerifier, JsonProcessConfig, LanguageModel, LocalProcessBroker,
+    MAX_MODEL_ATTEMPTS_PER_STEP, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES,
+    MacOsSeatbeltBroker, McpClient, MemoryContextConfig, MemoryEventStore, MemoryFailureMode,
+    MemoryHealthStatus, MemoryProvider, MemoryRegistry, ModelRegistry, ModelRetryPolicy,
+    NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolAuthorizer, ProtocolHandler,
+    ProtocolPrincipal, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
+    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
+    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
+    SqliteApprovalInbox, SqliteEventStore, SqliteHumanHandoffCoordinator, SqliteTaskCoordinator,
     SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
     StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
     ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
@@ -489,6 +491,32 @@ impl ProtocolAuthorizer for FixedLocalProcessAuthorizer {
                 "configured local-process authority cannot resolve a remote principal".to_owned(),
             ))
         }
+    }
+}
+
+struct ReferenceHumanHandoffSubjects {
+    runtime: Arc<HarnessRuntime>,
+    workflows: WorkflowEngine,
+}
+
+impl HumanHandoffSubjectResolver for ReferenceHumanHandoffSubjects {
+    fn exists<'a>(
+        &'a self,
+        subject: &'a HumanHandoffSubject,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, bool> {
+        Box::pin(async move {
+            match subject {
+                HumanHandoffSubject::Thread { thread_id } => Ok(self
+                    .runtime
+                    .load_thread_as(thread_id, authority)
+                    .await?
+                    .is_some()),
+                HumanHandoffSubject::WorkflowRun { run_id } => {
+                    Ok(self.workflows.load_as(run_id, authority).await?.is_some())
+                }
+            }
+        })
     }
 }
 
@@ -962,7 +990,7 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
@@ -1049,6 +1077,10 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let workflows = Arc::new(
         SqliteWorkflowCoordinator::open(loaded.data_directory.join("workflows.db")).await?,
     );
+    let human_handoffs = Arc::new(
+        SqliteHumanHandoffCoordinator::open(loaded.data_directory.join("human-handoffs.db"))
+            .await?,
+    );
 
     let approval_handler = Arc::new(InboxApprovalHandler::new(
         approvals.clone(),
@@ -1059,10 +1091,19 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let task_port: Arc<dyn TaskCoordinator> = tasks.clone();
     let workflow_port: Arc<dyn WorkflowCoordinator> = workflows;
     let workflow_engine = WorkflowEngine::new(workflow_port, tasks);
+    let handoff_port: Arc<dyn HumanHandoffCoordinator> = human_handoffs;
+    let handoff_engine = HumanHandoffEngine::new(
+        handoff_port,
+        Arc::new(ReferenceHumanHandoffSubjects {
+            runtime: runtime.clone(),
+            workflows: workflow_engine.clone(),
+        }),
+    );
     let handler = ProtocolHandler::new(runtime)
         .with_approval_inbox(approval_port)
         .with_task_coordinator(task_port)
         .with_workflow_engine(workflow_engine)
+        .with_human_handoff_engine(handoff_engine)
         .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
     let served = serve_stdio(handler).await;
     let shutdown = shutdown_mcp_clients(&mcp_clients).await;

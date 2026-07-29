@@ -113,6 +113,9 @@ id_type!(WorkflowRunId, "workflow-run");
 id_type!(WorkflowWaitId, "workflow-wait");
 id_type!(WorkflowCommandId, "workflow-command");
 id_type!(WorkflowSignalId, "workflow-signal");
+id_type!(HumanHandoffId, "human-handoff");
+id_type!(HumanHandoffCommandId, "human-handoff-command");
+id_type!(HumanHandoffClaimId, "human-handoff-claim");
 
 fn next_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
@@ -1739,6 +1742,17 @@ pub enum HarnessError {
         /// Revision found atomically by the coordinator.
         actual: u64,
     },
+    /// Human Handoff queue, claim, lease, or settlement contract failure.
+    HumanHandoff(String),
+    /// An atomic Human Handoff command lost an optimistic revision race.
+    HumanHandoffConflict {
+        /// Contended Human Handoff.
+        handoff_id: HumanHandoffId,
+        /// Revision observed before mutation.
+        expected: u64,
+        /// Revision found atomically by the coordinator.
+        actual: u64,
+    },
     /// Tool execution failure.
     Tool(String),
     /// External process broker, isolation, or I/O failure.
@@ -1857,6 +1871,15 @@ impl Display for HarnessError {
             } => write!(
                 formatter,
                 "workflow conflict on run {run_id}: expected revision {expected}, found {actual}"
+            ),
+            Self::HumanHandoff(message) => write!(formatter, "human handoff error: {message}"),
+            Self::HumanHandoffConflict {
+                handoff_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "human handoff conflict on {handoff_id}: expected revision {expected}, found {actual}"
             ),
             Self::Tool(message) => write!(formatter, "tool error: {message}"),
             Self::Execution(message) => write!(formatter, "execution error: {message}"),

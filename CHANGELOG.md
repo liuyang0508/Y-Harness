@@ -4,6 +4,13 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added independent Human Handoff schema 1 and Protocol v28 for durable
+  ownership transfer over existing same-tenant Threads or Workflow Runs:
+  actor-and-content-bound idempotency, revision CAS, stable priority queue,
+  finite authenticated-owner leases, never-reused claim fences,
+  tenant-partitioned Memory/SQLite coordination, conditional permissions,
+  projection/digest validation, and restart recovery through
+  `human-handoffs.db`;
 - added independent Workflow Run schema 1 and Protocol v27 above the durable
   Task Graph: revision-CAS commands with content-bound idempotency, fenced
   signal/timer waits, explicit retry waits, safe-boundary definition migration,

@@ -11,12 +11,13 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"27"` | exact `Initialize` request/response |
+| Client protocol | `"28"` | exact `Initialize` request/response |
 | State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
 | State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
 | Task Coordinator | `3` | per-graph SQLite schema column |
 | Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
+| Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
@@ -206,6 +207,18 @@ requires every Task to be complete before successful Workflow completion.
 Schema 1 is the first Workflow store, so there is no legacy migration or
 rolling mixed-version writer support. See
 [ADR 0127](adr/0127-durable-fenced-workflow-runs.md).
+Protocol v28 adds the optional Human Handoff surface and advertises Human
+Handoff store schema 1. A Handoff refers to one same-tenant Thread or Workflow
+Run, but owns an independent revisioned lifecycle: queued, lease-fenced claim,
+resolved, or cancelled. Creation and mutation identities are bound to the
+trusted actor and complete typed payload. Queue order and its cursor are
+priority-descending, request-time-ascending, then identity-ascending.
+Memory/SQLite implementations tenant-partition identity and validate persisted
+projections against the aggregate. Schema 1 is the first Handoff store, so no
+legacy migration or mixed-version writer support exists. Protocol permissions
+are command-specific; composing the schema coordinate alone does not enable
+the surface. See
+[ADR 0128](adr/0128-durable-lease-fenced-human-handoff.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from
@@ -227,7 +240,8 @@ The optional Domain Pack crate adds an authorization port, exact action and
 request types, bounded reference roles, an exact actor/tenant grant model, an
 authorized Store adapter, and a `Forbidden` error. These are additive Rust
 control-plane APIs. They do not alter Pack format/store schema 1, State schema
-14, Task schema 3, Workflow schema 1, or Protocol v27. See
+14, Task schema 3, Workflow schema 1, Human Handoff schema 1, or Protocol v28.
+See
 [ADR 0124](adr/0124-exact-domain-pack-role-authorization.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
@@ -281,6 +295,17 @@ HTTPS model gateway API `1` preserved the original JSON response whenever the
 request omits `x-y-harness-model-stream`. A request with that header set to
 `1` explicitly negotiates the API-1 NDJSON media mode; peers that do not support
 it fail the exact content-type check rather than silently changing semantics.
+
+Client protocol `28` preserves protocol-v27 framing, authority, ceilings, and
+existing State/Approval/Task/Workflow commands. It adds the optional Human
+Handoff schema-1 coordinate and command-specific lifecycle surface. A v28
+client must still check the advertised capabilities; the coordinate does not
+imply that a host composed a Handoff Engine. Protocol-v27 clients fail exact
+initialization rather than silently ignore ownership-transfer state.
+
+Client protocol `27` preserves protocol-v26 framing, authority, ceilings, and
+existing State/Approval/Task commands. It adds the optional Workflow schema-1
+coordinate and command-specific lifecycle surface.
 
 Client protocol `26` preserves protocol-v25 commands, framing, authority,
 permissions, request/response ceilings, and Task Graph schema 3. It advances
@@ -684,6 +709,8 @@ See [ADR 0126](adr/0126-runtime-bound-connector-evidence.md) for schema-14
 Runtime-bound Connector evidence, archive format 4, and Protocol v26.
 See [ADR 0127](adr/0127-durable-fenced-workflow-runs.md) for Workflow Run
 schema 1 and Protocol v27.
+See [ADR 0128](adr/0128-durable-lease-fenced-human-handoff.md) for Human
+Handoff schema 1 and Protocol v28.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -730,6 +757,12 @@ Workflow Run schema 1 is a new independent store. `yh serve` creates
 layout, unknown metadata version, or row that claims another schema fails
 closed; it is never guessed or migrated in place. There is no downgrade or
 rolling old/new writer claim for this first schema.
+
+Human Handoff schema 1 is another independent store. `yh serve` creates
+`human-handoffs.db` only when neither metadata nor Handoff tables exist. A
+partial layout, unknown metadata version, oversized row, projection/body
+drift, or actor-bound command-digest mismatch fails closed. There is no
+migration, downgrade, or rolling mixed-writer claim for this first schema.
 
 The first durable schema change must ship with:
 

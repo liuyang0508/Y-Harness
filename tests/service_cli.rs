@@ -16,13 +16,14 @@ use std::{
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand,
-    ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult, SECRET_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillPackage,
-    SkillSignature, SkillTransparencyReceipt, SqliteEventStore, StateEngine,
-    TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskGraphId, TaskId, ThreadId, TurnStatus,
-    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommandId, WorkflowCreateRequest, WorkflowDefinition,
-    WorkspaceMode, decode_thread_archive,
+    APPROVAL_INBOX_SCHEMA_VERSION, HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId,
+    HumanHandoffCreateRequest, HumanHandoffSubject, Item, ItemKind, PROTOCOL_VERSION,
+    ProtocolCommand, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
+    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
+    SignedSkillPackage, SkillPackage, SkillSignature, SkillTransparencyReceipt, SqliteEventStore,
+    StateEngine, TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskGraphId, TaskId, ThreadId,
+    TurnStatus, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommandId, WorkflowCreateRequest,
+    WorkflowDefinition, WorkflowRunId, WorkspaceMode, decode_thread_archive,
 };
 #[cfg(unix)]
 use y_harness::{CapabilityOrigin, OperationStatus};
@@ -73,7 +74,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
     assert!(report.contains(&format!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("authority: local-process / unscoped"));
@@ -1740,7 +1741,7 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
 }
 
 #[test]
-fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart() {
+fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restart() {
     let project = isolated_project("persistence");
     let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("init")
@@ -1782,6 +1783,21 @@ fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart()
                     },
                 },
             ),
+            request(
+                "create-human-handoff",
+                ProtocolCommand::CreateHumanHandoff {
+                    handoff_id: "persistent-handoff".to_owned(),
+                    request: HumanHandoffCreateRequest {
+                        command_id: HumanHandoffCommandId::from_static("create-persistent-handoff"),
+                        subject: HumanHandoffSubject::WorkflowRun {
+                            run_id: WorkflowRunId::from_static("persistent-workflow"),
+                        },
+                        queue: "support.primary".to_owned(),
+                        reason_code: "agent.escalation".to_owned(),
+                        priority: 7,
+                    },
+                },
+            ),
         ],
     );
     let thread_id = match &first[1].body {
@@ -1802,6 +1818,16 @@ fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart()
             result: ProtocolResult::WorkflowRunCreated { ref run }
         } if run.revision == 1
             && run.task_graph_id == TaskGraphId::from_static("persistent-graph")
+    ));
+    assert!(matches!(
+        first[4].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::HumanHandoffCreated {
+                ref handoff
+            }
+        } if handoff.revision == 1
+            && handoff.queue == "support.primary"
+            && matches!(handoff.status, y_harness::HumanHandoffStatus::Queued)
     ));
 
     let second = serve(
@@ -1830,6 +1856,12 @@ fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart()
                 "get-workflow",
                 ProtocolCommand::GetWorkflowRun {
                     run_id: "persistent-workflow".to_owned(),
+                },
+            ),
+            request(
+                "get-human-handoff",
+                ProtocolCommand::GetHumanHandoff {
+                    handoff_id: "persistent-handoff".to_owned(),
                 },
             ),
         ],
@@ -1870,7 +1902,26 @@ fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart()
             && run.definition.name == "persistent.workflow"
             && run.task_graph_id == TaskGraphId::from_static("persistent-graph")
     ));
-    for database in ["state.db", "approvals.db", "tasks.db", "workflows.db"] {
+    assert!(matches!(
+        second[4].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::HumanHandoff {
+                handoff: Some(ref handoff)
+            }
+        } if handoff.revision == 1
+            && handoff.queue == "support.primary"
+            && matches!(
+                handoff.subject,
+                HumanHandoffSubject::WorkflowRun { .. }
+            )
+    ));
+    for database in [
+        "state.db",
+        "approvals.db",
+        "tasks.db",
+        "workflows.db",
+        "human-handoffs.db",
+    ] {
         assert!(project.join(".y-harness").join(database).is_file());
     }
     fs::remove_dir_all(project).expect("remove isolated project");

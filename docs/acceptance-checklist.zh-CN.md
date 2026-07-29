@@ -36,14 +36,20 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"27","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"28","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
 - [ ] 返回一个且仅一个成功 JSON 响应。
-- [ ] 能力包含 Thread、Approval、Task Worker 和 Workflow 表面。
-- [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db`、`workflows.db` 已创建。
-- [ ] 服务重启后此前创建的 Thread、Task Graph 和 Workflow Run 仍可读取。
+- [ ] 能力包含 Thread、Approval、Task Worker、Workflow 和 Human Handoff
+      表面。
+- [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db`、`workflows.db` 和
+      `human-handoffs.db` 已创建。
+- [ ] 服务重启后此前创建的 Thread、Task Graph、Workflow Run 和 Human
+      Handoff 仍可读取。
+- [ ] Human Handoff 只能引用同租户的既有 Thread 或 Workflow Run；
+      Claim/续租/释放/结算要求精确 revision、当前 actor 与 claim fence，
+      同一 command ID 被其他 actor 或不同内容复用时失败。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
       `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
       或新的 running Turn 时均不修改 State。

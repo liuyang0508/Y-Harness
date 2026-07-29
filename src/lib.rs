@@ -10,6 +10,7 @@ mod approval;
 mod context;
 mod evaluation;
 mod execution;
+mod human_handoff;
 mod isolation;
 mod json;
 mod kernel;
@@ -61,22 +62,31 @@ pub use execution::{
     NetworkAccess, ProcessBroker, ProcessBrokerDescriptor, ProcessIsolation, ProcessOutput,
     ProcessRequest, ToolCompensator,
 };
+pub use human_handoff::{
+    HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoff, HumanHandoffApplyOutcome, HumanHandoffClaim,
+    HumanHandoffCommand, HumanHandoffCommandKind, HumanHandoffCommandResult,
+    HumanHandoffCoordinator, HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffEngine,
+    HumanHandoffPage, HumanHandoffSnapshot, HumanHandoffStatus, HumanHandoffSubject,
+    HumanHandoffSubjectResolver, HumanHandoffTransition, HumanHandoffTransitionKind,
+    MemoryHumanHandoffCoordinator, SqliteHumanHandoffCoordinator,
+};
 pub use kernel::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
     AuthorityContext, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId,
     ConnectorEvidence, ConnectorEvidenceClaim, EventId, ExecutionBinding, ExecutionPhase,
-    HarnessError, HarnessFuture, InvocationContextEvidence, Item, ItemId, ItemKind,
-    MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
-    MAX_MODEL_PROVIDER_RETRY_AFTER_MS, MAX_TOOL_CALLS_PER_BATCH,
-    MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, MemoryContextRecordStatus, ModelContinuation,
-    ModelEventSink, ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry,
-    ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage,
-    NewStreamEvent, OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool,
-    RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId,
-    TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage, ToolAuthorization,
-    ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
-    ToolExecutionResult, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome, WorkflowCommandId, WorkflowRunId, WorkflowSignalId, WorkflowWaitId,
+    HarnessError, HarnessFuture, HumanHandoffClaimId, HumanHandoffCommandId, HumanHandoffId,
+    InvocationContextEvidence, Item, ItemId, ItemKind, MAX_CONNECTOR_EVIDENCE_PER_RESULT,
+    MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES, MAX_MODEL_PROVIDER_RETRY_AFTER_MS,
+    MAX_TOOL_CALLS_PER_BATCH, MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, MemoryContextRecordStatus,
+    ModelContinuation, ModelEventSink, ModelOutput, ModelProviderFailure, ModelProviderFailureKind,
+    ModelRegistry, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall,
+    ModelUsage, NewStreamEvent, OperationId, PendingEvent, PolicyDecision, RegisteredModel,
+    RegisteredTool, RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId,
+    TaskLeaseId, TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage,
+    ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
+    ToolDescriptor, ToolExecutionResult, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus,
+    TurnStopReason, VerificationOutcome, WorkflowCommandId, WorkflowRunId, WorkflowSignalId,
+    WorkflowWaitId,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -106,7 +116,8 @@ pub use orchestration::{
     WorkspaceRequest,
 };
 pub use protocol::{
-    CompatibilityManifest, FingerprintProtocolAuthorizer, OperationStatus, OperationStreamEvent,
+    CompatibilityManifest, FingerprintProtocolAuthorizer, HumanHandoffQueuePage,
+    HumanHandoffSummary, HumanHandoffTransitionPage, OperationStatus, OperationStreamEvent,
     PROTOCOL_VERSION, ProtocolAuthorizer, ProtocolCommand, ProtocolError, ProtocolHandler,
     ProtocolPrincipal, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
     ProtocolShutdownReport, TaskGraphSummary, TaskRecordPage, WorkflowRunSummary,

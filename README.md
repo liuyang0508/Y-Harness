@@ -59,9 +59,9 @@ yh doctor
 yh serve
 ```
 
-`yh serve` is a headless Protocol v27 JSONL service over stdin/stdout. It
-persists State, approvals, Task coordination, and Workflow Runs under
-`.y-harness/`. A
+`yh serve` is a headless Protocol v28 JSONL service over stdin/stdout. It
+persists State, approvals, Task coordination, Workflow Runs, and Human
+Handoffs under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
 ```bash
@@ -96,7 +96,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v27 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v28 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -221,7 +221,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v27 specification](docs/protocol.md).
+[client protocol v28 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -788,11 +788,24 @@ immutable transition evidence. Memory and SQLite coordinators have equivalent
 contracts, and successful Run completion requires every linked Task to be
 durably complete. The reference service persists Runs in `workflows.db`.
 Background timer polling, automatic effect-safe retry, compensation planning,
-and Human Handoff remain separate future services. See
+and automatic Human Handoff routing remain separate future services. See
 [ADR 0127](docs/adr/0127-durable-fenced-workflow-runs.md).
 
+Human ownership transfer is a separate durable aggregate rather than an
+Approval or Workflow status. Human Handoff schema 1 accepts a same-tenant
+Thread or Workflow Run subject, queues by bounded priority and request time,
+and uses an authenticated-owner claim with a finite lease and a unique claim
+fence. Claim, renewal, release, expiration, resolution, and cancellation are
+revision-CAS commands bound to the trusted actor and complete typed payload.
+Memory and SQLite implementations share the same queue/cursor contract; the
+reference service persists them in `human-handoffs.db`. Creating a Handoff
+does not pause a Turn, route an IM conversation, wake a Workflow, authorize a
+business action, prove that `LocalProcess` is a person, or provide a background
+expiry worker. See
+[ADR 0128](docs/adr/0128-durable-lease-fenced-human-handoff.md).
+
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v27 preserves Protocol v26's 2 MiB request and 16 MiB
+protocol. Protocol v28 preserves Protocol v27's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -822,10 +835,13 @@ author that evidence or take over a bound Task. Protocol 26 advertises State
 and snapshot schema 14; Thread archive format 4 advances independently for
 Runtime-bound Connector evidence. Protocol clients can observe the durable
 record but cannot author or elevate a Tool into a trusted Connector. Protocol
-27 adds an optional schema-1 durable Workflow Run surface above one
+27 added an optional schema-1 durable Workflow Run surface above one
 same-tenant Task Graph. Revision-CAS commands, stable command digests, fenced
 signal/timer waits, explicit retry waits, and safe-boundary definition
-migration remain separate from Task lease/effect authority. Steering
+migration remain separate from Task lease/effect authority. Protocol 28 adds
+an optional schema-1 Human Handoff surface with command-specific permissions,
+actor-bound idempotency, exact claim ownership, and bounded queue/transition
+paging. Steering
 requires the exact
 active Turn, invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -925,7 +941,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v27. The Sessions panel shows direct fork ancestry from
+through Protocol v28. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

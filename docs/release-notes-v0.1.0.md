@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v27 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v28 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -98,8 +98,17 @@ safe-boundary definition migration survive restart without moving Task lease,
 effect, or worker authority into Workflow. Successful completion requires
 every linked Task to be complete. The reference service persists this
 independent aggregate in `workflows.db`.
+Human Handoff schema 1 and Protocol 28 add an optional ownership-transfer
+surface over an existing same-tenant Thread or Workflow Run. A bounded stable
+queue leads to a finite authenticated-owner claim with a unique fence.
+Actor-and-content-bound command identities, revision CAS, exact expiry,
+immutable transitions, tenant-partitioned Memory/SQLite coordination, and
+projection validation survive restart. The reference service persists the
+aggregate in `human-handoffs.db`. This lifecycle does not implicitly approve a
+decision, pause a Turn, route a channel, wake a Workflow, execute business
+actions, scan expired leases, or prove that `LocalProcess` is a human.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v27. Format/store schema 1 pins immutable component snapshots and a
+Protocol v28. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its
@@ -217,11 +226,12 @@ yh serve
 - optional TUI package: `0.1.0`
 - optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `27`
+- client protocol: `28`
 - State event/snapshot schema: `14` / `14`
 - Approval Inbox schema: `3`
 - Task Coordinator schema: `3`
 - Workflow Coordinator schema: `1`
+- Human Handoff Coordinator schema: `1`
 - Secret Provider API: `2`
 - Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`

@@ -20,8 +20,9 @@ pub(crate) use types::now_ms;
 pub use types::{
     ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
     AuthorityContext, Checkpoint, CheckpointId, ConnectorEvidence, ConnectorEvidenceClaim, EventId,
-    ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, InvocationContextEvidence, Item,
-    ItemId, ItemKind, MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
+    ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, HumanHandoffClaimId,
+    HumanHandoffCommandId, HumanHandoffId, InvocationContextEvidence, Item, ItemId, ItemKind,
+    MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
     MAX_MODEL_PROVIDER_RETRY_AFTER_MS, MAX_TOOL_CALLS_PER_BATCH, MemoryContextRecordStatus,
     ModelContinuation, ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRequest,
     ModelResponse, ModelStreamEvent, ModelToolCall, ModelUsage, NewStreamEvent, OperationId,
