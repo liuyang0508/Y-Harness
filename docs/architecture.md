@@ -303,6 +303,11 @@ direction:
 - a revisioned Task Coordinator with in-memory parity and durable SQLite CAS,
   restart recovery, cross-connection conflict detection, invariant validation,
   and stale-worker fencing;
+- an independent revisioned Workflow Run aggregate above one same-tenant Task
+  Graph, with content-bound command idempotency, signal/timer wait fencing,
+  explicit retry waits, safe-boundary definition migration, bounded immutable
+  transitions, Memory/SQLite parity, restart recovery, and Task-completion
+  proof without taking over Task lease or effect authority;
 - a public bounded Task Orchestrator that executes host-provided sub-Agent
   capabilities, advances dependencies, isolates timeout/panic failure, cancels
   fenced workers, and settles only an exact current lease;
@@ -323,11 +328,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v26 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v27 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 26
-  advertises State/snapshot schema 14 with Runtime-bound Connector evidence,
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 27
+  conditionally advertises Workflow Run schema 1 and its command-specific
+  permissions when the host composes Workflow and Task coordinators, protocol
+  26 advertises State/snapshot schema 14 with Runtime-bound Connector evidence,
   while protocol 25
   advertises Task Graph schema 3 for embedded-only governed attempt binding,
   protocol 24 advertises schema-13 Turn execution binding evidence while
@@ -350,8 +357,8 @@ direction:
   names, and schema-9 atomic Thread forks;
 - initialization-time compatibility coordinates for engine, State event,
   snapshot, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
-  Conversation Compactor API, Secret API, Skill API, model-gateway API, and
-  Workspace Provider API versions;
+  Conversation Compactor API, Secret API, Skill API, model-gateway API,
+  Workflow Coordinator, and Workspace Provider API versions;
 - bounded provisional model streams with step correlation, late-emission
   fencing, failure isolation, cursor paging, and explicit eviction gaps;
 - bounded JSONL stdio serving, cursor-paginated Event Store reads, and a
@@ -376,11 +383,11 @@ direction:
   Graders,
   exact-selected MCP Tools, explicitly activated digest-verified project
   Skills, Agent Memory Hub Context assembly, and an optional fixed
-  local-process tenant shared by Protocol State/Approval/Task, configured
-  Evaluation, archives, and direct Model Secret resolution;
+  local-process tenant shared by Protocol State/Approval/Task/Workflow,
+  configured Evaluation, archives, and direct Model Secret resolution;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v24, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v27, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
@@ -417,8 +424,10 @@ transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
 multi-principal reference-service tenant routing, general Secret-manager
 integration, tenant-partitioned MCP sessions, external Artifact storage and
-authorization, Domain Pack service/protocol integration, role and delegation
-claims, revocation, and policy hot reload remain explicit subsequent slices.
+authorization, background Workflow timer polling, automatic effect-safe Task
+retry, durable compensation planning, Human Handoff, Domain Pack
+service/protocol integration, role and delegation claims, revocation, and
+policy hot reload remain explicit subsequent slices.
 Task Artifact reference metadata is already part of its tenant-fenced Task
 Graph; this does not authorize or store the referenced external content.
 

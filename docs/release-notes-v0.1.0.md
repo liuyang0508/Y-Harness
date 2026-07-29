@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v26 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v27 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -91,8 +91,15 @@ ToolCall→Policy→ToolResult chain, strips evidence from Model Context, and
 rejects failed-result, digest, origin, authority, and cross-tenant archive
 tampering. Ordinary Tool, MCP, and JSON-command adapters retain their
 non-authoritative compatibility path. Thread archive format advances to 4.
+Workflow Run schema 1 and Protocol 27 add an optional durable control plane
+above one existing same-tenant Task Graph. Stable content-bound command
+identity, revision CAS, fenced signal/timer waits, explicit retry waits, and
+safe-boundary definition migration survive restart without moving Task lease,
+effect, or worker authority into Workflow. Successful completion requires
+every linked Task to be complete. The reference service persists this
+independent aggregate in `workflows.db`.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v26. Format/store schema 1 pins immutable component snapshots and a
+Protocol v27. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its
@@ -210,10 +217,11 @@ yh serve
 - optional TUI package: `0.1.0`
 - optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `23`
-- State event/snapshot schema: `12` / `12`
+- client protocol: `27`
+- State event/snapshot schema: `14` / `14`
 - Approval Inbox schema: `3`
-- Task Coordinator schema: `2`
+- Task Coordinator schema: `3`
+- Workflow Coordinator schema: `1`
 - Secret Provider API: `2`
 - Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`

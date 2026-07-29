@@ -11,11 +11,12 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"26"` | exact `Initialize` request/response |
+| Client protocol | `"27"` | exact `Initialize` request/response |
 | State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
 | State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
 | Task Coordinator | `3` | per-graph SQLite schema column |
+| Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
@@ -195,6 +196,16 @@ archive format 4 preserves the record and refuses cross-tenant authority
 rebinding. Protocol v26 advertises State/snapshot schema 14 but exposes no
 Connector-evidence authoring command. See
 [ADR 0126](adr/0126-runtime-bound-connector-evidence.md).
+Protocol v27 adds the optional Workflow Engine surface and advertises Workflow
+store schema 1. The additive Rust contract separates a revisioned Workflow Run
+from its linked Task Graph, uses digest-bound idempotent commands, exact
+signal/timer wait fencing, trusted server application time, safe-boundary
+definition migration, and tenant-partitioned Memory/SQLite persistence.
+`WorkflowEngine` verifies the linked same-tenant Task Graph at creation and
+requires every Task to be complete before successful Workflow completion.
+Schema 1 is the first Workflow store, so there is no legacy migration or
+rolling mixed-version writer support. See
+[ADR 0127](adr/0127-durable-fenced-workflow-runs.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from
@@ -216,7 +227,7 @@ The optional Domain Pack crate adds an authorization port, exact action and
 request types, bounded reference roles, an exact actor/tenant grant model, an
 authorized Store adapter, and a `Forbidden` error. These are additive Rust
 control-plane APIs. They do not alter Pack format/store schema 1, State schema
-14, Task schema 3, or Protocol v26. See
+14, Task schema 3, Workflow schema 1, or Protocol v27. See
 [ADR 0124](adr/0124-exact-domain-pack-role-authorization.md).
 External process launch is explicit, child environments are
 copied only by configured host-variable name, and MCP catalog discovery alone
@@ -671,6 +682,8 @@ execution evidence, archive format 3, and Protocol v24, plus
 schema 3 governed attempt evidence and Protocol v25.
 See [ADR 0126](adr/0126-runtime-bound-connector-evidence.md) for schema-14
 Runtime-bound Connector evidence, archive format 4, and Protocol v26.
+See [ADR 0127](adr/0127-durable-fenced-workflow-runs.md) for Workflow Run
+schema 1 and Protocol v27.
 
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
@@ -712,6 +725,12 @@ source shape. Old writers must not access a migrated store, and rollback is
 supported only by restoring the backup before any schema-3 write. See the
 [Task migration runbook](task-migration.md).
 
+Workflow Run schema 1 is a new independent store. `yh serve` creates
+`workflows.db` only when neither metadata nor Run tables exist. A partial
+layout, unknown metadata version, or row that claims another schema fails
+closed; it is never guessed or migrated in place. There is no downgrade or
+rolling old/new writer claim for this first schema.
+
 The first durable schema change must ship with:
 
 - an ADR and old/new schema fixtures;
@@ -734,9 +753,10 @@ minor release when doing so does not preserve a security defect. Protocol and
 durable schema support windows are declared per release. State schema 14 reads
 immutable schema-1 through schema-13 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
-reads schema 1 and schema 2. Task coordination reads only schema 2 in normal
-operation; `task-migrate` alone reads schema 1 and the earlier unversioned
-development layout.
+reads schema 1 and schema 2. Task coordination reads only schema 3 in normal
+operation; `task-migrate` alone reads schema 1, schema 2, and the earlier
+unversioned development layout. Workflow coordination reads only its first
+schema 1.
 
 The MSRV is Rust 1.88.0 and is enforced in CI. Platform support is proven only
 where the exact release commit has green jobs; configuration alone is not

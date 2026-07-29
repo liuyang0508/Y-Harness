@@ -9,10 +9,10 @@ not release-ready while any blocking row remains open.
 |---|---|---|
 | Minimum compiler | Rust 1.88 `check`, Clippy, tests, docs | passing |
 | Feature isolation | zero-default core, each optional feature, and all features | passing |
-| Deterministic tests | 397 Core library, 13 Domain Pack control-plane, 12 CLI, 25 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 522 total plus 8 explicitly ignored manual/environment fixtures; zero-default workspace passes 492 plus 4 ignored |
+| Deterministic tests | 412 Core library, 13 Domain Pack control-plane, 12 CLI, 25 Engine process/service, 11 TUI unit/render, 2 private-gateway TLS integration, 2 private-MCP TLS integration, 53 product/Engine evidence-adapter, and 7 fault-fixture tests | passing locally: 537 total plus 8 explicitly ignored manual/environment fixtures; zero-default workspace passes 507 plus 4 ignored |
 | Full-screen TUI PTY | demo and configured Engine modes; real Turn, atomic Thread fork, durable State, alternate screen and bracketed-paste restoration | debug and release binaries passing |
-| Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG and Mailbox | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 |
-| Distribution package | `cargo package --locked -p y-harness`, 242-file / 3.4 MiB clean-room Core crate verification (745.4 KiB compressed) | passing locally with State-14, Approval-3, Task-3, Secret-2, and Protocol-26 coordinates; optional control-plane crate remains a separate workspace package |
+| Installed operator path | isolated-prefix Engine and TUI installs; version, init, doctor, persistent service, demo, Task DAG, Mailbox, and durable Workflow Run | passing; TUI install contains only `yh-tui`; Task Graph terminal at revision 6 and Workflow restart recovery are process-tested |
+| Distribution package | `cargo package --locked -p y-harness`, clean-room Core crate verification | passing locally with State-14, Approval-3, Task-3, Workflow-1, Secret-2, and Protocol-27 coordinates; optional control-plane crate remains a separate workspace package |
 | Real memory integration | Agent Memory Hub stdio MCP round trip under macOS Seatbelt, network denied, offline embeddings | passing |
 | Dependency security | `cargo-audit 0.22.2 --deny warnings` over 290 locked crates | passing |
 | State performance | schema-12 tenant-fenced 1,000 events plus 64-Thread lineage page, 5 samples, SQLite WAL + FULL | 93.103 ms append; 2.711 ms full projection; 9.175 ms atomic fork; 0.278 ms Thread list; 2.410 ms snapshot load |
@@ -28,6 +28,7 @@ not release-ready while any blocking row remains open.
 | Durable Turn execution binding | schema-13 single content-free Item with trusted actor, exact configuration/environment SHA-256, revision, and tenant; Model-invisible, snapshot/reopen durable, archive-safe, exact on approval continuation | constructor/unknown-field/schema gate, pre-State tenant denial, duplicate denial, SQLite snapshot/reopen, Model invisibility, approval missing/substitution, Domain Pack conversion, and archive rebind-denial tests passing |
 | Runtime-bound Connector evidence | schema-14 optional bounded source claim in the atomic ToolResult; Runtime-bound registered Tool/origin, trusted actor/tenant, and exact output SHA-256; Model-hidden and archive-safe | compatibility-default ordinary Tool, atomic persistence, digest/origin/authority tamper, schema gate, same/cross-tenant archive, and model-projection tests passing; remote Connector authoring is intentionally absent |
 | Durable Task-attempt execution binding | schema-3 append-only exact Task/lease/attempt/worker/time/deployment evidence, persisted before Workspace/executor entry, tenant-exact, terminal/retry durable, and unbound-retry resistant | Graph retry/settlement/serde, Memory/SQLite tenant/reopen, Orchestrator executor-entry, protocol no-authorship, schema-1/schema-2 migration/restart, and old-schema evidence-smuggling tests passing; remote binding control and detailed protocol evidence inspection remain open |
+| Durable Workflow Run | independent schema-1 aggregate above one same-tenant Task Graph; revision CAS, content-bound command identity, signal/timer wait fences, explicit retry waits, safe-boundary definition migration, immutable transitions, bounded Memory/SQLite persistence, conditional Protocol v27 surface, and Task-completion proof | domain projection/tamper/duplicate/collision/timeout tests, Memory/SQLite parity, restart/cross-tenant/conflict/partial-store tests, command-specific authorization, protocol conflict/paging, and real service restart passing; background timer polling, automatic effect-safe Task retry, durable compensation planning, and Human Handoff remain open |
 | Optional Domain Pack control plane | format/store schema 1, immutable exact component pins, mandatory pinned Evaluation suite, exact actor/tenant/action authorization port, bounded no-fallback reference RBAC, terminal evaluation, independent approval, tenant-partitioned release/activation records, SQLite CAS, bounded rollback, and execution-time inventory binding | canonical/tamper/inventory tests plus complete authorized lifecycle, cross-tenant/no-fallback, panic-fail-closed/no-mutation, administrator separation-of-duty, Memory/SQLite reopen, projection-drift, conversion to generic Engine execution evidence, and two-connection CAS tests passing; remote lifecycle integration, external IAM adapter, canary, and multi-node HA remain open |
 | Secret hygiene | bounded source-tree pattern scan | no matches |
 | Source hygiene | no source artifact above 1 MiB; crate forbids `unsafe` | passing |
@@ -148,10 +149,10 @@ boundary remain explicit.
   lease/fenced remote continuation are not implemented.
 - A trusted per-Turn Authority Context can map a transport principal to an
   actor and tenant, binds remote Memory scope, and reaches State, Policy, Tool,
-  Task, direct Model Secret resolution, and MCP admission. Schema-12 Threads,
+  Task, Workflow, direct Model Secret resolution, and MCP admission. Schema-12 Threads,
   State reads/mutations, recovery, retained Operations, schema-3 Approval
-  records, schema-3 Task Graphs, and the optional Domain Pack control-plane
-  store are tenant-fenced. Secret API 2 supports exact embedded
+  records, schema-3 Task Graphs, schema-1 Workflow Runs, and the optional Domain
+  Pack control-plane store are tenant-fenced. Secret API 2 supports exact embedded
   tenant/reference mappings; legacy Providers and current shared MCP sessions
   fail closed. Task Artifact reference metadata is fenced with its Graph, but
   the external URI target has no Y-Harness storage or authorization boundary.
@@ -160,6 +161,13 @@ boundary remain explicit.
   general Secret-manager integration, tenant-partitioned MCP sessions,
   external Artifact storage, quotas, and retention remain open, so this is not
   a complete multi-tenant isolation claim.
+- Workflow schema 1 provides durable, fenced Run state and evidence above a
+  same-tenant Task Graph. The server clock and authenticated authority remain
+  host-owned; the Workflow never leases work or repeats a Tool effect. The
+  reference service does not yet poll timers in the background, automatically
+  retry Tasks, reconcile unknown effects, execute durable compensation plans,
+  or provide Human Handoff. SQLite provides single-host/multiprocess CAS, not
+  distributed scheduling or availability.
 - Domain Pack format/store schema 1 governs immutable component snapshots,
   terminal pinned-suite evaluation, independent approval, activation,
   deactivation, rollback, and current-inventory execution binding in a separate

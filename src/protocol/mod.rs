@@ -1,6 +1,7 @@
 //! Versioned runtime commands, asynchronous operations, and bounded JSONL stdio.
 
 mod task;
+mod workflow;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -30,14 +31,17 @@ use crate::{
     StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
     TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
     TaskMessagePage, Thread, ThreadId, ThreadSummary, TurnContextInput, TurnExecutionOptions,
-    TurnId, WORKSPACE_PROVIDER_API_VERSION,
+    TurnId, WORKFLOW_RUN_SCHEMA_VERSION, WORKSPACE_PROVIDER_API_VERSION, WorkflowApplyOutcome,
+    WorkflowCommand, WorkflowCommandKind, WorkflowCreateRequest, WorkflowEngine, WorkflowRunId,
 };
 
 pub use task::{TaskGraphSummary, TaskRecordPage};
 use task::{TaskProtocolService, TaskWorkerAccess};
+use workflow::WorkflowProtocolService;
+pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "26";
+pub const PROTOCOL_VERSION: &str = "27";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -60,12 +64,13 @@ const MAX_APPROVAL_PAGE: usize = 16;
 const DEFAULT_TASK_RECORD_PAGE: usize = 16;
 const DEFAULT_TASK_CLAIM_MAXIMUM: usize = 1;
 const DEFAULT_TASK_MESSAGE_PAGE: usize = 32;
+const DEFAULT_WORKFLOW_TRANSITION_PAGE: usize = 16;
 const MAX_PROTOCOL_PRINCIPALS: usize = 4_096;
 const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 27] = [
+const PROTOCOL_PERMISSIONS: [&str; 32] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -93,6 +98,11 @@ const PROTOCOL_PERMISSIONS: [&str; 27] = [
     "task.worker.heartbeat",
     "task.worker.messages.read",
     "task.worker.messages.send",
+    "workflow.run.create",
+    "workflow.run.get",
+    "workflow.run.mutate",
+    "workflow.signal.deliver",
+    "workflow.timer.wake",
 ];
 
 /// One correlated protocol request.
@@ -332,6 +342,36 @@ pub enum ProtocolCommand {
         /// Bounded message body.
         body: String,
     },
+    /// Creates one durable Workflow Run linked to an existing Task Graph.
+    CreateWorkflowRun {
+        /// Stable Run identity and retry key.
+        run_id: String,
+        /// Exact creation command and implementation coordinate.
+        request: WorkflowCreateRequest,
+    },
+    /// Reads one bounded current Workflow projection.
+    GetWorkflowRun {
+        /// Stable Run identity.
+        run_id: String,
+    },
+    /// Reads a bounded immutable Workflow transition page.
+    GetWorkflowTransitions {
+        /// Stable Run identity.
+        run_id: String,
+        /// Returns transitions strictly after this sequence.
+        after_sequence: Option<u64>,
+        /// Maximum number of transitions to return.
+        limit: Option<usize>,
+    },
+    /// Applies one idempotent lifecycle command.
+    ApplyWorkflowCommand {
+        /// Stable Run identity.
+        run_id: String,
+        /// Exact revision observed before a new mutation.
+        expected_revision: u64,
+        /// Retry-stable typed command.
+        command: WorkflowCommand,
+    },
 }
 
 impl ProtocolCommand {
@@ -364,6 +404,13 @@ impl ProtocolCommand {
             Self::FailTask { .. } => "task.worker.fail",
             Self::GetTaskMessages { .. } => "task.worker.messages.read",
             Self::SendTaskMessage { .. } => "task.worker.messages.send",
+            Self::CreateWorkflowRun { .. } => "workflow.run.create",
+            Self::GetWorkflowRun { .. } | Self::GetWorkflowTransitions { .. } => "workflow.run.get",
+            Self::ApplyWorkflowCommand { command, .. } => match &command.kind {
+                WorkflowCommandKind::DeliverSignal { .. } => "workflow.signal.deliver",
+                WorkflowCommandKind::WakeDue { .. } => "workflow.timer.wake",
+                _ => "workflow.run.mutate",
+            },
         }
     }
 }
@@ -754,6 +801,28 @@ pub enum ProtocolResult {
         /// Persisted ordered message.
         message: TaskMessage,
     },
+    /// Newly created or idempotently recognized Workflow Run.
+    WorkflowRunCreated {
+        /// Bounded current Run projection.
+        run: WorkflowRunSummary,
+    },
+    /// Loaded Workflow Run projection or explicit absence.
+    WorkflowRun {
+        /// Bounded current Run projection when found.
+        run: Option<WorkflowRunSummary>,
+    },
+    /// Bounded immutable Workflow transition page.
+    WorkflowTransitions {
+        /// Sequence-ordered transitions and continuation cursor.
+        page: WorkflowTransitionPage,
+    },
+    /// Successful new or duplicate Workflow command settlement.
+    WorkflowCommandApplied {
+        /// Current bounded Run projection.
+        run: WorkflowRunSummary,
+        /// Whether this request changed the durable revision.
+        outcome: WorkflowApplyOutcome,
+    },
 }
 
 /// Pollable asynchronous Turn state.
@@ -824,6 +893,8 @@ pub struct CompatibilityManifest {
     pub approval_inbox_schema: u32,
     /// Durable Task Coordinator graph schema accepted and written.
     pub task_graph_schema: u32,
+    /// Durable Workflow Run schema accepted and written.
+    pub workflow_run_schema: u32,
     /// Exact Memory Provider API version.
     pub memory_api: u32,
     /// Exact provider-specific Token Counter API version.
@@ -957,6 +1028,7 @@ pub struct ProtocolHandler {
     runtime: Arc<HarnessRuntime>,
     approvals: Option<Arc<dyn ApprovalInbox>>,
     tasks: Option<TaskProtocolService>,
+    workflows: Option<WorkflowProtocolService>,
     authorizer: Arc<dyn ProtocolAuthorizer>,
     operations: Arc<Mutex<BTreeMap<OperationId, ManagedOperation>>>,
     lifecycle: Arc<OperationLifecycle>,
@@ -971,6 +1043,7 @@ impl ProtocolHandler {
             runtime,
             approvals: None,
             tasks: None,
+            workflows: None,
             authorizer: Arc::new(LocalProcessAuthorizer),
             operations: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle: Arc::new(OperationLifecycle::new()),
@@ -989,6 +1062,13 @@ impl ProtocolHandler {
     #[must_use]
     pub fn with_task_coordinator(mut self, coordinator: Arc<dyn TaskCoordinator>) -> Self {
         self.tasks = Some(TaskProtocolService::new(coordinator));
+        self
+    }
+
+    /// Exposes durable Workflow lifecycle coordination.
+    #[must_use]
+    pub fn with_workflow_engine(mut self, engine: WorkflowEngine) -> Self {
+        self.workflows = Some(WorkflowProtocolService::new(engine));
         self
     }
 
@@ -1168,6 +1248,15 @@ impl ProtocolHandler {
                         "task.worker.messages.send".to_owned(),
                     ]);
                 }
+                if self.workflows.is_some() {
+                    capabilities.extend([
+                        "workflow.run.create".to_owned(),
+                        "workflow.run.get".to_owned(),
+                        "workflow.run.mutate".to_owned(),
+                        "workflow.signal.deliver".to_owned(),
+                        "workflow.timer.wake".to_owned(),
+                    ]);
+                }
                 capabilities.sort();
                 capabilities.retain(|permission| self.is_allowed(principal, permission));
                 Ok(ProtocolResult::Initialized {
@@ -1179,6 +1268,7 @@ impl ProtocolHandler {
                         state_snapshot_schema: STATE_SNAPSHOT_SCHEMA_VERSION,
                         approval_inbox_schema: APPROVAL_INBOX_SCHEMA_VERSION,
                         task_graph_schema: TASK_GRAPH_SCHEMA_VERSION,
+                        workflow_run_schema: WORKFLOW_RUN_SCHEMA_VERSION,
                         memory_api: MEMORY_API_VERSION,
                         token_counter_api: TOKEN_COUNTER_API_VERSION,
                         conversation_compactor_api: CONVERSATION_COMPACTOR_API_VERSION,
@@ -1848,6 +1938,56 @@ impl ProtocolHandler {
                     message,
                 })
             }
+            ProtocolCommand::CreateWorkflowRun { run_id, request } => {
+                validate_opaque_id("run_id", &run_id)?;
+                let run = self
+                    .workflow_service()?
+                    .create(WorkflowRunId::from_string(run_id), request, authority)
+                    .await?;
+                Ok(ProtocolResult::WorkflowRunCreated { run })
+            }
+            ProtocolCommand::GetWorkflowRun { run_id } => {
+                validate_opaque_id("run_id", &run_id)?;
+                let run = self
+                    .workflow_service()?
+                    .summary(&WorkflowRunId::from_string(run_id), authority)
+                    .await?;
+                Ok(ProtocolResult::WorkflowRun { run })
+            }
+            ProtocolCommand::GetWorkflowTransitions {
+                run_id,
+                after_sequence,
+                limit,
+            } => {
+                validate_opaque_id("run_id", &run_id)?;
+                let page = self
+                    .workflow_service()?
+                    .transitions(
+                        &WorkflowRunId::from_string(run_id),
+                        after_sequence.unwrap_or(0),
+                        limit.unwrap_or(DEFAULT_WORKFLOW_TRANSITION_PAGE),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::WorkflowTransitions { page })
+            }
+            ProtocolCommand::ApplyWorkflowCommand {
+                run_id,
+                expected_revision,
+                command,
+            } => {
+                validate_opaque_id("run_id", &run_id)?;
+                let (run, outcome) = self
+                    .workflow_service()?
+                    .apply(
+                        &WorkflowRunId::from_string(run_id),
+                        expected_revision,
+                        command,
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::WorkflowCommandApplied { run, outcome })
+            }
         }
     }
 
@@ -1871,6 +2011,12 @@ impl ProtocolHandler {
     fn task_service(&self) -> Result<&TaskProtocolService, HarnessError> {
         self.tasks.as_ref().ok_or_else(|| {
             HarnessError::Protocol("durable Task Coordinator is not configured".to_owned())
+        })
+    }
+
+    fn workflow_service(&self) -> Result<&WorkflowProtocolService, HarnessError> {
+        self.workflows.as_ref().ok_or_else(|| {
+            HarnessError::Protocol("durable Workflow Engine is not configured".to_owned())
         })
     }
 
@@ -2281,6 +2427,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
         HarnessError::RuntimeOverloaded { .. }
             | HarnessError::StateConflict { .. }
             | HarnessError::OrchestrationConflict { .. }
+            | HarnessError::WorkflowConflict { .. }
             | HarnessError::ApprovalConflict { .. }
             | HarnessError::Mcp(_)
     );
@@ -2289,6 +2436,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
             HarnessError::RuntimeOverloaded { .. } => "runtime_overloaded",
             HarnessError::StateConflict { .. } => "state_conflict",
             HarnessError::OrchestrationConflict { .. } => "orchestration_conflict",
+            HarnessError::WorkflowConflict { .. } => "workflow_conflict",
             HarnessError::ApprovalConflict { .. } => "approval_conflict",
             HarnessError::ProtocolDenied { .. } => "forbidden",
             HarnessError::Protocol(_) => "invalid_request",
@@ -2330,6 +2478,7 @@ mod tests {
         time::Duration,
     };
 
+    use semver::Version;
     use serde_json::json;
     use tokio::io::BufReader;
 
@@ -2346,13 +2495,15 @@ mod tests {
         ConnectorEvidence, ConnectorEvidenceClaim, EventStore, ExecutionBinding, HarnessError,
         HarnessFuture, HarnessRuntime, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
         MemoryApprovalInbox, MemoryEventStore, MemoryScope, MemoryTaskCoordinator,
-        ModelContinuation, ModelEventSink, ModelOutput, ModelRequest, ModelResponse, ModelStream,
-        ModelStreamEvent, OperationId, PendingEvent, PolicyDecision, PolicyEngine, RiskLevel,
-        SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine, StateEvent, StateSnapshot,
-        StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId,
-        TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool, ToolAuthorization, ToolCallBatch,
-        ToolCallBatchId, ToolContext, ToolDescriptor, ToolRegistry, TurnContextInput, TurnId,
-        TurnStatus, WorkspaceMode,
+        MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
+        ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
+        PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
+        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
+        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
+        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome, WorkflowCommand,
+        WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest, WorkflowDefinition,
+        WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2728,7 +2879,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_six_wire_envelopes_state_provenance_and_permissions_are_stable() {
+    fn protocol_twenty_seven_wire_envelopes_workflow_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -2736,14 +2887,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "26",
+                "protocol_version": "27",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "26",
+                "protocol_version": "27",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -2752,7 +2903,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "26",
+                "protocol_version": "27",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -2774,7 +2925,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "26",
+                "protocol_version": "27",
                 "body": {
                     "status": "success",
                     "result": {
@@ -2884,7 +3035,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "26",
+                "protocol_version": "27",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",
@@ -3367,6 +3518,84 @@ mod tests {
                 "send_task_message",
                 "task.worker.messages.send",
             ),
+            (
+                ProtocolCommand::CreateWorkflowRun {
+                    run_id: "workflow-run".to_owned(),
+                    request: WorkflowCreateRequest {
+                        command_id: WorkflowCommandId::from_static("create-workflow"),
+                        definition: WorkflowDefinition {
+                            name: "test.workflow".to_owned(),
+                            version: Version::new(1, 0, 0),
+                            content_sha256: "a".repeat(64),
+                        },
+                        task_graph_id: TaskGraphId::from_static("graph-fixture"),
+                    },
+                },
+                "create_workflow_run",
+                "workflow.run.create",
+            ),
+            (
+                ProtocolCommand::GetWorkflowRun {
+                    run_id: "workflow-run".to_owned(),
+                },
+                "get_workflow_run",
+                "workflow.run.get",
+            ),
+            (
+                ProtocolCommand::GetWorkflowTransitions {
+                    run_id: "workflow-run".to_owned(),
+                    after_sequence: Some(1),
+                    limit: Some(8),
+                },
+                "get_workflow_transitions",
+                "workflow.run.get",
+            ),
+            (
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "workflow-run".to_owned(),
+                    expected_revision: 1,
+                    command: WorkflowCommand {
+                        id: WorkflowCommandId::from_static("deliver-signal"),
+                        kind: WorkflowCommandKind::DeliverSignal {
+                            wait_id: WorkflowWaitId::from_static("wait"),
+                            signal_id: WorkflowSignalId::from_static("signal"),
+                            name: "test.signal".to_owned(),
+                            source: "test.source".to_owned(),
+                            idempotency_key: "event-1".to_owned(),
+                        },
+                    },
+                },
+                "apply_workflow_command",
+                "workflow.signal.deliver",
+            ),
+            (
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "workflow-run".to_owned(),
+                    expected_revision: 1,
+                    command: WorkflowCommand {
+                        id: WorkflowCommandId::from_static("wake-timer"),
+                        kind: WorkflowCommandKind::WakeDue {
+                            wait_id: WorkflowWaitId::from_static("wait"),
+                        },
+                    },
+                },
+                "apply_workflow_command",
+                "workflow.timer.wake",
+            ),
+            (
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "workflow-run".to_owned(),
+                    expected_revision: 1,
+                    command: WorkflowCommand {
+                        id: WorkflowCommandId::from_static("cancel-workflow"),
+                        kind: WorkflowCommandKind::Cancel {
+                            reason: "operator request".to_owned(),
+                        },
+                    },
+                },
+                "apply_workflow_command",
+                "workflow.run.mutate",
+            ),
         ];
         for (command, method, permission) in commands {
             assert_eq!(command.permission(), permission);
@@ -3821,6 +4050,176 @@ mod tests {
                     })
                 }
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workflow_protocol_is_conditional_idempotent_and_task_bound() {
+        let unconfigured = handler(Arc::new(ImmediateModel))
+            .handle(request("init-plain", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            unconfigured.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ..
+                }
+            } if !capabilities
+                .iter()
+                .any(|capability| capability.starts_with("workflow."))
+        ));
+
+        let tasks = Arc::new(MemoryTaskCoordinator::new());
+        let workflows =
+            WorkflowEngine::new(Arc::new(MemoryWorkflowCoordinator::new()), tasks.clone());
+        let configured = handler(Arc::new(ImmediateModel))
+            .with_task_coordinator(tasks)
+            .with_workflow_engine(workflows);
+        let initialized = configured
+            .handle(request("init-workflow", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ref compatibility,
+                    ..
+                }
+            } if capabilities
+                .iter()
+                .filter(|capability| capability.starts_with("workflow."))
+                .count() == 5
+                && compatibility.workflow_run_schema == 1
+        ));
+
+        configured
+            .handle(request(
+                "create-workflow-graph",
+                ProtocolCommand::CreateTaskGraph {
+                    graph_id: "workflow-graph".to_owned(),
+                    definitions: vec![task_definition("work", &[])],
+                },
+            ))
+            .await;
+        let create_request = WorkflowCreateRequest {
+            command_id: WorkflowCommandId::from_static("create-run"),
+            definition: WorkflowDefinition {
+                name: "test.workflow".to_owned(),
+                version: Version::new(1, 0, 0),
+                content_sha256: "a".repeat(64),
+            },
+            task_graph_id: TaskGraphId::from_static("workflow-graph"),
+        };
+        let created = configured
+            .handle(request(
+                "create-workflow",
+                ProtocolCommand::CreateWorkflowRun {
+                    run_id: "run".to_owned(),
+                    request: create_request,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            created.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::WorkflowRunCreated {
+                    ref run
+                }
+            } if run.revision == 1
+                && run.task_graph_id == TaskGraphId::from_static("workflow-graph")
+        ));
+
+        let wait = WorkflowCommand {
+            id: WorkflowCommandId::from_static("wait"),
+            kind: WorkflowCommandKind::WaitUntil {
+                wait_id: WorkflowWaitId::from_static("timer"),
+                due_at_ms: u64::MAX,
+            },
+        };
+        let applied = configured
+            .handle(request(
+                "wait-workflow",
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "run".to_owned(),
+                    expected_revision: 1,
+                    command: wait.clone(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            applied.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::WorkflowCommandApplied {
+                    ref run,
+                    outcome: WorkflowApplyOutcome::Applied,
+                }
+            } if run.revision == 2
+        ));
+        let duplicate = configured
+            .handle(request(
+                "replay-workflow",
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "run".to_owned(),
+                    expected_revision: 1,
+                    command: wait,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            duplicate.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::WorkflowCommandApplied {
+                    ref run,
+                    outcome: WorkflowApplyOutcome::Duplicate,
+                }
+            } if run.revision == 2
+        ));
+        let stale = configured
+            .handle(request(
+                "stale-workflow",
+                ProtocolCommand::ApplyWorkflowCommand {
+                    run_id: "run".to_owned(),
+                    expected_revision: 1,
+                    command: WorkflowCommand {
+                        id: WorkflowCommandId::from_static("stale-cancel"),
+                        kind: WorkflowCommandKind::Cancel {
+                            reason: "stale operator".to_owned(),
+                        },
+                    },
+                },
+            ))
+            .await;
+        assert!(matches!(
+            stale.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: true,
+                    ..
+                }
+            } if code == "workflow_conflict"
+        ));
+        let transitions = configured
+            .handle(request(
+                "workflow-transitions",
+                ProtocolCommand::GetWorkflowTransitions {
+                    run_id: "run".to_owned(),
+                    after_sequence: None,
+                    limit: Some(8),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            transitions.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::WorkflowTransitions {
+                    ref page
+                }
+            } if page.transitions.len() == 2
+                && page.next_after_sequence == Some(2)
+                && !page.has_more
         ));
     }
 

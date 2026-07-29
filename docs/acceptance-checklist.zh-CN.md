@@ -36,14 +36,14 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"26","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"27","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
 - [ ] 返回一个且仅一个成功 JSON 响应。
-- [ ] 能力包含 Thread、Approval 和 Task Worker 表面。
-- [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db` 已创建。
-- [ ] 服务重启后此前创建的 Thread 和 Task Graph 仍可读取。
+- [ ] 能力包含 Thread、Approval、Task Worker 和 Workflow 表面。
+- [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db`、`workflows.db` 已创建。
+- [ ] 服务重启后此前创建的 Thread、Task Graph 和 Workflow Run 仍可读取。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
       `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
       或新的 running Turn 时均不修改 State。

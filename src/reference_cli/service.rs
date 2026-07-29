@@ -31,11 +31,13 @@ use y_harness::{
     ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
     SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
-    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator, StateEngine,
-    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
-    TaskCoordinator, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
-    TurnExecutionOptions, TurnOutcome, VerificationRegistry, VerifierDescriptor,
-    decode_thread_archive, encode_thread_archive, register_selected_mcp_tools, serve_stdio,
+    SkillTrustStore, SqliteApprovalInbox, SqliteEventStore, SqliteTaskCoordinator,
+    SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
+    StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, ThreadId,
+    ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
+    VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
+    WorkflowEngine, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
+    serve_stdio,
 };
 
 #[cfg(feature = "https-model")]
@@ -960,7 +962,7 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
@@ -1044,6 +1046,9 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         Arc::new(SqliteApprovalInbox::open(loaded.data_directory.join("approvals.db")).await?);
     let tasks =
         Arc::new(SqliteTaskCoordinator::open(loaded.data_directory.join("tasks.db")).await?);
+    let workflows = Arc::new(
+        SqliteWorkflowCoordinator::open(loaded.data_directory.join("workflows.db")).await?,
+    );
 
     let approval_handler = Arc::new(InboxApprovalHandler::new(
         approvals.clone(),
@@ -1051,10 +1056,13 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     )?);
     let runtime = Arc::new(runtime.with_approval_handler(approval_handler));
     let approval_port: Arc<dyn ApprovalInbox> = approvals;
-    let task_port: Arc<dyn TaskCoordinator> = tasks;
+    let task_port: Arc<dyn TaskCoordinator> = tasks.clone();
+    let workflow_port: Arc<dyn WorkflowCoordinator> = workflows;
+    let workflow_engine = WorkflowEngine::new(workflow_port, tasks);
     let handler = ProtocolHandler::new(runtime)
         .with_approval_inbox(approval_port)
         .with_task_coordinator(task_port)
+        .with_workflow_engine(workflow_engine)
         .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
     let served = serve_stdio(handler).await;
     let shutdown = shutdown_mcp_clients(&mcp_clients).await;

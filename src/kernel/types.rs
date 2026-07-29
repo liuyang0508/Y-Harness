@@ -109,6 +109,10 @@ id_type!(ArtifactId, "artifact");
 id_type!(OperationId, "operation");
 id_type!(SteeringId, "steering");
 id_type!(ToolCallBatchId, "tool-batch");
+id_type!(WorkflowRunId, "workflow-run");
+id_type!(WorkflowWaitId, "workflow-wait");
+id_type!(WorkflowCommandId, "workflow-command");
+id_type!(WorkflowSignalId, "workflow-signal");
 
 fn next_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
@@ -1724,6 +1728,17 @@ pub enum HarnessError {
         /// Revision found atomically by the coordinator.
         actual: u64,
     },
+    /// Workflow Run, wait, signal, timer, retry, or migration contract failure.
+    Workflow(String),
+    /// An atomic Workflow Run command lost an optimistic revision race.
+    WorkflowConflict {
+        /// Contended Workflow Run.
+        run_id: WorkflowRunId,
+        /// Revision observed before mutation.
+        expected: u64,
+        /// Revision found atomically by the coordinator.
+        actual: u64,
+    },
     /// Tool execution failure.
     Tool(String),
     /// External process broker, isolation, or I/O failure.
@@ -1833,6 +1848,15 @@ impl Display for HarnessError {
             } => write!(
                 formatter,
                 "orchestration conflict on graph {graph_id}: expected revision {expected}, found {actual}"
+            ),
+            Self::Workflow(message) => write!(formatter, "workflow error: {message}"),
+            Self::WorkflowConflict {
+                run_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "workflow conflict on run {run_id}: expected revision {expected}, found {actual}"
             ),
             Self::Tool(message) => write!(formatter, "tool error: {message}"),
             Self::Execution(message) => write!(formatter, "execution error: {message}"),

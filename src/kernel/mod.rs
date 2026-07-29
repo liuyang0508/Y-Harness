@@ -29,5 +29,5 @@ pub use types::{
     TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage,
     ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
     ToolDescriptor, ToolExecutionResult, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome,
+    VerificationOutcome, WorkflowCommandId, WorkflowRunId, WorkflowSignalId, WorkflowWaitId,
 };

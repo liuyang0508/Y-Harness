@@ -38,7 +38,7 @@ reason to duplicate Runtime or State.
 | optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, schema-14 Runtime-bound Connector evidence, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
-| durable Task DAG and fenced workers | event/timer/human-wait Workflow |
+| durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits and safe-boundary definition migration | background timer service, automatic Task retry, durable compensation plan, or Human Handoff |
 | durable Approval Inbox | ownership transfer or Human Handoff |
 | digest-bound Thread handoff input | Human Handoff |
 | reproducible Evaluation runner and digest-bound Pack evaluation evidence | domain-specific suites, canary evidence, or automatic promotion policy |
@@ -98,6 +98,13 @@ and direct Model environment Secrets share that authority. Enabled shared MCP
 configuration fails before launch. This is deployment partitioning, not
 multi-principal authentication or tenant routing.
 
+ADR 0127 adds a separate Workflow Run aggregate above Task execution. It
+persists exact signal, timer, and explicit retry waits; fences every wake to
+the current wait identity; binds idempotent command identities to typed-command
+digests; allows same-name monotonic definition migration only at a durable
+wait; and exposes the tenant-fenced lifecycle through Protocol v27. The
+reference service stores Runs independently in `workflows.db`.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -115,7 +122,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v26 client
+Domain Pack lifecycle remains deliberately outside Core and the v27 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid
@@ -126,6 +133,7 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, durable Workflow
-waits/timers, Human Handoff, quota, retention, canary rollout, and multi-node
-control-plane availability remain open.
+Secret-manager integration, tenant-partitioned MCP sessions, background timer
+polling, automatic effect-safe Task retry, Workflow compensation planning,
+Human Handoff, quota, retention, canary rollout, and multi-node control-plane
+availability remain open.

@@ -4,6 +4,12 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added independent Workflow Run schema 1 and Protocol v27 above the durable
+  Task Graph: revision-CAS commands with content-bound idempotency, fenced
+  signal/timer waits, explicit retry waits, safe-boundary definition migration,
+  tenant-partitioned Memory/SQLite coordination, Task-completion proof,
+  conditional protocol capabilities, bounded transition evidence, and
+  restart recovery through `workflows.db`;
 - added State/snapshot schema 14 and Thread archive format 4 with bounded
   Runtime-bound Connector evidence: registered Tool/origin, trusted
   actor/tenant, exact output SHA-256, atomic ToolResult persistence,

@@ -465,15 +465,29 @@ schema must not advance.
 - Task Graph persistence uses an observed revision compare-and-swap. A conflict
   is returned to the caller for reload and semantic recomputation; stale
   mutations are never retried blindly.
+- Workflow persistence is a separate tenant-partitioned aggregate above a Task
+  Graph. It owns cross-time waits, migration, and terminal lifecycle; it never
+  becomes a second Task lease, worker, or effect authority.
+- Every Workflow mutation carries the exact positive revision observed by the
+  caller and a stable command identity bound to its complete typed payload.
+  Exact replay is idempotent; identity reuse with different content and new
+  commands against stale revisions fail closed.
+- Every Workflow wait has a stable fence. Signal delivery requires that exact
+  active wait and an idempotency identity; timer wake is valid only at or after
+  its due time, with timeout winning at the exact expiration boundary.
+- Workflow definition migration is allowed only at a declared safe boundary,
+  moves monotonically to a new name-compatible version/digest, and preserves
+  immutable prior transition evidence. A successful Workflow terminal command
+  requires every linked Task to be durably complete.
 - The Task Graph domain, not only its store, owns aggregate durable capacity.
   Construction and deserialization establish a conservative charge; every
   status/message mutation preflights its complete delta and publishes only a
   persistable result. The Coordinator retains an exact final encoding check.
 - Process-shared SQLite coordination is not described as multi-node consensus
   or distributed high availability.
-- Approval and Task Graph SQLite reads apply their declared payload and
-  identity bounds before text materialization; index/body and graph invariants
-  are still revalidated after decoding.
+- Approval, Task Graph, and Workflow SQLite reads apply their declared payload
+  and identity bounds before text materialization; index/body and aggregate
+  invariants are still revalidated after decoding.
 - Every State transition uses an Event Store compare-and-append against the
   observed stream version and recovery charge. Both metadata values and the
   event must change atomically; a stale writer must fail closed.

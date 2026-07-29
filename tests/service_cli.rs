@@ -14,13 +14,15 @@ use std::{
 };
 
 use ed25519_dalek::{Signer, SigningKey};
+use semver::Version;
 use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand,
     ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult, SECRET_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillPackage,
     SkillSignature, SkillTransparencyReceipt, SqliteEventStore, StateEngine,
-    TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskId, ThreadId, TurnStatus, WorkspaceMode,
-    decode_thread_archive,
+    TASK_GRAPH_SCHEMA_VERSION, TaskDefinition, TaskGraphId, TaskId, ThreadId, TurnStatus,
+    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommandId, WorkflowCreateRequest, WorkflowDefinition,
+    WorkspaceMode, decode_thread_archive,
 };
 #[cfg(unix)]
 use y_harness::{CapabilityOrigin, OperationStatus};
@@ -71,7 +73,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
     assert!(report.contains(&format!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("authority: local-process / unscoped"));
@@ -1738,7 +1740,7 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
 }
 
 #[test]
-fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
+fn persistent_service_recovers_threads_task_graphs_and_workflows_after_restart() {
     let project = isolated_project("persistence");
     let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("init")
@@ -1765,6 +1767,21 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
                     }],
                 },
             ),
+            request(
+                "create-workflow",
+                ProtocolCommand::CreateWorkflowRun {
+                    run_id: "persistent-workflow".to_owned(),
+                    request: WorkflowCreateRequest {
+                        command_id: WorkflowCommandId::from_static("create-persistent-workflow"),
+                        definition: WorkflowDefinition {
+                            name: "persistent.workflow".to_owned(),
+                            version: Version::new(1, 0, 0),
+                            content_sha256: "a".repeat(64),
+                        },
+                        task_graph_id: TaskGraphId::from_static("persistent-graph"),
+                    },
+                },
+            ),
         ],
     );
     let thread_id = match &first[1].body {
@@ -1778,6 +1795,13 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
         ProtocolResponseBody::Success {
             result: ProtocolResult::TaskGraphCreated { .. }
         }
+    ));
+    assert!(matches!(
+        first[3].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::WorkflowRunCreated { ref run }
+        } if run.revision == 1
+            && run.task_graph_id == TaskGraphId::from_static("persistent-graph")
     ));
 
     let second = serve(
@@ -1800,6 +1824,12 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
                 "get-graph",
                 ProtocolCommand::GetTaskGraph {
                     graph_id: "persistent-graph".to_owned(),
+                },
+            ),
+            request(
+                "get-workflow",
+                ProtocolCommand::GetWorkflowRun {
+                    run_id: "persistent-workflow".to_owned(),
                 },
             ),
         ],
@@ -1830,7 +1860,17 @@ fn persistent_service_recovers_threads_and_task_graphs_after_restart() {
             }
         } if graph.revision == 1 && graph.task_count == 1
     ));
-    for database in ["state.db", "approvals.db", "tasks.db"] {
+    assert!(matches!(
+        second[3].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::WorkflowRun {
+                run: Some(ref run)
+            }
+        } if run.revision == 1
+            && run.definition.name == "persistent.workflow"
+            && run.task_graph_id == TaskGraphId::from_static("persistent-graph")
+    ));
+    for database in ["state.db", "approvals.db", "tasks.db", "workflows.db"] {
         assert!(project.join(".y-harness").join(database).is_file());
     }
     fs::remove_dir_all(project).expect("remove isolated project");

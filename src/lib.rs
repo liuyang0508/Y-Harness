@@ -26,6 +26,7 @@ mod sqlite;
 mod state;
 mod transport;
 mod verification;
+mod workflow;
 
 pub use approval::{
     APPROVAL_INBOX_SCHEMA_VERSION, ApprovalInbox, ApprovalMigrationReport, ApprovalMigrationStatus,
@@ -75,7 +76,7 @@ pub use kernel::{
     TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage, ToolAuthorization,
     ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
     ToolExecutionResult, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome,
+    VerificationOutcome, WorkflowCommandId, WorkflowRunId, WorkflowSignalId, WorkflowWaitId,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -108,8 +109,8 @@ pub use protocol::{
     CompatibilityManifest, FingerprintProtocolAuthorizer, OperationStatus, OperationStreamEvent,
     PROTOCOL_VERSION, ProtocolAuthorizer, ProtocolCommand, ProtocolError, ProtocolHandler,
     ProtocolPrincipal, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
-    ProtocolShutdownReport, TaskGraphSummary, TaskRecordPage, serve_jsonl, serve_jsonl_as,
-    serve_stdio,
+    ProtocolShutdownReport, TaskGraphSummary, TaskRecordPage, WorkflowRunSummary,
+    WorkflowTransitionPage, serve_jsonl, serve_jsonl_as, serve_stdio,
 };
 pub use runtime::{
     AllowListPolicy, ApprovalHandler, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
@@ -153,6 +154,13 @@ pub use transport::{
 pub use transport::{TlsJsonlServer, TlsJsonlServerConfig, TlsJsonlServerReport};
 pub use verification::{
     RegisteredVerifier, VerificationRegistry, VerificationRequest, Verifier, VerifierDescriptor,
+};
+pub use workflow::{
+    MemoryWorkflowCoordinator, SqliteWorkflowCoordinator, WORKFLOW_RUN_SCHEMA_VERSION,
+    WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandKind, WorkflowCommandResult,
+    WorkflowCoordinator, WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRun,
+    WorkflowRunSnapshot, WorkflowStatus, WorkflowTransition, WorkflowTransitionKind, WorkflowWait,
+    WorkflowWakeReason,
 };
 
 /// Exact HTTPS JSON model-gateway contract version.
