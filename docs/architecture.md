@@ -327,6 +327,13 @@ direction:
   Connector entry, panic/timeout/cancellation isolation, and fail-closed
   post-dispatch uncertainty; one host call performs one sweep and Core owns no
   background consumer, Channel, credential, or reconciliation lifecycle;
+- embedded Governed Effect Reconciler API 1 with frozen exact-versioned
+  authoritative read-only lookup descriptors, default-deny pre-query Policy,
+  complete unknown-page revalidation, bounded concurrent lookup isolation,
+  evidence validation, deterministic actor/tenant/cycle/evidence-bound
+  settlement identity, and exact revision/attempt/lease CAS; duplicate
+  cross-host lookups may occur but Core owns no poller, query lease,
+  credential, target truth model, or external mutation authority;
 - embedded Temporal Driver API 2 with host-supplied time, optional
   Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
   source, disposable cursors, fail-closed extension-page revalidation,

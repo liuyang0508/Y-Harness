@@ -8,6 +8,8 @@
 mod coordinator;
 mod engine;
 mod executor;
+mod page;
+mod reconciler;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
@@ -32,6 +34,16 @@ pub use executor::{
     EffectExecutionRequest, EffectExecutor, EffectExecutorAttempt, EffectExecutorAttemptOutcome,
     EffectExecutorClock, EffectExecutorConfig, EffectExecutorRunReport, EffectExecutorRunRequest,
     EffectIdempotencyContract, RegisteredEffectConnector, SystemEffectExecutorClock,
+};
+pub use reconciler::{
+    AllowListEffectReconciliationPolicy, DenyAllEffectReconciliations,
+    EFFECT_RECONCILER_API_VERSION, EffectReconciler, EffectReconcilerAttempt,
+    EffectReconcilerAttemptOutcome, EffectReconcilerClock, EffectReconcilerConfig,
+    EffectReconcilerRunReport, EffectReconcilerRunRequest, EffectReconciliationConnector,
+    EffectReconciliationConnectorDescriptor, EffectReconciliationConnectorRegistry,
+    EffectReconciliationContract, EffectReconciliationDecision, EffectReconciliationOutcome,
+    EffectReconciliationPolicy, EffectReconciliationPolicyRequest, EffectReconciliationRequest,
+    RegisteredEffectReconciliationConnector, SystemEffectReconcilerClock,
 };
 
 const MAX_EFFECT_TRANSITIONS: usize = 4_096;

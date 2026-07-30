@@ -16,9 +16,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{task::JoinSet, time::timeout};
 
+#[cfg(test)]
+use super::EffectPage;
 use super::{
     EffectApplyOutcome, EffectCommand, EffectCommandKind, EffectEngine, EffectLease,
-    EffectOperation, EffectPage, EffectPageCursor, EffectReceipt, EffectSnapshot, EffectStatus,
+    EffectOperation, EffectPageCursor, EffectReceipt, EffectSnapshot, EffectStatus,
+    page::{EffectPageState, validate_effect_page},
     validate_application_time, validate_identity, validate_receipt,
 };
 use crate::{
@@ -609,11 +612,13 @@ impl EffectExecutor {
                 authority,
             )
             .await?;
-        validate_pending_page(
+        validate_effect_page(
+            "Effect Executor",
             &page,
             request.after.as_ref(),
             self.config.scan_limit,
             authority,
+            EffectPageState::Pending,
         )?;
 
         let mut prepared = Vec::new();
@@ -1165,49 +1170,6 @@ fn validate_run_request(
     Ok(())
 }
 
-fn validate_pending_page(
-    page: &EffectPage,
-    after: Option<&EffectPageCursor>,
-    limit: usize,
-    authority: &AuthorityContext,
-) -> Result<(), HarnessError> {
-    if page.effects.len() > limit {
-        return Err(HarnessError::Effect(
-            "Effect Executor pending page exceeds scan limit".to_owned(),
-        ));
-    }
-    let expected_cursor = page.effects.last().map(|snapshot| EffectPageCursor {
-        effect_id: snapshot.id().clone(),
-    });
-    if page.next_cursor != expected_cursor || (page.has_more && page.effects.len() != limit) {
-        return Err(HarnessError::Effect(
-            "Effect Executor pending page has inconsistent continuation".to_owned(),
-        ));
-    }
-    let mut previous = after.map(|cursor| cursor.effect_id.as_str());
-    for snapshot in &page.effects {
-        snapshot.effect().validate()?;
-        let transition_count = u64::try_from(snapshot.effect().transition_count())
-            .map_err(|_| HarnessError::Effect("Effect transition count overflow".to_owned()))?;
-        if snapshot.tenant_id() != authority.tenant_id()
-            || snapshot.effect().tenant_id() != authority.tenant_id()
-            || snapshot.revision() != transition_count
-            || !matches!(snapshot.effect().status(), EffectStatus::Pending { .. })
-        {
-            return Err(HarnessError::Effect(
-                "Effect Executor pending page projection is invalid".to_owned(),
-            ));
-        }
-        if previous.is_some_and(|prior| snapshot.id().as_str() <= prior) {
-            return Err(HarnessError::Effect(
-                "Effect Executor pending page identities are not ordered".to_owned(),
-            ));
-        }
-        previous = Some(snapshot.id().as_str());
-    }
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct ExecutionIdentity<'a> {
     purpose: &'a str,
@@ -1697,7 +1659,17 @@ mod tests {
 
         let mut bad_continuation = canonical.clone();
         bad_continuation.next_cursor = None;
-        assert!(validate_pending_page(&bad_continuation, None, 16, &authority).is_err());
+        assert!(
+            validate_effect_page(
+                "Effect Executor",
+                &bad_continuation,
+                None,
+                16,
+                &authority,
+                EffectPageState::Pending,
+            )
+            .is_err()
+        );
 
         let claimed = engine
             .apply_as(
@@ -1723,7 +1695,17 @@ mod tests {
             }),
             has_more: false,
         };
-        assert!(validate_pending_page(&non_pending, None, 16, &authority).is_err());
+        assert!(
+            validate_effect_page(
+                "Effect Executor",
+                &non_pending,
+                None,
+                16,
+                &authority,
+                EffectPageState::Pending,
+            )
+            .is_err()
+        );
     }
 
     #[test]

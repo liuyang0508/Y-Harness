@@ -20,6 +20,7 @@ upgrade support that has not been tested.
 | Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
 | Effect Ledger | `1` | store metadata plus per-Effect SQLite schema column |
 | Governed Effect Executor API | `1` | exact embedded Connector descriptor; not a durable or client-protocol coordinate |
+| Governed Effect Reconciler API | `1` | exact embedded read-only Connector descriptor; not a durable or client-protocol coordinate |
 | Temporal Driver API | `2` | exact embedded Rust API; not a durable or client-protocol coordinate |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
@@ -267,6 +268,15 @@ outcome, configuration, and report types, so wildcard imports or exhaustive
 external construction may require a source update. It adds no durable schema,
 Protocol v29 command, configuration field, or Core background task. See
 [ADR 0134](adr/0134-host-driven-governed-effect-executor.md).
+
+Governed Effect Reconciler API 1 is another additive embedded Rust surface over
+schema-1 Ledger reconciliation commands. Its distinct Connector descriptor
+requires an exact capability, explicit operation set, API coordinate, trust
+origin, and authoritative read-only lookup contract. The public pre-1.0 crate
+adds Reconciler, Connector, Policy, Clock, request, outcome, configuration, and
+report types. It adds no Effect schema, Protocol v29 command, configuration
+field, durable query lease, or Core background task. See
+[ADR 0135](adr/0135-host-driven-authoritative-effect-reconciliation.md).
 
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,

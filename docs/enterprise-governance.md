@@ -158,6 +158,17 @@ content. The API neither polls autonomously nor verifies Connector truth;
 operators still own credentials, containment, reconciliation, and service
 availability.
 
+ADR 0135 adds optional embedded Governed Effect Reconciler API 1 without
+weakening the Ledger's fail-closed uncertainty. A host registers exact
+authoritative read-only lookup Connectors, installs a default-deny pre-query
+Policy, supplies trusted time and Authority, and invokes bounded unknown
+sweeps. Valid target evidence settles through the existing
+revision/attempt/lease CAS. Missing, malformed, failed, panicked, timed-out,
+cancelled, or still-unknown observations perform no mutation. Duplicate
+cross-host queries are explicitly allowed only under the read-only contract;
+the host still owns credentials, containment, cadence, receipt truth, and
+service availability.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -187,7 +198,8 @@ only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
 Secret-manager integration, tenant-partitioned MCP sessions, a configured
-reference-service Effect consumer, receipt verification, automatic unknown
-reconciliation, Workflow compensation planning, automatic Human Handoff
+reference-service Effect execution/reconciliation consumer, receipt
+verification, reconciliation cadence/backoff, Workflow compensation planning,
+automatic Human Handoff
 channel routing/outbox delivery, quota, retention, canary rollout, and
 multi-node control-plane availability remain open.

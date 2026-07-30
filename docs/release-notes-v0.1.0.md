@@ -122,6 +122,14 @@ pre-Claim request, bounds concurrent Connector calls and deadlines, skips
 duplicate Claim callers, and converts every post-dispatch failure into durable
 uncertainty. It is host-driven and adds no Protocol command, polling thread,
 credential store, or receipt/reconciliation authority.
+Embedded Governed Effect Reconciler API 1 optionally converges `unknown`
+attempts through exact registered authoritative read-only lookup Connectors.
+It runs default-deny Policy before lookup, bounds concurrency and deadlines,
+isolates failure, validates evidence, and settles only through the existing
+revision/attempt/lease CAS. Duplicate lookup is permitted because the contract
+forbids external mutation; opaque failure and `StillUnknown` leave durable
+state unchanged. It adds no Effect schema, Protocol command, query lease,
+poller, credential store, or target truth model.
 Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
 Engines behind one bounded host-driven tick. It uses trusted host time and
 authority, tenant-local 1–256-record identity scans per source, disposable

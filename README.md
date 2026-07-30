@@ -861,6 +861,23 @@ Channel, credential store, receipt verifier, or reconciliation policy. See
 cargo run --locked --example effect_executor
 ```
 
+Unknown Effects may be converged by optional Governed Effect Reconciler API 1.
+Reconciliation Connectors register one exact capability and operation set plus
+an explicit authoritative read-only contract. A default-deny Policy runs before
+lookup; valid `Applied` or `NotApplied` evidence settles through the existing
+revision/attempt/lease CAS, while error, panic, timeout, cancellation,
+`StillUnknown`, or malformed evidence leaves the Effect unchanged. Duplicate
+cross-host queries are permitted only because the Connector contract forbids
+external mutation; settlement remains idempotent and fenced. Core owns no
+poller, query lease, credential store, or target truth model. See
+[ADR 0135](docs/adr/0135-host-driven-authoritative-effect-reconciliation.md)
+and the
+[`effect_reconciler`](examples/effect_reconciler.rs) public-API example:
+
+```bash
+cargo run --locked --example effect_reconciler
+```
+
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and

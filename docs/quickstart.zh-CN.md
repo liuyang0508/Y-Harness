@@ -174,6 +174,17 @@ Executor API 1，并注册精确版本的 Connector、显式 operation 集合和
 cargo run --locked --example effect_executor
 ```
 
+如果外部结果已经进入 `unknown`，可选装 Governed Effect Reconciler API 1，
+注册精确 capability/operation 和 `authoritative_read_only` 查询契约，再
+显式放行对账 Policy。它只查询权威目标状态，不会重试原操作；有效的
+`Applied` / `NotApplied` 证据经现有 revision/attempt/lease CAS 收敛，
+查询错误、panic、超时、取消、畸形证据或 `StillUnknown` 均保持原状态。
+宿主仍负责轮询节奏、凭据、Connector 隔离与回执真伪。可运行：
+
+```bash
+cargo run --locked --example effect_reconciler
+```
+
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：
 
