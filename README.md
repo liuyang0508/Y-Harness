@@ -967,10 +967,13 @@ and non-claims are fixed by
 [ADR 0138](docs/adr/0138-dispatch-time-effect-command-digest-locks.md).
 `secret_environment` is optional, contains references and host variable names
 only, is probed by `yh doctor`, and is resolved again under the exact Effect
-authority before every dispatch. It is not serialized to the Connector. See
-[ADR 0139](docs/adr/0139-typed-secret-use-and-effect-credential-custody.md).
-The current adapter resolves before entering the Broker; a later digest
-mismatch blocks child entry but may follow one Provider lookup.
+authority before every dispatch. It is not serialized to the Connector and is
+accepted only with dispatch SHA-256 integrity. The adapter preflights that
+digest before Provider resolution; the Broker measures again before child
+entry. A racing change may still cause issuance before the second measurement
+rejects it, so this is not an atomic executable-to-`exec` claim. See
+[ADR 0139](docs/adr/0139-typed-secret-use-and-effect-credential-custody.md) and
+[ADR 0140](docs/adr/0140-secret-gated-effect-command-integrity-preflight.md).
 
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v30 preserves Protocol v29's 2 MiB request and 16 MiB

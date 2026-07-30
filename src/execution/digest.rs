@@ -93,23 +93,14 @@ impl ProcessBroker for DigestLockedProcessBroker {
             let deadline = Instant::now().checked_add(request.timeout).ok_or_else(|| {
                 HarnessError::Execution("process timeout exceeds runtime clock".to_owned())
             })?;
-            let measurement = verify_program_sha256(&self.program, &self.expected_sha256);
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    return Err(HarnessError::Cancelled {
-                        phase: request.cancellation_phase,
-                    });
-                }
-                measured = timeout_at(deadline, measurement) => {
-                    measured
-                        .map_err(|_| {
-                            HarnessError::Execution(
-                                "configured executable digest measurement timed out".to_owned(),
-                            )
-                        })??;
-                }
-            }
+            verify_program_sha256_before(
+                &self.program,
+                &self.expected_sha256,
+                &cancellation,
+                request.cancellation_phase,
+                deadline,
+            )
+            .await?;
             request.timeout = deadline.saturating_duration_since(Instant::now());
             if request.timeout.is_zero() {
                 return Err(HarnessError::Execution(
@@ -118,6 +109,30 @@ impl ProcessBroker for DigestLockedProcessBroker {
             }
             self.delegate.execute(request, cancellation).await
         })
+    }
+}
+
+pub(super) async fn verify_program_sha256_before(
+    path: &Path,
+    expected: &str,
+    cancellation: &CancellationToken,
+    phase: crate::ExecutionPhase,
+    deadline: Instant,
+) -> Result<(), HarnessError> {
+    let measurement = verify_program_sha256(path, expected);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            Err(HarnessError::Cancelled { phase })
+        }
+        measured = timeout_at(deadline, measurement) => {
+            measured
+                .map_err(|_| {
+                    HarnessError::Execution(
+                        "configured executable digest measurement timed out".to_owned(),
+                    )
+                })?
+        }
     }
 }
 

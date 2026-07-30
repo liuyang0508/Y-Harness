@@ -82,11 +82,12 @@ plain `String` values in process configuration.
 - An external Connector is still trusted not to echo a credential into stdout,
   a receipt, or its target system. Output validation and content-free errors
   reduce accidental leakage; they do not certify arbitrary Connector code.
-- The adapter resolves immediately before calling the Process Broker. A
-  dispatch-time digest lock inside that Broker still prevents a drifted child
-  from starting, but the Provider may already have issued or audited a
-  credential. An integrity-before-resolution two-phase launch contract remains
-  separate work.
+- Credential-bearing adapters require dispatch SHA-256 evidence and perform an
+  additional bounded preflight before Provider resolution. The Broker still
+  remeasures before child entry. This prevents Provider lookup for drift
+  already present at call entry, but a change racing after the preflight can
+  still cause issuance before the second measurement rejects it. See
+  [ADR 0140](0140-secret-gated-effect-command-integrity-preflight.md).
 - The built-in reference service still offers environment-backed custody, not a
   vault, KMS, OAuth refresh service, rotation controller, or revocation feed.
   Embedded hosts can supply another API-3 `SecretProvider` without changing

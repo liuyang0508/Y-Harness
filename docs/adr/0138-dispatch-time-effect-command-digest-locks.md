@@ -65,7 +65,11 @@ Credential custody was deliberately left separate in this decision.
 `environment_from_host` remains an exact cleared-environment projection, not a
 general Secret manager. [ADR 0139](0139-typed-secret-use-and-effect-credential-custody.md)
 subsequently adds an Effect-native, per-dispatch Secret flow without inventing
-fake Thread and Turn identities.
+fake Thread and Turn identities. Credential-bearing adapters additionally
+preflight the frozen digest before Provider resolution and retain the Broker
+measurement before child entry; the two-measurement contract and remaining
+race are specified by
+[ADR 0140](0140-secret-gated-effect-command-integrity-preflight.md).
 
 ## Rejected alternatives
 

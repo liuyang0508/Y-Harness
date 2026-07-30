@@ -209,6 +209,15 @@ values, Effect input, JSON Connector envelopes, State, and diagnostics. This
 does not claim erasure of operating-system or child-process copies, arbitrary
 Connector honesty, vault/KMS/OAuth integration, rotation, or revocation.
 
+ADR 0140 requires every credential-bearing JSON Effect Connector to advertise
+dispatch SHA-256 integrity. The adapter measures before Provider resolution,
+then the Broker measures again before child entry, with both measurements,
+Provider work, queueing, and execution sharing one process deadline. Existing
+drift therefore performs no per-dispatch Provider lookup. A change racing
+after the first measurement can still cause issuance before the second rejects
+it; neither measurement is an atomic file-descriptor-to-`exec` or transitive
+artifact proof.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,

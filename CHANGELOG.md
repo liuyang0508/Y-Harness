@@ -8,11 +8,13 @@ All notable changes to Y-Harness are documented in this file.
   Agent-Turn, Governed-Effect, and service-use contexts; added optional
   authority-aware Effect `secret_environment` references, content-free startup
   probes, per-dispatch resolution into non-cloneable zeroizing process buffers,
-  fixed-tenant routing, cancellation-before-provider-entry, Doctor counts, and
-  real subprocess proof that credentials reach only the child environment and
-  never Connector JSON or diagnostics; OS/child copies, vault/KMS integration,
-  rotation, revocation, and arbitrary Connector honesty remain outside the
-  claim;
+  fixed-tenant routing, mandatory digest evidence, a Secret-gating integrity
+  preflight followed by the Broker's second measurement, shared deadline,
+  cancellation-before-provider-entry, Doctor counts, and real subprocess proof
+  that credentials reach only the child environment and never Connector JSON
+  or diagnostics; atomic executable-to-exec binding, OS/child copies,
+  vault/KMS integration, rotation, revocation, and arbitrary Connector honesty
+  remain outside the claim;
 - added dispatch-time executable SHA-256 locks for one-shot Process Brokers,
   with frozen measured/unmeasured integrity evidence, regular-file and 256 MiB
   bounds, exact-path enforcement, per-request cancellation/deadline accounting,

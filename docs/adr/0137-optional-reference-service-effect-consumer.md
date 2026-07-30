@@ -86,7 +86,9 @@ external command. The ADR 0138 command-file measurement is not an atomic OS exec
 binding or transitive dependency proof. ADR 0139 subsequently adds optional
 typed per-dispatch Secret resolution to this reference lifecycle; it does not
 turn the service into a vault, rotation controller, or proof of Connector
-honesty.
+honesty. ADR 0140 subsequently requires credential-bearing commands to pass a
+digest preflight before Provider resolution and retain the Broker's second
+measurement before child entry, without claiming an atomic OS exec binding.
 
 ## Rejected alternatives
 

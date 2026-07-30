@@ -144,10 +144,13 @@ default-deny, bounded loops over the authoritative Ledger. Every Connector
 uses a per-dispatch command-file SHA-256 drift lock. Optional
 `secret_environment` entries contain only opaque references and host variable
 names; Secret Provider API 3 resolves them under the exact typed Effect
-context and trusted Authority immediately before each dispatch. Protocol 30
-advertises API 3 without adding a Secret-bearing command. Values do not enter
-Effect input, JSON Connector envelopes, State, or diagnostics; operating-system
-and child-process copies are not covered by Y-Harness zeroization.
+context and trusted Authority immediately before each dispatch. Such
+Connectors require dispatch SHA-256 evidence: the adapter preflights before
+Provider resolution and the Broker measures again before child entry under one
+deadline. Protocol 30 advertises API 3 without adding a Secret-bearing command.
+Values do not enter Effect input, JSON Connector envelopes, State, or
+diagnostics; racing post-preflight issuance, atomic executable binding, and
+operating-system/child-process copies remain outside the claim.
 Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
 Engines behind one bounded host-driven tick. It uses trusted host time and
 authority, tenant-local 1–256-record identity scans per source, disposable
@@ -294,14 +297,17 @@ validation. This changes no durable or Protocol coordinate.
 - optional TUI package: `0.1.0`
 - optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `28`
+- client protocol: `30`
 - State event/snapshot schema: `14` / `14`
 - Approval Inbox schema: `3`
 - Task Coordinator schema: `3`
 - Workflow Coordinator schema: `1`
 - Human Handoff Coordinator schema: `1`
-- Temporal Driver API: `1` (embedded only)
-- Secret Provider API: `2`
+- Effect Ledger schema: `1`
+- Governed Effect Executor/Reconciler API: `1` / `1` (embedded only)
+- JSON Effect Connector protocol: `1`
+- Temporal Driver API: `2` (embedded only)
+- Secret Provider API: `3`
 - Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`
 

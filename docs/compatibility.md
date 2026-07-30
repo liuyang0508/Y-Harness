@@ -11,7 +11,7 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"29"` | exact `Initialize` request/response |
+| Client protocol | `"30"` | exact `Initialize` request/response |
 | State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
 | State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
@@ -30,7 +30,7 @@ upgrade support that has not been tested.
 | Thread archive format | `4` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
-| Secret Provider API | `2` | exact descriptor registration and trusted-authority resolution |
+| Secret Provider API | `3` | exact descriptor registration, typed use context, and trusted-authority resolution |
 | Skill package API | `"1"` | exact manifest validation |
 | HTTPS model gateway API | `"7"` | exact request/response header |
 
@@ -333,6 +333,17 @@ additively accepts `secret_environment`, but only Effect Connectors admit it;
 other adapters fail closed rather than inventing an authority context.
 Omission preserves the previous behavior. See
 [ADR 0139](adr/0139-typed-secret-use-and-effect-credential-custody.md).
+
+Credential-bearing JSON Effect adapters now require their frozen Broker
+descriptor to advertise `dispatch_sha256`. They preflight the exact command
+before Provider resolution, then retain the Broker's second measurement before
+child entry; both checks, Provider work, queueing, and execution share the
+configured process deadline. An external pre-1.0 Rust caller that attaches
+`EffectSecretEnvironment` to an unmeasured Broker now fails configuration.
+Credential-free adapters are unchanged. This adds no durable schema, client
+command, Protocol-v30 field, JSON Effect envelope, or service-schema
+coordinate, and it does not claim atomic executable-to-`exec` binding. See
+[ADR 0140](adr/0140-secret-gated-effect-command-integrity-preflight.md).
 
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,

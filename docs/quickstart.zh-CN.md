@@ -222,12 +222,15 @@ Broker 会在装配时及每次 dispatch 前，在同一个取消与总超时预
 以及可信 Authority 逐次解析。值只进入不可克隆、可清零的进程请求缓冲区，
 不会进入 Effect Ledger 或 JSON Connector stdin。操作系统与子进程收到的
 必要副本不在清零承诺内。`environment_from_host` 仍只是普通配置投影，
-不能替代这条 Secret 边界。
+不能替代这条 Secret 边界。带 Secret 的 Connector 必须配置
+`command_sha256`：适配器先在 Provider 查询前测量，Broker 再在子进程入口前
+测量；这会拒绝既有漂移，但不是原子 `exec` 绑定。
 
 - [`config/y-harness.effect-consumer.example.json`](../config/y-harness.effect-consumer.example.json)
 - [`ADR 0137`](adr/0137-optional-reference-service-effect-consumer.md)
 - [`ADR 0138`](adr/0138-dispatch-time-effect-command-digest-locks.md)
 - [`ADR 0139`](adr/0139-typed-secret-use-and-effect-credential-custody.md)
+- [`ADR 0140`](adr/0140-secret-gated-effect-command-integrity-preflight.md)
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：

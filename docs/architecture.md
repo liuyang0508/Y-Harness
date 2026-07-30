@@ -62,7 +62,9 @@ direction:
   references, non-serializable zeroizing values, debug redaction, typed
   Agent-Turn/Governed-Effect/service-use contexts, trusted-authority
   resolution, a global environment allow-list adapter for unscoped hosts, and
-  an exact tenant/reference adapter with no fallback;
+  an exact tenant/reference adapter with no fallback; credential-bearing JSON
+  Effect commands require frozen dispatch SHA-256 evidence, preflight before
+  Provider resolution, and Broker remeasurement before child entry;
 - an optional control-plane crate above Core with immutable digest-bound
   Domain Pack snapshots, exact component inventories, tenant-partitioned
   Memory/SQLite lifecycle records, independent evaluation approval,
