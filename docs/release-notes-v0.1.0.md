@@ -176,7 +176,9 @@ and TUI binaries drift, startup now reports both Protocol coordinates and the
 same-checkout reinstall commands instead of two unexplained numbers. The TUI
 also gives empty Threads an explicit first-Turn path, keeps short transcripts
 near the Composer, renders exact/sub-percent State pressure without false
-`0%`, and labels durable `local/demo` decisions as deterministic/no-network.
+`0%`, labels Header capacity as per-Thread events, labels Activity identifiers
+as global event sequences, and marks durable `local/demo` decisions as
+deterministic/no-network.
 Header identity is explicitly `LAST MODEL`: it is derived only from Protocol
 State Items and never predicts the next Engine-owned Route. The client still
 does not parse Engine configuration.

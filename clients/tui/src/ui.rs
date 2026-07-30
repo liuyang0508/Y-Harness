@@ -622,18 +622,8 @@ fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(area);
-    let summary = app.capacity.map_or_else(
-        || format!("{} recent durable events", app.activity.len()),
-        |capacity| {
-            format!(
-                "{} durable events · {} loaded",
-                capacity.used_events,
-                app.activity.len()
-            )
-        },
-    );
     frame.render_widget(
-        Paragraph::new(summary)
+        Paragraph::new(activity_summary(app))
             .style(Style::default().fg(MUTED))
             .wrap(Wrap { trim: false }),
         rows[0],
@@ -664,6 +654,23 @@ fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }),
         rows[1],
     );
+}
+
+fn activity_summary(app: &App) -> String {
+    let thread_events = app.capacity.map_or_else(
+        || format!("{} loaded thread events", app.activity.len()),
+        |capacity| format!("{} thread events", capacity.used_events),
+    );
+    match (app.activity.front(), app.activity.back()) {
+        (Some(first), Some(last)) if first.sequence == last.sequence => {
+            format!("{thread_events} · global sequence {}", first.sequence)
+        }
+        (Some(first), Some(last)) => format!(
+            "{thread_events} · global sequence {}–{}",
+            first.sequence, last.sequence
+        ),
+        _ => format!("{thread_events} · no global sequence loaded"),
+    }
 }
 
 fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1098,7 +1105,7 @@ fn format_capacity(capacity: StateCapacity, detailed: bool) -> String {
     let recovery_ratio = ratio_label(capacity.used_recovery_bytes, capacity.recovery_byte_limit);
     if detailed {
         format!(
-            "capacity {} · events {}/{} ({event_ratio}) · recovery {}/{} ({recovery_ratio})",
+            "capacity {} · thread events {}/{} ({event_ratio}) · recovery {}/{} ({recovery_ratio})",
             capacity_level(capacity.level),
             capacity.used_events,
             capacity.event_limit,
@@ -1107,7 +1114,7 @@ fn format_capacity(capacity: StateCapacity, detailed: bool) -> String {
         )
     } else {
         format!(
-            "capacity {} · events {event_ratio} · recovery {recovery_ratio}",
+            "capacity {} · thread events {event_ratio} · recovery {recovery_ratio}",
             capacity_level(capacity.level)
         )
     }
@@ -1225,9 +1232,25 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use y_harness::{ItemKind, StateCapacity, StateCapacityLevel};
 
-    use crate::app::{App, SidebarTab};
+    use crate::app::{ActivityEntry, App, SidebarTab};
 
-    use super::{format_capacity, input_cursor, ratio_label, render, sanitized};
+    use super::{activity_summary, format_capacity, input_cursor, ratio_label, render, sanitized};
+
+    fn fixture_capacity() -> StateCapacity {
+        StateCapacity {
+            used_events: 165,
+            event_limit: 65_536,
+            remaining_events: 65_371,
+            general_events_remaining: 65_370,
+            terminal_event_reserve: 1,
+            used_recovery_bytes: 12_288,
+            recovery_byte_limit: 67_108_864,
+            remaining_recovery_bytes: 67_096_576,
+            general_recovery_bytes_remaining: 67_092_480,
+            terminal_recovery_byte_reserve: 4_096,
+            level: StateCapacityLevel::Healthy,
+        }
+    }
 
     #[test]
     fn composer_cursor_counts_wide_unicode_and_wraps() {
@@ -1251,23 +1274,33 @@ mod tests {
         assert_eq!(ratio_label(0, 65_536), "0%");
         assert_eq!(ratio_label(1, 65_536), "<1%");
         assert_eq!(ratio_label(32_768, 65_536), "50%");
-        let capacity = StateCapacity {
-            used_events: 165,
-            event_limit: 65_536,
-            remaining_events: 65_371,
-            general_events_remaining: 65_370,
-            terminal_event_reserve: 1,
-            used_recovery_bytes: 12_288,
-            recovery_byte_limit: 67_108_864,
-            remaining_recovery_bytes: 67_096_576,
-            general_recovery_bytes_remaining: 67_092_480,
-            terminal_recovery_byte_reserve: 4_096,
-            level: StateCapacityLevel::Healthy,
-        };
-        let rendered = format_capacity(capacity, true);
-        assert!(rendered.contains("events 165/65536 (<1%)"));
+        let rendered = format_capacity(fixture_capacity(), true);
+        assert!(rendered.contains("thread events 165/65536 (<1%)"));
         assert!(rendered.contains("recovery 12.0 KiB/64.0 MiB (<1%)"));
         assert!(rendered.contains("capacity healthy"));
+    }
+
+    #[test]
+    fn activity_distinguishes_thread_count_from_global_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::test_fixture()?;
+        let mut capacity = fixture_capacity();
+        capacity.used_events = 9;
+        app.capacity = Some(capacity);
+        app.activity.clear();
+        app.activity.push_back(ActivityEntry {
+            sequence: 166,
+            text: "Thread created".to_owned(),
+        });
+        app.activity.push_back(ActivityEntry {
+            sequence: 174,
+            text: "Turn completed".to_owned(),
+        });
+        assert_eq!(
+            activity_summary(&app),
+            "9 thread events · global sequence 166–174"
+        );
+        Ok(())
     }
 
     #[test]

@@ -52,11 +52,13 @@ F1 或 ?         打开帮助
 
 空 Thread 会显示首个 Turn 的明确入口；短会话贴近 Composer，避免重要
 内容与输入区被大面积空白分隔。容量显示同时给出已用/上限和不会把非零
-压力舍入为 `0%` 的比例。TUI 只从权威 State Item 推导已实际参与决策的
-Model；检测到 `local/demo` 时会持续标记“确定性演示、无网络”，不会把
-它伪装成真实 LLM。Header 明确使用 `LAST MODEL`：历史 State 只能证明
-上一条决策，不能推断下一 Turn 的当前 Route。此增强不读取配置文件，
-也不改变 Protocol。
+压力舍入为 `0%` 的比例；Header 的 `thread events` 是当前 Thread 的
+容量，Activity 的 `global sequence` 是数据库全局事件序号，两者不会
+混用。TUI 只从权威 State Item 推导已实际参与决策的 Model；检测到
+`local/demo` 时会持续标记“确定性演示、无网络”，不会把它伪装成真实
+LLM。Header 明确使用 `LAST MODEL`：历史 State 只能证明上一条决策，
+不能推断下一 Turn 的当前 Route。此增强不读取配置文件，也不改变
+Protocol。
 
 Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直接父级
 及父流版本；选中后按 Enter 即可恢复。

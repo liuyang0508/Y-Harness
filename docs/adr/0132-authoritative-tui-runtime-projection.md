@@ -30,6 +30,9 @@ health, retry, or failover changes.
 - Render State capacity from the complete typed `StateCapacity`: include used
   and limit values, preserve the authoritative pressure level, and display a
   nonzero value below one percent as `<1%` rather than `0%`.
+- Label that capacity explicitly as `thread events`. Label Activity entry IDs
+  as `global sequence` and show the loaded range, because the two coordinates
+  are intentionally different.
 - Keep empty-state guidance and short-conversation positioning entirely in
   replaceable client rendering. They create no Engine State and change no
   Protocol semantics.
