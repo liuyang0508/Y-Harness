@@ -1,6 +1,9 @@
 //! Versioned shell-free JSON-command adapters for external Effect Connectors.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,11 +17,133 @@ use crate::{
     EffectExecutionRequest, EffectId, EffectLeaseId, EffectOperation,
     EffectReconciliationConnector, EffectReconciliationConnectorDescriptor,
     EffectReconciliationOutcome, EffectReconciliationRequest, ExecutionPhase, HarnessError,
-    HarnessFuture, kernel::capture_capability_metadata,
+    HarnessFuture, SecretEffectPhase, SecretProvider, SecretReference, SecretRequest,
+    SecretServiceUse, SecretUseContext, SecretValue, kernel::capture_capability_metadata,
 };
 
 /// Exact stdin/stdout envelope coordinate for JSON-command Effect adapters.
 pub const JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION: u32 = 1;
+
+/// Maximum secret environment variables resolved for one Effect process.
+pub const MAX_EFFECT_SECRET_ENVIRONMENT_ENTRIES: usize = 64;
+
+/// On-demand credential projection for one JSON-command Effect Connector.
+///
+/// Configuration retains only opaque references. Values are resolved under
+/// the request's trusted [`AuthorityContext`] immediately before dispatch and
+/// remain in non-serializable, zeroizing [`SecretValue`] buffers until the
+/// process request is dropped.
+#[derive(Clone)]
+pub struct EffectSecretEnvironment {
+    provider: Arc<dyn SecretProvider>,
+    variables: BTreeMap<String, SecretReference>,
+}
+
+impl EffectSecretEnvironment {
+    /// Validates one exact child-variable to Secret-reference projection.
+    pub fn new(
+        provider: Arc<dyn SecretProvider>,
+        variables: BTreeMap<String, SecretReference>,
+    ) -> Result<Self, HarnessError> {
+        if variables.is_empty() || variables.len() > MAX_EFFECT_SECRET_ENVIRONMENT_ENTRIES {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Effect secret environment must contain 1-{MAX_EFFECT_SECRET_ENVIRONMENT_ENTRIES} entries"
+            )));
+        }
+        if variables
+            .keys()
+            .any(|name| !super::valid_environment_name(name))
+        {
+            return Err(HarnessError::InvalidConfiguration(
+                "Effect secret environment contains an invalid child variable name".to_owned(),
+            ));
+        }
+        Ok(Self {
+            provider,
+            variables,
+        })
+    }
+
+    /// Probes every unique reference under deployment authority.
+    ///
+    /// Values are dropped immediately and never enter Connector configuration.
+    pub async fn probe(
+        &self,
+        consumer: &str,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
+        authority.validate_current("Effect Secret probe authority")?;
+        let references = self.variables.values().collect::<BTreeSet<_>>();
+        for reference in references {
+            self.provider
+                .resolve_as(
+                    SecretRequest {
+                        reference: reference.clone(),
+                        consumer: consumer.to_owned(),
+                        use_context: SecretUseContext::Service {
+                            use_case: SecretServiceUse::StartupProbe,
+                        },
+                    },
+                    authority,
+                )
+                .await
+                .map_err(|_| {
+                    HarnessError::Secret(
+                        "Effect Connector credential availability probe failed".to_owned(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn resolve(
+        &self,
+        consumer: &str,
+        authority: &AuthorityContext,
+        use_context: SecretUseContext,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<BTreeMap<String, SecretValue>, HarnessError> {
+        authority.validate_current("Effect Secret resolution authority")?;
+        let mut resolved = BTreeMap::new();
+        for (child_name, reference) in &self.variables {
+            let resolution = self.provider.resolve_as(
+                SecretRequest {
+                    reference: reference.clone(),
+                    consumer: consumer.to_owned(),
+                    use_context: use_context.clone(),
+                },
+                authority,
+            );
+            let value = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(HarnessError::Cancelled {
+                        phase: ExecutionPhase::Effect,
+                    });
+                }
+                result = resolution => result.map_err(|_| {
+                    HarnessError::Effect(
+                        "Effect Connector credential resolution failed".to_owned(),
+                    )
+                })?,
+            };
+            resolved.insert(child_name.clone(), value);
+        }
+        Ok(resolved)
+    }
+
+    fn validate_plain_environment(
+        &self,
+        plain: &BTreeMap<String, String>,
+    ) -> Result<(), HarnessError> {
+        if self.variables.keys().any(|name| plain.contains_key(name)) {
+            return Err(HarnessError::InvalidConfiguration(
+                "Effect plain and secret environment names must not overlap".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Cancellation-free execution request delivered to an external command.
 ///
@@ -102,6 +227,7 @@ pub struct JsonCommandEffectConnector {
     config: JsonProcessConfig,
     broker: Arc<dyn ProcessBroker>,
     broker_descriptor: ProcessBrokerDescriptor,
+    secret_environment: Option<EffectSecretEnvironment>,
 }
 
 impl JsonCommandEffectConnector {
@@ -125,7 +251,18 @@ impl JsonCommandEffectConnector {
             config,
             broker,
             broker_descriptor,
+            secret_environment: None,
         })
+    }
+
+    /// Adds an on-demand, authority-aware credential environment.
+    pub fn with_secret_environment(
+        mut self,
+        secret_environment: EffectSecretEnvironment,
+    ) -> Result<Self, HarnessError> {
+        secret_environment.validate_plain_environment(&self.config.environment)?;
+        self.secret_environment = Some(secret_environment);
+        Ok(self)
     }
 
     /// Returns the broker isolation visible to embedding Policy and operators.
@@ -157,6 +294,25 @@ impl EffectConnector for JsonCommandEffectConnector {
                 lease_expires_at_ms,
                 cancellation,
             } = request;
+            let secret_environment = match &self.secret_environment {
+                Some(environment) => {
+                    environment
+                        .resolve(
+                            &self.descriptor.capability,
+                            &authority,
+                            SecretUseContext::GovernedEffect {
+                                effect_id: effect_id.clone(),
+                                operation: operation.clone(),
+                                phase: SecretEffectPhase::Execution,
+                                attempt,
+                                lease_id: lease_id.clone(),
+                            },
+                            &cancellation,
+                        )
+                        .await?
+                }
+                None => BTreeMap::new(),
+            };
             let request = JsonEffectExecutionRequest {
                 protocol_version: JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
                 effect_id,
@@ -182,12 +338,11 @@ impl EffectConnector for JsonCommandEffectConnector {
                         ),
                     },
                 )?;
+            let mut process = self.config.request(stdin, ExecutionPhase::Effect);
+            process.secret_environment = secret_environment;
             let output = self
                 .broker
-                .execute(
-                    self.config.request(stdin, ExecutionPhase::Effect),
-                    cancellation,
-                )
+                .execute(process, cancellation)
                 .await
                 .map_err(map_effect_process_error)?;
             validate_process_success(&output, "Effect execution command")
@@ -210,6 +365,7 @@ pub struct JsonCommandEffectReconciliationConnector {
     config: JsonProcessConfig,
     broker: Arc<dyn ProcessBroker>,
     broker_descriptor: ProcessBrokerDescriptor,
+    secret_environment: Option<EffectSecretEnvironment>,
 }
 
 impl JsonCommandEffectReconciliationConnector {
@@ -233,7 +389,18 @@ impl JsonCommandEffectReconciliationConnector {
             config,
             broker,
             broker_descriptor,
+            secret_environment: None,
         })
+    }
+
+    /// Adds an on-demand, authority-aware credential environment.
+    pub fn with_secret_environment(
+        mut self,
+        secret_environment: EffectSecretEnvironment,
+    ) -> Result<Self, HarnessError> {
+        secret_environment.validate_plain_environment(&self.config.environment)?;
+        self.secret_environment = Some(secret_environment);
+        Ok(self)
     }
 
     /// Returns the broker isolation visible to embedding Policy and operators.
@@ -264,6 +431,25 @@ impl EffectReconciliationConnector for JsonCommandEffectReconciliationConnector 
                 lease_id,
                 cancellation,
             } = request;
+            let secret_environment = match &self.secret_environment {
+                Some(environment) => {
+                    environment
+                        .resolve(
+                            &self.descriptor.capability,
+                            &authority,
+                            SecretUseContext::GovernedEffect {
+                                effect_id: effect_id.clone(),
+                                operation: operation.clone(),
+                                phase: SecretEffectPhase::Reconciliation,
+                                attempt,
+                                lease_id: lease_id.clone(),
+                            },
+                            &cancellation,
+                        )
+                        .await?
+                }
+                None => BTreeMap::new(),
+            };
             let request = JsonEffectReconciliationRequest {
                 protocol_version: JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
                 effect_id,
@@ -288,12 +474,11 @@ impl EffectReconciliationConnector for JsonCommandEffectReconciliationConnector 
                         ),
                     },
                 )?;
+            let mut process = self.config.request(stdin, ExecutionPhase::Effect);
+            process.secret_environment = secret_environment;
             let output = self
                 .broker
-                .execute(
-                    self.config.request(stdin, ExecutionPhase::Effect),
-                    cancellation,
-                )
+                .execute(process, cancellation)
                 .await
                 .map_err(map_effect_process_error)?;
             validate_process_success(&output, "Effect reconciliation command")
@@ -332,7 +517,10 @@ fn map_effect_process_error(error: HarnessError) -> HarnessError {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -340,7 +528,8 @@ mod tests {
     use crate::{
         ActorIdentity, CapabilityOrigin, EffectConnectorRegistry, EffectIdempotencyContract,
         EffectReceipt, EffectReconciliationConnectorRegistry, EffectReconciliationContract,
-        ProcessIsolation, ProcessOutput, ProcessRequest,
+        ProcessIsolation, ProcessOutput, ProcessRequest, SECRET_API_VERSION,
+        SecretProviderDescriptor,
     };
 
     struct RecordingBroker {
@@ -442,6 +631,91 @@ mod tests {
                 Err(HarnessError::Execution(
                     "unreachable broker execution".to_owned(),
                 ))
+            })
+        }
+    }
+
+    struct RecordingSecretProvider {
+        fail: bool,
+        requests: Mutex<Vec<(SecretRequest, AuthorityContext)>>,
+    }
+
+    impl SecretProvider for RecordingSecretProvider {
+        fn descriptor(&self) -> SecretProviderDescriptor {
+            SecretProviderDescriptor {
+                name: "effect-secret-fixture".to_owned(),
+                description: "Records typed Effect Secret requests".to_owned(),
+                api_version: SECRET_API_VERSION,
+            }
+        }
+
+        fn resolve<'a>(&'a self, _request: SecretRequest) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async {
+                Err(HarnessError::Secret(
+                    "unscoped fixture resolution is forbidden".to_owned(),
+                ))
+            })
+        }
+
+        fn resolve_as<'a>(
+            &'a self,
+            request: SecretRequest,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("Secret requests")
+                    .push((request, authority.clone()));
+                if self.fail {
+                    return Err(HarnessError::Secret(
+                        "provider-secret-diagnostic".to_owned(),
+                    ));
+                }
+                SecretValue::new(b"short-lived-token".to_vec())
+            })
+        }
+    }
+
+    struct SecretAwareBroker {
+        output: ProcessOutput,
+        calls: AtomicUsize,
+    }
+
+    impl ProcessBroker for SecretAwareBroker {
+        fn descriptor(&self) -> ProcessBrokerDescriptor {
+            ProcessBrokerDescriptor {
+                name: "effect-secret-aware".to_owned(),
+                isolation: ProcessIsolation::Sandboxed {
+                    mechanism: "test".to_owned(),
+                },
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: crate::CancellationToken,
+        ) -> HarnessFuture<'a, ProcessOutput> {
+            Box::pin(async move {
+                assert!(!request.environment.contains_key("EFFECT_TOKEN"));
+                assert_eq!(
+                    request
+                        .secret_environment
+                        .get("EFFECT_TOKEN")
+                        .expect("resolved Secret")
+                        .expose_bytes(),
+                    b"short-lived-token"
+                );
+                assert!(
+                    !request
+                        .stdin
+                        .windows(b"short-lived-token".len())
+                        .any(|window| window == b"short-lived-token")
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.output.clone())
             })
         }
     }
@@ -639,6 +913,211 @@ mod tests {
                 .expect("request JSON")
                 .contains("cancellation")
         );
+    }
+
+    #[tokio::test]
+    async fn secret_environment_uses_typed_effect_context_and_never_enters_json() {
+        let provider = Arc::new(RecordingSecretProvider {
+            fail: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        let secret_environment = EffectSecretEnvironment::new(
+            provider.clone(),
+            BTreeMap::from([(
+                "EFFECT_TOKEN".to_owned(),
+                SecretReference::new("effect/channel-email").expect("reference"),
+            )]),
+        )
+        .expect("Secret environment");
+        secret_environment
+            .probe("channel.email", &authority())
+            .await
+            .expect("probe");
+
+        let execution_broker = Arc::new(SecretAwareBroker {
+            output: output(&JsonEffectExecutionResponse {
+                protocol_version: JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
+                outcome: EffectExecutionOutcome::Applied { receipt: receipt() },
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let execution = JsonCommandEffectConnector::new(
+            execution_descriptor(),
+            config(),
+            execution_broker.clone(),
+        )
+        .expect("execution Connector")
+        .with_secret_environment(secret_environment.clone())
+        .expect("execution Secret environment");
+        execution
+            .execute(execution_request(serde_json::json!({"message":"private"})))
+            .await
+            .expect("execution");
+
+        let reconciliation_broker = Arc::new(SecretAwareBroker {
+            output: output(&JsonEffectReconciliationResponse {
+                protocol_version: JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
+                outcome: EffectReconciliationOutcome::StillUnknown {
+                    reason_code: "provider.pending".to_owned(),
+                },
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let reconciliation = JsonCommandEffectReconciliationConnector::new(
+            reconciliation_descriptor(),
+            config(),
+            reconciliation_broker.clone(),
+        )
+        .expect("reconciliation Connector")
+        .with_secret_environment(secret_environment)
+        .expect("reconciliation Secret environment");
+        reconciliation
+            .query(reconciliation_request(serde_json::json!({
+                "message": "private"
+            })))
+            .await
+            .expect("reconciliation");
+
+        assert_eq!(execution_broker.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciliation_broker.calls.load(Ordering::SeqCst), 1);
+        let requests = provider.requests.lock().expect("Secret requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].0.use_context,
+            SecretUseContext::Service {
+                use_case: SecretServiceUse::StartupProbe
+            }
+        );
+        assert_eq!(requests[0].1.tenant_id(), Some("tenant-a"));
+        assert_eq!(
+            requests[1].0.use_context,
+            SecretUseContext::GovernedEffect {
+                effect_id: EffectId::from_static("effect-json"),
+                operation: operation(),
+                phase: SecretEffectPhase::Execution,
+                attempt: 2,
+                lease_id: EffectLeaseId::from_static("lease-json"),
+            }
+        );
+        assert_eq!(requests[1].0.consumer, "channel.email");
+        assert_eq!(
+            requests[2].0.use_context,
+            SecretUseContext::GovernedEffect {
+                effect_id: EffectId::from_static("effect-json"),
+                operation: operation(),
+                phase: SecretEffectPhase::Reconciliation,
+                attempt: 2,
+                lease_id: EffectLeaseId::from_static("lease-json"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_resolution_failure_and_precancellation_block_process_entry() {
+        let provider = Arc::new(RecordingSecretProvider {
+            fail: true,
+            requests: Mutex::new(Vec::new()),
+        });
+        let environment = EffectSecretEnvironment::new(
+            provider.clone(),
+            BTreeMap::from([(
+                "EFFECT_TOKEN".to_owned(),
+                SecretReference::new("effect/channel-email").expect("reference"),
+            )]),
+        )
+        .expect("Secret environment");
+        let broker = Arc::new(SecretAwareBroker {
+            output: output(&JsonEffectExecutionResponse {
+                protocol_version: JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
+                outcome: EffectExecutionOutcome::Applied { receipt: receipt() },
+            }),
+            calls: AtomicUsize::new(0),
+        });
+        let connector =
+            JsonCommandEffectConnector::new(execution_descriptor(), config(), broker.clone())
+                .expect("Connector")
+                .with_secret_environment(environment)
+                .expect("Secret environment");
+
+        let error = connector
+            .execute(execution_request(serde_json::json!({})))
+            .await
+            .expect_err("Secret failure");
+        assert_eq!(
+            error.to_string(),
+            "effect error: Effect Connector credential resolution failed"
+        );
+        assert!(!error.to_string().contains("provider-secret"));
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+
+        let provider = Arc::new(RecordingSecretProvider {
+            fail: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        let environment = EffectSecretEnvironment::new(
+            provider.clone(),
+            BTreeMap::from([(
+                "EFFECT_TOKEN".to_owned(),
+                SecretReference::new("effect/channel-email").expect("reference"),
+            )]),
+        )
+        .expect("Secret environment");
+        let connector =
+            JsonCommandEffectConnector::new(execution_descriptor(), config(), broker.clone())
+                .expect("Connector")
+                .with_secret_environment(environment)
+                .expect("Secret environment");
+        let request = execution_request(serde_json::json!({}));
+        request.cancellation.cancel();
+        assert!(matches!(
+            connector.execute(request).await,
+            Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Effect
+            })
+        ));
+        assert!(
+            provider
+                .requests
+                .lock()
+                .expect("Secret requests")
+                .is_empty()
+        );
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn secret_environment_rejects_invalid_or_overlapping_child_names() {
+        let provider = Arc::new(RecordingSecretProvider {
+            fail: false,
+            requests: Mutex::new(Vec::new()),
+        });
+        assert!(
+            EffectSecretEnvironment::new(
+                provider.clone(),
+                BTreeMap::from([(
+                    "INVALID-NAME".to_owned(),
+                    SecretReference::new("effect/channel-email").expect("reference"),
+                )]),
+            )
+            .is_err()
+        );
+
+        let environment = EffectSecretEnvironment::new(
+            provider,
+            BTreeMap::from([(
+                "EFFECT_TOKEN".to_owned(),
+                SecretReference::new("effect/channel-email").expect("reference"),
+            )]),
+        )
+        .expect("Secret environment");
+        let mut process = config();
+        process
+            .environment
+            .insert("EFFECT_TOKEN".to_owned(), "plain".to_owned());
+        let connector =
+            JsonCommandEffectConnector::new(execution_descriptor(), process, Arc::new(ErrorBroker))
+                .expect("Connector");
+        assert!(connector.with_secret_environment(environment).is_err());
     }
 
     #[test]

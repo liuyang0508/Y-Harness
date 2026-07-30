@@ -243,6 +243,13 @@ preserves disabled behavior. See
 [ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
 Reference-host lifecycle semantics are specified by
 [ADR 0130](adr/0130-optional-reference-service-temporal-lifecycle.md).
+Client protocol `30` preserves protocol-v29 commands, framing, authority,
+permissions, durable coordinates, and request/response ceilings. It advances
+the advertised Secret Provider coordinate to API 3 for typed Agent-Turn,
+Governed-Effect, and bounded service-use contexts. No Secret value or new
+Secret-bearing protocol command is introduced. Protocol-v29 clients fail exact
+initialization rather than assume every credential belongs to a Turn.
+
 Protocol v29 adds the optional schema-1 Effect Ledger surface. One immutable
 intent binds tenant, capability, operation, idempotency key, bounded input,
 request digest, actor, and server time before execution. A finite worker lease
@@ -309,6 +316,23 @@ additively accepts `command_sha256`; Effect consumer Connectors now require it.
 This changes no durable schema, Protocol v29, or JSON Effect wire coordinate
 and does not claim an atomic OS exec measurement. See
 [ADR 0138](adr/0138-dispatch-time-effect-command-digest-locks.md).
+
+Secret Provider API 3 replaces the mandatory Thread/Turn fields in the public
+pre-1.0 `SecretRequest` with a typed `SecretUseContext` covering Agent Turns,
+Governed Effect attempts, and bounded service operations. External Provider
+implementations that construct or inspect requests must migrate and advertise
+API 3; `resolve_as` remains the only actor/tenant authority boundary. The exact
+client protocol advances from v29 to v30 because `initialize` now advertises
+Secret API 3. No Secret value, new command, durable schema, Model Gateway
+payload, or JSON Effect envelope is added.
+
+The public pre-1.0 `ProcessRequest` adds `secret_environment`; external struct
+literals must initialize it. Values are non-cloneable `SecretValue` buffers and
+the request remains non-serializable. Service-schema-1 JSON process config
+additively accepts `secret_environment`, but only Effect Connectors admit it;
+other adapters fail closed rather than inventing an authority context.
+Omission preserves the previous behavior. See
+[ADR 0139](adr/0139-typed-secret-use-and-effect-credential-custody.md).
 
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,

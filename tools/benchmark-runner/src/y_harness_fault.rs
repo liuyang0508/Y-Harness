@@ -1253,6 +1253,7 @@ async fn run_fixture_command<T: for<'de> Deserialize<'de>>(
                 ],
                 current_dir: workspace.to_path_buf(),
                 environment: BTreeMap::new(),
+                secret_environment: BTreeMap::new(),
                 stdin: Vec::new(),
                 timeout: Duration::from_secs(10),
                 max_output_bytes: MAX_CAPTURE_BYTES,

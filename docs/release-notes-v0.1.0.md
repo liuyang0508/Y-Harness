@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v29 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v30 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -138,6 +138,16 @@ deadlines, cleared environment, exact response decoding, and diagnostic
 redaction preserve the existing Executor/Reconciler failure boundary. This
 adds no durable schema, client Protocol command, service configuration, or
 resident consumer.
+The optional reference-service Effect consumer supplies that resident
+lifecycle outside Core. Execution and reconciliation remain separate,
+default-deny, bounded loops over the authoritative Ledger. Every Connector
+uses a per-dispatch command-file SHA-256 drift lock. Optional
+`secret_environment` entries contain only opaque references and host variable
+names; Secret Provider API 3 resolves them under the exact typed Effect
+context and trusted Authority immediately before each dispatch. Protocol 30
+advertises API 3 without adding a Secret-bearing command. Values do not enter
+Effect input, JSON Connector envelopes, State, or diagnostics; operating-system
+and child-process copies are not covered by Y-Harness zeroization.
 Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
 Engines behind one bounded host-driven tick. It uses trusted host time and
 authority, tenant-local 1–256-record identity scans per source, disposable
@@ -149,7 +159,7 @@ policy. Omission remains disabled; opt-in polling uses the fixed service
 Authority, skip-missed cadence, bounded health diagnostics, and
 Temporal-before-Protocol-before-MCP shutdown.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v29. Format/store schema 1 pins immutable component snapshots and a
+Protocol v30. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its

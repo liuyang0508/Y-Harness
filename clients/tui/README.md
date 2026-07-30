@@ -4,7 +4,7 @@ Optional full-screen terminal client for the headless Y-Harness Engine.
 
 The TUI is not an execution host and owns no authoritative Agent state. At
 runtime it starts `yh serve` (or `yh serve-demo`) and communicates exclusively
-through Protocol v29 JSONL over the child process pipes.
+through Protocol v30 JSONL over the child process pipes.
 
 ```bash
 cargo install --locked --path clients/tui

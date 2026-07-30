@@ -51,7 +51,7 @@ use workflow::WorkflowProtocolService;
 pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "29";
+pub const PROTOCOL_VERSION: &str = "30";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -3285,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_nine_wire_envelopes_and_permissions_are_stable() {
+    fn protocol_thirty_wire_envelopes_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -3293,14 +3293,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "29",
+                "protocol_version": "30",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "29",
+                "protocol_version": "30",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -3309,7 +3309,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "29",
+                "protocol_version": "30",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -3331,7 +3331,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "29",
+                "protocol_version": "30",
                 "body": {
                     "status": "success",
                     "result": {
@@ -3441,7 +3441,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "29",
+                "protocol_version": "30",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",

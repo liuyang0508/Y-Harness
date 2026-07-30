@@ -30,7 +30,7 @@ use y_harness::{
 
 use super::{
     CliResult,
-    service::{LoadedConfig, ServiceJsonProcessConfig, build_json_process},
+    service::{LoadedConfig, ServiceJsonProcessConfig, build_json_effect_process},
 };
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
@@ -198,6 +198,8 @@ struct ConfiguredEffectExecutionAssembly {
     poll_interval: Duration,
     failure_backoff: Duration,
     connector_count: usize,
+    credential_connector_count: usize,
+    secret_variable_count: usize,
     allow_count: usize,
 }
 
@@ -208,6 +210,8 @@ struct ConfiguredEffectReconciliationAssembly {
     poll_interval: Duration,
     failure_backoff: Duration,
     connector_count: usize,
+    credential_connector_count: usize,
+    secret_variable_count: usize,
     allow_count: usize,
 }
 
@@ -253,8 +257,10 @@ impl ConfiguredEffectConsumerAssembly {
             || "execution disabled".to_owned(),
             |configured| {
                 format!(
-                    "execution {} dispatch-locked connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
+                    "execution {} dispatch-locked connector(s) / {} credential-scoped / {} secret variable(s) / {} allow(s) / {} ms poll / {} ms backoff",
                     configured.connector_count,
+                    configured.credential_connector_count,
+                    configured.secret_variable_count,
                     configured.allow_count,
                     configured.poll_interval.as_millis(),
                     configured.failure_backoff.as_millis()
@@ -265,8 +271,10 @@ impl ConfiguredEffectConsumerAssembly {
             || "reconciliation disabled".to_owned(),
             |configured| {
                 format!(
-                    "reconciliation {} dispatch-locked connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
+                    "reconciliation {} dispatch-locked connector(s) / {} credential-scoped / {} secret variable(s) / {} allow(s) / {} ms poll / {} ms backoff",
                     configured.connector_count,
+                    configured.credential_connector_count,
+                    configured.secret_variable_count,
                     configured.allow_count,
                     configured.poll_interval.as_millis(),
                     configured.failure_backoff.as_millis()
@@ -277,29 +285,29 @@ impl ConfiguredEffectConsumerAssembly {
     }
 }
 
-pub(super) fn build(loaded: &LoadedConfig) -> CliResult<Option<ConfiguredEffectConsumerAssembly>> {
+pub(super) async fn build(
+    loaded: &LoadedConfig,
+) -> CliResult<Option<ConfiguredEffectConsumerAssembly>> {
     let Some(configured) = loaded.effect_consumer() else {
         return Ok(None);
     };
     configured.validate()?;
 
-    let execution = configured
-        .execution
-        .as_ref()
-        .map(|configured| build_execution(loaded, configured))
-        .transpose()?;
-    let reconciliation = configured
-        .reconciliation
-        .as_ref()
-        .map(|configured| build_reconciliation(loaded, configured))
-        .transpose()?;
+    let execution = match &configured.execution {
+        Some(configured) => Some(build_execution(loaded, configured).await?),
+        None => None,
+    };
+    let reconciliation = match &configured.reconciliation {
+        Some(configured) => Some(build_reconciliation(loaded, configured).await?),
+        None => None,
+    };
     Ok(Some(ConfiguredEffectConsumerAssembly {
         execution,
         reconciliation,
     }))
 }
 
-fn build_execution(
+async fn build_execution(
     loaded: &LoadedConfig,
     configured: &ServiceEffectExecutionConfig,
 ) -> CliResult<ConfiguredEffectExecutionAssembly> {
@@ -319,25 +327,31 @@ fn build_execution(
             )
             .into());
         }
-        let (process, broker) = build_json_process(
+        let (process, broker, secret_environment) = build_json_effect_process(
             loaded,
             &connector.process,
             &format!("Effect execution Connector {}", connector.capability),
+            &connector.capability,
+        )
+        .await?;
+        let mut adapter = JsonCommandEffectConnector::new(
+            EffectConnectorDescriptor {
+                capability: connector.capability.clone(),
+                api_version: EFFECT_EXECUTOR_API_VERSION,
+                operations: connector.operations.clone(),
+                idempotency: connector.idempotency,
+            },
+            process,
+            broker,
         )?;
+        if let Some(secret_environment) = secret_environment {
+            adapter = adapter.with_secret_environment(secret_environment)?;
+        }
         connectors.register(
             CapabilityOrigin::External {
                 id: connector.origin_id.clone(),
             },
-            Arc::new(JsonCommandEffectConnector::new(
-                EffectConnectorDescriptor {
-                    capability: connector.capability.clone(),
-                    api_version: EFFECT_EXECUTOR_API_VERSION,
-                    operations: connector.operations.clone(),
-                    idempotency: connector.idempotency,
-                },
-                process,
-                broker,
-            )?),
+            Arc::new(adapter),
         )?;
     }
 
@@ -352,11 +366,21 @@ fn build_execution(
         poll_interval: Duration::from_millis(configured.poll_interval_ms),
         failure_backoff: Duration::from_millis(configured.failure_backoff_ms),
         connector_count: configured.connectors.len(),
+        credential_connector_count: configured
+            .connectors
+            .iter()
+            .filter(|connector| !connector.process.secret_environment.is_empty())
+            .count(),
+        secret_variable_count: configured
+            .connectors
+            .iter()
+            .map(|connector| connector.process.secret_environment.len())
+            .sum(),
         allow_count: configured.allow.len(),
     })
 }
 
-fn build_reconciliation(
+async fn build_reconciliation(
     loaded: &LoadedConfig,
     configured: &ServiceEffectReconciliationConfig,
 ) -> CliResult<ConfiguredEffectReconciliationAssembly> {
@@ -376,25 +400,31 @@ fn build_reconciliation(
             )
             .into());
         }
-        let (process, broker) = build_json_process(
+        let (process, broker, secret_environment) = build_json_effect_process(
             loaded,
             &connector.process,
             &format!("Effect reconciliation Connector {}", connector.capability),
+            &connector.capability,
+        )
+        .await?;
+        let mut adapter = JsonCommandEffectReconciliationConnector::new(
+            EffectReconciliationConnectorDescriptor {
+                capability: connector.capability.clone(),
+                api_version: EFFECT_RECONCILER_API_VERSION,
+                operations: connector.operations.clone(),
+                contract: connector.contract,
+            },
+            process,
+            broker,
         )?;
+        if let Some(secret_environment) = secret_environment {
+            adapter = adapter.with_secret_environment(secret_environment)?;
+        }
         connectors.register(
             CapabilityOrigin::External {
                 id: connector.origin_id.clone(),
             },
-            Arc::new(JsonCommandEffectReconciliationConnector::new(
-                EffectReconciliationConnectorDescriptor {
-                    capability: connector.capability.clone(),
-                    api_version: EFFECT_RECONCILER_API_VERSION,
-                    operations: connector.operations.clone(),
-                    contract: connector.contract,
-                },
-                process,
-                broker,
-            )?),
+            Arc::new(adapter),
         )?;
     }
 
@@ -409,6 +439,16 @@ fn build_reconciliation(
         poll_interval: Duration::from_millis(configured.poll_interval_ms),
         failure_backoff: Duration::from_millis(configured.failure_backoff_ms),
         connector_count: configured.connectors.len(),
+        credential_connector_count: configured
+            .connectors
+            .iter()
+            .filter(|connector| !connector.process.secret_environment.is_empty())
+            .count(),
+        secret_variable_count: configured
+            .connectors
+            .iter()
+            .map(|connector| connector.process.secret_environment.len())
+            .sum(),
         allow_count: configured.allow.len(),
     })
 }

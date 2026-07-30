@@ -76,18 +76,18 @@ pub use evaluation::{
 };
 pub use execution::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
-    DenyProcessBroker, DigestLockedProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES,
-    JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JSON_GRADER_MAX_INPUT_BYTES,
-    JsonCommandConversationCompactor, JsonCommandEffectConnector,
+    DenyProcessBroker, DigestLockedProcessBroker, EffectSecretEnvironment,
+    JSON_COMMAND_MAX_INPUT_BYTES, JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
+    JSON_GRADER_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandEffectConnector,
     JsonCommandEffectReconciliationConnector, JsonCommandGrader, JsonCommandModel,
     JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
     JsonConversationCompactionRequest, JsonConversationCompactionResponse,
     JsonEffectExecutionRequest, JsonEffectExecutionResponse, JsonEffectReconciliationRequest,
     JsonEffectReconciliationResponse, JsonGradeRequest, JsonGradeResponse, JsonModelSettlement,
     JsonProcessConfig, JsonToolRequest, JsonVerificationOutcome, JsonVerificationRequest,
-    LocalProcessBroker, MAX_DIGEST_LOCKED_PROGRAM_BYTES, MacOsSeatbeltBroker, NetworkAccess,
-    ProcessBroker, ProcessBrokerDescriptor, ProcessExecutableIntegrity, ProcessIsolation,
-    ProcessOutput, ProcessRequest, ToolCompensator,
+    LocalProcessBroker, MAX_DIGEST_LOCKED_PROGRAM_BYTES, MAX_EFFECT_SECRET_ENVIRONMENT_ENTRIES,
+    MacOsSeatbeltBroker, NetworkAccess, ProcessBroker, ProcessBrokerDescriptor,
+    ProcessExecutableIntegrity, ProcessIsolation, ProcessOutput, ProcessRequest, ToolCompensator,
 };
 pub use human_handoff::{
     HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoff, HumanHandoffApplyOutcome, HumanHandoffClaim,
@@ -159,9 +159,9 @@ pub use runtime::{
     TurnExecutionOptions,
 };
 pub use secret::{
-    EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretProvider,
-    SecretProviderDescriptor, SecretReference, SecretRegistry, SecretRequest, SecretValue,
-    TenantEnvironmentSecretProvider,
+    EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretEffectPhase,
+    SecretProvider, SecretProviderDescriptor, SecretReference, SecretRegistry, SecretRequest,
+    SecretServiceUse, SecretUseContext, SecretValue, TenantEnvironmentSecretProvider,
 };
 #[cfg(feature = "https-skill")]
 pub use skill::{

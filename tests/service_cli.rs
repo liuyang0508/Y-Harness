@@ -485,6 +485,8 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
 #[cfg(unix)]
 #[test]
 fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_terminal_effects() {
+    const HOST_SECRET_NAME: &str = "YH_EFFECT_TEST_TOKEN";
+    const SECRET_VALUE: &str = "effect-e2e-secret-token";
     let project = isolated_project("effect-consumer");
     let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("init")
@@ -502,6 +504,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     write_executable(
         &execution,
         "#!/bin/sh\n\
+         if [ -z \"${EFFECT_TOKEN:-}\" ]; then exit 23; fi\n\
          read -r request\n\
          printf '%s\\n' \"$request\" >> execution-requests.jsonl\n\
          printf '%s\\n' \
@@ -509,6 +512,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
          \"reason_code\":\"target.uncertain\"}}'\n",
     );
     let reconciliation_content = "#!/bin/sh\n\
+         if [ -z \"${EFFECT_TOKEN:-}\" ]; then exit 23; fi\n\
          read -r request\n\
          printf '%s\\n' \"$request\" >> reconciliation-requests.jsonl\n\
          if [ -f reconciliation-ready ]; then\n\
@@ -530,6 +534,12 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
             "command": command,
             "command_sha256": sha256_file(command),
             "current_directory": ".",
+            "secret_environment": {
+                "EFFECT_TOKEN": {
+                    "reference": "effect/notification-test",
+                    "host_environment": HOST_SECRET_NAME
+                }
+            },
             "timeout_ms": 5_000,
             "max_output_bytes": 65_536,
             "launch": {
@@ -593,6 +603,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("doctor")
         .arg(&config_path)
+        .env(HOST_SECRET_NAME, SECRET_VALUE)
         .output()
         .expect("run Effect consumer doctor");
     assert!(
@@ -604,9 +615,11 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
         String::from_utf8(doctor.stdout)
             .expect("UTF-8 Effect consumer doctor")
             .contains(
-                "effect consumer: enabled (execution 1 dispatch-locked connector(s) / 1 allow(s) / \
-             100 ms poll / 100 ms backoff; reconciliation 1 dispatch-locked connector(s) / \
-             1 allow(s) / 100 ms poll / 100 ms backoff)"
+                "effect consumer: enabled (execution 1 dispatch-locked connector(s) / \
+             1 credential-scoped / 1 secret variable(s) / 1 allow(s) / 100 ms poll / \
+             100 ms backoff; reconciliation 1 dispatch-locked connector(s) / \
+             1 credential-scoped / 1 secret variable(s) / 1 allow(s) / 100 ms poll / \
+             100 ms backoff)"
             )
     );
 
@@ -645,6 +658,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
         .args(["serve", "y-harness.json"])
         .current_dir(&project)
+        .env(HOST_SECRET_NAME, SECRET_VALUE)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -739,6 +753,26 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
         "idle Effect consumer service must preserve protocol stdout purity"
     );
     let diagnostics = String::from_utf8(settled.stderr).expect("UTF-8 Effect diagnostics");
+    assert!(!diagnostics.contains(SECRET_VALUE));
+    assert!(
+        !fs::read_to_string(&config_path)
+            .expect("read Secret-reference config")
+            .contains(SECRET_VALUE)
+    );
+    assert!(
+        !String::from_utf8_lossy(
+            &fs::read(project.join("execution-requests.jsonl"))
+                .expect("read execution requests for Secret leak")
+        )
+        .contains(SECRET_VALUE)
+    );
+    assert!(
+        !String::from_utf8_lossy(
+            &fs::read(project.join("reconciliation-requests.jsonl"))
+                .expect("read reconciliation requests for Secret leak")
+        )
+        .contains(SECRET_VALUE)
+    );
     assert!(
         diagnostics.contains("Y-Harness Effect reconciliation degraded: 1 attempt(s) unavailable")
     );
@@ -751,6 +785,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     let mut restarted = Command::new(env!("CARGO_BIN_EXE_yh"))
         .args(["serve", "y-harness.json"])
         .current_dir(&project)
+        .env(HOST_SECRET_NAME, SECRET_VALUE)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

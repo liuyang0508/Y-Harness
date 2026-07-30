@@ -21,35 +21,34 @@ use y_harness::{
     CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
     ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
     DEFAULT_MAX_PARALLEL_TOOL_CALLS, DigestLockedProcessBroker, EFFECT_LEDGER_SCHEMA_VERSION,
-    EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine, EvaluationBaseline, EvaluationCase,
-    EvaluationEngine, EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor,
-    GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
-    HumanHandoffCoordinator, HumanHandoffEngine, HumanHandoffSubject, HumanHandoffSubjectResolver,
-    InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
-    JsonCommandGrader, JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool,
-    JsonCommandVerifier, JsonProcessConfig, LanguageModel, LocalProcessBroker,
-    MAX_MODEL_ATTEMPTS_PER_STEP, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES,
-    MacOsSeatbeltBroker, McpClient, MemoryContextConfig, MemoryEventStore, MemoryFailureMode,
-    MemoryHealthStatus, MemoryProvider, MemoryRegistry, ModelRegistry, ModelRetryPolicy,
-    NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolAuthorizer, ProtocolHandler,
-    ProtocolPrincipal, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
-    STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
-    SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
-    SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEventStore, SqliteHumanHandoffCoordinator,
-    SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
-    StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, TemporalDriver, ThreadId,
-    ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
-    VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
-    WorkflowEngine, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
-    serve_jsonl,
+    EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine, EffectSecretEnvironment,
+    EvaluationBaseline, EvaluationCase, EvaluationEngine, EvaluationReport, EvaluationSuite,
+    EvaluationTarget, GraderDescriptor, GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError,
+    HarnessFuture, HarnessRuntime, HumanHandoffCoordinator, HumanHandoffEngine,
+    HumanHandoffSubject, HumanHandoffSubjectResolver, InboxApprovalHandler,
+    JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandGrader,
+    JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
+    JsonProcessConfig, LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP,
+    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
+    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
+    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
+    ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
+    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
+    SkillTrustStore, SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEventStore,
+    SqliteHumanHandoffCoordinator, SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine,
+    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
+    TaskCoordinator, TemporalDriver, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
+    TurnExecutionOptions, TurnOutcome, VerificationRegistry, VerifierDescriptor,
+    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator, WorkflowEngine, decode_thread_archive,
+    encode_thread_archive, register_selected_mcp_tools, serve_jsonl,
 };
 
-#[cfg(feature = "https-model")]
-use y_harness::TenantEnvironmentSecretProvider;
-#[cfg(any(feature = "https-mcp", feature = "https-model"))]
 use y_harness::{
-    EnvironmentSecretProvider, SecretProvider, SecretReference, SecretRequest, TurnId,
+    EnvironmentSecretProvider, SecretProvider, SecretReference, TenantEnvironmentSecretProvider,
 };
+#[cfg(any(feature = "https-mcp", feature = "https-model"))]
+use y_harness::{SecretRequest, SecretServiceUse, SecretUseContext};
 
 #[cfg(feature = "https-mcp")]
 use y_harness::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
@@ -285,11 +284,20 @@ pub(super) struct ServiceJsonProcessConfig {
     current_directory: String,
     #[serde(default)]
     environment_from_host: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) secret_environment: BTreeMap<String, ServiceProcessSecretConfig>,
     #[serde(default = "default_tool_timeout_ms")]
     pub(super) timeout_ms: u64,
     #[serde(default = "default_tool_max_output_bytes")]
     max_output_bytes: usize,
     launch: ServiceProcessLaunchConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ServiceProcessSecretConfig {
+    reference: String,
+    host_environment: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -915,7 +923,7 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         "will be created"
     };
     let stores = validate_existing_stores(&loaded).await?;
-    let effect_consumer = build_effect_consumer(&loaded)?;
+    let effect_consumer = build_effect_consumer(&loaded).await?;
     let evaluation = build_evaluation(&loaded)?;
     let models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, models.demo_tools).await?;
@@ -1192,7 +1200,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     require_contained_directory(&loaded.root, &loaded.data_directory)?;
     validate_existing_stores(&loaded).await?;
 
-    let configured_effect_consumer = build_effect_consumer(&loaded)?;
+    let configured_effect_consumer = build_effect_consumer(&loaded).await?;
     let configured_models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
     let state = StateEngine::new(Arc::new(
@@ -2234,6 +2242,41 @@ pub(super) fn build_json_process(
     configured: &ServiceJsonProcessConfig,
     role: &str,
 ) -> CliResult<(JsonProcessConfig, Arc<dyn ProcessBroker>)> {
+    if !configured.secret_environment.is_empty() {
+        return Err(format!(
+            "{role} does not support secret_environment; only governed Effect Connectors may resolve process credentials"
+        )
+        .into());
+    }
+    build_json_process_base(loaded, configured, role)
+}
+
+pub(super) async fn build_json_effect_process(
+    loaded: &LoadedConfig,
+    configured: &ServiceJsonProcessConfig,
+    role: &str,
+    consumer: &str,
+) -> CliResult<(
+    JsonProcessConfig,
+    Arc<dyn ProcessBroker>,
+    Option<EffectSecretEnvironment>,
+)> {
+    let (process, broker) = build_json_process_base(loaded, configured, role)?;
+    let secret_environment = configured_effect_secret_environment(loaded, configured)?;
+    if let Some(environment) = &secret_environment {
+        environment
+            .probe(consumer, &loaded.authority()?)
+            .await
+            .map_err(|_| format!("{role} credential availability probe failed"))?;
+    }
+    Ok((process, broker, secret_environment))
+}
+
+fn build_json_process_base(
+    loaded: &LoadedConfig,
+    configured: &ServiceJsonProcessConfig,
+    role: &str,
+) -> CliResult<(JsonProcessConfig, Arc<dyn ProcessBroker>)> {
     let command = PathBuf::from(&configured.command);
     if !command.is_absolute() || !command.is_file() {
         return Err(format!(
@@ -2268,6 +2311,42 @@ pub(super) fn build_json_process(
     process.environment = environment_from_host(&configured.environment_from_host)?;
     process.validate()?;
     Ok((process, broker))
+}
+
+fn configured_effect_secret_environment(
+    loaded: &LoadedConfig,
+    configured: &ServiceJsonProcessConfig,
+) -> Result<Option<EffectSecretEnvironment>, HarnessError> {
+    if configured.secret_environment.is_empty() {
+        return Ok(None);
+    }
+    if configured
+        .secret_environment
+        .keys()
+        .any(|name| configured.environment_from_host.contains_key(name))
+    {
+        return Err(HarnessError::InvalidConfiguration(
+            "Effect plain and secret environment names must not overlap".to_owned(),
+        ));
+    }
+    let mut provider_mappings = BTreeMap::new();
+    let mut child_mappings = BTreeMap::new();
+    for (child_name, configured_secret) in &configured.secret_environment {
+        let reference = SecretReference::new(configured_secret.reference.clone())?;
+        if let Some(existing) = provider_mappings.insert(
+            reference.clone(),
+            configured_secret.host_environment.clone(),
+        ) && existing != configured_secret.host_environment
+        {
+            return Err(HarnessError::InvalidConfiguration(
+                "one Effect secret reference cannot select multiple host environment variables"
+                    .to_owned(),
+            ));
+        }
+        child_mappings.insert(child_name.clone(), reference);
+    }
+    let provider = configured_environment_secret_provider(loaded, provider_mappings)?;
+    EffectSecretEnvironment::new(provider, child_mappings).map(Some)
 }
 
 fn environment_from_host(
@@ -2349,8 +2428,9 @@ async fn build_https_mcp_client(
         .resolve(SecretRequest {
             reference,
             consumer: configured.id.clone(),
-            thread_id: ThreadId::from_static("doctor-thread"),
-            turn_id: TurnId::from_static("doctor-turn"),
+            use_context: SecretUseContext::Service {
+                use_case: SecretServiceUse::StartupProbe,
+            },
         })
         .await?;
     Ok(ConfiguredMcpClient::Https(Arc::new(
@@ -2543,18 +2623,26 @@ fn configured_environment_secrets(
     reference: &SecretReference,
     environment: String,
 ) -> Result<Arc<dyn SecretProvider>, HarnessError> {
+    configured_environment_secret_provider(
+        loaded,
+        BTreeMap::from([(reference.clone(), environment)]),
+    )
+}
+
+/// Selects the unscoped or exact-tenant environment adapter for explicit mappings.
+fn configured_environment_secret_provider(
+    loaded: &LoadedConfig,
+    mappings: BTreeMap<SecretReference, String>,
+) -> Result<Arc<dyn SecretProvider>, HarnessError> {
     let authority = loaded.authority()?;
     match authority.tenant_id() {
         None => Ok(Arc::new(EnvironmentSecretProvider::new(
             "service-environment",
-            BTreeMap::from([(reference.clone(), environment)]),
+            mappings,
         )?)),
         Some(tenant_id) => Ok(Arc::new(TenantEnvironmentSecretProvider::new(
             "service-tenant-environment",
-            BTreeMap::from([(
-                tenant_id.to_owned(),
-                BTreeMap::from([(reference.clone(), environment)]),
-            )]),
+            BTreeMap::from([(tenant_id.to_owned(), mappings)]),
         )?)),
     }
 }
@@ -2580,8 +2668,9 @@ async fn build_openai_model(
             SecretRequest {
                 reference: reference.clone(),
                 consumer: id.to_owned(),
-                thread_id: ThreadId::from_static("doctor-thread"),
-                turn_id: TurnId::from_static("doctor-turn"),
+                use_context: SecretUseContext::Service {
+                    use_case: SecretServiceUse::StartupProbe,
+                },
             },
             &loaded.authority()?,
         )
@@ -2637,8 +2726,9 @@ async fn build_https_model(
             SecretRequest {
                 reference: reference.clone(),
                 consumer: id.to_owned(),
-                thread_id: ThreadId::from_static("doctor-thread"),
-                turn_id: TurnId::from_static("doctor-turn"),
+                use_context: SecretUseContext::Service {
+                    use_case: SecretServiceUse::StartupProbe,
+                },
             },
             &loaded.authority()?,
         )
@@ -3265,8 +3355,8 @@ mod tests {
         fs::remove_dir_all(root).expect("remove Temporal config fixture");
     }
 
-    #[test]
-    fn effect_consumer_requires_explicit_exact_authority_and_bounded_timeouts() {
+    #[tokio::test]
+    async fn effect_consumer_requires_explicit_exact_authority_and_bounded_timeouts() {
         let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
             .expect("canonical project");
         let command = std::env::current_exe()
@@ -3331,10 +3421,11 @@ mod tests {
         };
 
         let valid = build_effect_consumer(&loaded(configured("send", 1, 1_000)))
+            .await
             .expect("valid Effect consumer")
             .expect("Effect consumer enabled");
         assert!(valid.doctor_summary().contains(
-            "execution 1 dispatch-locked connector(s) / 1 allow(s) / 100 ms poll / 100 ms backoff"
+            "execution 1 dispatch-locked connector(s) / 0 credential-scoped / 0 secret variable(s) / 1 allow(s) / 100 ms poll / 100 ms backoff"
         ));
 
         let mut unlocked =
@@ -3346,6 +3437,7 @@ mod tests {
         let unlocked =
             serde_json::from_value::<ServiceConfig>(unlocked).expect("decode unlocked fixture");
         let error = build_effect_consumer(&loaded(unlocked))
+            .await
             .err()
             .expect("reject unlocked Effect Connector");
         assert!(
@@ -3355,6 +3447,7 @@ mod tests {
         );
 
         let unsupported = build_effect_consumer(&loaded(configured("delete", 1, 1_000)))
+            .await
             .err()
             .expect("reject unsupported allow");
         assert!(unsupported.to_string().contains(
@@ -3362,6 +3455,7 @@ mod tests {
         ));
 
         let duplicate = build_effect_consumer(&loaded(configured("send", 2, 1_000)))
+            .await
             .err()
             .expect("reject duplicate Connector");
         assert!(
@@ -3371,6 +3465,7 @@ mod tests {
         );
 
         let timeout = build_effect_consumer(&loaded(configured("send", 1, 2_001)))
+            .await
             .err()
             .expect("reject Connector timeout outside Executor budget");
         assert!(
@@ -3378,6 +3473,26 @@ mod tests {
                 .to_string()
                 .contains("process timeout 2001 ms exceeds executor execution timeout 2000 ms")
         );
+
+        let mut missing_secret =
+            serde_json::to_value(configured("send", 1, 1_000)).expect("encode Secret fixture");
+        missing_secret["effect_consumer"]["execution"]["connectors"][0]["process"]["secret_environment"] = serde_json::json!({
+            "EFFECT_TOKEN": {
+                "reference": "effect/private-test",
+                "host_environment": "YH_DELIBERATELY_MISSING_EFFECT_SECRET"
+            }
+        });
+        let missing_secret =
+            serde_json::from_value::<ServiceConfig>(missing_secret).expect("decode Secret fixture");
+        let error = build_effect_consumer(&loaded(missing_secret))
+            .await
+            .err()
+            .expect("reject unavailable Effect Secret");
+        assert!(error.to_string().contains(
+            "Effect execution Connector notification.test credential availability probe failed"
+        ));
+        assert!(!error.to_string().contains("private-test"));
+        assert!(!error.to_string().contains("YH_DELIBERATELY"));
     }
 
     #[tokio::test]
@@ -3399,6 +3514,7 @@ mod tests {
                     args: Vec::new(),
                     current_directory: ".".to_owned(),
                     environment_from_host: std::collections::BTreeMap::new(),
+                    secret_environment: std::collections::BTreeMap::new(),
                     timeout_ms: 1_000,
                     max_output_bytes: 1_024,
                     launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },
@@ -3442,6 +3558,7 @@ mod tests {
                     args: Vec::new(),
                     current_directory: ".".to_owned(),
                     environment_from_host: std::collections::BTreeMap::new(),
+                    secret_environment: std::collections::BTreeMap::new(),
                     timeout_ms: 1_000,
                     max_output_bytes: 1_024,
                     launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },
@@ -3492,6 +3609,7 @@ mod tests {
                         args: Vec::new(),
                         current_directory: ".".to_owned(),
                         environment_from_host: std::collections::BTreeMap::new(),
+                        secret_environment: std::collections::BTreeMap::new(),
                         timeout_ms: 1_000,
                         max_output_bytes: 1_024,
                         launch: ServiceProcessLaunchConfig::Unrestricted { max_concurrency: 1 },

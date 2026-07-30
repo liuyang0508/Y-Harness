@@ -51,7 +51,7 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"29","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"30","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 

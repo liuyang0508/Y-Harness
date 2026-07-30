@@ -61,10 +61,11 @@ trusted artifact installation path, operating-system containment, and
 platform-specific signed-code or immutable-image controls appropriate to its
 threat model.
 
-Credential custody remains separate. `environment_from_host` is still an exact
-cleared-environment projection, not a general Secret manager or per-Effect
-short-lived Secret flow. Adding that flow requires an Effect-native Secret
-request context instead of inventing fake Thread and Turn identities.
+Credential custody was deliberately left separate in this decision.
+`environment_from_host` remains an exact cleared-environment projection, not a
+general Secret manager. [ADR 0139](0139-typed-secret-use-and-effect-credential-custody.md)
+subsequently adds an Effect-native, per-dispatch Secret flow without inventing
+fake Thread and Turn identities.
 
 ## Rejected alternatives
 

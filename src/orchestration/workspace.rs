@@ -530,6 +530,7 @@ impl GitWorktreeWorkspaceProvider {
                     args,
                     current_dir: self.repository_root.clone(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: GIT_COMMAND_TIMEOUT,
                     max_output_bytes: GIT_OUTPUT_BYTES,

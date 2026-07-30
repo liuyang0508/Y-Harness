@@ -388,6 +388,7 @@ mod tests {
             args: Vec::new(),
             current_dir: std::env::temp_dir(),
             environment: BTreeMap::new(),
+            secret_environment: BTreeMap::new(),
             stdin: b"request".to_vec(),
             timeout: Duration::from_secs(2),
             max_output_bytes: 1_024,

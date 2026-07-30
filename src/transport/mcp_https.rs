@@ -41,7 +41,7 @@ use super::mcp::{
 };
 use crate::{
     CancellationToken, ExecutionPhase, HarnessError, HarnessFuture, SecretProvider,
-    SecretReference, SecretRequest, ThreadId, TurnId,
+    SecretReference, SecretRequest, SecretServiceUse, SecretUseContext,
 };
 
 const MAX_HTTPS_MCP_URL_BYTES: usize = 8_192;
@@ -387,8 +387,9 @@ impl StrictHttpsJsonClient {
             .resolve(SecretRequest {
                 reference: self.reference.clone(),
                 consumer: "https-mcp".to_owned(),
-                thread_id: ThreadId::from_static("https-mcp-session"),
-                turn_id: TurnId::from_static("https-mcp-request"),
+                use_context: SecretUseContext::Service {
+                    use_case: SecretServiceUse::TransportRequest,
+                },
             })
             .await
             .map_err(|_| {

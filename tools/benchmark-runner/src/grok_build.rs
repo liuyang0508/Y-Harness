@@ -207,6 +207,7 @@ pub(super) async fn execute(spec: RunSpec) -> AppResult<ExternalRunReport> {
         args: arguments(&spec, &prompt_file.path)?,
         current_dir: workspace,
         environment,
+        secret_environment: BTreeMap::new(),
         stdin: Vec::new(),
         timeout: Duration::from_millis(spec.timeout_ms),
         max_output_bytes: MAX_OUTPUT_BYTES,

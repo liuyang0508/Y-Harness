@@ -1,4 +1,4 @@
-//! Bounded Protocol v29 client over a supervised `yh` child process.
+//! Bounded Protocol v30 client over a supervised `yh` child process.
 
 use std::{
     error::Error,
@@ -351,7 +351,7 @@ mod tests {
     fn protocol_mismatch_names_both_coordinates_and_the_reinstall_path() {
         let diagnostic = protocol_mismatch("23").to_string();
         assert!(diagnostic.contains("Engine protocol \"23\""));
-        assert!(diagnostic.contains("TUI protocol 29"));
+        assert!(diagnostic.contains("TUI protocol 30"));
         assert!(diagnostic.contains("./scripts/install.sh"));
         assert!(diagnostic.contains("./scripts/install-tui.sh"));
     }

@@ -65,7 +65,7 @@ as `ready` or `will be created`; it never creates, bootstraps, or migrates a
 database. A legacy store fails with the exact backup-first migration command
 that must be run after all writers are stopped.
 
-`yh serve` is a headless Protocol v29 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v30 JSONL service over stdin/stdout. It
 persists State, approvals, Task coordination, Workflow Runs, and Human
 Handoffs, and durable external Effects under `.y-harness/`. A
 language-neutral Task Worker example is included:
@@ -102,7 +102,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v29 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v30 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -227,7 +227,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v29 specification](docs/protocol.md).
+[client protocol v30 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -597,10 +597,14 @@ yh task-migrate \
 See the [Task migration runbook](docs/task-migration.md) and
 [ADR 0119](docs/adr/0119-durable-task-graph-tenant-ownership.md).
 
-Secret Provider API 2 receives the same trusted per-Turn authority used by
-State, Policy, Tool, Approval, and Task execution. Direct HTTPS gateway and
-OpenAI adapters resolve credentials against that authority while keeping it
-out of serialized Model payloads. Existing Secret Providers still serve
+Secret Provider API 3 receives the same trusted authority used by State,
+Policy, Tool, Approval, Task, and Effect execution. `SecretUseContext`
+distinguishes an exact Agent Turn, Governed Effect attempt, and bounded service
+operation without inventing Thread/Turn identities. Direct HTTPS gateway and
+OpenAI adapters resolve credentials against Turn authority while keeping it
+out of serialized Model payloads. Effect Connectors may resolve opaque
+references per dispatch into non-cloneable zeroizing process buffers; values
+never enter the JSON Connector envelope. Existing Secret Providers still serve
 unscoped hosts; tenant-scoped requests fail closed until a Provider implements
 authority-aware resolution. The embedded tenant environment Provider requires
 an exact tenant/reference mapping and never falls back to a global mapping.
@@ -612,6 +616,8 @@ service can now select one exact local-process tenant; its direct Model
 environment mappings are assembled through the tenant provider, while enabled
 shared MCP configuration fails before launch. See
 [ADR 0125](docs/adr/0125-fixed-tenant-reference-service-authority.md).
+Effect credential custody and its OS/child-copy non-claims are fixed by
+[ADR 0139](docs/adr/0139-typed-secret-use-and-effect-credential-custody.md).
 
 The optional `y-harness-domain-pack` crate sits above the semantic Core. Its
 format-1 immutable snapshots pin exact Workflow, Skill, Tool, Policy,
@@ -935,6 +941,12 @@ Effect:
             "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "args": ["--execute"],
             "current_directory": ".",
+            "secret_environment": {
+              "TARGET_API_TOKEN": {
+                "reference": "effect/notification-primary",
+                "host_environment": "NOTIFICATION_API_TOKEN"
+              }
+            },
             "timeout_ms": 240000,
             "max_output_bytes": 65536,
             "launch": {"type": "unrestricted", "max_concurrency": 8}
@@ -953,9 +965,15 @@ Reconciliation uses the same lifecycle fields plus `reconciler`,
 the placeholder digest with the exact command-file SHA-256. Integrity semantics
 and non-claims are fixed by
 [ADR 0138](docs/adr/0138-dispatch-time-effect-command-digest-locks.md).
+`secret_environment` is optional, contains references and host variable names
+only, is probed by `yh doctor`, and is resolved again under the exact Effect
+authority before every dispatch. It is not serialized to the Connector. See
+[ADR 0139](docs/adr/0139-typed-secret-use-and-effect-credential-custody.md).
+The current adapter resolves before entering the Broker; a later digest
+mismatch blocks child entry but may follow one Provider lookup.
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
+protocol. Protocol v30 preserves Protocol v29's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -994,6 +1012,9 @@ actor-bound idempotency, exact claim ownership, and bounded queue/transition
 paging. Protocol 29 adds an optional schema-1 Effect Ledger with
 tenant-scoped idempotency uniqueness, finite worker leases, fail-closed
 unknown outcomes, explicit reconciliation, and content-free external receipts.
+Protocol 30 advertises Secret Provider API 3 and its typed Turn, Effect, and
+service use contexts; it adds no Secret-bearing client command or durable
+schema.
 Temporal Driver API 2 may convert expired exact leases to `unknown`; it never
 requeues or executes the effect. Steering requires the exact active Turn,
 invalidates crossed provisional Model output, and never executes
@@ -1094,7 +1115,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v29. The Sessions panel shows direct fork ancestry from
+through Protocol v30. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

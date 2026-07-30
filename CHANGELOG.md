@@ -4,12 +4,21 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- advanced Secret Provider API to 3 and client Protocol to v30 with typed
+  Agent-Turn, Governed-Effect, and service-use contexts; added optional
+  authority-aware Effect `secret_environment` references, content-free startup
+  probes, per-dispatch resolution into non-cloneable zeroizing process buffers,
+  fixed-tenant routing, cancellation-before-provider-entry, Doctor counts, and
+  real subprocess proof that credentials reach only the child environment and
+  never Connector JSON or diagnostics; OS/child copies, vault/KMS integration,
+  rotation, revocation, and arbitrary Connector honesty remain outside the
+  claim;
 - added dispatch-time executable SHA-256 locks for one-shot Process Brokers,
   with frozen measured/unmeasured integrity evidence, regular-file and 256 MiB
   bounds, exact-path enforcement, per-request cancellation/deadline accounting,
   drift rejection before child entry, and restoration recovery; reference
   Effect execution and reconciliation now require the lock while atomic OS exec
-  binding, transitive dependency integrity, and credential custody remain open;
+  binding and transitive dependency integrity remain open;
 - added an opt-in reference-service Effect consumer lifecycle with independently
   configurable execution and reconciliation loops, separate exact Connector
   registries and non-empty allowlists, explicit trust origins and frozen

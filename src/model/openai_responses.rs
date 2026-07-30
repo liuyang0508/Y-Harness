@@ -10,7 +10,7 @@ use super::{authorization_header, provider_failure, provider_http_failure};
 use crate::{
     HarnessError, HarnessFuture, ItemKind, LanguageModel, ModelContinuation, ModelOutput,
     ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream, ModelToolCall, ModelUsage,
-    SecretProvider, SecretReference, SecretRequest, kernel::validate_model_id,
+    SecretProvider, SecretReference, SecretRequest, SecretUseContext, kernel::validate_model_id,
 };
 
 const OPENAI_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -183,8 +183,10 @@ impl OpenAiResponsesModel {
                 SecretRequest {
                     reference: self.config.api_key.clone(),
                     consumer: self.id.clone(),
-                    thread_id: request.thread_id,
-                    turn_id: request.turn_id,
+                    use_context: SecretUseContext::AgentTurn {
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                    },
                 },
                 &request.authority,
             )

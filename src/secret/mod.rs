@@ -6,7 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthorityContext, CapabilityOrigin, HarnessError, HarnessFuture, ThreadId, TurnId,
+    AuthorityContext, CapabilityOrigin, EffectId, EffectLeaseId, EffectOperation, HarnessError,
+    HarnessFuture, ThreadId, TurnId,
     kernel::{
         capture_capability_metadata, validate_capability_name, validate_capability_origin,
         validate_registry_growth,
@@ -14,7 +15,7 @@ use crate::{
 };
 
 /// Current Y-Harness Secret Provider contract version.
-pub const SECRET_API_VERSION: u32 = 2;
+pub const SECRET_API_VERSION: u32 = 3;
 
 const MAX_SECRET_REFERENCE_BYTES: usize = 256;
 const MAX_SECRET_VALUE_BYTES: usize = 65_536;
@@ -87,6 +88,21 @@ impl SecretValue {
     pub fn expose_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
+
+    /// Exposes a UTF-8 credential to an immediate text-only boundary.
+    ///
+    /// The failure is deliberately content-free. Callers must not include
+    /// provider diagnostics or credential bytes in a wider error.
+    pub fn expose_str(&self) -> Result<&str, HarnessError> {
+        std::str::from_utf8(self.expose_bytes())
+            .map_err(|_| HarnessError::Secret("secret value is not valid UTF-8".to_owned()))
+    }
+
+    /// Returns the credential byte length without exposing its contents.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 impl fmt::Debug for SecretValue {
@@ -95,17 +111,71 @@ impl fmt::Debug for SecretValue {
     }
 }
 
+/// Governed Effect phase that is consuming one credential.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretEffectPhase {
+    /// A freshly claimed Effect is entering its mutating Connector.
+    Execution,
+    /// An uncertain Effect is entering its authoritative read-only lookup.
+    Reconciliation,
+}
+
+/// Reference-service operation that consumes a credential without a Turn.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretServiceUse {
+    /// Startup or Doctor availability validation under deployment authority.
+    StartupProbe,
+    /// One request on an explicitly configured shared transport session.
+    TransportRequest,
+}
+
+/// Typed, non-secret reason for resolving one credential.
+///
+/// A usage is evidence for Provider authorization and audit. It is not an
+/// authority source: actor and tenant identity remain exclusively in the
+/// separately supplied [`AuthorityContext`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SecretUseContext {
+    /// A Model or another capability serving one exact Agent Turn.
+    AgentTurn {
+        /// Owning Thread.
+        thread_id: ThreadId,
+        /// Active Turn.
+        turn_id: TurnId,
+    },
+    /// A durable Governed Effect entering one exact Connector attempt.
+    GovernedEffect {
+        /// Stable durable Effect identity.
+        effect_id: EffectId,
+        /// Immutable external operation coordinate.
+        operation: EffectOperation,
+        /// Mutating execution or authoritative read-only reconciliation.
+        phase: SecretEffectPhase,
+        /// Positive durable attempt.
+        attempt: u32,
+        /// Exact execution fence associated with the attempt.
+        lease_id: EffectLeaseId,
+    },
+    /// A deployment-owned operation with no legitimate Thread or Turn.
+    Service {
+        /// Exact bounded service purpose.
+        use_case: SecretServiceUse,
+    },
+}
+
 /// Context supplied to a secret resolver without any secret material.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretRequest {
     /// Opaque reference selected by host configuration.
     pub reference: SecretReference,
     /// Capability consuming the credential.
     pub consumer: String,
-    /// Thread whose operation triggered resolution.
-    pub thread_id: ThreadId,
-    /// Turn whose operation triggered resolution.
-    pub turn_id: TurnId,
+    /// Typed operation context; never a substitute for trusted authority.
+    pub use_context: SecretUseContext,
 }
 
 /// Stable metadata for one resolver implementation.
@@ -404,7 +474,7 @@ mod tests {
 
     use super::{
         EnvironmentSecretProvider, SECRET_API_VERSION, SecretProvider, SecretProviderDescriptor,
-        SecretReference, SecretRegistry, SecretRequest, SecretValue,
+        SecretReference, SecretRegistry, SecretRequest, SecretUseContext, SecretValue,
         TenantEnvironmentSecretProvider,
     };
     use crate::{
@@ -460,8 +530,10 @@ mod tests {
             .resolve(SecretRequest {
                 reference,
                 consumer: "provider/model".to_owned(),
-                thread_id: ThreadId::from_static("thread"),
-                turn_id: TurnId::from_static("turn"),
+                use_context: SecretUseContext::AgentTurn {
+                    thread_id: ThreadId::from_static("thread"),
+                    turn_id: TurnId::from_static("turn"),
+                },
             })
             .await
             .expect_err("missing value");
@@ -523,8 +595,10 @@ mod tests {
         SecretRequest {
             reference: SecretReference::new(reference).expect("reference"),
             consumer: "provider/model".to_owned(),
-            thread_id: ThreadId::from_static("thread"),
-            turn_id: TurnId::from_static("turn"),
+            use_context: SecretUseContext::AgentTurn {
+                thread_id: ThreadId::from_static("thread"),
+                turn_id: TurnId::from_static("turn"),
+            },
         }
     }
 

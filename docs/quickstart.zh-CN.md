@@ -81,7 +81,7 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v29 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v30 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -110,9 +110,9 @@ my-harness/
 迁移数据库或生成备份。旧版、残缺、未知 Schema 会在任何外部 Model、
 MCP 或 Memory 进程启动前失败关闭，并给出对应迁移命令。
 
-## 4. 运行 Protocol v29 服务
+## 4. 运行 Protocol v30 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v29 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v30 帧：
 
 ```bash
 yh serve y-harness.json
@@ -123,7 +123,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"29","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"30","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 
@@ -204,9 +204,30 @@ Broker 会在装配时及每次 dispatch 前，在同一个取消与总超时预
 机制不是原子 OS exec 绑定，也不覆盖解释器、参数脚本、动态库或同权限
 文件系统竞态。完整配置与边界见：
 
+需要凭据的 Effect Connector 可选用引用式环境注入：
+
+```json
+{
+  "secret_environment": {
+    "TARGET_API_TOKEN": {
+      "reference": "effect/notification-primary",
+      "host_environment": "NOTIFICATION_API_TOKEN"
+    }
+  }
+}
+```
+
+配置不含凭据值；`doctor` 通过类型化的 Service Secret 上下文做可用性
+探测，运行时再依据真实 `EffectId + operation + phase + attempt + lease`
+以及可信 Authority 逐次解析。值只进入不可克隆、可清零的进程请求缓冲区，
+不会进入 Effect Ledger 或 JSON Connector stdin。操作系统与子进程收到的
+必要副本不在清零承诺内。`environment_from_host` 仍只是普通配置投影，
+不能替代这条 Secret 边界。
+
 - [`config/y-harness.effect-consumer.example.json`](../config/y-harness.effect-consumer.example.json)
 - [`ADR 0137`](adr/0137-optional-reference-service-effect-consumer.md)
 - [`ADR 0138`](adr/0138-dispatch-time-effect-command-digest-locks.md)
+- [`ADR 0139`](adr/0139-typed-secret-use-and-effect-credential-custody.md)
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：

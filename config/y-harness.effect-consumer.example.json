@@ -38,8 +38,11 @@
               "--execute"
             ],
             "current_directory": ".",
-            "environment_from_host": {
-              "PROVIDER_TOKEN": "PROVIDER_TOKEN"
+            "secret_environment": {
+              "PROVIDER_TOKEN": {
+                "reference": "effect/notification-provider",
+                "host_environment": "PROVIDER_TOKEN"
+              }
             },
             "timeout_ms": 240000,
             "max_output_bytes": 65536,
@@ -81,8 +84,11 @@
               "--reconcile"
             ],
             "current_directory": ".",
-            "environment_from_host": {
-              "PROVIDER_TOKEN": "PROVIDER_TOKEN"
+            "secret_environment": {
+              "PROVIDER_TOKEN": {
+                "reference": "effect/notification-provider",
+                "host_environment": "PROVIDER_TOKEN"
+              }
             },
             "timeout_ms": 60000,
             "max_output_bytes": 65536,

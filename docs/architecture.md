@@ -58,10 +58,11 @@ direction:
   provenance on model-produced State;
 - construction-time frozen model identity, with synchronous metadata panic
   isolation and no provider re-entry while recording State or Observability;
-- a versioned Secret Provider API 2 registry with opaque serializable
-  references, non-serializable zeroizing values, debug redaction,
-  trusted-authority resolution, a global environment allow-list adapter for
-  unscoped hosts, and an exact tenant/reference adapter with no fallback;
+- a versioned Secret Provider API 3 registry with opaque serializable
+  references, non-serializable zeroizing values, debug redaction, typed
+  Agent-Turn/Governed-Effect/service-use contexts, trusted-authority
+  resolution, a global environment allow-list adapter for unscoped hosts, and
+  an exact tenant/reference adapter with no fallback;
 - an optional control-plane crate above Core with immutable digest-bound
   Domain Pack snapshots, exact component inventories, tenant-partitioned
   Memory/SQLite lifecycle records, independent evaluation approval,
@@ -337,11 +338,15 @@ direction:
 - exact JSON Effect Connector protocol 1 with separate execution and
   authoritative read-only reconciliation envelopes, cancellation-free process
   requests, typed Effect-phase cancellation, strict version settlement, and
-  shell-free Process Broker execution; adapter failure returns to the existing
+  shell-free Process Broker execution; optional Secret references resolve
+  under exact Effect authority per dispatch into zeroizing, non-serialized
+  process environment buffers; adapter failure returns to the existing
   Executor/Reconciler uncertainty rules;
 - an opt-in reference-service Effect consumer with independently configurable
   execution and reconciliation loops, separate exact Connector registries and
   non-empty allowlists, mandatory per-dispatch command-file SHA-256 locks,
+  optional content-free credential probes and reference-only Secret
+  environments,
   bounded cadence/backoff/concurrency/timeouts, disposable process-local
   cursors, content-free health transitions, and
   Effect-before-Temporal-before-Protocol/MCP shutdown while leaving Core
@@ -378,10 +383,12 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v29 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v30 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 29
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 30
+  advertises Secret Provider API 3 and its typed use contexts without adding a
+  Secret-bearing wire command; protocol 29 historically
   conditionally advertises Effect Ledger schema 1 and command-specific worker,
   reconciliation, and cancellation permissions; protocol 28 historically
   introduced Human Handoff schema 1 and its command-specific
@@ -440,21 +447,23 @@ direction:
   Skills, Agent Memory Hub Context assembly, and an optional fixed
   local-process tenant shared by Protocol State/Approval/Task/Workflow/Human
   Handoff,
-  configured Evaluation, archives, and direct Model Secret resolution;
+  configured Evaluation, archives, direct Model Secret resolution, and
+  per-dispatch Effect Connector Secret resolution;
 - read-only preflight of every existing authoritative service store before
   external capability construction, with exact ready/create reporting,
   actionable explicit migration diagnostics, and repeated validation during
   the later mutation-capable open;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v29, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v30, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
   local broker, a scoped macOS Seatbelt write/network sandbox, an optional
   exact-path dispatch-time SHA-256 drift-lock wrapper with frozen integrity
-  evidence, and JSON command adapters for Tools, Models, semantic Conversation
+  evidence, a separate non-cloneable zeroizing Secret environment on process
+  requests, and JSON command adapters for Tools, Models, semantic Conversation
   Compactors, completion Verifiers, and Evaluation Graders; Models preserve the compatible bare-output
   wire or explicitly select a strict Provider-evidence/failure settlement,
   while exact owner cancellation propagates into external Model, Context,

@@ -10,9 +10,10 @@ pub use compensation::{
 };
 pub use digest::{DigestLockedProcessBroker, MAX_DIGEST_LOCKED_PROGRAM_BYTES};
 pub use effect::{
-    JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JsonCommandEffectConnector,
+    EffectSecretEnvironment, JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JsonCommandEffectConnector,
     JsonCommandEffectReconciliationConnector, JsonEffectExecutionRequest,
     JsonEffectExecutionResponse, JsonEffectReconciliationRequest, JsonEffectReconciliationResponse,
+    MAX_EFFECT_SECRET_ENVIRONMENT_ENTRIES,
 };
 
 use std::{
@@ -49,8 +50,8 @@ use crate::{
     EvaluationCase, EvaluationExecution, EvaluationSample, ExecutionPhase, Grade, Grader,
     GraderDescriptor, HarnessError, HarnessFuture, LanguageModel, ModelContinuation, ModelOutput,
     ModelProviderFailure, ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream,
-    ModelUsage, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor, TurnId,
-    VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
+    ModelUsage, SecretValue, ThreadId, Tool, ToolBatchExecution, ToolContext, ToolDescriptor,
+    TurnId, VerificationOutcome, VerificationRequest, Verifier, VerifierDescriptor,
     kernel::{capture_capability_metadata, validate_capability_name, validate_model_id},
 };
 
@@ -148,6 +149,12 @@ pub struct ProcessRequest {
     pub current_dir: PathBuf,
     /// Exact environment after the inherited environment is cleared.
     pub environment: BTreeMap<String, String>,
+    /// Short-lived zeroizing environment resolved immediately before dispatch.
+    ///
+    /// These values are never serializable or cloneable. Zeroization covers
+    /// only these `SecretValue` buffers; the process launcher, operating
+    /// system, and child process necessarily receive unproved copies.
+    pub secret_environment: BTreeMap<String, SecretValue>,
     /// Bytes written to child stdin before it is closed.
     ///
     /// Live Runtime phases accept at most [`JSON_COMMAND_MAX_INPUT_BYTES`];
@@ -278,11 +285,26 @@ impl ProcessBroker for LocalProcessBroker {
             };
 
             let mut command = Command::new(&request.program);
+            let secret_environment = request
+                .secret_environment
+                .iter()
+                .map(|(name, value)| {
+                    value
+                        .expose_str()
+                        .map(|value| (name.as_str(), value))
+                        .map_err(|_| {
+                            HarnessError::Execution(
+                                "process secret environment contains a non-UTF-8 value".to_owned(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             command
                 .args(&request.args)
                 .current_dir(&request.current_dir)
                 .env_clear()
                 .envs(&request.environment)
+                .envs(secret_environment)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -635,6 +657,7 @@ impl JsonProcessConfig {
             args: self.args.clone(),
             current_dir: self.current_dir.clone(),
             environment: self.environment.clone(),
+            secret_environment: BTreeMap::new(),
             stdin,
             timeout: self.timeout,
             max_output_bytes: self.max_output_bytes,
@@ -1374,12 +1397,28 @@ fn validate_request(request: &ProcessRequest) -> Result<(), HarnessError> {
             "process args must contain at most {MAX_ARGUMENTS} non-empty values of at most {MAX_ARGUMENT_BYTES} bytes"
         )));
     }
-    if request.environment.len() > MAX_ENVIRONMENT_ENTRIES {
+    let environment_entries = request
+        .environment
+        .len()
+        .checked_add(request.secret_environment.len())
+        .ok_or_else(|| {
+            HarnessError::InvalidConfiguration("process environment count overflow".to_owned())
+        })?;
+    if environment_entries > MAX_ENVIRONMENT_ENTRIES {
         return Err(HarnessError::InvalidConfiguration(format!(
             "process environment exceeds {MAX_ENVIRONMENT_ENTRIES} entries"
         )));
     }
-    let environment_bytes =
+    if request
+        .secret_environment
+        .keys()
+        .any(|name| request.environment.contains_key(name))
+    {
+        return Err(HarnessError::InvalidConfiguration(
+            "process plain and secret environment names must not overlap".to_owned(),
+        ));
+    }
+    let plain_environment_bytes =
         request
             .environment
             .iter()
@@ -1398,6 +1437,24 @@ fn validate_request(request: &ProcessRequest) -> Result<(), HarnessError> {
                         )
                     })
             })?;
+    let environment_bytes = request.secret_environment.iter().try_fold(
+        plain_environment_bytes,
+        |total, (name, value)| {
+            if !valid_environment_name(name) {
+                return Err(HarnessError::InvalidConfiguration(
+                    "invalid process secret environment name".to_owned(),
+                ));
+            }
+            total
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .ok_or_else(|| {
+                    HarnessError::InvalidConfiguration(
+                        "process environment size overflow".to_owned(),
+                    )
+                })
+        },
+    )?;
     if environment_bytes > MAX_ENVIRONMENT_BYTES {
         return Err(HarnessError::InvalidConfiguration(format!(
             "process environment exceeds {MAX_ENVIRONMENT_BYTES} bytes"
@@ -1862,6 +1919,7 @@ mod tests {
             args: Vec::new(),
             current_dir: PathBuf::from("/"),
             environment: BTreeMap::new(),
+            secret_environment: BTreeMap::new(),
             stdin: vec![0; super::MAX_STDIN_BYTES + 1],
             timeout: Duration::from_secs(1),
             max_output_bytes: 1_024,
@@ -2803,6 +2861,7 @@ mod tests {
                     ],
                     current_dir: std::env::temp_dir(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: Duration::from_millis(250),
                     max_output_bytes: 1_024,
@@ -2840,6 +2899,7 @@ mod tests {
                     args: vec!["bounded".to_owned()],
                     current_dir: std::env::temp_dir(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: Duration::from_secs(1),
                     max_output_bytes: 4,
@@ -2873,6 +2933,7 @@ mod tests {
                     args: vec![allowed.join("created").to_string_lossy().into_owned()],
                     current_dir: allowed.clone(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: Duration::from_secs(2),
                     max_output_bytes: 1_024,
@@ -2892,6 +2953,7 @@ mod tests {
                     args: vec!["-c".to_owned(), "printf compatible >/dev/null".to_owned()],
                     current_dir: allowed.clone(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: Duration::from_secs(2),
                     max_output_bytes: 1_024,
@@ -2910,6 +2972,7 @@ mod tests {
                     args: vec![denied.join("blocked").to_string_lossy().into_owned()],
                     current_dir: allowed.clone(),
                     environment: BTreeMap::new(),
+                    secret_environment: BTreeMap::new(),
                     stdin: Vec::new(),
                     timeout: Duration::from_secs(2),
                     max_output_bytes: 1_024,

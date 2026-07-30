@@ -1,10 +1,10 @@
-# Client protocol v29
+# Client protocol v30
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"29"` is exact. Every request carries that value, and a peer
+Protocol version `"30"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "29",
+  "protocol_version": "30",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "29",
+  "protocol_version": "30",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "29",
+  "protocol_version": "30",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "29",
+  "protocol_version": "30",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "29",
+  "protocol_version": "30",
   "body": {
     "status": "success",
     "result": {
@@ -144,7 +144,7 @@ The result type is `initialized`:
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
-        "secret_api": 2,
+        "secret_api": 3,
         "skill_api": "1",
         "model_gateway_api": "7",
         "workspace_provider_api": "1"
@@ -170,13 +170,17 @@ the complete Task Graph/worker, Workflow, and Human Handoff lifecycle are
 fenced by the exact transport-resolved tenant; commands contain no tenant
 selector.
 
-Secret Provider API 2 receives that same trusted authority inside the Engine.
-Legacy Secret Providers remain usable for unscoped operations and fail closed
-for tenant-scoped resolution. Direct Model adapters do not serialize actor or
-tenant authority into Model Provider payloads. Current shared stdio and HTTPS
-MCP clients likewise reject tenant-scoped Tool calls before invoking the
-remote client unless an embedding host supplies a client implementation that
-proves tenant-partitioned credentials and sessions.
+Secret Provider API 3 receives that same trusted authority inside the Engine.
+Its in-process request distinguishes an Agent Turn, Governed Effect attempt,
+and bounded service use without treating any serialized context as authority.
+API-3 Providers remain usable for unscoped operations and fail closed for
+tenant-scoped resolution until they implement `resolve_as`. Direct Model
+adapters do not serialize actor or tenant authority into Model Provider
+payloads. Effect Secret values are likewise absent from the client protocol,
+durable Effect input, and external JSON Connector envelope. Current shared
+stdio and HTTPS MCP clients reject tenant-scoped Tool calls before invoking
+the remote client unless an embedding host supplies a client implementation
+that proves tenant-partitioned credentials and sessions.
 
 ## Methods
 
@@ -760,7 +764,7 @@ A new command against a stale revision returns retryable `effect_conflict`.
 The ledger does not itself authorize, execute, retry, compensate, or verify a
 business action.
 
-Temporal Driver API 2 is an embedded host API, not a Protocol v29 command or
+Temporal Driver API 2 is an embedded host API, not a Protocol v30 command or
 capability. A host may invoke one bounded tick with trusted authority and time
 to discover due Workflow waits, expired Handoff claims, and expired Effect
 leases, then reuse the existing fenced domain commands. The reference
@@ -1128,7 +1132,7 @@ observable through this protocol requires the compatibility action defined in
 
 ## Bounds and retention
 
-| Boundary | Protocol v29 value |
+| Boundary | Protocol v30 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -1168,7 +1172,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"29"` |
+| `unsupported_version` | Request protocol is not exactly `"30"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |

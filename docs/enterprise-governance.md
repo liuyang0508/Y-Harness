@@ -197,6 +197,18 @@ recover without service restart. This is intentionally a command-file drift
 lock, not an atomic OS exec measurement, transitive artifact proof, credential
 manager, or Connector truth certificate.
 
+ADR 0139 advances Secret Provider API to 3 and client Protocol to v30. A typed
+Secret use context distinguishes Agent Turns, Governed Effect
+execution/reconciliation attempts, and bounded service operations without
+inventing identities or accepting serialized tenant authority. Optional
+reference Effect `secret_environment` entries retain only opaque references
+and explicit host variable names, probe availability with content-free errors,
+and resolve again under exact Effect Authority before every dispatch into
+non-cloneable zeroizing process buffers. Secret values remain outside config
+values, Effect input, JSON Connector envelopes, State, and diagnostics. This
+does not claim erasure of operating-system or child-process copies, arbitrary
+Connector honesty, vault/KMS/OAuth integration, rotation, or revocation.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -214,7 +226,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v29 client
+Domain Pack lifecycle remains deliberately outside Core and the v30 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid

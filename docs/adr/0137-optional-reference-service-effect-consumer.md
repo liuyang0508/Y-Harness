@@ -83,7 +83,10 @@ Secret manager, verify business receipts, or provide a durable per-target
 circuit breaker. A fixed-tenant deployment still needs tenant-appropriate
 credentials and Connector behavior. Operators must evaluate and sandbox each
 external command. The ADR 0138 command-file measurement is not an atomic OS exec
-binding or transitive dependency proof.
+binding or transitive dependency proof. ADR 0139 subsequently adds optional
+typed per-dispatch Secret resolution to this reference lifecycle; it does not
+turn the service into a vault, rotation controller, or proof of Connector
+honesty.
 
 ## Rejected alternatives
 

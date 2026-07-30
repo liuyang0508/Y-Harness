@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 use crate::{
     HarnessError, HarnessFuture, LanguageModel, MODEL_GATEWAY_API_VERSION, ModelOutput,
     ModelProviderFailure, ModelProviderFailureKind, ModelRequest, ModelResponse, ModelStream,
-    SecretProvider, SecretReference, SecretRequest, SecretValue, kernel::validate_model_id,
+    SecretProvider, SecretReference, SecretRequest, SecretUseContext, SecretValue,
+    kernel::validate_model_id,
 };
 
 const MAX_HTTP_MODEL_REQUEST_BYTES: usize = 16_777_216;
@@ -474,8 +475,10 @@ impl HttpsJsonModel {
                 SecretRequest {
                     reference: self.config.bearer_secret.clone(),
                     consumer: self.id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    turn_id: request.turn_id.clone(),
+                    use_context: SecretUseContext::AgentTurn {
+                        thread_id: request.thread_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                    },
                 },
                 &request.authority,
             )
