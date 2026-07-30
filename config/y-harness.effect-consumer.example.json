@@ -33,6 +33,7 @@
           "idempotency": "target_enforced",
           "process": {
             "command": "/absolute/path/to/effect-connector",
+            "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "args": [
               "--execute"
             ],
@@ -75,6 +76,7 @@
           "contract": "authoritative_read_only",
           "process": {
             "command": "/absolute/path/to/effect-connector",
+            "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "args": [
               "--reconcile"
             ],

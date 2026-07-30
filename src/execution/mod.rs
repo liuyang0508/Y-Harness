@@ -1,12 +1,14 @@
 //! Bounded external-process execution and JSON command capability adapters.
 
 mod compensation;
+mod digest;
 mod effect;
 
 pub use compensation::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
     ToolCompensator,
 };
+pub use digest::{DigestLockedProcessBroker, MAX_DIGEST_LOCKED_PROGRAM_BYTES};
 pub use effect::{
     JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JsonCommandEffectConnector,
     JsonCommandEffectReconciliationConnector, JsonEffectExecutionRequest,
@@ -96,6 +98,31 @@ pub enum NetworkAccess {
     Allow,
 }
 
+/// Measured integrity enforced by one Process Broker.
+///
+/// A dispatch-time digest detects command-file drift before every launch. It
+/// does not atomically bind the measured file to the operating-system exec,
+/// cover interpreters or dynamic dependencies, or contain an unrestricted
+/// process.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProcessExecutableIntegrity {
+    /// The broker does not measure executable content.
+    #[default]
+    Unmeasured,
+    /// The broker remeasures one exact command file before every dispatch.
+    DispatchSha256 {
+        /// Expected lowercase SHA-256 command-file digest.
+        sha256: String,
+    },
+}
+
+impl ProcessExecutableIntegrity {
+    fn is_unmeasured(&self) -> bool {
+        matches!(self, Self::Unmeasured)
+    }
+}
+
 /// Trust-bearing description of one external execution broker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessBrokerDescriptor {
@@ -103,6 +130,12 @@ pub struct ProcessBrokerDescriptor {
     pub name: String,
     /// Enforced isolation strength.
     pub isolation: ProcessIsolation,
+    /// Executable-integrity measurement enforced by this broker.
+    #[serde(
+        default,
+        skip_serializing_if = "ProcessExecutableIntegrity::is_unmeasured"
+    )]
+    pub executable_integrity: ProcessExecutableIntegrity,
 }
 
 /// One bounded, shell-free child-process request.
@@ -165,6 +198,7 @@ impl ProcessBroker for DenyProcessBroker {
         ProcessBrokerDescriptor {
             name: "deny".to_owned(),
             isolation: ProcessIsolation::Denied,
+            executable_integrity: ProcessExecutableIntegrity::Unmeasured,
         }
     }
 
@@ -215,6 +249,7 @@ impl ProcessBroker for LocalProcessBroker {
         ProcessBrokerDescriptor {
             name: format!("local-unrestricted-{}", self.maximum_concurrency),
             isolation: ProcessIsolation::Unrestricted,
+            executable_integrity: ProcessExecutableIntegrity::Unmeasured,
         }
     }
 
@@ -541,6 +576,7 @@ impl ProcessBroker for MacOsSeatbeltBroker {
             isolation: ProcessIsolation::Sandboxed {
                 mechanism: "macos-seatbelt-write-network".to_owned(),
             },
+            executable_integrity: ProcessExecutableIntegrity::Unmeasured,
         }
     }
 
@@ -1310,6 +1346,10 @@ fn validate_broker_descriptor(descriptor: &ProcessBrokerDescriptor) -> Result<()
     if let ProcessIsolation::Sandboxed { mechanism } = &descriptor.isolation {
         validate_capability_name("process sandbox mechanism", mechanism)?;
     }
+    if let ProcessExecutableIntegrity::DispatchSha256 { sha256 } = &descriptor.executable_integrity
+    {
+        digest::validate_program_sha256(sha256)?;
+    }
     Ok(())
 }
 
@@ -1668,7 +1708,7 @@ mod tests {
         JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
         JsonConversationCompactionRequest, JsonGradeRequest, JsonProcessConfig,
         JsonVerificationRequest, LocalProcessBroker, ProcessBroker, ProcessBrokerDescriptor,
-        ProcessIsolation, ProcessOutput, ProcessRequest,
+        ProcessExecutableIntegrity, ProcessIsolation, ProcessOutput, ProcessRequest,
     };
     #[cfg(target_os = "macos")]
     use super::{MacOsSeatbeltBroker, NetworkAccess};
@@ -1702,6 +1742,7 @@ mod tests {
                 isolation: ProcessIsolation::Sandboxed {
                     mechanism: "test".to_owned(),
                 },
+                executable_integrity: ProcessExecutableIntegrity::Unmeasured,
             }
         }
 
@@ -1728,6 +1769,7 @@ mod tests {
                 isolation: ProcessIsolation::Sandboxed {
                     mechanism: "test".to_owned(),
                 },
+                executable_integrity: ProcessExecutableIntegrity::Unmeasured,
             }
         }
 

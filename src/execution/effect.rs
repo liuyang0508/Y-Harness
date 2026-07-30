@@ -356,6 +356,7 @@ mod tests {
                 isolation: ProcessIsolation::Sandboxed {
                     mechanism: "test".to_owned(),
                 },
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             }
         }
 
@@ -382,6 +383,7 @@ mod tests {
             ProcessBrokerDescriptor {
                 name: "effect-error".to_owned(),
                 isolation: ProcessIsolation::Denied,
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             }
         }
 
@@ -407,6 +409,7 @@ mod tests {
                 isolation: ProcessIsolation::Sandboxed {
                     mechanism: "test".to_owned(),
                 },
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             }
         }
 

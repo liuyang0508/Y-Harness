@@ -189,6 +189,14 @@ before Temporal, Protocol, and MCP shutdown. The lifecycle does not certify
 Connector honesty, sandbox unrestricted commands, or provide distributed rate
 limits and target truth.
 
+ADR 0138 requires every reference-service Effect Connector to bind an exact
+command-file SHA-256. The Process Broker records measured versus unmeasured
+integrity and remeasures before each dispatch inside the existing cancellation
+and total timeout budget. Drift fails before child entry and restoration can
+recover without service restart. This is intentionally a command-file drift
+lock, not an atomic OS exec measurement, transitive artifact proof, credential
+manager, or Connector truth certificate.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -217,8 +225,9 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, reference-service
-Effect executable content pinning, receipt verification, durable per-target
+Secret-manager integration, tenant-partitioned MCP sessions, atomic Effect
+executable-to-exec binding and transitive artifact verification, receipt
+verification, durable per-target
 circuit breaking/rate limits, Workflow compensation planning,
 automatic Human Handoff
 channel routing/outbox delivery, quota, retention, canary rollout, and

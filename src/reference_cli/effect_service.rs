@@ -116,6 +116,9 @@ impl ServiceEffectConsumerConfig {
                 execution.failure_backoff_ms,
             )?;
             execution.executor.validate()?;
+            for connector in &execution.connectors {
+                require_command_lock("execution", &connector.capability, &connector.process)?;
+            }
         }
         if let Some(reconciliation) = &self.reconciliation {
             validate_cadence(
@@ -124,9 +127,25 @@ impl ServiceEffectConsumerConfig {
                 reconciliation.failure_backoff_ms,
             )?;
             reconciliation.reconciler.validate()?;
+            for connector in &reconciliation.connectors {
+                require_command_lock("reconciliation", &connector.capability, &connector.process)?;
+            }
         }
         Ok(())
     }
+}
+
+fn require_command_lock(
+    mode: &str,
+    capability: &str,
+    process: &ServiceJsonProcessConfig,
+) -> Result<(), HarnessError> {
+    if process.command_sha256.is_none() {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "Effect {mode} Connector {capability} requires command_sha256"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_cadence(
@@ -234,7 +253,7 @@ impl ConfiguredEffectConsumerAssembly {
             || "execution disabled".to_owned(),
             |configured| {
                 format!(
-                    "execution {} connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
+                    "execution {} dispatch-locked connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
                     configured.connector_count,
                     configured.allow_count,
                     configured.poll_interval.as_millis(),
@@ -246,7 +265,7 @@ impl ConfiguredEffectConsumerAssembly {
             || "reconciliation disabled".to_owned(),
             |configured| {
                 format!(
-                    "reconciliation {} connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
+                    "reconciliation {} dispatch-locked connector(s) / {} allow(s) / {} ms poll / {} ms backoff",
                     configured.connector_count,
                     configured.allow_count,
                     configured.poll_interval.as_millis(),
@@ -262,6 +281,7 @@ pub(super) fn build(loaded: &LoadedConfig) -> CliResult<Option<ConfiguredEffectC
     let Some(configured) = loaded.effect_consumer() else {
         return Ok(None);
     };
+    configured.validate()?;
 
     let execution = configured
         .execution

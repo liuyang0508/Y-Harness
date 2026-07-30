@@ -4,6 +4,12 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added dispatch-time executable SHA-256 locks for one-shot Process Brokers,
+  with frozen measured/unmeasured integrity evidence, regular-file and 256 MiB
+  bounds, exact-path enforcement, per-request cancellation/deadline accounting,
+  drift rejection before child entry, and restoration recovery; reference
+  Effect execution and reconciliation now require the lock while atomic OS exec
+  binding, transitive dependency integrity, and credential custody remain open;
 - added an opt-in reference-service Effect consumer lifecycle with independently
   configurable execution and reconciliation loops, separate exact Connector
   registries and non-empty allowlists, explicit trust origins and frozen

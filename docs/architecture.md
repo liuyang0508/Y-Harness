@@ -341,8 +341,9 @@ direction:
   Executor/Reconciler uncertainty rules;
 - an opt-in reference-service Effect consumer with independently configurable
   execution and reconciliation loops, separate exact Connector registries and
-  non-empty allowlists, bounded cadence/backoff/concurrency/timeouts,
-  disposable process-local cursors, content-free health transitions, and
+  non-empty allowlists, mandatory per-dispatch command-file SHA-256 locks,
+  bounded cadence/backoff/concurrency/timeouts, disposable process-local
+  cursors, content-free health transitions, and
   Effect-before-Temporal-before-Protocol/MCP shutdown while leaving Core
   task-free and the Ledger authoritative;
 - embedded Temporal Driver API 2 with host-supplied time, optional
@@ -446,14 +447,15 @@ direction:
   the later mutation-capable open;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v28, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v29, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
 - a deny-by-default external Process Broker, an explicitly unrestricted bounded
-  local broker, a scoped macOS Seatbelt write/network sandbox, and JSON command
-  adapters for Tools, Models, semantic Conversation Compactors, completion
-  Verifiers, and Evaluation Graders; Models preserve the compatible bare-output
+  local broker, a scoped macOS Seatbelt write/network sandbox, an optional
+  exact-path dispatch-time SHA-256 drift-lock wrapper with frozen integrity
+  evidence, and JSON command adapters for Tools, Models, semantic Conversation
+  Compactors, completion Verifiers, and Evaluation Graders; Models preserve the compatible bare-output
   wire or explicitly select a strict Provider-evidence/failure settlement,
   while exact owner cancellation propagates into external Model, Context,
   Verification, and Evaluation execution; local execution permits 1–4096

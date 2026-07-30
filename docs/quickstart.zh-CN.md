@@ -198,10 +198,15 @@ cargo run --locked --example json_effect_connector
 两者彼此独立，分别拥有精确 Connector 注册表和非空 allowlist；注册能力
 不等于获得调用权限。轮询、失败退避、并发和超时均有界，进程内 cursor
 不承担恢复语义，唯一持久恢复权威仍是 Effect Ledger。省略配置时不会启动
-后台任务。完整配置与边界见：
+后台任务。每个 Effect Connector 都必须配置真实的 `command_sha256`；
+Broker 会在装配时及每次 dispatch 前，在同一个取消与总超时预算内重新
+测量命令文件。摘要漂移时不会进入子进程，恢复原字节后可继续运行。这个
+机制不是原子 OS exec 绑定，也不覆盖解释器、参数脚本、动态库或同权限
+文件系统竞态。完整配置与边界见：
 
 - [`config/y-harness.effect-consumer.example.json`](../config/y-harness.effect-consumer.example.json)
 - [`ADR 0137`](adr/0137-optional-reference-service-effect-consumer.md)
+- [`ADR 0138`](adr/0138-dispatch-time-effect-command-digest-locks.md)
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：

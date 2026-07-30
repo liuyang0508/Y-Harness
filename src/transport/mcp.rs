@@ -294,6 +294,7 @@ impl StdioMcpLaunchAuthority {
             descriptor: ProcessBrokerDescriptor {
                 name: "stdio-mcp-deny".to_owned(),
                 isolation: ProcessIsolation::Denied,
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             },
             concurrency: None,
             seatbelt: None,
@@ -311,6 +312,7 @@ impl StdioMcpLaunchAuthority {
             descriptor: ProcessBrokerDescriptor {
                 name: format!("stdio-mcp-local-unrestricted-{maximum_concurrency}"),
                 isolation: ProcessIsolation::Unrestricted,
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             },
             concurrency: Some(Arc::new(Semaphore::new(maximum_concurrency))),
             seatbelt: None,
@@ -334,6 +336,7 @@ impl StdioMcpLaunchAuthority {
                 isolation: ProcessIsolation::Sandboxed {
                     mechanism: "macos-seatbelt-write-network".to_owned(),
                 },
+                executable_integrity: crate::ProcessExecutableIntegrity::Unmeasured,
             },
             concurrency: Some(Arc::new(Semaphore::new(maximum_concurrency))),
             seatbelt: Some(MacOsSeatbeltPolicy::new(writable_roots, network_access)?),

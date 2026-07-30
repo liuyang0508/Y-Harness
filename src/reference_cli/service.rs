@@ -20,10 +20,10 @@ use y_harness::{
     ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
     CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
     ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
-    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EFFECT_LEDGER_SCHEMA_VERSION, EVALUATION_FORMAT_VERSION,
-    EffectCoordinator, EffectEngine, EvaluationBaseline, EvaluationCase, EvaluationEngine,
-    EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor, GraderRegistry,
-    HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, DigestLockedProcessBroker, EFFECT_LEDGER_SCHEMA_VERSION,
+    EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine, EvaluationBaseline, EvaluationCase,
+    EvaluationEngine, EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor,
+    GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
     HumanHandoffCoordinator, HumanHandoffEngine, HumanHandoffSubject, HumanHandoffSubjectResolver,
     InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
     JsonCommandGrader, JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool,
@@ -277,6 +277,8 @@ struct ServiceGraderConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct ServiceJsonProcessConfig {
     command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) command_sha256: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default = "default_current_directory")]
@@ -2255,6 +2257,14 @@ pub(super) fn build_json_process(
     };
     process.validate()?;
     let broker = build_process_broker(&loaded.root, &configured.launch)?;
+    let broker: Arc<dyn ProcessBroker> = match &configured.command_sha256 {
+        Some(expected_sha256) => Arc::new(DigestLockedProcessBroker::new(
+            broker,
+            process.program.clone(),
+            expected_sha256.clone(),
+        )?),
+        None => broker,
+    };
     process.environment = environment_from_host(&configured.environment_from_host)?;
     process.validate()?;
     Ok((process, broker))
@@ -2964,6 +2974,8 @@ const fn default_tool_max_output_bytes() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::{
         CapabilityOrigin, EvaluationBaseline, EvaluationSuite, LoadedConfig, ServiceConfig,
         ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig,
@@ -3261,6 +3273,14 @@ mod tests {
             .expect("current executable")
             .to_string_lossy()
             .into_owned();
+        let digest = Sha256::digest(fs::read(&command).expect("read current executable"));
+        let command_sha256 = digest
+            .iter()
+            .fold(String::with_capacity(64), |mut encoded, byte| {
+                use std::fmt::Write as _;
+                write!(encoded, "{byte:02x}").expect("encode digest");
+                encoded
+            });
         let configured = |allow_operation: &str, connectors: usize, process_timeout_ms: u64| {
             let connector = serde_json::json!({
                 "origin_id": "test/effect-execution",
@@ -3269,6 +3289,7 @@ mod tests {
                 "idempotency": "target_enforced",
                 "process": {
                     "command": command,
+                    "command_sha256": command_sha256,
                     "current_directory": ".",
                     "timeout_ms": process_timeout_ms,
                     "max_output_bytes": 1_024,
@@ -3312,10 +3333,25 @@ mod tests {
         let valid = build_effect_consumer(&loaded(configured("send", 1, 1_000)))
             .expect("valid Effect consumer")
             .expect("Effect consumer enabled");
+        assert!(valid.doctor_summary().contains(
+            "execution 1 dispatch-locked connector(s) / 1 allow(s) / 100 ms poll / 100 ms backoff"
+        ));
+
+        let mut unlocked =
+            serde_json::to_value(configured("send", 1, 1_000)).expect("encode unlocked fixture");
+        unlocked["effect_consumer"]["execution"]["connectors"][0]["process"]
+            .as_object_mut()
+            .expect("process object")
+            .remove("command_sha256");
+        let unlocked =
+            serde_json::from_value::<ServiceConfig>(unlocked).expect("decode unlocked fixture");
+        let error = build_effect_consumer(&loaded(unlocked))
+            .err()
+            .expect("reject unlocked Effect Connector");
         assert!(
-            valid
-                .doctor_summary()
-                .contains("execution 1 connector(s) / 1 allow(s) / 100 ms poll / 100 ms backoff")
+            error
+                .to_string()
+                .contains("Effect execution Connector notification.test requires command_sha256")
         );
 
         let unsupported = build_effect_consumer(&loaded(configured("delete", 1, 1_000)))
@@ -3359,6 +3395,7 @@ mod tests {
                         .expect("current executable")
                         .to_string_lossy()
                         .into_owned(),
+                    command_sha256: None,
                     args: Vec::new(),
                     current_directory: ".".to_owned(),
                     environment_from_host: std::collections::BTreeMap::new(),
@@ -3401,6 +3438,7 @@ mod tests {
                         .expect("current executable")
                         .to_string_lossy()
                         .into_owned(),
+                    command_sha256: None,
                     args: Vec::new(),
                     current_directory: ".".to_owned(),
                     environment_from_host: std::collections::BTreeMap::new(),
@@ -3450,6 +3488,7 @@ mod tests {
                             .expect("current executable")
                             .to_string_lossy()
                             .into_owned(),
+                        command_sha256: None,
                         args: Vec::new(),
                         current_directory: ".".to_owned(),
                         environment_from_host: std::collections::BTreeMap::new(),

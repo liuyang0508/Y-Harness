@@ -40,6 +40,8 @@ registration-derived Policy would erase that distinction.
   its routing capability. Process command, working directory, environment projection,
   isolation, concurrency, input/output, and timeout continue through the
   existing `ProcessBroker`.
+- ADR 0138 subsequently requires a dispatch-time command SHA-256 lock for every
+  configured execution and reconciliation Connector.
 - Require each process timeout to fit inside its enclosing execution or lookup
   timeout. Existing Executor lease validation independently requires enough
   post-execution settlement reserve.
@@ -80,7 +82,8 @@ process a sandbox, provide dynamic config reload, distribute rate limits, own a
 Secret manager, verify business receipts, or provide a durable per-target
 circuit breaker. A fixed-tenant deployment still needs tenant-appropriate
 credentials and Connector behavior. Operators must evaluate and sandbox each
-external command.
+external command. The ADR 0138 command-file measurement is not an atomic OS exec
+binding or transitive dependency proof.
 
 ## Rejected alternatives
 

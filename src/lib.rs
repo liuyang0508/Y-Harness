@@ -76,16 +76,18 @@ pub use evaluation::{
 };
 pub use execution::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
-    DenyProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES, JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION,
-    JSON_GRADER_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandEffectConnector,
+    DenyProcessBroker, DigestLockedProcessBroker, JSON_COMMAND_MAX_INPUT_BYTES,
+    JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JSON_GRADER_MAX_INPUT_BYTES,
+    JsonCommandConversationCompactor, JsonCommandEffectConnector,
     JsonCommandEffectReconciliationConnector, JsonCommandGrader, JsonCommandModel,
     JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
     JsonConversationCompactionRequest, JsonConversationCompactionResponse,
     JsonEffectExecutionRequest, JsonEffectExecutionResponse, JsonEffectReconciliationRequest,
     JsonEffectReconciliationResponse, JsonGradeRequest, JsonGradeResponse, JsonModelSettlement,
     JsonProcessConfig, JsonToolRequest, JsonVerificationOutcome, JsonVerificationRequest,
-    LocalProcessBroker, MacOsSeatbeltBroker, NetworkAccess, ProcessBroker, ProcessBrokerDescriptor,
-    ProcessIsolation, ProcessOutput, ProcessRequest, ToolCompensator,
+    LocalProcessBroker, MAX_DIGEST_LOCKED_PROGRAM_BYTES, MacOsSeatbeltBroker, NetworkAccess,
+    ProcessBroker, ProcessBrokerDescriptor, ProcessExecutableIntegrity, ProcessIsolation,
+    ProcessOutput, ProcessRequest, ToolCompensator,
 };
 pub use human_handoff::{
     HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoff, HumanHandoffApplyOutcome, HumanHandoffClaim,

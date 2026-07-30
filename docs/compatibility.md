@@ -299,6 +299,17 @@ the previous no-consumer behavior. This adds no Effect schema, Protocol v29
 command, or Core background task. See
 [ADR 0137](adr/0137-optional-reference-service-effect-consumer.md).
 
+The public pre-1.0 `ProcessBrokerDescriptor` adds
+`executable_integrity`, with serde-default `unmeasured` compatibility for
+historical serialized descriptors; external Rust struct literals must add the
+field. `DigestLockedProcessBroker` reports `dispatch_sha256` and remeasures one
+exact regular command path before each dispatch under the request's existing
+cancellation and total timeout. Shared one-shot service process configuration
+additively accepts `command_sha256`; Effect consumer Connectors now require it.
+This changes no durable schema, Protocol v29, or JSON Effect wire coordinate
+and does not claim an atomic OS exec measurement. See
+[ADR 0138](adr/0138-dispatch-time-effect-command-digest-locks.md).
+
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from

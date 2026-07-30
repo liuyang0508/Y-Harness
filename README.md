@@ -899,8 +899,13 @@ Connector registry. Registration does not grant authority, and omission starts
 no background work. Commands are preflighted by `yh doctor`, missed ticks are
 skipped, unavailable pages use bounded process-local backoff, diagnostics are
 content-free health transitions, and both loops stop before Protocol/MCP
-shutdown. The Ledger remains the only durable recovery authority, so restart
-may repeat safe scans but cannot replay a terminal Effect:
+shutdown. Every Effect command requires a lowercase `command_sha256`; the
+selected Broker verifies it at assembly and again before every dispatch within
+the existing cancellation and timeout budget. Drift prevents child entry, but
+this remains non-atomic command-file measurement rather than a sandbox or
+transitive dependency lock. The Ledger remains the only durable recovery
+authority, so restart may repeat safe scans but cannot replay a terminal
+Effect:
 
 ```json
 {
@@ -927,6 +932,7 @@ may repeat safe scans but cannot replay a terminal Effect:
           "idempotency": "target_enforced",
           "process": {
             "command": "/absolute/path/to/effect-connector",
+            "command_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "args": ["--execute"],
             "current_directory": ".",
             "timeout_ms": 240000,
@@ -943,7 +949,10 @@ may repeat safe scans but cannot replay a terminal Effect:
 Reconciliation uses the same lifecycle fields plus `reconciler`,
 `contract: "authoritative_read_only"`, and its own process. See the complete
 [Effect consumer example](config/y-harness.effect-consumer.example.json) and
-[ADR 0137](docs/adr/0137-optional-reference-service-effect-consumer.md).
+[ADR 0137](docs/adr/0137-optional-reference-service-effect-consumer.md). Replace
+the placeholder digest with the exact command-file SHA-256. Integrity semantics
+and non-claims are fixed by
+[ADR 0138](docs/adr/0138-dispatch-time-effect-command-digest-locks.md).
 
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
@@ -1183,6 +1192,12 @@ the Tool is semantically safe against every other eligible same-response call, w
 Runtime-driven external Models receive the same Turn
 cancellation token through their model-step handle, so a custom broker can
 cooperatively stop work instead of relying only on future-drop cleanup.
+Embedding hosts may wrap a one-shot Broker in `DigestLockedProcessBroker`.
+Its descriptor freezes `dispatch_sha256` evidence and it remeasures one exact
+regular command file before each dispatch under the same cancellation and total
+timeout. This detects resident-service drift; it is explicitly not an atomic
+OS exec measurement and does not cover interpreters, arguments, libraries, or
+same-authority filesystem races.
 
 The reference service exposes the existing Model adapter as
 `model.type = "json_command"` in either the compatible single-Model form or the

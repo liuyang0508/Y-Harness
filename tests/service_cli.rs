@@ -16,6 +16,8 @@ use std::{
 
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use y_harness::{
     APPROVAL_INBOX_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION, EffectCommandId,
     EffectCreateRequest, EffectOperation, HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId,
@@ -506,13 +508,18 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
          '{\"protocol_version\":1,\"outcome\":{\"outcome\":\"unknown\",\
          \"reason_code\":\"target.uncertain\"}}'\n",
     );
-    write_executable(
-        &reconciliation,
-        "#!/bin/sh\n\
+    let reconciliation_content = "#!/bin/sh\n\
          read -r request\n\
          printf '%s\\n' \"$request\" >> reconciliation-requests.jsonl\n\
-         printf '%s\\n' '{\"protocol_version\":1,\"malformed\":true}'\n",
-    );
+         if [ -f reconciliation-ready ]; then\n\
+           printf '%s\\n' \
+         '{\"protocol_version\":1,\"outcome\":{\"outcome\":\"applied\",\"receipt\":{\
+         \"source\":\"test-target\",\"external_id\":\"message-42\",\"observed_at_ms\":1,\
+         \"response_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n\
+         else\n\
+           printf '%s\\n' '{\"protocol_version\":1,\"malformed\":true}'\n\
+         fi\n";
+    write_executable(&reconciliation, reconciliation_content);
 
     let config_path = project.join("y-harness.json");
     let mut config: serde_json::Value =
@@ -521,6 +528,7 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     let process = |command: &Path| {
         serde_json::json!({
             "command": command,
+            "command_sha256": sha256_file(command),
             "current_directory": ".",
             "timeout_ms": 5_000,
             "max_output_bytes": 65_536,
@@ -596,9 +604,9 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
         String::from_utf8(doctor.stdout)
             .expect("UTF-8 Effect consumer doctor")
             .contains(
-                "effect consumer: enabled (execution 1 connector(s) / 1 allow(s) / 100 ms poll / \
-             100 ms backoff; reconciliation 1 connector(s) / 1 allow(s) / 100 ms poll / \
-             100 ms backoff)"
+                "effect consumer: enabled (execution 1 dispatch-locked connector(s) / 1 allow(s) / \
+             100 ms poll / 100 ms backoff; reconciliation 1 dispatch-locked connector(s) / \
+             1 allow(s) / 100 ms poll / 100 ms backoff)"
             )
     );
 
@@ -667,13 +675,38 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
     write_executable(
         &reconciliation,
         "#!/bin/sh\n\
-         read -r request\n\
-         printf '%s\\n' \"$request\" >> reconciliation-requests.jsonl\n\
+         touch tampered-connector-ran\n\
          printf '%s\\n' \
          '{\"protocol_version\":1,\"outcome\":{\"outcome\":\"applied\",\"receipt\":{\
-         \"source\":\"test-target\",\"external_id\":\"message-42\",\"observed_at_ms\":1,\
-         \"response_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n",
+         \"source\":\"tampered-target\",\"external_id\":\"forged\",\"observed_at_ms\":1,\
+         \"response_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}}'\n",
     );
+    std::thread::sleep(Duration::from_millis(150));
+    let reconciliation_during_drift =
+        fs::read(project.join("reconciliation-requests.jsonl")).expect("read drift requests");
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(
+        !project.join("tampered-connector-ran").exists(),
+        "dispatch-time digest lock allowed a drifted Connector to start"
+    );
+    assert_eq!(
+        fs::read(project.join("reconciliation-requests.jsonl"))
+            .expect("read requests during drift"),
+        reconciliation_during_drift,
+        "a drifted Connector received an Effect request"
+    );
+    let still_unknown = runtime
+        .block_on(effect_engine.load(&effect_id))
+        .expect("load Effect after Connector drift")
+        .expect("Effect exists");
+    assert!(matches!(
+        still_unknown.effect().status(),
+        EffectStatus::Unknown { .. }
+    ));
+
+    write_executable(&reconciliation, reconciliation_content);
+    fs::write(project.join("reconciliation-ready"), b"ready")
+        .expect("make authoritative target result visible");
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -2882,6 +2915,18 @@ fn write_executable(path: &Path, content: &str) {
         .permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions).expect("make fixture executable");
+}
+
+#[cfg(unix)]
+fn sha256_file(path: &Path) -> String {
+    let digest = Sha256::digest(fs::read(path).expect("read digest fixture"));
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            use std::fmt::Write as _;
+            write!(encoded, "{byte:02x}").expect("encode digest fixture");
+            encoded
+        })
 }
 
 fn isolated_project(label: &str) -> PathBuf {
