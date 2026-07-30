@@ -31,12 +31,13 @@ yh doctor "$project/y-harness.json"
 
 - [ ] `y-harness.json`、`.gitignore` 和 `.y-harness/` 已创建。
 - [ ] 对同一路径再次执行 `yh init` 失败，原配置字节不变。
-- [ ] `doctor` 输出 Protocol、schema、模型、数据目录、五库
+- [ ] `doctor` 输出 Protocol、schema、模型、数据目录、六库
       `ready`/`will be created` 状态和 `status: ok`。
 - [ ] 把旧版 State 测试库放入数据目录后，`doctor` 与 `serve` 都在构造
       外部 Model/MCP 前返回 `state-migrate` 指引；数据库字节不变且不会
       自动生成备份。
-- [ ] 只含部分 Workflow 表的数据库失败关闭，不被当成可初始化空库。
+- [ ] 只含部分 Workflow 或 Effect 表的数据库失败关闭，不被当成可初始化空库，
+      且 `doctor`/`serve` 在外部 Model 构造前不修改该库。
 - [ ] 重启服务后，TUI Sessions 面板仍能列出并恢复此前 Thread，分叉项显示权威直接父级。
 - [ ] TUI `/name <标题>` 设置的名称在重启后仍显示，`/name` 可清除。
 - [ ] TUI `/fork [已终结-turn-id]` 创建独立子 Thread；父子后续 Turn
@@ -50,22 +51,24 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"28","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"29","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
 - [ ] 返回一个且仅一个成功 JSON 响应。
-- [ ] 能力包含 Thread、Approval、Task Worker、Workflow 和 Human Handoff
+- [ ] 能力包含 Thread、Approval、Task Worker、Workflow、Human Handoff
+      和 Effect
       表面。
 - [ ] `.y-harness/state.db`、`approvals.db`、`tasks.db`、`workflows.db` 和
-      `human-handoffs.db` 已创建。
+      `human-handoffs.db`、`effects.db` 已创建。
 - [ ] 服务重启后此前创建的 Thread、Task Graph、Workflow Run 和 Human
-      Handoff 仍可读取。
+      Handoff 与 Effect 仍可读取。
 - [ ] Human Handoff 只能引用同租户的既有 Thread 或 Workflow Run；
       Claim/续租/释放/结算要求精确 revision、当前 actor 与 claim fence，
       同一 command ID 被其他 actor 或不同内容复用时失败。
 - [ ] 嵌入宿主可用同一租户 Authority 与可信时间调用有限 Temporal tick，
-      推进到期 Workflow 等待和过期 Claim；Core 不会自行启动后台轮询。
+      推进到期 Workflow 等待、过期 Claim 和 Effect 租约；Effect 进入
+      `unknown` 而非重试，Core 不会自行启动后台轮询。
 - [ ] `yh serve` 未配置 `temporal` 时不轮询；显式配置后使用同一固定
       Authority，限制 cadence/scan、跳过漏拍，并在 stdio 关闭时先停止。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确

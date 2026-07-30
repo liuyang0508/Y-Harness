@@ -20,9 +20,10 @@ use y_harness::{
     ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
     CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
     ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
-    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EVALUATION_FORMAT_VERSION, EvaluationBaseline, EvaluationCase,
-    EvaluationEngine, EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor,
-    GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, EFFECT_LEDGER_SCHEMA_VERSION, EVALUATION_FORMAT_VERSION,
+    EffectCoordinator, EffectEngine, EvaluationBaseline, EvaluationCase, EvaluationEngine,
+    EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor, GraderRegistry,
+    HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
     HumanHandoffCoordinator, HumanHandoffEngine, HumanHandoffSubject, HumanHandoffSubjectResolver,
     InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
     JsonCommandGrader, JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool,
@@ -34,8 +35,8 @@ use y_harness::{
     ProtocolPrincipal, SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
     STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine, SkillId, SkillPackage,
     SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement, SkillTrustStore,
-    SqliteApprovalInbox, SqliteEventStore, SqliteHumanHandoffCoordinator, SqliteTaskCoordinator,
-    SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
+    SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEventStore, SqliteHumanHandoffCoordinator,
+    SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
     StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, TemporalDriver, ThreadId,
     ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
     VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
@@ -468,6 +469,7 @@ struct ExistingStoreReadiness {
     tasks: bool,
     workflows: bool,
     human_handoffs: bool,
+    effects: bool,
 }
 
 impl LoadedConfig {
@@ -1016,15 +1018,16 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
-        "stores: state={} approval={} task={} workflow={} handoff={}",
+        "stores: state={} approval={} task={} workflow={} handoff={} effect={}",
         readiness_label(stores.state),
         readiness_label(stores.approvals),
         readiness_label(stores.tasks),
         readiness_label(stores.workflows),
-        readiness_label(stores.human_handoffs)
+        readiness_label(stores.human_handoffs),
+        readiness_label(stores.effects)
     );
     println!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
@@ -1049,6 +1052,10 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         &loaded.data_directory.join("human-handoffs.db"),
         "Human Handoff Coordinator",
     )?;
+    let effects = existing_database(
+        &loaded.data_directory.join("effects.db"),
+        "Effect Coordinator",
+    )?;
 
     if state {
         SqliteEventStore::validate_existing(loaded.data_directory.join("state.db")).await?;
@@ -1069,6 +1076,10 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         )
         .await?;
     }
+    if effects {
+        SqliteEffectCoordinator::validate_existing(loaded.data_directory.join("effects.db"))
+            .await?;
+    }
 
     Ok(ExistingStoreReadiness {
         state,
@@ -1076,6 +1087,7 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         tasks,
         workflows,
         human_handoffs,
+        effects,
     })
 }
 
@@ -1181,6 +1193,8 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         SqliteHumanHandoffCoordinator::open(loaded.data_directory.join("human-handoffs.db"))
             .await?,
     );
+    let effects =
+        Arc::new(SqliteEffectCoordinator::open(loaded.data_directory.join("effects.db")).await?);
 
     let approval_handler = Arc::new(InboxApprovalHandler::new(
         approvals.clone(),
@@ -1199,6 +1213,8 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
             workflows: workflow_engine.clone(),
         }),
     );
+    let effect_port: Arc<dyn EffectCoordinator> = effects;
+    let effect_engine = EffectEngine::new(effect_port);
     let temporal_service = loaded
         .config
         .temporal
@@ -1208,7 +1224,8 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
             temporal_service::start(
                 TemporalDriver::new()
                     .with_workflow_engine(workflow_engine.clone())
-                    .with_human_handoff_engine(handoff_engine.clone()),
+                    .with_human_handoff_engine(handoff_engine.clone())
+                    .with_effect_engine(effect_engine.clone()),
                 authority.clone(),
                 config,
             )
@@ -1219,6 +1236,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         .with_task_coordinator(task_port)
         .with_workflow_engine(workflow_engine)
         .with_human_handoff_engine(handoff_engine)
+        .with_effect_engine(effect_engine)
         .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
     let served = serve_jsonl(
         &handler,

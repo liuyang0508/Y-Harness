@@ -4,6 +4,15 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added independent Effect Ledger schema 1 and Protocol v29 for durable,
+  tenant-scoped external side-effect intent: immutable bounded requests,
+  operation/idempotency uniqueness, finite fenced worker leases, fail-closed
+  `unknown` outcomes, explicit authoritative reconciliation, content-free
+  receipts, Memory/SQLite parity, read-only preflight, and restart recovery
+  through `effects.db`;
+- advanced embedded Temporal Driver API to 2 with optional bounded Effect
+  lease expiry. Exact expiration becomes `unknown`; the driver neither
+  executes nor blindly retries an external effect;
 - added embedded Temporal Driver API 1 with host-supplied time, bounded
   tenant-local identity scans over authoritative Workflow/Handoff aggregates,
   disposable cursors, fail-closed extension-page validation, deterministic

@@ -2,22 +2,24 @@
 //!
 //! The Temporal Driver owns no authoritative scheduler database and starts no
 //! background task. A host supplies trusted time and calls [`TemporalDriver::tick_as`].
-//! Workflow and Human Handoff aggregates remain the durable source of truth;
-//! their existing revisions and fences settle concurrent ticks.
+//! Workflow, Human Handoff, and Effect aggregates remain the durable source of
+//! truth; their existing revisions and fences settle concurrent ticks.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ActorIdentity, AuthorityContext, HarnessError, HumanHandoffApplyOutcome, HumanHandoffClaimId,
-    HumanHandoffCommand, HumanHandoffCommandId, HumanHandoffCommandKind, HumanHandoffDueClaim,
-    HumanHandoffDueScanPage, HumanHandoffEngine, HumanHandoffId, WorkflowApplyOutcome,
-    WorkflowCommand, WorkflowCommandId, WorkflowCommandKind, WorkflowDueScanPage, WorkflowDueWait,
-    WorkflowEngine, WorkflowRunId, WorkflowWaitId,
+    ActorIdentity, AuthorityContext, EffectApplyOutcome, EffectCommand, EffectCommandId,
+    EffectCommandKind, EffectDueLease, EffectDueScanPage, EffectEngine, EffectId, EffectLeaseId,
+    HarnessError, HumanHandoffApplyOutcome, HumanHandoffClaimId, HumanHandoffCommand,
+    HumanHandoffCommandId, HumanHandoffCommandKind, HumanHandoffDueClaim, HumanHandoffDueScanPage,
+    HumanHandoffEngine, HumanHandoffId, WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandId,
+    WorkflowCommandKind, WorkflowDueScanPage, WorkflowDueWait, WorkflowEngine, WorkflowRunId,
+    WorkflowWaitId,
 };
 
 /// Exact embedded Temporal Driver API coordinate.
-pub const TEMPORAL_DRIVER_API_VERSION: u32 = 1;
+pub const TEMPORAL_DRIVER_API_VERSION: u32 = 2;
 /// Maximum authoritative identities visited per configured source and tick.
 pub const MAX_TEMPORAL_SCAN_LIMIT: usize = 256;
 
@@ -37,6 +39,9 @@ pub struct TemporalTickCursor {
     /// Last visited Human Handoff while that source still has more records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_after_handoff_id: Option<HumanHandoffId>,
+    /// Last visited Effect while that source still has more records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_after_effect_id: Option<EffectId>,
 }
 
 /// One bounded deterministic tick request.
@@ -90,6 +95,19 @@ pub enum TemporalTarget {
         /// Exclusive expiration boundary.
         expires_at_ms: u64,
     },
+    /// One expired external-effect execution lease.
+    EffectLease {
+        /// Stable Effect identity.
+        effect_id: EffectId,
+        /// Revision observed with the lease.
+        revision: u64,
+        /// Exact execution fence.
+        lease_id: EffectLeaseId,
+        /// Positive attempt owned by the lease.
+        attempt: u32,
+        /// Exclusive expiration boundary.
+        expires_at_ms: u64,
+    },
 }
 
 /// Content-free settlement of one temporal command.
@@ -135,6 +153,8 @@ pub struct TemporalTickReport {
     pub workflows: TemporalScanProgress,
     /// Human Handoff scan evidence, or zeros when that source is not installed.
     pub human_handoffs: TemporalScanProgress,
+    /// Effect scan evidence, or zeros when that source is not installed.
+    pub effects: TemporalScanProgress,
     /// Continuation for the next tick; completed source sweeps reset to `None`.
     pub next_cursor: TemporalTickCursor,
     /// Deterministically source-then-identity ordered advancement attempts.
@@ -146,6 +166,7 @@ pub struct TemporalTickReport {
 pub struct TemporalDriver {
     workflows: Option<WorkflowEngine>,
     human_handoffs: Option<HumanHandoffEngine>,
+    effects: Option<EffectEngine>,
 }
 
 impl TemporalDriver {
@@ -166,6 +187,13 @@ impl TemporalDriver {
     #[must_use]
     pub fn with_human_handoff_engine(mut self, engine: HumanHandoffEngine) -> Self {
         self.human_handoffs = Some(engine);
+        self
+    }
+
+    /// Installs expired Effect-lease discovery and fail-closed unknown settlement.
+    #[must_use]
+    pub fn with_effect_engine(mut self, engine: EffectEngine) -> Self {
+        self.effects = Some(engine);
         self
     }
 
@@ -215,8 +243,21 @@ impl TemporalDriver {
         } else {
             empty_handoff_page()
         };
+        let effect_page = if let Some(engine) = &self.effects {
+            engine
+                .scan_due_as(
+                    request.at_ms,
+                    request.cursor.effect_after_effect_id.as_ref(),
+                    request.scan_limit,
+                    authority,
+                )
+                .await?
+        } else {
+            empty_effect_page()
+        };
         validate_workflow_scan_page(&workflow_page, &request, authority)?;
         validate_handoff_scan_page(&handoff_page, &request, authority)?;
+        validate_effect_scan_page(&effect_page, &request, authority)?;
 
         // Precompute every fallible command identity before the first durable
         // mutation. Later provider failures become per-attempt settlements.
@@ -268,11 +309,36 @@ impl TemporalDriver {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let effect_commands = effect_page
+            .due
+            .iter()
+            .map(|due| {
+                temporal_command_id(
+                    "effect-expire",
+                    authority.actor(),
+                    due.effect_id.as_str(),
+                    due.lease_id.as_str(),
+                )
+                .map(|id| {
+                    (
+                        due.clone(),
+                        id.clone(),
+                        EffectCommand {
+                            id: EffectCommandId::from_string(id),
+                            kind: EffectCommandKind::ExpireLease {
+                                lease_id: due.lease_id.clone(),
+                            },
+                        },
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut attempts = Vec::with_capacity(
             workflow_commands
                 .len()
-                .saturating_add(handoff_commands.len()),
+                .saturating_add(handoff_commands.len())
+                .saturating_add(effect_commands.len()),
         );
         if let Some(engine) = &self.workflows {
             for (due, command_id, command) in workflow_commands {
@@ -328,11 +394,42 @@ impl TemporalDriver {
                 });
             }
         }
+        if let Some(engine) = &self.effects {
+            for (due, command_id, command) in effect_commands {
+                let outcome = match engine
+                    .apply_as(
+                        &due.effect_id,
+                        due.revision,
+                        command,
+                        request.at_ms,
+                        authority,
+                    )
+                    .await
+                {
+                    Ok(result) => match result.outcome {
+                        EffectApplyOutcome::Applied => TemporalAttemptOutcome::Applied,
+                        EffectApplyOutcome::Duplicate => TemporalAttemptOutcome::Duplicate,
+                    },
+                    Err(HarnessError::EffectConflict { actual, .. }) => {
+                        TemporalAttemptOutcome::Fenced {
+                            actual_revision: actual,
+                        }
+                    }
+                    Err(_) => TemporalAttemptOutcome::Failed,
+                };
+                attempts.push(TemporalAttempt {
+                    target: effect_target(due),
+                    command_id,
+                    outcome,
+                });
+            }
+        }
 
         Ok(TemporalTickReport {
             at_ms: request.at_ms,
             workflows: progress(&workflow_page),
             human_handoffs: handoff_progress(&handoff_page),
+            effects: effect_progress(&effect_page),
             next_cursor: TemporalTickCursor {
                 workflow_after_run_id: workflow_page
                     .has_more
@@ -341,6 +438,10 @@ impl TemporalDriver {
                 handoff_after_handoff_id: handoff_page
                     .has_more
                     .then_some(handoff_page.next_after_handoff_id)
+                    .flatten(),
+                effect_after_effect_id: effect_page
+                    .has_more
+                    .then_some(effect_page.next_after_effect_id)
                     .flatten(),
             },
             attempts,
@@ -371,6 +472,9 @@ fn validate_request(
     if let Some(handoff_id) = &request.cursor.handoff_after_handoff_id {
         validate_temporal_identity("Human Handoff continuation", handoff_id.as_str())?;
     }
+    if let Some(effect_id) = &request.cursor.effect_after_effect_id {
+        validate_temporal_identity("Effect continuation", effect_id.as_str())?;
+    }
     Ok(())
 }
 
@@ -386,6 +490,11 @@ fn validate_installed_cursors(
     if driver.human_handoffs.is_none() && cursor.handoff_after_handoff_id.is_some() {
         return Err(HarnessError::Temporal(
             "Human Handoff cursor supplied without a Human Handoff Engine".to_owned(),
+        ));
+    }
+    if driver.effects.is_none() && cursor.effect_after_effect_id.is_some() {
+        return Err(HarnessError::Temporal(
+            "Effect cursor supplied without an Effect Engine".to_owned(),
         ));
     }
     Ok(())
@@ -515,6 +624,66 @@ fn validate_handoff_scan_page(
     Ok(())
 }
 
+fn validate_effect_scan_page(
+    page: &EffectDueScanPage,
+    request: &TemporalTickRequest,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    validate_scan_progress(
+        "Effect",
+        page.scanned,
+        page.due.len(),
+        page.has_more,
+        page.next_after_effect_id.is_some(),
+        request.scan_limit,
+    )?;
+    if let Some(next) = &page.next_after_effect_id {
+        validate_temporal_identity("Effect continuation", next.as_str())?;
+        if request
+            .cursor
+            .effect_after_effect_id
+            .as_ref()
+            .is_some_and(|after| next.as_str() <= after.as_str())
+        {
+            return Err(invalid_scan("Effect", "continuation did not advance"));
+        }
+    }
+    let mut previous = request
+        .cursor
+        .effect_after_effect_id
+        .as_ref()
+        .map(EffectId::as_str);
+    for due in &page.due {
+        validate_temporal_identity("Effect", due.effect_id.as_str())?;
+        validate_temporal_identity("Effect lease", due.lease_id.as_str())?;
+        if due.tenant_id.as_deref() != authority.tenant_id() {
+            return Err(invalid_scan("Effect", "tenant projection mismatch"));
+        }
+        if due.revision == 0
+            || due.attempt == 0
+            || due.expires_at_ms == 0
+            || due.expires_at_ms > request.at_ms
+        {
+            return Err(invalid_scan("Effect", "lease is not currently expired"));
+        }
+        if previous.is_some_and(|prior| due.effect_id.as_str() <= prior) {
+            return Err(invalid_scan("Effect", "due identities are not ordered"));
+        }
+        if page
+            .next_after_effect_id
+            .as_ref()
+            .is_none_or(|next| due.effect_id.as_str() > next.as_str())
+        {
+            return Err(invalid_scan(
+                "Effect",
+                "due identity exceeds the visited page",
+            ));
+        }
+        previous = Some(due.effect_id.as_str());
+    }
+    Ok(())
+}
+
 fn validate_scan_progress(
     kind: &str,
     scanned: usize,
@@ -591,6 +760,16 @@ fn handoff_target(due: HumanHandoffDueClaim) -> TemporalTarget {
     }
 }
 
+fn effect_target(due: EffectDueLease) -> TemporalTarget {
+    TemporalTarget::EffectLease {
+        effect_id: due.effect_id,
+        revision: due.revision,
+        lease_id: due.lease_id,
+        attempt: due.attempt,
+        expires_at_ms: due.expires_at_ms,
+    }
+}
+
 fn progress(page: &WorkflowDueScanPage) -> TemporalScanProgress {
     TemporalScanProgress {
         scanned: page.scanned,
@@ -600,6 +779,14 @@ fn progress(page: &WorkflowDueScanPage) -> TemporalScanProgress {
 }
 
 fn handoff_progress(page: &HumanHandoffDueScanPage) -> TemporalScanProgress {
+    TemporalScanProgress {
+        scanned: page.scanned,
+        due: page.due.len(),
+        has_more: page.has_more,
+    }
+}
+
+fn effect_progress(page: &EffectDueScanPage) -> TemporalScanProgress {
     TemporalScanProgress {
         scanned: page.scanned,
         due: page.due.len(),
@@ -625,6 +812,15 @@ fn empty_handoff_page() -> HumanHandoffDueScanPage {
     }
 }
 
+fn empty_effect_page() -> EffectDueScanPage {
+    EffectDueScanPage {
+        due: Vec::new(),
+        next_after_effect_id: None,
+        has_more: false,
+        scanned: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, sync::Arc};
@@ -633,10 +829,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        HarnessFuture, HumanHandoffCreateRequest, HumanHandoffStatus, HumanHandoffSubject,
-        HumanHandoffSubjectResolver, MemoryHumanHandoffCoordinator, MemoryTaskCoordinator,
-        MemoryWorkflowCoordinator, TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskId,
-        WorkflowCoordinator, WorkflowDefinition, WorkflowStatus, WorkspaceMode,
+        EffectCreateRequest, EffectOperation, EffectStatus, HarnessFuture,
+        HumanHandoffCreateRequest, HumanHandoffStatus, HumanHandoffSubject,
+        HumanHandoffSubjectResolver, MemoryEffectCoordinator, MemoryHumanHandoffCoordinator,
+        MemoryTaskCoordinator, MemoryWorkflowCoordinator, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskId, WorkflowCoordinator, WorkflowDefinition, WorkflowStatus,
+        WorkspaceMode,
     };
 
     struct ExistingSubject;
@@ -780,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_boundary_tick_advances_workflow_and_handoff_without_side_effect_loop() {
+    async fn exact_boundary_tick_advances_workflow_handoff_and_effect_fences() {
         let authority = authority("worker");
         let tasks = Arc::new(MemoryTaskCoordinator::new());
         let graph_id = TaskGraphId::from_static("graph");
@@ -842,9 +1040,47 @@ mod tests {
             .await
             .expect("claim");
 
+        let effect_engine = EffectEngine::new(Arc::new(MemoryEffectCoordinator::new()));
+        let effect_id = EffectId::from_static("effect");
+        effect_engine
+            .create_as(
+                effect_id.clone(),
+                EffectCreateRequest {
+                    command_id: EffectCommandId::from_static("create-effect"),
+                    operation: EffectOperation {
+                        capability: "channel.email".to_owned(),
+                        operation: "send".to_owned(),
+                    },
+                    idempotency_key: "message".to_owned(),
+                    input: serde_json::json!({"artifact_ref":"message"}),
+                    not_before_ms: 10,
+                },
+                10,
+                &authority,
+            )
+            .await
+            .expect("create effect");
+        effect_engine
+            .apply_as(
+                &effect_id,
+                1,
+                EffectCommand {
+                    id: EffectCommandId::from_static("claim-effect"),
+                    kind: EffectCommandKind::Claim {
+                        lease_id: EffectLeaseId::from_static("effect-lease"),
+                        lease_duration_ms: 1_000,
+                    },
+                },
+                20,
+                &authority,
+            )
+            .await
+            .expect("claim effect");
+
         let driver = TemporalDriver::new()
             .with_workflow_engine(workflow_engine.clone())
-            .with_human_handoff_engine(handoff_engine.clone());
+            .with_human_handoff_engine(handoff_engine.clone())
+            .with_effect_engine(effect_engine.clone());
         let early = driver
             .tick_as(
                 TemporalTickRequest {
@@ -871,7 +1107,8 @@ mod tests {
             .expect("due tick");
         assert_eq!(due.workflows.due, 1);
         assert_eq!(due.human_handoffs.due, 1);
-        assert_eq!(due.attempts.len(), 2);
+        assert_eq!(due.effects.due, 1);
+        assert_eq!(due.attempts.len(), 3);
         assert!(
             due.attempts
                 .iter()
@@ -896,6 +1133,16 @@ mod tests {
                 .handoff()
                 .status(),
             HumanHandoffStatus::Queued
+        ));
+        assert!(matches!(
+            effect_engine
+                .load_as(&effect_id, &authority)
+                .await
+                .expect("load")
+                .expect("effect")
+                .effect()
+                .status(),
+            EffectStatus::Unknown { .. }
         ));
     }
 
@@ -1044,6 +1291,7 @@ mod tests {
                 cursor: TemporalTickCursor {
                     workflow_after_run_id: Some(WorkflowRunId::from_static("run")),
                     handoff_after_handoff_id: None,
+                    effect_after_effect_id: None,
                 },
             })
             .await

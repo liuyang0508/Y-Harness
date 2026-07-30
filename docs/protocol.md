@@ -1,10 +1,10 @@
-# Client protocol v28
+# Client protocol v29
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"28"` is exact. Every request carries that value, and a peer
+Protocol version `"29"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "28",
+  "protocol_version": "29",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "28",
+  "protocol_version": "29",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "28",
+  "protocol_version": "29",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "28",
+  "protocol_version": "29",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "28",
+  "protocol_version": "29",
   "body": {
     "status": "success",
     "result": {
@@ -140,6 +140,7 @@ The result type is `initialized`:
         "task_graph_schema": 3,
         "workflow_run_schema": 1,
         "human_handoff_schema": 1,
+        "effect_ledger_schema": 1,
         "memory_api": 1,
         "token_counter_api": 1,
         "conversation_compactor_api": 1,
@@ -160,6 +161,7 @@ configured; Workflow permissions appear only when a Workflow Engine is
 configured over that Task Coordinator and a durable Workflow Coordinator;
 Human Handoff permissions appear only when a Human Handoff Engine is
 configured with durable coordination and authoritative subject resolution. A
+client sees Effect permissions only when a durable Effect Engine is installed. A
 client must not infer a permission from a compatibility coordinate.
 
 For a tenant-scoped authority, Approval and Task permissions are available
@@ -222,6 +224,11 @@ than `before_sequence`.
 | `list_queued_human_handoffs` | `queue`, optional `after`, optional `limit` | `human_handoff.queue.list` | `human_handoff_queue` |
 | `get_human_handoff_transitions` | `handoff_id`, optional `after_sequence`, optional `limit` | `human_handoff.get` | `human_handoff_transitions` |
 | `apply_human_handoff_command` | `handoff_id`, `expected_revision`, `command` | command-specific Human Handoff permission | `human_handoff_command_applied` |
+| `create_effect` | `effect_id`, `request` | `effect.create` | `effect_created` |
+| `get_effect` | `effect_id` | `effect.get` | `effect` |
+| `list_effects` | optional `status`, optional `after`, optional `limit` | `effect.list` | `effects` |
+| `get_effect_transitions` | `effect_id`, optional `after_sequence`, optional `limit` | `effect.get` | `effect_transitions` |
+| `apply_effect_command` | `effect_id`, `expected_revision`, `command` | command-specific Effect permission | `effect_command_applied` |
 
 `memory_scope` has this shape and defaults to an empty scope:
 
@@ -693,14 +700,74 @@ those effects explicitly through Workflow waits, Policy, Channel gateways, and
 Connectors. `LocalProcess` is trusted process attribution, not proof of an
 individual human.
 
-Temporal Driver API 1 is an embedded host API, not a Protocol v28 command or
+## Durable Effect lifecycle
+
+Effect coordination is optional and appears only when the host installs a
+durable Effect Engine. It records one external side-effect intent before a
+worker may execute it and separates worker ownership from external-system
+settlement.
+
+`create_effect` accepts a proposed `effect_id` and a request containing:
+
+- stable creation `command_id`;
+- capability and operation names;
+- a target-system `idempotency_key`;
+- a bounded structured `input`;
+- positive `not_before_ms`.
+
+The exact `(tenant, capability, operation, idempotency_key)` coordinate is
+unique. Exact actor/content replay returns the canonical existing Effect,
+including when the repeated request proposes another Effect identity.
+Different content under the same coordinate fails closed.
+
+Effects are `pending`, `claimed`, `unknown`, `applied`, `rejected`, or
+`cancelled`. `apply_effect_command` supports:
+
+- `claim`: acquire the eligible positive attempt with a never-reused
+  `lease_id` and 1,000–604,800,000 millisecond duration;
+- `renew_lease`: extend the exact active owner/lease;
+- `record_applied`: settle the active lease with a content-free source receipt;
+- `record_not_applied`: authoritatively prove no effect and either reject
+  terminally or select an explicit `retry_at_ms`;
+- `record_unknown`: report an uncertain active attempt without making it
+  retryable;
+- `expire_lease`: convert an expired exact lease to `unknown`;
+- `reconcile_applied` or `reconcile_not_applied`: settle the exact unknown
+  attempt and lease;
+- `cancel`: stop only a never-claimed pending Effect.
+
+At the exact lease expiration boundary, worker settlement loses. Lease
+expiration never requeues work because worker death does not prove the
+external action was absent. Only authoritative not-applied settlement may
+select a later attempt. Receipts contain source, external identity,
+observation time, and normalized response/proof digest; they contain no
+credential or arbitrary Provider response.
+
+Create, get, list, claim, renewal, worker settlement, expired-lease
+management, reconciliation, and cancellation use `effect.create`,
+`effect.get`, `effect.list`, `effect.worker.claim`, `effect.worker.renew`,
+`effect.worker.settle`, `effect.lease.manage`, `effect.reconcile`, and
+`effect.cancel`.
+
+`list_effects` is identity ordered, accepts at most 64 records, and may filter
+an exact lifecycle. Its entries deliberately omit the bounded request `input`;
+an authorized worker must use `get_effect` for one exact Effect before
+execution. The list retains `input_sha256`, operation, revision, lifecycle,
+and transition count so discovery is useful without replicating potentially
+sensitive request or idempotency material.
+`get_effect_transitions` exposes bounded immutable actor-attributed evidence.
+A new command against a stale revision returns retryable `effect_conflict`.
+The ledger does not itself authorize, execute, retry, compensate, or verify a
+business action.
+
+Temporal Driver API 2 is an embedded host API, not a Protocol v29 command or
 capability. A host may invoke one bounded tick with trusted authority and time
-to discover due Workflow waits and expired Handoff claims, then reuse the
-existing fenced domain commands. The reference `yh serve` process does not
-start that polling lifecycle by default. An operator may explicitly enable its
-host-owned loop through service config without adding a Protocol capability;
-protocol clients still cannot submit temporal application time, cadence, or
-cursors.
+to discover due Workflow waits, expired Handoff claims, and expired Effect
+leases, then reuse the existing fenced domain commands. The reference
+`yh serve` process does not start that polling lifecycle by default. An
+operator may explicitly enable its host-owned loop through service config
+without adding a Protocol capability; protocol clients still cannot submit
+temporal application time, cadence, or cursors.
 
 ## Paging
 
@@ -1054,13 +1121,14 @@ The exact current definitions are the serialized public contracts in
 [`approval/mod.rs`](../src/approval/mod.rs), and
 [`orchestration/mod.rs`](../src/orchestration/mod.rs), and
 [`workflow/mod.rs`](../src/workflow/mod.rs), and
-[`human_handoff/mod.rs`](../src/human_handoff/mod.rs). A change that alters a domain
-record observable through this protocol requires the compatibility action
-defined in [`compatibility.md`](compatibility.md).
+[`human_handoff/mod.rs`](../src/human_handoff/mod.rs), and
+[`effect/mod.rs`](../src/effect/mod.rs). A change that alters a domain record
+observable through this protocol requires the compatibility action defined in
+[`compatibility.md`](compatibility.md).
 
 ## Bounds and retention
 
-| Boundary | Protocol v28 value |
+| Boundary | Protocol v29 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -1100,7 +1168,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"28"` |
+| `unsupported_version` | Request protocol is not exactly `"29"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |

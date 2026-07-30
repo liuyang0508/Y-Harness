@@ -1,5 +1,6 @@
 //! Versioned runtime commands, asynchronous operations, and bounded JSONL stdio.
 
+mod effect;
 mod human_handoff;
 mod task;
 mod workflow;
@@ -26,10 +27,12 @@ use crate::isolation::isolate_future;
 use crate::{
     APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalDecision, ApprovalId, ApprovalInbox,
     ApprovalRecord, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-    HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessRuntime, HumanHandoffApplyOutcome,
-    HumanHandoffCommand, HumanHandoffCommandKind, HumanHandoffCreateRequest, HumanHandoffCursor,
-    HumanHandoffEngine, HumanHandoffId, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope,
-    ModelEventSink, ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
+    EFFECT_LEDGER_SCHEMA_VERSION, EffectApplyOutcome, EffectCommand, EffectCommandKind,
+    EffectCreateRequest, EffectEngine, EffectId, EffectPageCursor, HUMAN_HANDOFF_SCHEMA_VERSION,
+    HarnessError, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffCommand,
+    HumanHandoffCommandKind, HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffEngine,
+    HumanHandoffId, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope, ModelEventSink,
+    ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
     StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
     TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
@@ -38,6 +41,8 @@ use crate::{
     WorkflowCommand, WorkflowCommandKind, WorkflowCreateRequest, WorkflowEngine, WorkflowRunId,
 };
 
+use effect::EffectProtocolService;
+pub use effect::{EffectListEntry, EffectListPage, EffectSummary, EffectTransitionPage};
 use human_handoff::HumanHandoffProtocolService;
 pub use human_handoff::{HumanHandoffQueuePage, HumanHandoffSummary, HumanHandoffTransitionPage};
 pub use task::{TaskGraphSummary, TaskRecordPage};
@@ -46,7 +51,7 @@ use workflow::WorkflowProtocolService;
 pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "28";
+pub const PROTOCOL_VERSION: &str = "29";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -71,12 +76,13 @@ const DEFAULT_TASK_CLAIM_MAXIMUM: usize = 1;
 const DEFAULT_TASK_MESSAGE_PAGE: usize = 32;
 const DEFAULT_WORKFLOW_TRANSITION_PAGE: usize = 16;
 const DEFAULT_HANDOFF_PAGE: usize = 16;
+const DEFAULT_EFFECT_PAGE: usize = 16;
 const MAX_PROTOCOL_PRINCIPALS: usize = 4_096;
 const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 40] = [
+const PROTOCOL_PERMISSIONS: [&str; 49] = [
     "initialize",
     "operation.cancel",
     "operation.events",
@@ -117,6 +123,15 @@ const PROTOCOL_PERMISSIONS: [&str; 40] = [
     "human_handoff.queue.manage",
     "human_handoff.resolve",
     "human_handoff.cancel",
+    "effect.create",
+    "effect.get",
+    "effect.list",
+    "effect.worker.claim",
+    "effect.worker.renew",
+    "effect.worker.settle",
+    "effect.lease.manage",
+    "effect.reconcile",
+    "effect.cancel",
 ];
 
 /// One correlated protocol request.
@@ -425,6 +440,45 @@ pub enum ProtocolCommand {
         /// Retry-stable typed command.
         command: HumanHandoffCommand,
     },
+    /// Persists one external-effect intent before execution.
+    CreateEffect {
+        /// Proposed stable identity; idempotency may resolve to an existing identity.
+        effect_id: String,
+        /// Exact immutable intent and creation command.
+        request: EffectCreateRequest,
+    },
+    /// Reads one bounded current Effect projection.
+    GetEffect {
+        /// Stable Effect identity.
+        effect_id: String,
+    },
+    /// Lists one bounded identity-ordered Effect page.
+    ListEffects {
+        /// Optional exact lifecycle filter.
+        status: Option<String>,
+        /// Optional exclusive stable cursor.
+        after: Option<EffectPageCursor>,
+        /// Maximum number of Effects to return.
+        limit: Option<usize>,
+    },
+    /// Reads one bounded immutable Effect transition page.
+    GetEffectTransitions {
+        /// Stable Effect identity.
+        effect_id: String,
+        /// Returns transitions strictly after this sequence.
+        after_sequence: Option<u64>,
+        /// Maximum number of transitions to return.
+        limit: Option<usize>,
+    },
+    /// Applies one actor-bound Effect lifecycle command.
+    ApplyEffectCommand {
+        /// Stable Effect identity.
+        effect_id: String,
+        /// Exact revision observed before a new mutation.
+        expected_revision: u64,
+        /// Retry-stable typed command.
+        command: EffectCommand,
+    },
 }
 
 impl ProtocolCommand {
@@ -476,6 +530,20 @@ impl ProtocolCommand {
                 HumanHandoffCommandKind::ExpireClaim { .. } => "human_handoff.queue.manage",
                 HumanHandoffCommandKind::Resolve { .. } => "human_handoff.resolve",
                 HumanHandoffCommandKind::Cancel { .. } => "human_handoff.cancel",
+            },
+            Self::CreateEffect { .. } => "effect.create",
+            Self::GetEffect { .. } | Self::GetEffectTransitions { .. } => "effect.get",
+            Self::ListEffects { .. } => "effect.list",
+            Self::ApplyEffectCommand { command, .. } => match &command.kind {
+                EffectCommandKind::Claim { .. } => "effect.worker.claim",
+                EffectCommandKind::RenewLease { .. } => "effect.worker.renew",
+                EffectCommandKind::RecordApplied { .. }
+                | EffectCommandKind::RecordNotApplied { .. }
+                | EffectCommandKind::RecordUnknown { .. } => "effect.worker.settle",
+                EffectCommandKind::ExpireLease { .. } => "effect.lease.manage",
+                EffectCommandKind::ReconcileApplied { .. }
+                | EffectCommandKind::ReconcileNotApplied { .. } => "effect.reconcile",
+                EffectCommandKind::Cancel { .. } => "effect.cancel",
             },
         }
     }
@@ -916,6 +984,33 @@ pub enum ProtocolResult {
         /// Whether this request changed the durable revision.
         outcome: HumanHandoffApplyOutcome,
     },
+    /// Newly created or idempotently recognized Effect.
+    EffectCreated {
+        /// Bounded current Effect projection.
+        effect: EffectSummary,
+    },
+    /// Loaded Effect projection or explicit absence.
+    Effect {
+        /// Bounded current Effect projection when found.
+        effect: Option<EffectSummary>,
+    },
+    /// Bounded identity-ordered Effect page.
+    Effects {
+        /// Matching Effects and continuation cursor.
+        page: EffectListPage,
+    },
+    /// Bounded immutable Effect transition page.
+    EffectTransitions {
+        /// Sequence-ordered transitions and continuation cursor.
+        page: EffectTransitionPage,
+    },
+    /// Successful new or duplicate Effect command settlement.
+    EffectCommandApplied {
+        /// Current bounded Effect projection.
+        effect: EffectSummary,
+        /// Whether this request changed the durable revision.
+        outcome: EffectApplyOutcome,
+    },
 }
 
 /// Pollable asynchronous Turn state.
@@ -990,6 +1085,8 @@ pub struct CompatibilityManifest {
     pub workflow_run_schema: u32,
     /// Durable Human Handoff schema accepted and written.
     pub human_handoff_schema: u32,
+    /// Durable Effect Ledger schema accepted and written.
+    pub effect_ledger_schema: u32,
     /// Exact Memory Provider API version.
     pub memory_api: u32,
     /// Exact provider-specific Token Counter API version.
@@ -1125,6 +1222,7 @@ pub struct ProtocolHandler {
     tasks: Option<TaskProtocolService>,
     workflows: Option<WorkflowProtocolService>,
     human_handoffs: Option<HumanHandoffProtocolService>,
+    effects: Option<EffectProtocolService>,
     authorizer: Arc<dyn ProtocolAuthorizer>,
     operations: Arc<Mutex<BTreeMap<OperationId, ManagedOperation>>>,
     lifecycle: Arc<OperationLifecycle>,
@@ -1141,6 +1239,7 @@ impl ProtocolHandler {
             tasks: None,
             workflows: None,
             human_handoffs: None,
+            effects: None,
             authorizer: Arc::new(LocalProcessAuthorizer),
             operations: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle: Arc::new(OperationLifecycle::new()),
@@ -1173,6 +1272,13 @@ impl ProtocolHandler {
     #[must_use]
     pub fn with_human_handoff_engine(mut self, engine: HumanHandoffEngine) -> Self {
         self.human_handoffs = Some(HumanHandoffProtocolService::new(engine));
+        self
+    }
+
+    /// Exposes durable external-effect intent and settlement coordination.
+    #[must_use]
+    pub fn with_effect_engine(mut self, engine: EffectEngine) -> Self {
+        self.effects = Some(EffectProtocolService::new(engine));
         self
     }
 
@@ -1373,6 +1479,19 @@ impl ProtocolHandler {
                         "human_handoff.resolve".to_owned(),
                     ]);
                 }
+                if self.effects.is_some() {
+                    capabilities.extend([
+                        "effect.cancel".to_owned(),
+                        "effect.create".to_owned(),
+                        "effect.get".to_owned(),
+                        "effect.lease.manage".to_owned(),
+                        "effect.list".to_owned(),
+                        "effect.reconcile".to_owned(),
+                        "effect.worker.claim".to_owned(),
+                        "effect.worker.renew".to_owned(),
+                        "effect.worker.settle".to_owned(),
+                    ]);
+                }
                 capabilities.sort();
                 capabilities.retain(|permission| self.is_allowed(principal, permission));
                 Ok(ProtocolResult::Initialized {
@@ -1386,6 +1505,7 @@ impl ProtocolHandler {
                         task_graph_schema: TASK_GRAPH_SCHEMA_VERSION,
                         workflow_run_schema: WORKFLOW_RUN_SCHEMA_VERSION,
                         human_handoff_schema: HUMAN_HANDOFF_SCHEMA_VERSION,
+                        effect_ledger_schema: EFFECT_LEDGER_SCHEMA_VERSION,
                         memory_api: MEMORY_API_VERSION,
                         token_counter_api: TOKEN_COUNTER_API_VERSION,
                         conversation_compactor_api: CONVERSATION_COMPACTOR_API_VERSION,
@@ -2174,6 +2294,72 @@ impl ProtocolHandler {
                     .await?;
                 Ok(ProtocolResult::HumanHandoffCommandApplied { handoff, outcome })
             }
+            ProtocolCommand::CreateEffect { effect_id, request } => {
+                validate_opaque_id("effect_id", &effect_id)?;
+                let effect = self
+                    .effect_service()?
+                    .create(EffectId::from_string(effect_id), request, authority)
+                    .await?;
+                Ok(ProtocolResult::EffectCreated { effect })
+            }
+            ProtocolCommand::GetEffect { effect_id } => {
+                validate_opaque_id("effect_id", &effect_id)?;
+                let effect = self
+                    .effect_service()?
+                    .summary(&EffectId::from_string(effect_id), authority)
+                    .await?;
+                Ok(ProtocolResult::Effect { effect })
+            }
+            ProtocolCommand::ListEffects {
+                status,
+                after,
+                limit,
+            } => {
+                let page = self
+                    .effect_service()?
+                    .list(
+                        status.as_deref(),
+                        after.as_ref(),
+                        limit.unwrap_or(DEFAULT_EFFECT_PAGE),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::Effects { page })
+            }
+            ProtocolCommand::GetEffectTransitions {
+                effect_id,
+                after_sequence,
+                limit,
+            } => {
+                validate_opaque_id("effect_id", &effect_id)?;
+                let page = self
+                    .effect_service()?
+                    .transitions(
+                        &EffectId::from_string(effect_id),
+                        after_sequence.unwrap_or(0),
+                        limit.unwrap_or(DEFAULT_EFFECT_PAGE),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::EffectTransitions { page })
+            }
+            ProtocolCommand::ApplyEffectCommand {
+                effect_id,
+                expected_revision,
+                command,
+            } => {
+                validate_opaque_id("effect_id", &effect_id)?;
+                let (effect, outcome) = self
+                    .effect_service()?
+                    .apply(
+                        &EffectId::from_string(effect_id),
+                        expected_revision,
+                        command,
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::EffectCommandApplied { effect, outcome })
+            }
         }
     }
 
@@ -2209,6 +2395,12 @@ impl ProtocolHandler {
     fn human_handoff_service(&self) -> Result<&HumanHandoffProtocolService, HarnessError> {
         self.human_handoffs.as_ref().ok_or_else(|| {
             HarnessError::Protocol("durable Human Handoff Engine is not configured".to_owned())
+        })
+    }
+
+    fn effect_service(&self) -> Result<&EffectProtocolService, HarnessError> {
+        self.effects.as_ref().ok_or_else(|| {
+            HarnessError::Protocol("durable Effect Engine is not configured".to_owned())
         })
     }
 
@@ -2621,6 +2813,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
             | HarnessError::OrchestrationConflict { .. }
             | HarnessError::WorkflowConflict { .. }
             | HarnessError::HumanHandoffConflict { .. }
+            | HarnessError::EffectConflict { .. }
             | HarnessError::ApprovalConflict { .. }
             | HarnessError::Mcp(_)
     );
@@ -2631,6 +2824,7 @@ fn protocol_error(error: HarnessError) -> ProtocolError {
             HarnessError::OrchestrationConflict { .. } => "orchestration_conflict",
             HarnessError::WorkflowConflict { .. } => "workflow_conflict",
             HarnessError::HumanHandoffConflict { .. } => "human_handoff_conflict",
+            HarnessError::EffectConflict { .. } => "effect_conflict",
             HarnessError::ApprovalConflict { .. } => "approval_conflict",
             HarnessError::ProtocolDenied { .. } => "forbidden",
             HarnessError::Protocol(_) => "invalid_request",
@@ -2686,21 +2880,24 @@ mod tests {
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
         ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin,
-        ConnectorEvidence, ConnectorEvidenceClaim, EventStore, ExecutionBinding, HarnessError,
+        ConnectorEvidence, ConnectorEvidenceClaim, EffectApplyOutcome, EffectCommand,
+        EffectCommandId, EffectCommandKind, EffectCreateRequest, EffectEngine, EffectId,
+        EffectLeaseId, EffectOperation, EffectStatus, EventStore, ExecutionBinding, HarnessError,
         HarnessFuture, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffClaimId,
         HumanHandoffCommand, HumanHandoffCommandId, HumanHandoffCommandKind,
         HumanHandoffCreateRequest, HumanHandoffEngine, HumanHandoffSubject,
         HumanHandoffSubjectResolver, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
-        MemoryApprovalInbox, MemoryEventStore, MemoryHumanHandoffCoordinator, MemoryScope,
-        MemoryTaskCoordinator, MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink,
-        ModelOutput, ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, OperationId,
-        PendingEvent, PolicyDecision, PolicyEngine, RiskLevel, SnapshotMaintenanceConfig,
-        StateCapacityLevel, StateEngine, StateEvent, StateSnapshot, StoredEvent, TaskCompletion,
-        TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread,
-        ThreadId, Tool, ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext,
-        ToolDescriptor, ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome,
-        WorkflowCommand, WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest,
-        WorkflowDefinition, WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
+        MemoryApprovalInbox, MemoryEffectCoordinator, MemoryEventStore,
+        MemoryHumanHandoffCoordinator, MemoryScope, MemoryTaskCoordinator,
+        MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
+        ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
+        PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
+        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
+        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
+        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome, WorkflowCommand,
+        WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest, WorkflowDefinition,
+        WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -3088,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_twenty_eight_wire_envelopes_and_permissions_are_stable() {
+    fn protocol_twenty_nine_wire_envelopes_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -3096,14 +3293,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "28",
+                "protocol_version": "29",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "28",
+                "protocol_version": "29",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -3112,7 +3309,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "28",
+                "protocol_version": "29",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -3134,7 +3331,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "28",
+                "protocol_version": "29",
                 "body": {
                     "status": "success",
                     "result": {
@@ -3244,7 +3441,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "28",
+                "protocol_version": "29",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",
@@ -4740,6 +4937,213 @@ mod tests {
             } if page.transitions.len() == 2
                 && page.next_after_sequence == Some(2)
                 && !page.has_more
+        ));
+    }
+
+    #[tokio::test]
+    async fn effect_protocol_is_conditional_idempotent_and_fail_closed() {
+        let unconfigured = handler(Arc::new(ImmediateModel))
+            .handle(request("init-plain", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            unconfigured.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ..
+                }
+            } if !capabilities
+                .iter()
+                .any(|capability| capability.starts_with("effect."))
+        ));
+
+        let configured = handler(Arc::new(ImmediateModel))
+            .with_effect_engine(EffectEngine::new(Arc::new(MemoryEffectCoordinator::new())));
+        let initialized = configured
+            .handle(request("init-effect", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized {
+                    ref capabilities,
+                    ref compatibility,
+                    ..
+                }
+            } if capabilities
+                .iter()
+                .filter(|capability| capability.starts_with("effect."))
+                .count() == 9
+                && compatibility.effect_ledger_schema == 1
+        ));
+
+        let create = EffectCreateRequest {
+            command_id: EffectCommandId::from_static("create"),
+            operation: EffectOperation {
+                capability: "channel.email".to_owned(),
+                operation: "send".to_owned(),
+            },
+            idempotency_key: "message-42".to_owned(),
+            input: serde_json::json!({"artifact_ref":"message-42"}),
+            not_before_ms: 1,
+        };
+        let created = configured
+            .handle(request(
+                "create-effect",
+                ProtocolCommand::CreateEffect {
+                    effect_id: "effect".to_owned(),
+                    request: create.clone(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            created.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::EffectCreated {
+                    ref effect
+                }
+            } if effect.revision == 1
+                && matches!(effect.status, EffectStatus::Pending { .. })
+        ));
+        let duplicate = configured
+            .handle(request(
+                "create-effect-alias",
+                ProtocolCommand::CreateEffect {
+                    effect_id: "effect-alias".to_owned(),
+                    request: create,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            duplicate.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::EffectCreated {
+                    ref effect
+                }
+            } if effect.effect_id == EffectId::from_static("effect")
+        ));
+
+        let claim = EffectCommand {
+            id: EffectCommandId::from_static("claim"),
+            kind: EffectCommandKind::Claim {
+                lease_id: EffectLeaseId::from_static("lease"),
+                lease_duration_ms: 60_000,
+            },
+        };
+        let claimed = configured
+            .handle(request(
+                "claim-effect",
+                ProtocolCommand::ApplyEffectCommand {
+                    effect_id: "effect".to_owned(),
+                    expected_revision: 1,
+                    command: claim.clone(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            claimed.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::EffectCommandApplied {
+                    ref effect,
+                    outcome: EffectApplyOutcome::Applied,
+                }
+            } if effect.revision == 2
+                && matches!(effect.status, EffectStatus::Claimed { .. })
+        ));
+        let replay = configured
+            .handle(request(
+                "replay-effect",
+                ProtocolCommand::ApplyEffectCommand {
+                    effect_id: "effect".to_owned(),
+                    expected_revision: 1,
+                    command: claim,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            replay.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::EffectCommandApplied {
+                    ref effect,
+                    outcome: EffectApplyOutcome::Duplicate,
+                }
+            } if effect.revision == 2
+        ));
+        let stale = configured
+            .handle(request(
+                "stale-effect",
+                ProtocolCommand::ApplyEffectCommand {
+                    effect_id: "effect".to_owned(),
+                    expected_revision: 1,
+                    command: EffectCommand {
+                        id: EffectCommandId::from_static("cancel"),
+                        kind: EffectCommandKind::Cancel {
+                            reason_code: "operator.cancelled".to_owned(),
+                        },
+                    },
+                },
+            ))
+            .await;
+        assert!(matches!(
+            stale.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: true,
+                    ..
+                }
+            } if code == "effect_conflict"
+        ));
+        let page = configured
+            .handle(request(
+                "list-effects",
+                ProtocolCommand::ListEffects {
+                    status: Some("claimed".to_owned()),
+                    after: None,
+                    limit: Some(8),
+                },
+            ))
+            .await;
+        let ProtocolResponseBody::Success {
+            result: ProtocolResult::Effects { page },
+        } = &page.body
+        else {
+            panic!("unexpected Effect list response: {:?}", page.body);
+        };
+        assert_eq!(page.effects.len(), 1);
+        assert!(!page.has_more);
+        let listed = serde_json::to_value(&page.effects[0]).expect("encode Effect list entry");
+        assert!(
+            listed.get("input").is_none(),
+            "Effect list entry must not disclose request input"
+        );
+        assert_eq!(
+            listed
+                .get("input_sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+
+        let oversized_page = configured
+            .handle(request(
+                "list-effects-too-large",
+                ProtocolCommand::ListEffects {
+                    status: None,
+                    after: None,
+                    limit: Some(65),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            oversized_page.body,
+            ProtocolResponseBody::Error {
+                error: ProtocolError {
+                    ref code,
+                    retryable: false,
+                    ..
+                }
+            } if code == "invalid_request"
         ));
     }
 

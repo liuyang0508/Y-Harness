@@ -16,7 +16,8 @@ use std::{
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId,
+    APPROVAL_INBOX_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION, EffectCommandId,
+    EffectCreateRequest, EffectOperation, HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId,
     HumanHandoffCreateRequest, HumanHandoffSubject, Item, ItemKind, PROTOCOL_VERSION,
     ProtocolCommand, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
     SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
@@ -78,7 +79,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
     assert!(report.contains(&format!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("authority: local-process / unscoped"));
@@ -93,7 +94,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("temporal: disabled"));
     assert!(report.contains(
         "stores: state=will be created approval=will be created task=will be created \
-         workflow=will be created handoff=will be created"
+         workflow=will be created handoff=will be created effect=will be created"
     ));
     assert!(report.contains("status: ok"));
 
@@ -120,7 +121,9 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(
         String::from_utf8(current_doctor.stdout)
             .expect("UTF-8 current-store doctor")
-            .contains("stores: state=ready approval=ready task=ready workflow=ready handoff=ready")
+            .contains(
+                "stores: state=ready approval=ready task=ready workflow=ready handoff=ready effect=ready"
+            )
     );
     fs::remove_dir_all(project).expect("remove isolated project");
 }
@@ -248,6 +251,57 @@ fn doctor_rejects_a_partial_workflow_store() {
     assert!(!doctor.status.success());
     assert!(String::from_utf8_lossy(&doctor.stderr).contains("SQLite Workflow store is partial"));
     fs::remove_dir_all(project).expect("remove partial Workflow fixture");
+}
+
+#[test]
+fn doctor_and_service_reject_a_partial_effect_store_before_model_construction() {
+    let project = isolated_project("doctor-partial-effect");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let database = project.join(".y-harness/effects.db");
+    {
+        let connection =
+            rusqlite::Connection::open(&database).expect("open partial Effect fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE effect_store_meta (
+                    singleton INTEGER PRIMARY KEY,
+                    schema_version INTEGER NOT NULL
+                );",
+            )
+            .expect("install partial Effect fixture");
+    }
+    let before = fs::read(&database).expect("read partial Effect fixture");
+
+    for command in ["doctor", "serve"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+            .arg(command)
+            .arg("y-harness.json")
+            .current_dir(&project)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run partial Effect preflight");
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("SQLite Effect Ledger is partial"),
+            "unexpected {command} diagnostic: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("missing-model"),
+            "external Model construction ran before Effect preflight"
+        );
+        assert_eq!(
+            fs::read(&database).expect("read partial Effect after preflight"),
+            before,
+            "{command} preflight mutated the partial Effect store"
+        );
+    }
+    fs::remove_dir_all(project).expect("remove partial Effect fixture");
 }
 
 #[test]
@@ -2072,7 +2126,7 @@ printf '%s' '{"score":1.0,"passed":true,"rationale":"configured grade passed"}'
 }
 
 #[test]
-fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restart() {
+fn persistent_service_recovers_threads_tasks_workflows_handoffs_and_effects_after_restart() {
     let project = isolated_project("persistence");
     let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("init")
@@ -2129,6 +2183,22 @@ fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restar
                     },
                 },
             ),
+            request(
+                "create-effect",
+                ProtocolCommand::CreateEffect {
+                    effect_id: "persistent-effect".to_owned(),
+                    request: EffectCreateRequest {
+                        command_id: EffectCommandId::from_static("create-persistent-effect"),
+                        operation: EffectOperation {
+                            capability: "channel.email".to_owned(),
+                            operation: "send".to_owned(),
+                        },
+                        idempotency_key: "persistent-message".to_owned(),
+                        input: serde_json::json!({"artifact_ref":"message"}),
+                        not_before_ms: 1,
+                    },
+                },
+            ),
         ],
     );
     let thread_id = match &first[1].body {
@@ -2159,6 +2229,15 @@ fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restar
         } if handoff.revision == 1
             && handoff.queue == "support.primary"
             && matches!(handoff.status, y_harness::HumanHandoffStatus::Queued)
+    ));
+    assert!(matches!(
+        first[5].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::EffectCreated {
+                ref effect
+            }
+        } if effect.revision == 1
+            && effect.effect_id == y_harness::EffectId::from_static("persistent-effect")
     ));
 
     let second = serve(
@@ -2193,6 +2272,12 @@ fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restar
                 "get-human-handoff",
                 ProtocolCommand::GetHumanHandoff {
                     handoff_id: "persistent-handoff".to_owned(),
+                },
+            ),
+            request(
+                "get-effect",
+                ProtocolCommand::GetEffect {
+                    effect_id: "persistent-effect".to_owned(),
                 },
             ),
         ],
@@ -2246,12 +2331,22 @@ fn persistent_service_recovers_threads_tasks_workflows_and_handoffs_after_restar
                 HumanHandoffSubject::WorkflowRun { .. }
             )
     ));
+    assert!(matches!(
+        second[5].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Effect {
+                effect: Some(ref effect)
+            }
+        } if effect.revision == 1
+            && effect.operation.capability == "channel.email"
+    ));
     for database in [
         "state.db",
         "approvals.db",
         "tasks.db",
         "workflows.db",
         "human-handoffs.db",
+        "effects.db",
     ] {
         assert!(project.join(".y-harness").join(database).is_file());
     }

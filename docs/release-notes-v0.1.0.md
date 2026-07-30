@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v28 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v29 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -107,18 +107,26 @@ projection validation survive restart. The reference service persists the
 aggregate in `human-handoffs.db`. The aggregate itself does not implicitly
 approve a decision, pause a Turn, route a channel, wake a Workflow, execute
 business actions, own a polling loop, or prove that `LocalProcess` is a human.
-Embedded Temporal Driver API 1 composes optional Workflow and Handoff Engines
-behind one bounded host-driven tick. It uses trusted host time and authority,
-tenant-local 1–256-record identity scans, disposable cursors, deterministic
-actor-and-fence command identities, and the existing CAS transitions to settle
-each attempt as applied, duplicate, fenced, or failed. It starts no background
-task and adds no scheduler database. Reference-service config schema 1
-additively accepts an optional `temporal` policy. Omission remains disabled;
-opt-in polling uses the fixed service Authority, skip-missed cadence, bounded
-health diagnostics, and Temporal-before-Protocol-before-MCP shutdown. It does
-not change Protocol 28 or durable schemas.
+Effect Ledger schema 1 and Protocol 29 add an independent durable external
+side-effect intent boundary. One immutable tenant/capability/operation/
+idempotency coordinate is committed before execution. A finite worker lease
+owns one exact attempt; expiry becomes `unknown` and cannot be retried without
+authoritative reconciliation. Content-free receipts, actor/content-bound
+commands, revision CAS, Memory/SQLite parity, bounded paging, and restart
+recovery live in `effects.db`. Temporal Driver API 2 may expire the exact lease
+to `unknown`, but it never performs the external operation.
+Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
+Engines behind one bounded host-driven tick. It uses trusted host time and
+authority, tenant-local 1–256-record identity scans per source, disposable
+cursors, deterministic actor-and-fence command identities, and existing CAS
+transitions to settle each attempt as applied, duplicate, fenced, or failed.
+It starts no background task and adds no scheduler database.
+Reference-service config schema 1 additively accepts an optional `temporal`
+policy. Omission remains disabled; opt-in polling uses the fixed service
+Authority, skip-missed cadence, bounded health diagnostics, and
+Temporal-before-Protocol-before-MCP shutdown.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v28. Format/store schema 1 pins immutable component snapshots and a
+Protocol v29. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its

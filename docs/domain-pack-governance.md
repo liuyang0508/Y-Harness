@@ -128,13 +128,14 @@ control service must authenticate the actor and tenant, then use
 `DomainPackAuthorizer`. It must also produce truthful component inventories
 and keep installed components immutable for the binding lifetime.
 
-The current package is a Rust library, not a Protocol v28 command, CLI, remote
+The current package is a Rust library, not a Protocol v29 command, CLI, remote
 control-plane service, identity provider, registry, or automatic config
 mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, background
-Workflow/Handoff polling, automatic Human Handoff routing, or domain-specific
-Evaluation content. Generic Temporal Driver API 1 can advance due Workflow
-waits and expired Handoff claims when an embedding host invokes it, but a
+Workflow/Handoff/Effect polling, automatic Human Handoff routing or Effect
+execution, or domain-specific Evaluation content. Generic Temporal Driver API
+2 can advance due Workflow waits, expired Handoff claims, and expired Effect
+leases when an embedding host invokes it, but a
 Domain Pack neither activates that driver nor acquires scheduling, ownership,
 or channel authority merely by referencing those capabilities.
 

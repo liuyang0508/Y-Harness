@@ -116,6 +116,9 @@ id_type!(WorkflowSignalId, "workflow-signal");
 id_type!(HumanHandoffId, "human-handoff");
 id_type!(HumanHandoffCommandId, "human-handoff-command");
 id_type!(HumanHandoffClaimId, "human-handoff-claim");
+id_type!(EffectId, "effect");
+id_type!(EffectCommandId, "effect-command");
+id_type!(EffectLeaseId, "effect-lease");
 
 fn next_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
@@ -1753,6 +1756,17 @@ pub enum HarnessError {
         /// Revision found atomically by the coordinator.
         actual: u64,
     },
+    /// Durable external-effect intent, lease, settlement, or reconciliation failure.
+    Effect(String),
+    /// An atomic Effect command lost an optimistic revision race.
+    EffectConflict {
+        /// Contended Effect.
+        effect_id: EffectId,
+        /// Revision observed by the caller.
+        expected: u64,
+        /// Revision found atomically by the ledger.
+        actual: u64,
+    },
     /// Temporal Driver request, discovery, or bounded maintenance failure.
     Temporal(String),
     /// Tool execution failure.
@@ -1882,6 +1896,15 @@ impl Display for HarnessError {
             } => write!(
                 formatter,
                 "human handoff conflict on {handoff_id}: expected revision {expected}, found {actual}"
+            ),
+            Self::Effect(message) => write!(formatter, "effect error: {message}"),
+            Self::EffectConflict {
+                effect_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "effect conflict on {effect_id}: expected revision {expected}, found {actual}"
             ),
             Self::Temporal(message) => write!(formatter, "temporal driver error: {message}"),
             Self::Tool(message) => write!(formatter, "tool error: {message}"),

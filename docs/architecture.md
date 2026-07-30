@@ -315,8 +315,13 @@ direction:
   transitions, Memory/SQLite parity, projection validation, and restart
   recovery without implicitly pausing, routing, approving, or executing the
   subject;
-- embedded Temporal Driver API 1 with host-supplied time, optional
-  Workflow/Handoff composition, 1–256-record tenant-local identity scans per
+- an independent revisioned Effect Ledger that commits bounded external
+  intent before execution, tenant-scopes operation/idempotency identity,
+  fences one finite worker attempt, treats lease expiry as `unknown`, and
+  requires exact content-free receipt or authoritative reconciliation before
+  retry or terminal settlement;
+- embedded Temporal Driver API 2 with host-supplied time, optional
+  Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
   source, disposable cursors, fail-closed extension-page revalidation,
   deterministic actor-and-fence command identity, exact-boundary advancement
   through existing CAS commands, and independent
@@ -347,11 +352,13 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v28 negotiation with the asymmetric 2 MiB request/16 MiB
+- protocol-v29 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 28
-  conditionally advertises Human Handoff schema 1 and its command-specific
+  explicit Token Counter and Conversation Compactor API coordinate; protocol 29
+  conditionally advertises Effect Ledger schema 1 and command-specific worker,
+  reconciliation, and cancellation permissions; protocol 28 historically
+  introduced Human Handoff schema 1 and its command-specific
   permissions when the host composes a Human Handoff Engine, protocol 27
   conditionally advertises Workflow Run schema 1 and its command-specific
   permissions when the host composes Workflow and Task coordinators, protocol

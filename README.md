@@ -65,9 +65,9 @@ as `ready` or `will be created`; it never creates, bootstraps, or migrates a
 database. A legacy store fails with the exact backup-first migration command
 that must be run after all writers are stopped.
 
-`yh serve` is a headless Protocol v28 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v29 JSONL service over stdin/stdout. It
 persists State, approvals, Task coordination, Workflow Runs, and Human
-Handoffs under `.y-harness/`. A
+Handoffs, and durable external Effects under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
 ```bash
@@ -102,7 +102,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v28 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v29 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -227,7 +227,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v28 specification](docs/protocol.md).
+[client protocol v29 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -812,7 +812,8 @@ business action, or prove that `LocalProcess` is a person. An expired claim can
 be returned to the queue by the same optional Temporal host lifecycle. See
 [ADR 0128](docs/adr/0128-durable-lease-fenced-human-handoff.md).
 
-Temporal Driver API 1 optionally composes those two time-owned aggregates.
+Temporal Driver API 2 optionally composes Workflow, Handoff, and expired
+Effect-lease advancement.
 One host-driven `tick` scans at most 256 authoritative Workflow Runs and 256
 Human Handoffs, then advances exact due wait/claim fences through the existing
 CAS commands. Coordinator pages are revalidated before mutation. Its identity
@@ -845,7 +846,7 @@ cargo run --locked --example temporal_driver
 ```
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v28 preserves Protocol v27's 2 MiB request and 16 MiB
+protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -881,9 +882,12 @@ signal/timer waits, explicit retry waits, and safe-boundary definition
 migration remain separate from Task lease/effect authority. Protocol 28 adds
 an optional schema-1 Human Handoff surface with command-specific permissions,
 actor-bound idempotency, exact claim ownership, and bounded queue/transition
-paging. Steering
-requires the exact
-active Turn, invalidates crossed provisional Model output, and never executes
+paging. Protocol 29 adds an optional schema-1 Effect Ledger with
+tenant-scoped idempotency uniqueness, finite worker leases, fail-closed
+unknown outcomes, explicit reconciliation, and content-free external receipts.
+Temporal Driver API 2 may convert expired exact leases to `unknown`; it never
+requeues or executes the effect. Steering requires the exact active Turn,
+invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
 Coordinator, it also exposes bounded graph administration and
 transport-authenticated worker claim, heartbeat, messaging, completion, and
@@ -981,7 +985,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v28. The Sessions panel shows direct fork ancestry from
+through Protocol v29. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

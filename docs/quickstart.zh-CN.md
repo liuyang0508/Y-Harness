@@ -81,7 +81,7 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v28 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v29 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -104,15 +104,15 @@ my-harness/
 ```
 
 它使用 no-clobber 语义：配置已经存在时直接失败，不覆盖用户内容。
-默认配置使用本地演示模型。`doctor` 先以只读权限预检已有的五个 SQLite
+默认配置使用本地演示模型。`doctor` 先以只读权限预检已有的六个 SQLite
 权威库，再验证配置版本、模型构造、凭据、Provider 权限和数据目录边界。
 它会将每个库报告为 `ready` 或 `will be created`，但不会创建、初始化、
 迁移数据库或生成备份。旧版、残缺、未知 Schema 会在任何外部 Model、
 MCP 或 Memory 进程启动前失败关闭，并给出对应迁移命令。
 
-## 4. 运行 Protocol v28 服务
+## 4. 运行 Protocol v29 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v28 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v29 帧：
 
 ```bash
 yh serve y-harness.json
@@ -123,7 +123,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"28","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"29","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 
@@ -135,14 +135,16 @@ printf '%s\n' \
 ├── approvals.db   持久化审批 Inbox
 ├── tasks.db             Task Graph、租约、消息和结算
 ├── workflows.db         Workflow Run、等待、迁移和命令证据
-└── human-handoffs.db    人工接管队列、Claim 租约和结算证据
+├── human-handoffs.db    人工接管队列、Claim 租约和结算证据
+└── effects.db           外部副作用意图、执行租约、不确定态与对账证据
 ```
 
-五个 SQLite 权威库均使用 WAL、`synchronous=FULL` 和精确 schema
+六个 SQLite 权威库均使用 WAL、`synchronous=FULL` 和精确 schema
 校验。服务重启后 Thread、Task Graph、Workflow Run 与 Human Handoff
-均可恢复。Human Handoff 只记录人工所有权生命周期；它不会隐式暂停
+以及 Effect 均可恢复。Human Handoff 只记录人工所有权生命周期；它不会隐式暂停
 Turn、路由 IM、唤醒对话或执行业务操作。库级 Temporal Driver 可以由
-嵌入宿主显式调用来推进到期 Workflow 等待和过期 Claim。Reference
+嵌入宿主显式调用来推进到期 Workflow 等待、过期 Claim 和过期 Effect
+执行租约。Effect 租约到期只进入 `unknown`，绝不自动重试。Reference
 Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式加入：
 
 ```json
@@ -158,7 +160,7 @@ Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式
 且是“每个事实源、每个 tick”的上限。启用后服务使用与 Protocol 相同
 的固定 Authority，漏掉的节拍不会补跑；关闭 stdin 时先停止轮询，再
 清理 Protocol Operation 和 MCP。它只推进已有 CAS 状态，不会自动
-执行 Task、Tool、补偿或消息路由。可直接复制
+执行 Task、Effect、Tool、补偿或消息路由。可直接复制
 `config/y-harness.temporal.example.json` 并用 `yh doctor` 检查。
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
@@ -172,8 +174,8 @@ yh task-migrate .y-harness/tasks.db .y-harness/tasks-pre-v3.rollback.db
 
 不要把三条命令当成固定启动步骤；只迁移 Doctor 指出的旧库。迁移工具
 不会覆盖回滚文件，也不会猜测历史 Thread、Approval 或 Graph 的租户。
-成功后再次执行 `yh doctor y-harness.json`，确认五个库均为 `ready`。
-Workflow 与 Human Handoff 当前从 Schema 1 起步，不存在可猜测的旧版
+成功后再次执行 `yh doctor y-harness.json`，确认六个库均为 `ready`。
+Workflow、Human Handoff 与 Effect 当前从 Schema 1 起步，不存在可猜测的旧版
 迁移路径。
 
 终态 Thread 可以在项目之间迁移，文件只承担传输，State Engine 仍是

@@ -11,14 +11,15 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"28"` | exact `Initialize` request/response |
+| Client protocol | `"29"` | exact `Initialize` request/response |
 | State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
 | State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
 | Task Coordinator | `3` | per-graph SQLite schema column |
 | Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
 | Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
-| Temporal Driver API | `1` | exact embedded Rust API; not a durable or client-protocol coordinate |
+| Effect Ledger | `1` | store metadata plus per-Effect SQLite schema column |
+| Temporal Driver API | `2` | exact embedded Rust API; not a durable or client-protocol coordinate |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
@@ -221,7 +222,7 @@ legacy migration or mixed-version writer support exists. Protocol permissions
 are command-specific; composing the schema coordinate alone does not enable
 the surface. See
 [ADR 0128](adr/0128-durable-lease-fenced-human-handoff.md).
-Temporal Driver API 1 additively composes any installed Workflow and Human
+Temporal Driver API 1 additively composed installed Workflow and Human
 Handoff Engines behind one bounded host-invoked tick. The host supplies trusted
 Unix time and exact authority; each source visits at most 1–256 authoritative
 tenant-local identities, returns a disposable continuation, and applies only
@@ -239,6 +240,23 @@ preserves disabled behavior. See
 [ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
 Reference-host lifecycle semantics are specified by
 [ADR 0130](adr/0130-optional-reference-service-temporal-lifecycle.md).
+Protocol v29 adds the optional schema-1 Effect Ledger surface. One immutable
+intent binds tenant, capability, operation, idempotency key, bounded input,
+request digest, actor, and server time before execution. A finite worker lease
+owns one exact positive attempt. Applied, authoritatively not-applied, unknown,
+and reconciliation settlements are actor/content bound and revision fenced.
+Lease expiration moves to `unknown`, never back to pending; only explicit
+not-applied evidence may select a later attempt. Memory and SQLite
+Coordinators share exact idempotency uniqueness, tenant fencing, bounded
+identity paging, and expired-lease scans. Effect schema 1 is a new independent
+store with no inferred migration or mixed-version writer support.
+
+Temporal Driver API 2 additively composes an optional Effect Engine. It scans
+the same bounded tenant-local identity space and applies only the existing
+`expire_lease` command after complete cross-source validation. The cursor and
+report add an Effect coordinate, so exhaustive Rust construction requires a
+source update. The API still owns no background task or scheduler database.
+See [ADR 0133](adr/0133-durable-effect-ledger.md).
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from
@@ -654,7 +672,7 @@ does not change client protocol or durable data.
 
 ## Read-only store preflight
 
-The concrete SQLite State, Approval, Task, Workflow, and Human Handoff adapters
+The concrete SQLite State, Approval, Task, Workflow, Human Handoff, and Effect adapters
 add public asynchronous `validate_existing` functions. They validate an
 existing regular database through a read-only, `query_only` connection and
 perform no creation, bootstrap, migration, or backup publication.

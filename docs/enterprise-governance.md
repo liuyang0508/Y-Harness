@@ -120,7 +120,7 @@ does not route a channel, pause a Turn, wake a Workflow, execute business
 actions, or claim that `LocalProcess` authenticates a human. The optional
 reference-host Temporal loop can only expire the existing claim fence.
 
-ADR 0129 adds embedded Temporal Driver API 1. An embedding host supplies one
+ADR 0129 added embedded Temporal Driver API 1. An embedding host supplies one
 trusted authority and Unix time to a bounded tick. The driver scans
 authoritative Workflow and Handoff rows by tenant-local identity, computes all
 command identities before mutation, and advances due fences only through the
@@ -135,6 +135,17 @@ Authority and wall clock, skips missed cadence ticks, retains only a
 process-local cursor, emits bounded degraded/recovered diagnostics, and stops
 maintenance before Protocol Operations and MCP clients. Protocol callers
 cannot choose time, cursor, or cadence.
+
+ADR 0133 adds a separate schema-1 Effect Ledger and advances Protocol to v29.
+One immutable tenant/capability/operation/idempotency coordinate and bounded
+request is committed before execution. A finite worker lease owns one exact
+attempt; expiration becomes `unknown`, never a blind retry. Only a receipt or
+explicit reconciliation of the exact attempt/lease can settle it as applied
+or authoritatively not applied. Memory/SQLite parity, revision CAS,
+actor/content-bound commands, bounded scans, read-only service preflight, and
+restart recovery are executable. Temporal Driver API 2 optionally advances
+expired Effect leases through the same fenced command boundary. No Core loop
+executes pending Effects or verifies external receipt truth.
 
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
@@ -153,7 +164,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v28 client
+Domain Pack lifecycle remains deliberately outside Core and the v29 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid
@@ -164,7 +175,7 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, automatic
-effect-safe Task retry, Workflow compensation planning, automatic
+Secret-manager integration, tenant-partitioned MCP sessions, automatic Effect
+execution, receipt verification, Workflow compensation planning, automatic
 Human Handoff channel routing/outbox delivery, quota, retention, canary
 rollout, and multi-node control-plane availability remain open.

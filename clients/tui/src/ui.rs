@@ -265,7 +265,7 @@ fn render_transcript_empty_state(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::default(),
         Line::styled(
-            "The TUI is connected to the headless Engine through Protocol v28.",
+            "The TUI is connected to the headless Engine through Protocol v29.",
             Style::default().fg(Color::White),
         ),
         Line::styled(
@@ -955,7 +955,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v28.",
+            "Approvals and Tasks are accessed exclusively through Protocol v29.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -1324,7 +1324,7 @@ mod tests {
         assert!(!screen.contains("never-render-this-ciphertext"));
         assert!(screen.contains("STEERING QUEUED"));
         assert!(screen.contains("Prefer the durable boundary"));
-        assert!(screen.contains("Keep clients behind Protocol v28"));
+        assert!(screen.contains("Keep clients behind Protocol v29"));
         assert!(screen.contains("Harness design"));
         assert!(screen.contains("Activity"));
         Ok(())
@@ -1433,7 +1433,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("START A CONVERSATION"));
-        assert!(screen.contains("headless Engine through Protocol v28"));
+        assert!(screen.contains("headless Engine through Protocol v29"));
         assert!(screen.contains("press Enter"));
         assert!(screen.contains("first durable decision"));
         Ok(())
