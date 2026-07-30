@@ -784,6 +784,8 @@ pub enum ExecutionPhase {
     Approval,
     /// Authorized tool execution.
     Tool,
+    /// Durable external Effect execution or reconciliation outside a Turn.
+    Effect,
     /// Candidate-result verification.
     Verification,
     /// Offline or online evaluation grading outside the live Agent Loop.

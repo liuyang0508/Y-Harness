@@ -334,6 +334,11 @@ direction:
   settlement identity, and exact revision/attempt/lease CAS; duplicate
   cross-host lookups may occur but Core owns no poller, query lease,
   credential, target truth model, or external mutation authority;
+- exact JSON Effect Connector protocol 1 with separate execution and
+  authoritative read-only reconciliation envelopes, cancellation-free process
+  requests, typed Effect-phase cancellation, strict version settlement, and
+  shell-free Process Broker execution; adapter failure returns to the existing
+  Executor/Reconciler uncertainty rules and adds no service consumer;
 - embedded Temporal Driver API 2 with host-supplied time, optional
   Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
   source, disposable cursors, fail-closed extension-page revalidation,

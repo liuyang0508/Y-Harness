@@ -878,6 +878,21 @@ and the
 cargo run --locked --example effect_reconciler
 ```
 
+Hosts may implement both Connector contracts in any language through exact
+JSON Effect Connector protocol 1. `JsonCommandEffectConnector` and
+`JsonCommandEffectReconciliationConnector` run one absolute executable through
+the selected `ProcessBroker`: no shell, no inherited environment, bounded
+input/output/time/concurrency, exact protocol validation, and typed Effect
+cancellation. The adapter does not bypass either default-deny Policy or Ledger
+CAS, and it does not make an unrestricted child process safe. Service
+configuration and resident consumption remain separate, still-open host work.
+See [ADR 0136](docs/adr/0136-versioned-brokered-json-effect-connectors.md) and
+the self-hosting public example:
+
+```bash
+cargo run --locked --example json_effect_connector
+```
+
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and

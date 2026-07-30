@@ -21,6 +21,7 @@ upgrade support that has not been tested.
 | Effect Ledger | `1` | store metadata plus per-Effect SQLite schema column |
 | Governed Effect Executor API | `1` | exact embedded Connector descriptor; not a durable or client-protocol coordinate |
 | Governed Effect Reconciler API | `1` | exact embedded read-only Connector descriptor; not a durable or client-protocol coordinate |
+| JSON Effect Connector protocol | `1` | exact stdin/stdout process envelopes; no negotiation or fallback |
 | Temporal Driver API | `2` | exact embedded Rust API; not a durable or client-protocol coordinate |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
@@ -277,6 +278,15 @@ adds Reconciler, Connector, Policy, Clock, request, outcome, configuration, and
 report types. It adds no Effect schema, Protocol v29 command, configuration
 field, durable query lease, or Core background task. See
 [ADR 0135](adr/0135-host-driven-authoritative-effect-reconciliation.md).
+
+JSON Effect Connector protocol 1 adds strict cancellation-free process request
+and response envelopes plus brokered execution/reconciliation adapters.
+Requests carry immutable Effect/Authority/attempt/lease evidence; every
+response carries the same exact protocol coordinate. `ExecutionPhase` adds
+`Effect`, so exhaustive external matches require a source update. This process
+wire adds no Effect schema, client Protocol v29 command, service configuration
+field, or Core background task. See
+[ADR 0136](adr/0136-versioned-brokered-json-effect-connectors.md).
 
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,

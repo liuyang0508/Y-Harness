@@ -303,6 +303,11 @@ internals or read Engine storage directly.
 - Configured Evaluation Graders use strict bounded Process Broker requests and
   are constructed only by diagnostic/Evaluation surfaces. Ordinary service
   startup must not acquire unused Grader environment or process authority.
+- JSON-command Effect execution and reconciliation use distinct exact-versioned
+  envelopes, `ExecutionPhase::Effect`, no `Debug` request representation, and
+  the same shell-free Process Broker boundary. Adapter process failure never
+  becomes authoritative settlement; only Executor/Reconciler validation and
+  Ledger CAS may change Effect state.
 - `yh eval-smoke` is the minimum executable behavioral regression gate. Its
   versioned suite and baseline must change in the same review as an intentional
   contract change; weakening a threshold solely to accept a regression is not

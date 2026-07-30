@@ -185,6 +185,16 @@ cargo run --locked --example effect_executor
 cargo run --locked --example effect_reconciler
 ```
 
+如果 Connector 使用其他语言实现，可采用精确 JSON Effect Connector
+protocol 1。两个适配器分别处理执行和只读对账，经 `ProcessBroker` 直接
+传参而不经过 shell，清空继承环境并限制输入、输出、时间与并发；它们不
+会绕过 Policy、Ledger CAS 或 Unknown 规则。当前仍需嵌入宿主显式装配，
+reference service 尚未接受 Effect Connector 配置。可运行真实子进程示例：
+
+```bash
+cargo run --locked --example json_effect_connector
+```
+
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：
 

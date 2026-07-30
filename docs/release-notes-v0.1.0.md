@@ -130,6 +130,14 @@ revision/attempt/lease CAS. Duplicate lookup is permitted because the contract
 forbids external mutation; opaque failure and `StillUnknown` leave durable
 state unchanged. It adds no Effect schema, Protocol command, query lease,
 poller, credential store, or target truth model.
+JSON Effect Connector protocol 1 adds strict versioned execution and
+reconciliation process envelopes plus shell-free `ProcessBroker` adapters.
+Requests retain Authority and immutable attempt/lease evidence while keeping
+cancellation in-process. Typed `ExecutionPhase::Effect`, bounded I/O and
+deadlines, cleared environment, exact response decoding, and diagnostic
+redaction preserve the existing Executor/Reconciler failure boundary. This
+adds no durable schema, client Protocol command, service configuration, or
+resident consumer.
 Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
 Engines behind one bounded host-driven tick. It uses trusted host time and
 authority, tenant-local 1–256-record identity scans per source, disposable

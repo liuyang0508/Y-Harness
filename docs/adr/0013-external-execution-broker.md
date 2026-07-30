@@ -29,9 +29,10 @@ One-shot executable capabilities use a typed `ProcessBroker` authority.
   Turn cancellation token through its model-step handle to executable Model
   adapters, while the Model-phase future boundary remains the final deadline
   and drop fence.
-- `JsonCommandTool` and `JsonCommandModel` provide typed JSON adapters over the
-  same broker. External Tools still enter the ordinary Tool registry and cannot
-  bypass Policy.
+- `JsonCommandTool`, `JsonCommandModel`, and the versioned execution and
+  reconciliation Effect adapters provide typed JSON contracts over the same
+  broker. External Tools still enter ordinary Tool Policy; Effect adapters
+  still enter their default-deny Policy and durable Ledger boundaries.
 
 Persistent duplex transports cannot use this completion-oriented contract.
 Stdio MCP therefore uses a separate default-deny, concurrency-bounded launch
@@ -54,9 +55,9 @@ untrusted extension cannot self-assert a stronger isolation class.
 
 ## Consequences
 
-Operators can add CLI Tools and model-provider bridges without shelling out from
-the Agent Loop or duplicating cancellation logic. Process failure and malformed
-JSON remain bounded capability failures.
+Operators can add CLI Tools, model-provider bridges, and external Effect target
+adapters without shelling out from the Agent Loop or duplicating cancellation
+logic. Process failure and malformed JSON remain bounded capability failures.
 
 Production deployments that require isolation must select a platform broker
 whose declared restriction set matches their threat model. Selecting the

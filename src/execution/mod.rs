@@ -1,10 +1,16 @@
 //! Bounded external-process execution and JSON command capability adapters.
 
 mod compensation;
+mod effect;
 
 pub use compensation::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,
     ToolCompensator,
+};
+pub use effect::{
+    JSON_EFFECT_CONNECTOR_PROTOCOL_VERSION, JsonCommandEffectConnector,
+    JsonCommandEffectReconciliationConnector, JsonEffectExecutionRequest,
+    JsonEffectExecutionResponse, JsonEffectReconciliationRequest, JsonEffectReconciliationResponse,
 };
 
 use std::{

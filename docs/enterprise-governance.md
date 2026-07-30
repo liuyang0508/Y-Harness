@@ -169,6 +169,14 @@ cross-host queries are explicitly allowed only under the read-only contract;
 the host still owns credentials, containment, cadence, receipt truth, and
 service availability.
 
+ADR 0136 adds exact JSON Effect Connector protocol 1 and separate brokered
+execution/read-only-reconciliation adapters. Any language may implement the
+strict bounded stdin/stdout contract, while Process Broker still owns
+shell-free launch, cleared environment, isolation metadata, cancellation, and
+resource bounds. The adapters return into the existing Policy and Ledger
+boundaries; they do not install reference-service configuration, polling,
+credentials, or trust in Connector assertions.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
