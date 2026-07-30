@@ -79,6 +79,8 @@ jobs:
         run: |
           cargo run --locked --example embedded
           cargo run --locked --example orchestrated
+          cargo run --locked --example temporal_driver
+          cargo run --locked --example effect_executor
       - name: Harness regression evaluation
         run: cargo run --locked -- eval-smoke
       - name: Public documentation

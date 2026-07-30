@@ -845,6 +845,22 @@ not execute Tasks, route Handoffs, or add a Protocol command. See
 cargo run --locked --example temporal_driver
 ```
 
+Hosts that need to consume pending Effects may compose embedded Governed
+Effect Executor API 1. Connectors register one exact capability, an explicit
+operation set, trust origin, API coordinate, and target- or
+Connector-enforced idempotency contract. Execution is default-deny: Policy is
+evaluated before the durable Claim, duplicate Claim callers never re-enter a
+Connector, and every panic, error, timeout, or cancellation after dispatch is
+settled as `unknown`, never blindly retried. Each call scans a bounded page and
+uses bounded concurrency; Core still starts no consumer loop and owns no
+Channel, credential store, receipt verifier, or reconciliation policy. See
+[ADR 0134](docs/adr/0134-host-driven-governed-effect-executor.md) and the
+[`effect_executor`](examples/effect_executor.rs) public-API example:
+
+```bash
+cargo run --locked --example effect_executor
+```
+
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and

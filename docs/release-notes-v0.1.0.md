@@ -115,6 +115,13 @@ authoritative reconciliation. Content-free receipts, actor/content-bound
 commands, revision CAS, Memory/SQLite parity, bounded paging, and restart
 recovery live in `effects.db`. Temporal Driver API 2 may expire the exact lease
 to `unknown`, but it never performs the external operation.
+Embedded Governed Effect Executor API 1 optionally consumes those pending
+intents through exact-versioned registered Connectors. It freezes explicit
+operation and idempotency contracts, denies execution until Policy permits a
+pre-Claim request, bounds concurrent Connector calls and deadlines, skips
+duplicate Claim callers, and converts every post-dispatch failure into durable
+uncertainty. It is host-driven and adds no Protocol command, polling thread,
+credential store, or receipt/reconciliation authority.
 Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
 Engines behind one bounded host-driven tick. It uses trusted host time and
 authority, tenant-local 1–256-record identity scans per source, disposable

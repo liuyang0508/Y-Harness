@@ -147,6 +147,17 @@ restart recovery are executable. Temporal Driver API 2 optionally advances
 expired Effect leases through the same fenced command boundary. No Core loop
 executes pending Effects or verifies external receipt truth.
 
+ADR 0134 adds optional embedded Governed Effect Executor API 1 without moving
+deployment lifecycle into Core. A host registers exact-versioned Connectors
+with frozen operation and idempotency contracts, installs an explicit
+pre-Claim Policy, supplies trusted time and Authority, and invokes bounded
+pending sweeps. Exact Claim replay never authorizes a second Connector entry.
+Once dispatch begins, error, panic, timeout, and cancellation become durable
+`unknown` outcomes. Reports omit request, idempotency, receipt, and Provider
+content. The API neither polls autonomously nor verifies Connector truth;
+operators still own credentials, containment, reconciliation, and service
+availability.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -175,7 +186,8 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, automatic Effect
-execution, receipt verification, Workflow compensation planning, automatic
-Human Handoff channel routing/outbox delivery, quota, retention, canary
-rollout, and multi-node control-plane availability remain open.
+Secret-manager integration, tenant-partitioned MCP sessions, a configured
+reference-service Effect consumer, receipt verification, automatic unknown
+reconciliation, Workflow compensation planning, automatic Human Handoff
+channel routing/outbox delivery, quota, retention, canary rollout, and
+multi-node control-plane availability remain open.

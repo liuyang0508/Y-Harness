@@ -320,6 +320,13 @@ direction:
   fences one finite worker attempt, treats lease expiry as `unknown`, and
   requires exact content-free receipt or authoritative reconciliation before
   retry or terminal settlement;
+- embedded Governed Effect Executor API 1 with frozen exact-versioned
+  Connector descriptors, explicit target/Connector idempotency contracts,
+  default-deny pre-Claim Policy, complete pending-page revalidation,
+  deterministic actor/tenant/cycle-bound Claim identity, bounded concurrent
+  Connector entry, panic/timeout/cancellation isolation, and fail-closed
+  post-dispatch uncertainty; one host call performs one sweep and Core owns no
+  background consumer, Channel, credential, or reconciliation lifecycle;
 - embedded Temporal Driver API 2 with host-supplied time, optional
   Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
   source, disposable cursors, fail-closed extension-page revalidation,

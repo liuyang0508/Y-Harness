@@ -48,11 +48,17 @@ pub use context::{
     TurnContextInput,
 };
 pub use effect::{
+    AllowListEffectExecutionPolicy, DenyAllEffectExecutions, EFFECT_EXECUTOR_API_VERSION,
     EFFECT_LEDGER_SCHEMA_VERSION, Effect, EffectApplyOutcome, EffectCommand, EffectCommandKind,
-    EffectCommandResult, EffectCoordinator, EffectCreateRequest, EffectDueLease, EffectDueScanPage,
-    EffectEngine, EffectLease, EffectOperation, EffectPage, EffectPageCursor, EffectReceipt,
-    EffectSnapshot, EffectStatus, EffectTransition, EffectTransitionKind, MemoryEffectCoordinator,
-    SqliteEffectCoordinator,
+    EffectCommandResult, EffectConnector, EffectConnectorDescriptor, EffectConnectorRegistry,
+    EffectCoordinator, EffectCreateRequest, EffectDueLease, EffectDueScanPage, EffectEngine,
+    EffectExecutionDecision, EffectExecutionOutcome, EffectExecutionPolicy,
+    EffectExecutionPolicyRequest, EffectExecutionRequest, EffectExecutor, EffectExecutorAttempt,
+    EffectExecutorAttemptOutcome, EffectExecutorClock, EffectExecutorConfig,
+    EffectExecutorRunReport, EffectExecutorRunRequest, EffectIdempotencyContract, EffectLease,
+    EffectOperation, EffectPage, EffectPageCursor, EffectReceipt, EffectSnapshot, EffectStatus,
+    EffectTransition, EffectTransitionKind, MemoryEffectCoordinator, RegisteredEffectConnector,
+    SqliteEffectCoordinator, SystemEffectExecutorClock,
 };
 pub use evaluation::{
     BaselineComparison, BaselineFailure, BaselineRequirement, EVALUATION_FORMAT_VERSION,

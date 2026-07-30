@@ -163,6 +163,17 @@ Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式
 执行 Task、Effect、Tool、补偿或消息路由。可直接复制
 `config/y-harness.temporal.example.json` 并用 `yh doctor` 检查。
 
+如果嵌入产品需要执行 `pending` Effect，可选装 Governed Effect
+Executor API 1，并注册精确版本的 Connector、显式 operation 集合和
+幂等契约，再安装默认拒绝之外的执行 Policy。每次 `run_once_as` 只做
+一次有界扫描；同一 Claim 的重复调用者不会再次进入 Connector，分发后
+的错误、panic、超时或取消一律落为 `unknown`。Core 不会替宿主启动
+消费者线程，也不管理 Channel、凭据、回执真伪或自动对账。可运行：
+
+```bash
+cargo run --locked --example effect_executor
+```
+
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：
 

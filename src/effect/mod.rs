@@ -7,6 +7,7 @@
 
 mod coordinator;
 mod engine;
+mod executor;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
@@ -24,6 +25,14 @@ pub use coordinator::{
     SqliteEffectCoordinator,
 };
 pub use engine::EffectEngine;
+pub use executor::{
+    AllowListEffectExecutionPolicy, DenyAllEffectExecutions, EFFECT_EXECUTOR_API_VERSION,
+    EffectConnector, EffectConnectorDescriptor, EffectConnectorRegistry, EffectExecutionDecision,
+    EffectExecutionOutcome, EffectExecutionPolicy, EffectExecutionPolicyRequest,
+    EffectExecutionRequest, EffectExecutor, EffectExecutorAttempt, EffectExecutorAttemptOutcome,
+    EffectExecutorClock, EffectExecutorConfig, EffectExecutorRunReport, EffectExecutorRunRequest,
+    EffectIdempotencyContract, RegisteredEffectConnector, SystemEffectExecutorClock,
+};
 
 const MAX_EFFECT_TRANSITIONS: usize = 4_096;
 const MAX_EFFECT_JSON_BYTES: usize = 16_777_216;

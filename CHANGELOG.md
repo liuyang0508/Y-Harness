@@ -4,6 +4,14 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added embedded Governed Effect Executor API 1: exact-versioned Connector
+  registration, frozen operation/idempotency contracts, default-deny
+  pre-Claim Policy, bounded host-driven pending sweeps, deterministic
+  actor/tenant-bound Claim identities, finite execution deadlines,
+  panic/cancellation isolation, post-dispatch fail-closed `unknown`
+  settlement, source-ordered bounded concurrency, and content-free reports;
+  Core still owns no polling lifecycle, Channel implementation, credential
+  store, receipt verifier, or automatic reconciliation;
 - added independent Effect Ledger schema 1 and Protocol v29 for durable,
   tenant-scoped external side-effect intent: immutable bounded requests,
   operation/idempotency uniqueness, finite fenced worker leases, fail-closed
