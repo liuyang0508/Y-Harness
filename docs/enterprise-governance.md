@@ -177,6 +177,18 @@ resource bounds. The adapters return into the existing Policy and Ledger
 boundaries; they do not install reference-service configuration, polling,
 credentials, or trust in Connector assertions.
 
+ADR 0137 adds an opt-in reference-service lifecycle without moving consumer
+ownership into Core. Execution and reconciliation use independent tasks,
+Connector registries, exact non-empty allowlists, cadence, backoff, concurrency,
+and timeout budgets. A trust-bearing `origin_id` is distinct from the routing
+capability; registration never implies Policy authority. The fixed service
+Authority reaches every sweep, process-local cursors are disposable, durable
+Claim/settlement CAS remains authoritative across restart, and only
+content-free degraded/recovered transitions reach stderr. Effect loops stop
+before Temporal, Protocol, and MCP shutdown. The lifecycle does not certify
+Connector honesty, sandbox unrestricted commands, or provide distributed rate
+limits and target truth.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -205,9 +217,9 @@ This is not a complete multi-tenant claim. Task `Artifact` records contain
 only bounded reference metadata (`uri`, digest, media type, and size) inside a
 tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
-Secret-manager integration, tenant-partitioned MCP sessions, a configured
-reference-service Effect execution/reconciliation consumer, receipt
-verification, reconciliation cadence/backoff, Workflow compensation planning,
+Secret-manager integration, tenant-partitioned MCP sessions, reference-service
+Effect executable content pinning, receipt verification, durable per-target
+circuit breaking/rate limits, Workflow compensation planning,
 automatic Human Handoff
 channel routing/outbox delivery, quota, retention, canary rollout, and
 multi-node control-plane availability remain open.

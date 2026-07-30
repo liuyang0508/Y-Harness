@@ -4,6 +4,13 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- added an opt-in reference-service Effect consumer lifecycle with independently
+  configurable execution and reconciliation loops, separate exact Connector
+  registries and non-empty allowlists, explicit trust origins and frozen
+  contracts, bounded cadence/backoff/concurrency/timeouts, disposable cursors,
+  content-free health transitions, ordered shutdown, real subprocess
+  degrade/recover coverage, and restart proof that terminal Effects are not
+  replayed; Core remains task-free and the Effect Ledger remains authoritative;
 - added embedded Governed Effect Executor API 1: exact-versioned Connector
   registration, frozen operation/idempotency contracts, default-deny
   pre-Claim Policy, bounded host-driven pending sweeps, deterministic

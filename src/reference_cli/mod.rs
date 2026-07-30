@@ -1,5 +1,6 @@
 //! Local reference hosts and clients for exercising the public Runtime surface.
 
+mod effect_service;
 mod eval_smoke;
 mod service;
 mod temporal_service;

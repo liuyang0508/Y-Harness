@@ -62,6 +62,7 @@ use y_harness::{HttpsSkillSource, HttpsSkillSourceConfig};
 
 use super::{
     CliResult, DemoModel, EchoTool,
+    effect_service::{self, ServiceEffectConsumerConfig, build as build_effect_consumer},
     temporal_service::{self, ServiceTemporalConfig},
 };
 
@@ -111,6 +112,8 @@ struct ServiceConfig {
     evaluation: Option<ServiceEvaluationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temporal: Option<ServiceTemporalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect_consumer: Option<ServiceEffectConsumerConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -135,6 +138,7 @@ impl Default for ServiceConfig {
             skills: None,
             evaluation: None,
             temporal: None,
+            effect_consumer: None,
         }
     }
 }
@@ -271,7 +275,7 @@ struct ServiceGraderConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ServiceJsonProcessConfig {
+pub(super) struct ServiceJsonProcessConfig {
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -280,7 +284,7 @@ struct ServiceJsonProcessConfig {
     #[serde(default)]
     environment_from_host: BTreeMap<String, String>,
     #[serde(default = "default_tool_timeout_ms")]
-    timeout_ms: u64,
+    pub(super) timeout_ms: u64,
     #[serde(default = "default_tool_max_output_bytes")]
     max_output_bytes: usize,
     launch: ServiceProcessLaunchConfig,
@@ -455,7 +459,7 @@ enum ServiceMemoryFailureMode {
     FailTurn,
 }
 
-struct LoadedConfig {
+pub(super) struct LoadedConfig {
     config: ServiceConfig,
     path: PathBuf,
     root: PathBuf,
@@ -473,6 +477,10 @@ struct ExistingStoreReadiness {
 }
 
 impl LoadedConfig {
+    pub(super) fn effect_consumer(&self) -> Option<&ServiceEffectConsumerConfig> {
+        self.config.effect_consumer.as_ref()
+    }
+
     /// Resolves and revalidates the deployment authority at each trust boundary.
     fn authority(&self) -> Result<AuthorityContext, HarnessError> {
         configured_authority(&self.config)
@@ -905,6 +913,7 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         "will be created"
     };
     let stores = validate_existing_stores(&loaded).await?;
+    let effect_consumer = build_effect_consumer(&loaded)?;
     let evaluation = build_evaluation(&loaded)?;
     let models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, models.demo_tools).await?;
@@ -1015,6 +1024,14 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         );
     } else {
         println!("temporal: disabled");
+    }
+    if let Some(effect_consumer) = &effect_consumer {
+        println!(
+            "effect consumer: enabled ({})",
+            effect_consumer.doctor_summary()
+        );
+    } else {
+        println!("effect consumer: disabled");
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
@@ -1173,6 +1190,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     require_contained_directory(&loaded.root, &loaded.data_directory)?;
     validate_existing_stores(&loaded).await?;
 
+    let configured_effect_consumer = build_effect_consumer(&loaded)?;
     let configured_models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
     let state = StateEngine::new(Arc::new(
@@ -1215,6 +1233,12 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     );
     let effect_port: Arc<dyn EffectCoordinator> = effects;
     let effect_engine = EffectEngine::new(effect_port);
+    let effect_service = configured_effect_consumer
+        .map(|configured| {
+            let configured = configured.assemble(effect_engine.clone())?;
+            effect_service::start(configured, authority.clone())
+        })
+        .transpose()?;
     let temporal_service = loaded
         .config
         .temporal
@@ -1244,6 +1268,10 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         TokioBufWriter::new(tokio_io::stdout()),
     )
     .await;
+    let effect_shutdown = match effect_service {
+        Some(effect_service) => effect_service.shutdown().await,
+        None => Ok(()),
+    };
     let temporal_shutdown = match temporal_service {
         Some(temporal_service) => temporal_service.shutdown().await,
         None => Ok(()),
@@ -1251,6 +1279,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let protocol_shutdown = shutdown_protocol_handler(&handler).await;
     let mcp_shutdown = shutdown_mcp_clients(&mcp_clients).await;
     served?;
+    effect_shutdown?;
     temporal_shutdown?;
     protocol_shutdown?;
     mcp_shutdown
@@ -2198,7 +2227,7 @@ fn build_process_broker(
     }
 }
 
-fn build_json_process(
+pub(super) fn build_json_process(
     loaded: &LoadedConfig,
     configured: &ServiceJsonProcessConfig,
     role: &str,
@@ -2667,6 +2696,9 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
     if let Some(temporal) = &config.temporal {
         temporal.validate()?;
     }
+    if let Some(effect_consumer) = &config.effect_consumer {
+        effect_consumer.validate()?;
+    }
     configured_authority(&config)?;
     let root = path
         .parent()
@@ -2936,8 +2968,9 @@ mod tests {
         CapabilityOrigin, EvaluationBaseline, EvaluationSuite, LoadedConfig, ServiceConfig,
         ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig,
         ServiceProcessLaunchConfig, ServiceToolConfig, ServiceVerifierConfig, ToolBatchExecution,
-        build_capabilities, build_evaluation, build_models, configured_authority,
-        configured_skill_trust, load_config, resolve_data_directory, verify_file_sha256,
+        build_capabilities, build_effect_consumer, build_evaluation, build_models,
+        configured_authority, configured_skill_trust, load_config, resolve_data_directory,
+        verify_file_sha256,
     };
     use std::{
         fs,
@@ -3220,6 +3253,97 @@ mod tests {
         fs::remove_dir_all(root).expect("remove Temporal config fixture");
     }
 
+    #[test]
+    fn effect_consumer_requires_explicit_exact_authority_and_bounded_timeouts() {
+        let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("canonical project");
+        let command = std::env::current_exe()
+            .expect("current executable")
+            .to_string_lossy()
+            .into_owned();
+        let configured = |allow_operation: &str, connectors: usize, process_timeout_ms: u64| {
+            let connector = serde_json::json!({
+                "origin_id": "test/effect-execution",
+                "capability": "notification.test",
+                "operations": ["send"],
+                "idempotency": "target_enforced",
+                "process": {
+                    "command": command,
+                    "current_directory": ".",
+                    "timeout_ms": process_timeout_ms,
+                    "max_output_bytes": 1_024,
+                    "launch": {"type": "unrestricted", "max_concurrency": 1}
+                }
+            });
+            let connector_list = std::iter::repeat_n(connector, connectors).collect::<Vec<_>>();
+            serde_json::from_value::<ServiceConfig>(serde_json::json!({
+                "schema_version": 1,
+                "data_directory": ".y-harness",
+                "model": {"type": "demo"},
+                "effect_consumer": {
+                    "execution": {
+                        "poll_interval_ms": 100,
+                        "failure_backoff_ms": 100,
+                        "executor": {
+                            "scan_limit": 8,
+                            "max_concurrency": 2,
+                            "policy_timeout_ms": 1_000,
+                            "execution_timeout_ms": 2_000,
+                            "settlement_reserve_ms": 1_000,
+                            "lease_duration_ms": 5_000
+                        },
+                        "allow": [{
+                            "capability": "notification.test",
+                            "operation": allow_operation
+                        }],
+                        "connectors": connector_list
+                    }
+                }
+            }))
+            .expect("Effect consumer config")
+        };
+        let loaded = |config| LoadedConfig {
+            config,
+            path: root.join("y-harness.json"),
+            data_directory: root.join(".y-harness"),
+            root: root.clone(),
+        };
+
+        let valid = build_effect_consumer(&loaded(configured("send", 1, 1_000)))
+            .expect("valid Effect consumer")
+            .expect("Effect consumer enabled");
+        assert!(
+            valid
+                .doctor_summary()
+                .contains("execution 1 connector(s) / 1 allow(s) / 100 ms poll / 100 ms backoff")
+        );
+
+        let unsupported = build_effect_consumer(&loaded(configured("delete", 1, 1_000)))
+            .err()
+            .expect("reject unsupported allow");
+        assert!(unsupported.to_string().contains(
+            "Effect execution allow notification.test/delete has no exact configured Connector"
+        ));
+
+        let duplicate = build_effect_consumer(&loaded(configured("send", 2, 1_000)))
+            .err()
+            .expect("reject duplicate Connector");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate Effect execution Connector notification.test")
+        );
+
+        let timeout = build_effect_consumer(&loaded(configured("send", 1, 2_001)))
+            .err()
+            .expect("reject Connector timeout outside Executor budget");
+        assert!(
+            timeout
+                .to_string()
+                .contains("process timeout 2001 ms exceeds executor execution timeout 2000 ms")
+        );
+    }
+
     #[tokio::test]
     async fn configured_json_tool_preserves_explicit_parallel_safety() {
         let root = fs::canonicalize(std::env::current_dir().expect("current directory"))
@@ -3410,6 +3534,16 @@ mod tests {
             .expect("Temporal example enables polling")
             .validate()
             .expect("valid Temporal example bounds");
+        let effect_consumer = serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.effect-consumer.example.json"
+        ))
+        .expect("Effect consumer service example config");
+        effect_consumer
+            .effect_consumer
+            .as_ref()
+            .expect("Effect consumer example enables polling")
+            .validate()
+            .expect("valid Effect consumer example bounds");
         let suite: EvaluationSuite =
             serde_json::from_str(include_str!("../../evals/configured-example-suite.json"))
                 .expect("configured Evaluation example suite");

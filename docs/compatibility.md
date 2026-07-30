@@ -288,6 +288,17 @@ wire adds no Effect schema, client Protocol v29 command, service configuration
 field, or Core background task. See
 [ADR 0136](adr/0136-versioned-brokered-json-effect-connectors.md).
 
+Reference-service config schema 1 additively accepts an optional strict
+`effect_consumer` object. Execution and reconciliation are independently
+optional and require separate exact Connector registries, explicit non-empty
+capability/operation allowlists, bounded cadence/backoff, and their existing
+bounded Executor/Reconciler policies. Every Connector adds a required
+trust-bearing `origin_id`; execution additionally declares idempotency, while
+reconciliation declares the authoritative read-only contract. Omission retains
+the previous no-consumer behavior. This adds no Effect schema, Protocol v29
+command, or Core background task. See
+[ADR 0137](adr/0137-optional-reference-service-effect-consumer.md).
+
 The public pre-1.0 `TurnExecutionOptions` now adds an optional trusted
 `ExecutionBinding`. State schema 13 records at most one binding per Turn,
 requires its tenant to equal authoritative Thread ownership, excludes it from

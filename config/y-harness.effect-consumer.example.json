@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo",
+    "id": "local/demo"
+  },
+  "effect_consumer": {
+    "execution": {
+      "poll_interval_ms": 1000,
+      "failure_backoff_ms": 5000,
+      "executor": {
+        "scan_limit": 64,
+        "max_concurrency": 8,
+        "policy_timeout_ms": 5000,
+        "execution_timeout_ms": 240000,
+        "settlement_reserve_ms": 30000,
+        "lease_duration_ms": 300000
+      },
+      "allow": [
+        {
+          "capability": "notification.command",
+          "operation": "send"
+        }
+      ],
+      "connectors": [
+        {
+          "origin_id": "deployment/notification-command-execution",
+          "capability": "notification.command",
+          "operations": [
+            "send"
+          ],
+          "idempotency": "target_enforced",
+          "process": {
+            "command": "/absolute/path/to/effect-connector",
+            "args": [
+              "--execute"
+            ],
+            "current_directory": ".",
+            "environment_from_host": {
+              "PROVIDER_TOKEN": "PROVIDER_TOKEN"
+            },
+            "timeout_ms": 240000,
+            "max_output_bytes": 65536,
+            "launch": {
+              "type": "unrestricted",
+              "max_concurrency": 8
+            }
+          }
+        }
+      ]
+    },
+    "reconciliation": {
+      "poll_interval_ms": 5000,
+      "failure_backoff_ms": 30000,
+      "reconciler": {
+        "scan_limit": 64,
+        "max_concurrency": 8,
+        "policy_timeout_ms": 5000,
+        "lookup_timeout_ms": 60000
+      },
+      "allow": [
+        {
+          "capability": "notification.command",
+          "operation": "send"
+        }
+      ],
+      "connectors": [
+        {
+          "origin_id": "deployment/notification-command-reconciliation",
+          "capability": "notification.command",
+          "operations": [
+            "send"
+          ],
+          "contract": "authoritative_read_only",
+          "process": {
+            "command": "/absolute/path/to/effect-connector",
+            "args": [
+              "--reconcile"
+            ],
+            "current_directory": ".",
+            "environment_from_host": {
+              "PROVIDER_TOKEN": "PROVIDER_TOKEN"
+            },
+            "timeout_ms": 60000,
+            "max_output_bytes": 65536,
+            "launch": {
+              "type": "unrestricted",
+              "max_concurrency": 8
+            }
+          }
+        }
+      ]
+    }
+  }
+}

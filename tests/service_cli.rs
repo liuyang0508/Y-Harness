@@ -10,6 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader},
+    os::unix::fs::PermissionsExt,
     time::Duration,
 };
 
@@ -29,7 +30,10 @@ use y_harness::{
     WorkflowTransitionKind, WorkflowWaitId, WorkspaceMode, decode_thread_archive,
 };
 #[cfg(unix)]
-use y_harness::{CapabilityOrigin, OperationStatus};
+use y_harness::{
+    CapabilityOrigin, EffectEngine, EffectId, EffectStatus, OperationStatus,
+    SqliteEffectCoordinator,
+};
 
 const STATE_V1_FIXTURE: &str = include_str!("fixtures/state-v1.sql");
 
@@ -92,6 +96,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("conversation: 32 Turns / 65536 tokens / 65536 bytes"));
     assert!(report.contains("conversation compactor: disabled"));
     assert!(report.contains("temporal: disabled"));
+    assert!(report.contains("effect consumer: disabled"));
     assert!(report.contains(
         "stores: state=will be created approval=will be created task=will be created \
          workflow=will be created handoff=will be created effect=will be created"
@@ -473,6 +478,276 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
         String::from_utf8_lossy(&settled.stderr)
     );
     fs::remove_dir_all(project).expect("remove Temporal service fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_terminal_effects() {
+    let project = isolated_project("effect-consumer");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("init Effect consumer project");
+    assert!(
+        initialized.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let execution = project.join("effect-execute");
+    let reconciliation = project.join("effect-reconcile");
+    write_executable(
+        &execution,
+        "#!/bin/sh\n\
+         read -r request\n\
+         printf '%s\\n' \"$request\" >> execution-requests.jsonl\n\
+         printf '%s\\n' \
+         '{\"protocol_version\":1,\"outcome\":{\"outcome\":\"unknown\",\
+         \"reason_code\":\"target.uncertain\"}}'\n",
+    );
+    write_executable(
+        &reconciliation,
+        "#!/bin/sh\n\
+         read -r request\n\
+         printf '%s\\n' \"$request\" >> reconciliation-requests.jsonl\n\
+         printf '%s\\n' '{\"protocol_version\":1,\"malformed\":true}'\n",
+    );
+
+    let config_path = project.join("y-harness.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).expect("read Effect consumer config"))
+            .expect("decode Effect consumer config");
+    let process = |command: &Path| {
+        serde_json::json!({
+            "command": command,
+            "current_directory": ".",
+            "timeout_ms": 5_000,
+            "max_output_bytes": 65_536,
+            "launch": {
+                "type": "unrestricted",
+                "max_concurrency": 1
+            }
+        })
+    };
+    config["effect_consumer"] = serde_json::json!({
+        "execution": {
+            "poll_interval_ms": 100,
+            "failure_backoff_ms": 100,
+            "executor": {
+                "scan_limit": 16,
+                "max_concurrency": 2,
+                "policy_timeout_ms": 1_000,
+                "execution_timeout_ms": 10_000,
+                "settlement_reserve_ms": 5_000,
+                "lease_duration_ms": 20_000
+            },
+            "allow": [{
+                "capability": "notification.test",
+                "operation": "send"
+            }],
+            "connectors": [{
+                "origin_id": "test/effect-execution",
+                "capability": "notification.test",
+                "operations": ["send"],
+                "idempotency": "target_enforced",
+                "process": process(&execution)
+            }]
+        },
+        "reconciliation": {
+            "poll_interval_ms": 100,
+            "failure_backoff_ms": 100,
+            "reconciler": {
+                "scan_limit": 16,
+                "max_concurrency": 2,
+                "policy_timeout_ms": 1_000,
+                "lookup_timeout_ms": 10_000
+            },
+            "allow": [{
+                "capability": "notification.test",
+                "operation": "send"
+            }],
+            "connectors": [{
+                "origin_id": "test/effect-reconciliation",
+                "capability": "notification.test",
+                "operations": ["send"],
+                "contract": "authoritative_read_only",
+                "process": process(&reconciliation)
+            }]
+        }
+    });
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("encode Effect consumer config"),
+    )
+    .expect("write Effect consumer config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run Effect consumer doctor");
+    assert!(
+        doctor.status.success(),
+        "Effect consumer doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8(doctor.stdout)
+            .expect("UTF-8 Effect consumer doctor")
+            .contains(
+                "effect consumer: enabled (execution 1 connector(s) / 1 allow(s) / 100 ms poll / \
+             100 ms backoff; reconciliation 1 connector(s) / 1 allow(s) / 100 ms poll / \
+             100 ms backoff)"
+            )
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build Effect consumer test Runtime");
+    let effect_id = EffectId::from_static("service-effect-consumer");
+    let effect_engine = runtime.block_on(async {
+        let effects = Arc::new(
+            SqliteEffectCoordinator::open(project.join(".y-harness/effects.db"))
+                .await
+                .expect("open Effect Coordinator"),
+        );
+        let engine = EffectEngine::new(effects);
+        engine
+            .create(
+                effect_id.clone(),
+                EffectCreateRequest {
+                    command_id: EffectCommandId::from_static("create-service-effect"),
+                    operation: EffectOperation {
+                        capability: "notification.test".to_owned(),
+                        operation: "send".to_owned(),
+                    },
+                    idempotency_key: "service-effect-idempotency".to_owned(),
+                    input: serde_json::json!({"artifact_ref":"message-42"}),
+                    not_before_ms: 1,
+                },
+                1,
+            )
+            .await
+            .expect("create pending service Effect");
+        engine
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Effect consumer service");
+    let input = child.stdin.take().expect("Effect consumer service stdin");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let effect = effect_engine
+                    .load(&effect_id)
+                    .await
+                    .expect("load uncertain Effect")
+                    .expect("Effect exists");
+                if matches!(effect.effect().status(), EffectStatus::Unknown { .. })
+                    && project.join("execution-requests.jsonl").is_file()
+                    && project.join("reconciliation-requests.jsonl").is_file()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Effect consumer reaches degraded reconciliation");
+    });
+
+    write_executable(
+        &reconciliation,
+        "#!/bin/sh\n\
+         read -r request\n\
+         printf '%s\\n' \"$request\" >> reconciliation-requests.jsonl\n\
+         printf '%s\\n' \
+         '{\"protocol_version\":1,\"outcome\":{\"outcome\":\"applied\",\"receipt\":{\
+         \"source\":\"test-target\",\"external_id\":\"message-42\",\"observed_at_ms\":1,\
+         \"response_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}}'\n",
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let effect = effect_engine
+                    .load(&effect_id)
+                    .await
+                    .expect("load converged Effect")
+                    .expect("Effect exists");
+                if matches!(effect.effect().status(), EffectStatus::Applied { .. }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Effect consumer recovers and converges");
+    });
+
+    drop(input);
+    let settled = child
+        .wait_with_output()
+        .expect("settle Effect consumer service");
+    assert!(
+        settled.status.success(),
+        "Effect consumer service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    assert!(
+        settled.stdout.is_empty(),
+        "idle Effect consumer service must preserve protocol stdout purity"
+    );
+    let diagnostics = String::from_utf8(settled.stderr).expect("UTF-8 Effect diagnostics");
+    assert!(
+        diagnostics.contains("Y-Harness Effect reconciliation degraded: 1 attempt(s) unavailable")
+    );
+    assert!(diagnostics.contains("Y-Harness Effect reconciliation recovered"));
+
+    let execution_before_restart =
+        fs::read(project.join("execution-requests.jsonl")).expect("read execution requests");
+    let reconciliation_before_restart = fs::read(project.join("reconciliation-requests.jsonl"))
+        .expect("read reconciliation requests");
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("restart Effect consumer service");
+    let restarted_input = restarted.stdin.take().expect("restarted service stdin");
+    std::thread::sleep(Duration::from_millis(350));
+    drop(restarted_input);
+    let restarted = restarted
+        .wait_with_output()
+        .expect("settle restarted Effect consumer service");
+    assert!(
+        restarted.status.success(),
+        "restarted Effect consumer failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert!(restarted.stdout.is_empty());
+    assert!(restarted.stderr.is_empty());
+    assert_eq!(
+        fs::read(project.join("execution-requests.jsonl")).expect("reread execution requests"),
+        execution_before_restart,
+        "terminal Effect was executed after restart"
+    );
+    assert_eq!(
+        fs::read(project.join("reconciliation-requests.jsonl"))
+            .expect("reread reconciliation requests"),
+        reconciliation_before_restart,
+        "terminal Effect was reconciled after restart"
+    );
+    fs::remove_dir_all(project).expect("remove Effect consumer fixture");
 }
 
 #[test]
@@ -2597,6 +2872,16 @@ fn serve(project: &Path, requests: Vec<ProtocolRequest>) -> Vec<ProtocolResponse
         .lines()
         .map(|line| serde_json::from_str(line).expect("decode service response"))
         .collect()
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) {
+    fs::write(path, content).expect("write executable fixture");
+    let mut permissions = fs::metadata(path)
+        .expect("read executable fixture metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).expect("make fixture executable");
 }
 
 fn isolated_project(label: &str) -> PathBuf {

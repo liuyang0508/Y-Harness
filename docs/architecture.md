@@ -338,7 +338,13 @@ direction:
   authoritative read-only reconciliation envelopes, cancellation-free process
   requests, typed Effect-phase cancellation, strict version settlement, and
   shell-free Process Broker execution; adapter failure returns to the existing
-  Executor/Reconciler uncertainty rules and adds no service consumer;
+  Executor/Reconciler uncertainty rules;
+- an opt-in reference-service Effect consumer with independently configurable
+  execution and reconciliation loops, separate exact Connector registries and
+  non-empty allowlists, bounded cadence/backoff/concurrency/timeouts,
+  disposable process-local cursors, content-free health transitions, and
+  Effect-before-Temporal-before-Protocol/MCP shutdown while leaving Core
+  task-free and the Ledger authoritative;
 - embedded Temporal Driver API 2 with host-supplied time, optional
   Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
   source, disposable cursors, fail-closed extension-page revalidation,

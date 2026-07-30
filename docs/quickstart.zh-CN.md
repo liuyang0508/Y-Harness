@@ -188,12 +188,20 @@ cargo run --locked --example effect_reconciler
 如果 Connector 使用其他语言实现，可采用精确 JSON Effect Connector
 protocol 1。两个适配器分别处理执行和只读对账，经 `ProcessBroker` 直接
 传参而不经过 shell，清空继承环境并限制输入、输出、时间与并发；它们不
-会绕过 Policy、Ledger CAS 或 Unknown 规则。当前仍需嵌入宿主显式装配，
-reference service 尚未接受 Effect Connector 配置。可运行真实子进程示例：
+会绕过 Policy、Ledger CAS 或 Unknown 规则。可运行真实子进程示例：
 
 ```bash
 cargo run --locked --example json_effect_connector
 ```
+
+`yh serve` 也可通过严格的 `effect_consumer` 配置选装常驻执行和对账循环。
+两者彼此独立，分别拥有精确 Connector 注册表和非空 allowlist；注册能力
+不等于获得调用权限。轮询、失败退避、并发和超时均有界，进程内 cursor
+不承担恢复语义，唯一持久恢复权威仍是 Effect Ledger。省略配置时不会启动
+后台任务。完整配置与边界见：
+
+- [`config/y-harness.effect-consumer.example.json`](../config/y-harness.effect-consumer.example.json)
+- [`ADR 0137`](adr/0137-optional-reference-service-effect-consumer.md)
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：

@@ -884,14 +884,66 @@ JSON Effect Connector protocol 1. `JsonCommandEffectConnector` and
 the selected `ProcessBroker`: no shell, no inherited environment, bounded
 input/output/time/concurrency, exact protocol validation, and typed Effect
 cancellation. The adapter does not bypass either default-deny Policy or Ledger
-CAS, and it does not make an unrestricted child process safe. Service
-configuration and resident consumption remain separate, still-open host work.
+CAS, and it does not make an unrestricted child process safe.
 See [ADR 0136](docs/adr/0136-versioned-brokered-json-effect-connectors.md) and
 the self-hosting public example:
 
 ```bash
 cargo run --locked --example json_effect_connector
 ```
+
+The reference `yh serve` host can optionally own resident Effect consumption.
+Execution and reconciliation are configured independently under
+`effect_consumer`; each requires a non-empty exact allowlist and a separate
+Connector registry. Registration does not grant authority, and omission starts
+no background work. Commands are preflighted by `yh doctor`, missed ticks are
+skipped, unavailable pages use bounded process-local backoff, diagnostics are
+content-free health transitions, and both loops stop before Protocol/MCP
+shutdown. The Ledger remains the only durable recovery authority, so restart
+may repeat safe scans but cannot replay a terminal Effect:
+
+```json
+{
+  "effect_consumer": {
+    "execution": {
+      "poll_interval_ms": 1000,
+      "failure_backoff_ms": 5000,
+      "executor": {
+        "scan_limit": 64,
+        "max_concurrency": 8,
+        "policy_timeout_ms": 5000,
+        "execution_timeout_ms": 240000,
+        "settlement_reserve_ms": 30000,
+        "lease_duration_ms": 300000
+      },
+      "allow": [
+        {"capability": "notification.command", "operation": "send"}
+      ],
+      "connectors": [
+        {
+          "origin_id": "deployment/notification-command-execution",
+          "capability": "notification.command",
+          "operations": ["send"],
+          "idempotency": "target_enforced",
+          "process": {
+            "command": "/absolute/path/to/effect-connector",
+            "args": ["--execute"],
+            "current_directory": ".",
+            "timeout_ms": 240000,
+            "max_output_bytes": 65536,
+            "launch": {"type": "unrestricted", "max_concurrency": 8}
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Reconciliation uses the same lifecycle fields plus `reconciler`,
+`contract: "authoritative_read_only"`, and its own process. See the complete
+[Effect consumer example](config/y-harness.effect-consumer.example.json) and
+[ADR 0137](docs/adr/0137-optional-reference-service-effect-consumer.md).
 
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v29 preserves Protocol v28's 2 MiB request and 16 MiB
