@@ -59,6 +59,15 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 `/approvals`、`/tasks`、`/refresh`、`/cancel`、`/help` 和 `/quit`。
 连接真实配置时执行 `yh-tui --config y-harness.json`。
 
+如果出现 `Engine protocol ... did not match TUI protocol ...`，说明独立
+安装的 `yh` 与 `yh-tui` 来自不同源码修订；Cargo 包版本相同也不能代表
+协议坐标相同。请在同一个仓库检出版本中依次重新执行：
+
+```bash
+./scripts/install.sh
+./scripts/install-tui.sh
+```
+
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 

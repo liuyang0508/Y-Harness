@@ -171,7 +171,9 @@ Threads without opening Engine storage. Protocol 16 includes optional direct
 lineage in those content-free summaries, and the Sessions panel renders the
 parent identity/version without projecting full histories.
 The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
-protocol; it keeps no title or branch store.
+protocol; it keeps no title or branch store. If independently installed Engine
+and TUI binaries drift, startup now reports both Protocol coordinates and the
+same-checkout reinstall commands instead of two unexplained numbers.
 The independent benchmark runner emits exact non-claim external-run formats
 for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
 CLIs. Real released Claude Code `2.1.143`, Codex `0.145.0`, Grok Build

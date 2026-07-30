@@ -136,11 +136,7 @@ impl ProtocolClient {
             .into());
         }
         if response.protocol_version != PROTOCOL_VERSION {
-            return Err(io::Error::other(format!(
-                "Engine protocol {:?} did not match {PROTOCOL_VERSION}",
-                response.protocol_version
-            ))
-            .into());
+            return Err(protocol_mismatch(&response.protocol_version).into());
         }
         match response.body {
             ProtocolResponseBody::Success { result } => Ok(result),
@@ -193,6 +189,15 @@ impl ProtocolClient {
             }
         }
     }
+}
+
+fn protocol_mismatch(engine_protocol: &str) -> io::Error {
+    io::Error::other(format!(
+        "Engine protocol {engine_protocol:?} did not match TUI protocol \
+         {PROTOCOL_VERSION}. Install matching `yh` and `yh-tui` builds; from \
+         one Y-Harness checkout run `./scripts/install.sh` and \
+         `./scripts/install-tui.sh`"
+    ))
 }
 
 #[derive(Default)]
@@ -299,7 +304,7 @@ mod tests {
 
     use super::{
         EngineDiagnostics, EngineMode, MAX_ENGINE_DIAGNOSTIC_BYTES, ProtocolClient,
-        read_bounded_line_with_limit,
+        protocol_mismatch, read_bounded_line_with_limit,
     };
 
     #[tokio::test]
@@ -340,5 +345,14 @@ mod tests {
         assert!(rendered.contains("�secret"));
         assert!(rendered.ends_with('…'));
         assert!(rendered.len() <= MAX_ENGINE_DIAGNOSTIC_BYTES + 32);
+    }
+
+    #[test]
+    fn protocol_mismatch_names_both_coordinates_and_the_reinstall_path() {
+        let diagnostic = protocol_mismatch("23").to_string();
+        assert!(diagnostic.contains("Engine protocol \"23\""));
+        assert!(diagnostic.contains("TUI protocol 28"));
+        assert!(diagnostic.contains("./scripts/install.sh"));
+        assert!(diagnostic.contains("./scripts/install-tui.sh"));
     }
 }
