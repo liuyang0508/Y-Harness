@@ -19,7 +19,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 use y_harness::{
     ApprovalDecision, ItemKind, MemoryContextRecordStatus, PROTOCOL_VERSION, PolicyDecision,
-    RiskLevel, StateCapacityLevel, TaskStatus, TurnStatus, VerificationOutcome,
+    RiskLevel, StateCapacity, StateCapacityLevel, TaskStatus, TurnStatus, VerificationOutcome,
 };
 
 use crate::app::{App, Focus, SidebarTab};
@@ -35,6 +35,7 @@ const WARNING: Color = Color::Rgb(240, 190, 90);
 const ERROR: Color = Color::Rgb(240, 100, 105);
 const MAX_VISIBLE_ITEMS: usize = 256;
 const MAX_RENDERED_TEXT_CHARS: usize = 16_384;
+const DEMO_MODEL_ID: &str = "local/demo";
 
 /// Alternate-screen terminal session restored on every ordinary error/unwind.
 pub(crate) struct TerminalSession {
@@ -126,34 +127,44 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         },
     );
     let capacity = app.capacity.map_or_else(
-        || "capacity —".to_owned(),
+        || ("capacity unavailable".to_owned(), MUTED),
         |capacity| {
-            let event_percent = percent(capacity.used_events, capacity.event_limit);
-            let byte_percent = percent(capacity.used_recovery_bytes, capacity.recovery_byte_limit);
-            format!(
-                "state {}% events · {}% bytes · {}",
-                event_percent,
-                byte_percent,
-                capacity_level(capacity.level)
+            (
+                format_capacity(capacity, area.width >= 100),
+                capacity_level_color(capacity.level),
             )
         },
     );
+    let mut identity_line = vec![
+        Span::styled(
+            " Y-HARNESS ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        running,
+        Span::styled(
+            format!("  {} · protocol v{PROTOCOL_VERSION}", app.server),
+            Style::default().fg(MUTED),
+        ),
+    ];
+    if let Some(model_id) = latest_observed_model_id(app) {
+        if model_id == DEMO_MODEL_ID {
+            identity_line.push(Span::styled(
+                " · LAST MODEL local/demo · DETERMINISTIC / NO NETWORK",
+                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            identity_line.push(Span::styled(
+                format!(" · LAST MODEL {}", clipped(model_id, 96)),
+                Style::default().fg(ASSISTANT),
+            ));
+        }
+    }
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                " Y-HARNESS ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            running,
-            Span::styled(
-                format!("  {} · protocol v{PROTOCOL_VERSION}", app.server),
-                Style::default().fg(MUTED),
-            ),
-        ]),
+        Line::from(identity_line),
         Line::from(vec![
             Span::styled(
                 format!(" engine {} ", app.engine_version),
@@ -178,7 +189,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     }),
                 Style::default().fg(MUTED),
             ),
-            Span::styled(capacity, Style::default().fg(MUTED)),
+            Span::styled(capacity.0, Style::default().fg(capacity.1)),
         ]),
     ];
     frame.render_widget(
@@ -216,15 +227,75 @@ fn render_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if app.thread.turns.is_empty() && app.active.is_none() {
+        render_transcript_empty_state(frame, inner);
+        return;
+    }
+
     let lines = transcript_lines(app);
     let line_count = wrapped_line_count(&lines, inner.width);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let max_scroll = line_count.saturating_sub(usize::from(inner.height));
     let from_bottom = app.transcript_scroll_from_bottom.min(max_scroll);
+    if max_scroll == 0 {
+        let content_height = (line_count.min(usize::from(u16::MAX)) as u16)
+            .max(1)
+            .min(inner.height);
+        let content = Rect {
+            y: inner
+                .y
+                .saturating_add(inner.height.saturating_sub(content_height)),
+            height: content_height,
+            ..inner
+        };
+        frame.render_widget(paragraph, content);
+        return;
+    }
     let scroll = max_scroll
         .saturating_sub(from_bottom)
         .min(usize::from(u16::MAX)) as u16;
     frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+}
+
+fn render_transcript_empty_state(frame: &mut Frame<'_>, area: Rect) {
+    let lines = vec![
+        Line::styled(
+            "START A CONVERSATION",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Line::default(),
+        Line::styled(
+            "The TUI is connected to the headless Engine through Protocol v28.",
+            Style::default().fg(Color::White),
+        ),
+        Line::styled(
+            "Type a prompt below and press Enter to create an authoritative Turn.",
+            Style::default().fg(Color::White),
+        ),
+        Line::default(),
+        Line::styled(
+            "Activity shows durable execution · F1 shows commands and boundaries",
+            Style::default().fg(MUTED),
+        ),
+        Line::styled(
+            "The registered Model identity appears after its first durable decision.",
+            Style::default().fg(MUTED),
+        ),
+    ];
+    let height = (lines.len().min(usize::from(u16::MAX)) as u16).min(area.height);
+    let content = Rect {
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        height,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        content,
+    );
 }
 
 fn transcript_lines(app: &App) -> Vec<Line<'static>> {
@@ -251,12 +322,16 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(vec![
             Span::styled(
-                format!("TURN {} ", short_id(turn.id.as_str())),
+                format!("TURN {} · ", short_id(turn.id.as_str())),
                 Style::default().fg(MUTED),
             ),
             Span::styled(
                 turn_status(&turn.status),
                 Style::default().fg(turn_status_color(&turn.status)),
+            ),
+            Span::styled(
+                format!(" · {} records", turn.items.len()),
+                Style::default().fg(MUTED),
             ),
         ]));
         for item in turn.items.iter().skip(turn.items.len() - visible) {
@@ -286,12 +361,6 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
             ));
         }
         append_multiline(&mut lines, &active.provisional, Color::White);
-    }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "No Turns yet. Type a prompt below and press Enter.",
-            Style::default().fg(MUTED),
-        ));
     }
     lines
 }
@@ -331,10 +400,18 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
         ItemKind::AssistantMessage {
             model_id, content, ..
         } => {
-            lines.push(Line::styled(
-                format!("ASSISTANT · {}", model_id.as_deref().unwrap_or("legacy")),
+            let model_id = model_id.as_deref().unwrap_or("legacy");
+            let mut label = vec![Span::styled(
+                format!("ASSISTANT · {model_id}"),
                 Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
-            ));
+            )];
+            if model_id == DEMO_MODEL_ID {
+                label.push(Span::styled(
+                    " · DETERMINISTIC DEMO",
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(label));
             append_multiline(lines, content, Color::White);
         }
         ItemKind::ProviderContinuation {
@@ -347,13 +424,23 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
                 Style::default().fg(MUTED),
             ));
         }
-        ItemKind::ToolCall { name, input, .. } => {
+        ItemKind::ToolCall {
+            model_id,
+            name,
+            input,
+            ..
+        } => {
             lines.push(Line::styled(
-                format!("▶ TOOL · {name}"),
+                format!(
+                    "  ▶ TOOL · {name}{}",
+                    model_id.as_deref().map_or_else(String::new, |model_id| {
+                        format!(" · requested by {model_id}")
+                    })
+                ),
                 Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
-                compact_json(input),
+                format!("    {}", compact_json(input)),
                 Style::default().fg(MUTED),
             ));
         }
@@ -372,7 +459,10 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
                     WARNING,
                 ),
             };
-            lines.push(Line::styled(label, Style::default().fg(color)));
+            lines.push(Line::styled(
+                format!("  {label}"),
+                Style::default().fg(color),
+            ));
         }
         ItemKind::ApprovalRequested {
             approval_id,
@@ -407,16 +497,16 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
         } => {
             lines.push(Line::styled(
                 if *is_error {
-                    "■ TOOL RESULT · failed"
+                    "  ■ TOOL RESULT · failed"
                 } else {
-                    "■ TOOL RESULT · completed"
+                    "  ■ TOOL RESULT · completed"
                 },
                 Style::default()
                     .fg(if *is_error { ERROR } else { ASSISTANT })
                     .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
-                compact_json(output),
+                format!("    {}", compact_json(output)),
                 Style::default().fg(MUTED),
             ));
         }
@@ -528,7 +618,27 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let visible = usize::from(area.height.max(1));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(area);
+    let summary = app.capacity.map_or_else(
+        || format!("{} recent durable events", app.activity.len()),
+        |capacity| {
+            format!(
+                "{} durable events · {} loaded",
+                capacity.used_events,
+                app.activity.len()
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(summary)
+            .style(Style::default().fg(MUTED))
+            .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    let visible = usize::from(rows[1].height.max(1));
     let items = app
         .activity
         .iter()
@@ -552,7 +662,7 @@ fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             items
         }),
-        area,
+        rows[1],
     );
 }
 
@@ -963,12 +1073,74 @@ fn centered_rect(horizontal: u16, vertical: u16, area: Rect) -> Rect {
         .split(vertical_layout[1])[1]
 }
 
-fn percent(used: u64, limit: u64) -> u64 {
-    if limit == 0 {
-        100
-    } else {
-        used.saturating_mul(100).checked_div(limit).unwrap_or(100)
+fn latest_observed_model_id(app: &App) -> Option<&str> {
+    for turn in app.thread.turns.iter().rev() {
+        for item in turn.items.iter().rev() {
+            match &item.kind {
+                ItemKind::AssistantMessage {
+                    model_id: Some(model_id),
+                    ..
+                }
+                | ItemKind::ToolCall {
+                    model_id: Some(model_id),
+                    ..
+                }
+                | ItemKind::ProviderContinuation { model_id, .. } => return Some(model_id),
+                _ => {}
+            }
+        }
     }
+    None
+}
+
+fn format_capacity(capacity: StateCapacity, detailed: bool) -> String {
+    let event_ratio = ratio_label(capacity.used_events, capacity.event_limit);
+    let recovery_ratio = ratio_label(capacity.used_recovery_bytes, capacity.recovery_byte_limit);
+    if detailed {
+        format!(
+            "capacity {} · events {}/{} ({event_ratio}) · recovery {}/{} ({recovery_ratio})",
+            capacity_level(capacity.level),
+            capacity.used_events,
+            capacity.event_limit,
+            format_bytes(capacity.used_recovery_bytes),
+            format_bytes(capacity.recovery_byte_limit),
+        )
+    } else {
+        format!(
+            "capacity {} · events {event_ratio} · recovery {recovery_ratio}",
+            capacity_level(capacity.level)
+        )
+    }
+}
+
+fn ratio_label(used: u64, limit: u64) -> String {
+    if limit == 0 {
+        return "invalid".to_owned();
+    }
+    if used == 0 {
+        return "0%".to_owned();
+    }
+    let percentage = (u128::from(used) * 100 / u128::from(limit)).min(100);
+    if percentage == 0 {
+        "<1%".to_owned()
+    } else {
+        format!("{percentage}%")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    for (unit, label) in [
+        (1_073_741_824_u64, "GiB"),
+        (1_048_576_u64, "MiB"),
+        (1_024_u64, "KiB"),
+    ] {
+        if bytes >= unit {
+            let whole = bytes / unit;
+            let decimal = bytes % unit * 10 / unit;
+            return format!("{whole}.{decimal} {label}");
+        }
+    }
+    format!("{bytes} B")
 }
 
 fn capacity_level(level: StateCapacityLevel) -> &'static str {
@@ -978,6 +1150,16 @@ fn capacity_level(level: StateCapacityLevel) -> &'static str {
         StateCapacityLevel::Critical => "critical",
         StateCapacityLevel::TerminalOnly => "terminal-only",
         StateCapacityLevel::Exhausted => "exhausted",
+    }
+}
+
+fn capacity_level_color(level: StateCapacityLevel) -> Color {
+    match level {
+        StateCapacityLevel::Healthy => ASSISTANT,
+        StateCapacityLevel::Warning => WARNING,
+        StateCapacityLevel::Critical
+        | StateCapacityLevel::TerminalOnly
+        | StateCapacityLevel::Exhausted => ERROR,
     }
 }
 
@@ -1041,10 +1223,11 @@ fn short_id(identity: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
+    use y_harness::{ItemKind, StateCapacity, StateCapacityLevel};
 
     use crate::app::{App, SidebarTab};
 
-    use super::{input_cursor, render, sanitized};
+    use super::{format_capacity, input_cursor, ratio_label, render, sanitized};
 
     #[test]
     fn composer_cursor_counts_wide_unicode_and_wraps() {
@@ -1061,6 +1244,30 @@ mod tests {
         );
         assert_eq!(sanitized("line\nnext", 64, true), "line\nnext");
         assert_eq!(sanitized("12345", 3, false), "123…");
+    }
+
+    #[test]
+    fn capacity_usage_never_rounds_nonzero_pressure_to_zero() {
+        assert_eq!(ratio_label(0, 65_536), "0%");
+        assert_eq!(ratio_label(1, 65_536), "<1%");
+        assert_eq!(ratio_label(32_768, 65_536), "50%");
+        let capacity = StateCapacity {
+            used_events: 165,
+            event_limit: 65_536,
+            remaining_events: 65_371,
+            general_events_remaining: 65_370,
+            terminal_event_reserve: 1,
+            used_recovery_bytes: 12_288,
+            recovery_byte_limit: 67_108_864,
+            remaining_recovery_bytes: 67_096_576,
+            general_recovery_bytes_remaining: 67_092_480,
+            terminal_recovery_byte_reserve: 4_096,
+            level: StateCapacityLevel::Healthy,
+        };
+        let rendered = format_capacity(capacity, true);
+        assert!(rendered.contains("events 165/65536 (<1%)"));
+        assert!(rendered.contains("recovery 12.0 KiB/64.0 MiB (<1%)"));
+        assert!(rendered.contains("capacity healthy"));
     }
 
     #[test]
@@ -1091,6 +1298,33 @@ mod tests {
     }
 
     #[test]
+    fn short_transcript_stays_near_the_composer() -> Result<(), Box<dyn std::error::Error>> {
+        const WIDTH: usize = 120;
+        let backend = TestBackend::new(WIDTH as u16, 32);
+        let mut terminal = Terminal::new(backend)?;
+        let app = App::test_fixture()?;
+        terminal.draw(|frame| render(frame, &app))?;
+        let turn_row = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(WIDTH)
+            .position(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("TURN")
+            })
+            .ok_or("rendered transcript has no Turn header")?;
+        assert!(
+            turn_row > 10,
+            "short transcript was not bottom-aligned: row {turn_row}"
+        );
+        assert!(turn_row < 25, "Turn header overlapped Composer");
+        Ok(())
+    }
+
+    #[test]
     fn session_panel_renders_authoritative_thread_summaries()
     -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(120, 32);
@@ -1113,6 +1347,66 @@ mod tests {
     }
 
     #[test]
+    fn last_durable_demo_decision_is_prominent_without_predicting_the_next_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.input.clear();
+        app.input_cursor = 0;
+        let Some(last_item) = app
+            .thread
+            .turns
+            .last_mut()
+            .and_then(|turn| turn.items.last_mut())
+        else {
+            return Err("fixture has no final assistant Item".into());
+        };
+        let ItemKind::AssistantMessage { model_id, .. } = &mut last_item.kind else {
+            return Err("fixture final Item is not an assistant message".into());
+        };
+        *model_id = Some("local/demo".to_owned());
+
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("LAST MODEL local/demo · DETERMINISTIC / NO NETWORK"));
+        assert!(screen.contains("ASSISTANT · local/demo · DETERMINISTIC DEMO"));
+        assert!(screen.contains("Ask the Harness"));
+        assert!(!screen.contains("next model local/demo"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_thread_explains_the_engine_boundary_and_first_action()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.thread.turns.clear();
+        app.input.clear();
+        app.input_cursor = 0;
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("START A CONVERSATION"));
+        assert!(screen.contains("headless Engine through Protocol v28"));
+        assert!(screen.contains("press Enter"));
+        assert!(screen.contains("first durable decision"));
+        Ok(())
+    }
+
+    #[test]
     fn undersized_terminal_renders_a_safe_fallback() -> Result<(), Box<dyn std::error::Error>> {
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend)?;
@@ -1126,6 +1420,27 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("needs at least 60×18"));
+        Ok(())
+    }
+
+    #[test]
+    fn minimum_supported_terminal_keeps_all_layouts_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(60, 18);
+        let mut terminal = Terminal::new(backend)?;
+        let app = App::test_fixture()?;
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Y-HARNESS"));
+        assert!(screen.contains("Conversation"));
+        assert!(screen.contains("Composer"));
+        assert!(!screen.contains("needs at least"));
         Ok(())
     }
 }

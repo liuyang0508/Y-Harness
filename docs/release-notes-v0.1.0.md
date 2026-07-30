@@ -173,7 +173,13 @@ parent identity/version without projecting full histories.
 The TUI exposes `/name [title]` and `/fork [terminal-turn-id]` through the
 protocol; it keeps no title or branch store. If independently installed Engine
 and TUI binaries drift, startup now reports both Protocol coordinates and the
-same-checkout reinstall commands instead of two unexplained numbers.
+same-checkout reinstall commands instead of two unexplained numbers. The TUI
+also gives empty Threads an explicit first-Turn path, keeps short transcripts
+near the Composer, renders exact/sub-percent State pressure without false
+`0%`, and labels durable `local/demo` decisions as deterministic/no-network.
+Header identity is explicitly `LAST MODEL`: it is derived only from Protocol
+State Items and never predicts the next Engine-owned Route. The client still
+does not parse Engine configuration.
 The independent benchmark runner emits exact non-claim external-run formats
 for released Claude Code, Codex, Grok Build, Pi, OpenCode, and Hermes Agent
 CLIs. Real released Claude Code `2.1.143`, Codex `0.145.0`, Grok Build

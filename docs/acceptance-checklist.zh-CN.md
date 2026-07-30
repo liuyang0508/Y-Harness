@@ -10,6 +10,11 @@
 - [ ] `yh demo "验收 Harness"` 返回终态文本、Thread ID 和 Trace 路径。
 - [ ] `yh-tui --demo` 进入 alternate screen，可执行 Turn、查看 Inspector
       并用 `/quit` 完整恢复终端。
+- [ ] 空 Thread 给出首个 Turn 引导；短会话靠近 Composer；非零 State
+      压力显示为 `<1%` 而不是 `0%`，并保留已用/上限。
+- [ ] `local/demo` 在 Header 和对应 Assistant 记录中明确标记为
+      deterministic/no-network；Header 使用 `LAST MODEL`，不从历史记录
+      推断下一 Turn 的 Engine Route。
 - [ ] Engine/TUI 协议不匹配时，错误同时报告两个协议坐标，并给出从同一
       Checkout 重装 `yh` 与 `yh-tui` 的命令。
 - [ ] 不安装 `yh-tui` 时，`yh serve`、嵌入式 Core 和协议行为保持不变。
