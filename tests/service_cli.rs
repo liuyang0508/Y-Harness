@@ -30,6 +30,8 @@ use y_harness::{
 #[cfg(unix)]
 use y_harness::{CapabilityOrigin, OperationStatus};
 
+const STATE_V1_FIXTURE: &str = include_str!("fixtures/state-v1.sql");
+
 #[test]
 fn init_is_no_clobber_and_doctor_validates_the_project() {
     let project = isolated_project("init");
@@ -89,8 +91,163 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     assert!(report.contains("conversation: 32 Turns / 65536 tokens / 65536 bytes"));
     assert!(report.contains("conversation compactor: disabled"));
     assert!(report.contains("temporal: disabled"));
+    assert!(report.contains(
+        "stores: state=will be created approval=will be created task=will be created \
+         workflow=will be created handoff=will be created"
+    ));
     assert!(report.contains("status: ok"));
+
+    let initialized = serve(
+        &project,
+        vec![request("initialize", ProtocolCommand::Initialize {})],
+    );
+    assert!(matches!(
+        initialized[0].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    let current_doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run current-store doctor");
+    assert!(
+        current_doctor.status.success(),
+        "current-store doctor failed: {}",
+        String::from_utf8_lossy(&current_doctor.stderr)
+    );
+    assert!(
+        String::from_utf8(current_doctor.stdout)
+            .expect("UTF-8 current-store doctor")
+            .contains("stores: state=ready approval=ready task=ready workflow=ready handoff=ready")
+    );
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[test]
+fn doctor_rejects_legacy_state_before_provider_assembly_without_mutation() {
+    let project = isolated_project("doctor-legacy-state");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let database = project.join(".y-harness/state.db");
+    {
+        let connection = rusqlite::Connection::open(&database).expect("open legacy State fixture");
+        connection
+            .execute_batch(STATE_V1_FIXTURE)
+            .expect("install legacy State fixture");
+    }
+    let before = fs::read(&database).expect("read legacy State before doctor");
+    fs::write(
+        project.join("y-harness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "data_directory": ".y-harness",
+            "model": {
+                "type": "json_command",
+                "id": "external/must-not-start",
+                "process": {
+                    "command": project.join("missing-model"),
+                    "launch": {
+                        "type": "unrestricted",
+                        "max_concurrency": 1
+                    }
+                }
+            }
+        }))
+        .expect("encode legacy doctor config"),
+    )
+    .expect("write legacy doctor config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg("y-harness.json")
+        .current_dir(&project)
+        .output()
+        .expect("run legacy State doctor");
+    assert!(!doctor.status.success());
+    let diagnostic = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        diagnostic.contains("SQLite State schema migration required"),
+        "unexpected doctor diagnostic: {diagnostic}"
+    );
+    assert!(diagnostic.contains("yh state-migrate"));
+    assert!(!diagnostic.contains("missing-model"));
+    assert_eq!(
+        fs::read(&database).expect("read legacy State after doctor"),
+        before,
+        "doctor must not mutate a legacy database"
+    );
+    assert!(
+        fs::read_dir(project.join(".y-harness"))
+            .expect("read data directory")
+            .all(|entry| !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .contains("backup")),
+        "doctor must not create a migration backup"
+    );
+
+    let service = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("serve")
+        .arg("y-harness.json")
+        .current_dir(&project)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run legacy State service");
+    assert!(!service.status.success());
+    let service_diagnostic = String::from_utf8_lossy(&service.stderr);
+    assert!(
+        service_diagnostic.contains("SQLite State schema migration required"),
+        "unexpected service diagnostic: {service_diagnostic}"
+    );
+    assert!(service_diagnostic.contains("yh state-migrate"));
+    assert!(!service_diagnostic.contains("missing-model"));
+    assert_eq!(
+        fs::read(&database).expect("read legacy State after service preflight"),
+        before,
+        "service preflight must not mutate a legacy database"
+    );
+    fs::remove_dir_all(project).expect("remove legacy doctor fixture");
+}
+
+#[test]
+fn doctor_rejects_a_partial_workflow_store() {
+    let project = isolated_project("doctor-partial-workflow");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let database = project.join(".y-harness/workflows.db");
+    {
+        let connection =
+            rusqlite::Connection::open(&database).expect("open partial Workflow fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_store_meta (
+                    singleton INTEGER PRIMARY KEY,
+                    schema_version INTEGER NOT NULL
+                );",
+            )
+            .expect("install partial Workflow fixture");
+    }
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg("y-harness.json")
+        .current_dir(&project)
+        .output()
+        .expect("run partial Workflow doctor");
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stderr).contains("SQLite Workflow store is partial"));
+    fs::remove_dir_all(project).expect("remove partial Workflow fixture");
 }
 
 #[test]

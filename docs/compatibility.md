@@ -652,6 +652,25 @@ The current unreleased `0.1.0` source requires a
 security correction removes implicit unrestricted MCP process execution. It
 does not change client protocol or durable data.
 
+## Read-only store preflight
+
+The concrete SQLite State, Approval, Task, Workflow, and Human Handoff adapters
+add public asynchronous `validate_existing` functions. They validate an
+existing regular database through a read-only, `query_only` connection and
+perform no creation, bootstrap, migration, or backup publication.
+
+The reference `doctor` and `serve` hosts call these validators before external
+capability construction. Missing stores remain eligible for first creation;
+current or empty stores are accepted; legacy stores return the existing
+operator migration diagnostic; partial, mixed, malformed, and unknown stores
+fail closed. `serve` still repeats authoritative validation while opening each
+store, so preflight is not treated as race protection.
+
+This is an additive pre-1.0 Rust API and host-ordering change. It does not
+advance service configuration schema 1, Protocol v28, State 14, Approval 3,
+Task 3, Workflow 1, or Human Handoff 1. See
+[ADR 0131](adr/0131-read-only-service-store-preflight.md).
+
 ## Migration discipline
 
 State schemas 1 through 13 are supported migration sources. Populated SQLite

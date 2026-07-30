@@ -408,6 +408,10 @@ direction:
   local-process tenant shared by Protocol State/Approval/Task/Workflow/Human
   Handoff,
   configured Evaluation, archives, and direct Model Secret resolution;
+- read-only preflight of every existing authoritative service store before
+  external capability construction, with exact ready/create reporting,
+  actionable explicit migration diagnostics, and repeated validation during
+  the later mutation-capable open;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
   v28, with bounded tenant-fenced recent-Thread navigation, authoritative

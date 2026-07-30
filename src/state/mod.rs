@@ -32,7 +32,7 @@ use crate::{
         validate_value_shape,
     },
     kernel::validate_capability_name,
-    sqlite::{bounded_optional_text, bounded_text},
+    sqlite::{bounded_optional_text, bounded_text, open_read_only},
 };
 
 /// Current append-only State event schema.
@@ -743,6 +743,22 @@ pub struct SqliteEventStore {
 }
 
 impl SqliteEventStore {
+    /// Validates one existing State database without creating or mutating it.
+    ///
+    /// Missing paths are errors. Hosts that treat absence as a fresh store
+    /// should check existence before calling this preflight.
+    pub async fn validate_existing(path: impl AsRef<Path>) -> Result<(), HarnessError> {
+        let path = path.as_ref().to_owned();
+        task::spawn_blocking(move || {
+            let connection =
+                open_read_only(&path).map_err(|error| HarnessError::State(error.to_string()))?;
+            configure_sqlite_busy_timeout(&connection)?;
+            migration::validate_or_bootstrap_store(&connection)
+        })
+        .await
+        .map_err(|error| HarnessError::State(format!("SQLite validation task failed: {error}")))?
+    }
+
     /// Opens or creates a database and enforces required durability pragmas.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();

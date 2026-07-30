@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task};
 
 use super::{MAX_TASK_GRAPH_JSON_BYTES, TaskGraph};
-use crate::{AuthorityContext, HarnessError, HarnessFuture, TaskGraphId, sqlite::bounded_text};
+use crate::{
+    AuthorityContext, HarnessError, HarnessFuture, TaskGraphId,
+    sqlite::{bounded_text, open_read_only},
+};
 
 /// Current durable Task Coordinator graph schema.
 pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 3;
@@ -231,6 +234,30 @@ pub struct SqliteTaskCoordinator {
 }
 
 impl SqliteTaskCoordinator {
+    /// Validates one existing Task database without creating or mutating it.
+    ///
+    /// Missing paths are errors. An existing database without `task_graphs`
+    /// remains eligible for first-open bootstrap.
+    pub async fn validate_existing(path: impl AsRef<Path>) -> Result<(), HarnessError> {
+        let path = path.as_ref().to_owned();
+        task::spawn_blocking(move || {
+            let connection = open_read_only(&path)
+                .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+            if table_exists(&connection, "task_graphs")? {
+                validate_current_table(&connection)
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::Orchestration(format!("SQLite validation task failed: {error}"))
+        })?
+    }
+
     /// Opens or creates a coordinator database with durable WAL settings.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();
@@ -647,6 +674,18 @@ fn validate_current_table(connection: &Connection) -> Result<(), HarnessError> {
         )));
     }
     Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, HarnessError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+            )",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(|error| HarnessError::Orchestration(error.to_string()))
 }
 
 fn tenant_storage_key(tenant_id: Option<&str>) -> &str {

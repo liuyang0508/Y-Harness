@@ -461,6 +461,15 @@ struct LoadedConfig {
     data_directory: PathBuf,
 }
 
+#[derive(Default)]
+struct ExistingStoreReadiness {
+    state: bool,
+    approvals: bool,
+    tasks: bool,
+    workflows: bool,
+    human_handoffs: bool,
+}
+
 impl LoadedConfig {
     /// Resolves and revalidates the deployment authority at each trust boundary.
     fn authority(&self) -> Result<AuthorityContext, HarnessError> {
@@ -880,8 +889,6 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
 pub async fn run_doctor(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
     let authority = loaded.authority()?;
-    let evaluation = build_evaluation(&loaded)?;
-    let models = build_models(&loaded).await?;
     let data_state = if loaded.data_directory.exists() {
         require_contained_directory(&loaded.root, &loaded.data_directory)?;
         if !loaded.data_directory.is_dir() {
@@ -895,6 +902,9 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     } else {
         "will be created"
     };
+    let stores = validate_existing_stores(&loaded).await?;
+    let evaluation = build_evaluation(&loaded)?;
+    let models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, models.demo_tools).await?;
 
     println!("Y-Harness doctor");
@@ -1006,11 +1016,84 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
+        "stores: state={} approval={} task={} workflow={} handoff={}",
+        readiness_label(stores.state),
+        readiness_label(stores.approvals),
+        readiness_label(stores.tasks),
+        readiness_label(stores.workflows),
+        readiness_label(stores.human_handoffs)
+    );
+    println!(
         "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
     Ok(())
+}
+
+async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingStoreReadiness> {
+    if !loaded.data_directory.exists() {
+        return Ok(ExistingStoreReadiness::default());
+    }
+    let state = existing_database(&loaded.data_directory.join("state.db"), "State")?;
+    let approvals = existing_database(
+        &loaded.data_directory.join("approvals.db"),
+        "Approval Inbox",
+    )?;
+    let tasks = existing_database(&loaded.data_directory.join("tasks.db"), "Task Coordinator")?;
+    let workflows = existing_database(
+        &loaded.data_directory.join("workflows.db"),
+        "Workflow Coordinator",
+    )?;
+    let human_handoffs = existing_database(
+        &loaded.data_directory.join("human-handoffs.db"),
+        "Human Handoff Coordinator",
+    )?;
+
+    if state {
+        SqliteEventStore::validate_existing(loaded.data_directory.join("state.db")).await?;
+    }
+    if approvals {
+        SqliteApprovalInbox::validate_existing(loaded.data_directory.join("approvals.db")).await?;
+    }
+    if tasks {
+        SqliteTaskCoordinator::validate_existing(loaded.data_directory.join("tasks.db")).await?;
+    }
+    if workflows {
+        SqliteWorkflowCoordinator::validate_existing(loaded.data_directory.join("workflows.db"))
+            .await?;
+    }
+    if human_handoffs {
+        SqliteHumanHandoffCoordinator::validate_existing(
+            loaded.data_directory.join("human-handoffs.db"),
+        )
+        .await?;
+    }
+
+    Ok(ExistingStoreReadiness {
+        state,
+        approvals,
+        tasks,
+        workflows,
+        human_handoffs,
+    })
+}
+
+fn existing_database(path: &Path, kind: &str) -> CliResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "{kind} database must be a regular file without symlinks: {}",
+            path.display()
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+const fn readiness_label(present: bool) -> &'static str {
+    if present { "ready" } else { "will be created" }
 }
 
 /// Exports one terminal durable Thread without loading service capabilities.
@@ -1076,6 +1159,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let authority = loaded.authority()?;
     fs::create_dir_all(&loaded.data_directory)?;
     require_contained_directory(&loaded.root, &loaded.data_directory)?;
+    validate_existing_stores(&loaded).await?;
 
     let configured_models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;

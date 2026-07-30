@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     AuthorityContext, HarnessError, HarnessFuture, WorkflowRunId, WorkflowWaitId,
-    sqlite::bounded_text,
+    sqlite::{bounded_text, open_read_only},
 };
 
 /// Current durable Workflow Run schema.
@@ -367,6 +367,26 @@ pub struct SqliteWorkflowCoordinator {
 }
 
 impl SqliteWorkflowCoordinator {
+    /// Validates one existing Workflow database without creating or mutating it.
+    ///
+    /// Missing paths are errors. An existing database with neither Workflow
+    /// table remains eligible for first-open bootstrap.
+    pub async fn validate_existing(path: impl AsRef<Path>) -> Result<(), HarnessError> {
+        let path = path.as_ref().to_owned();
+        task::spawn_blocking(move || {
+            let connection =
+                open_read_only(&path).map_err(|error| HarnessError::Workflow(error.to_string()))?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(sql_error)?;
+            validate_existing_store(&connection)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::Workflow(format!("Workflow validation task failed: {error}"))
+        })?
+    }
+
     /// Opens or creates a schema-1 Workflow store with durable WAL settings.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();
@@ -679,6 +699,18 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), HarnessErro
                 .map_err(sql_error)?;
             transaction.commit().map_err(sql_error)
         }
+        (true, true) => validate_store(connection),
+        _ => Err(HarnessError::Workflow(
+            "SQLite Workflow store is partial".to_owned(),
+        )),
+    }
+}
+
+fn validate_existing_store(connection: &Connection) -> Result<(), HarnessError> {
+    let has_meta = table_exists(connection, "workflow_store_meta")?;
+    let has_runs = table_exists(connection, "workflow_runs")?;
+    match (has_meta, has_runs) {
+        (false, false) => Ok(()),
         (true, true) => validate_store(connection),
         _ => Err(HarnessError::Workflow(
             "SQLite Workflow store is partial".to_owned(),

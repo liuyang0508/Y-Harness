@@ -22,7 +22,12 @@ yh doctor "$project/y-harness.json"
 
 - [ ] `y-harness.json`、`.gitignore` 和 `.y-harness/` 已创建。
 - [ ] 对同一路径再次执行 `yh init` 失败，原配置字节不变。
-- [ ] `doctor` 输出 Protocol、schema、模型、数据目录和 `status: ok`。
+- [ ] `doctor` 输出 Protocol、schema、模型、数据目录、五库
+      `ready`/`will be created` 状态和 `status: ok`。
+- [ ] 把旧版 State 测试库放入数据目录后，`doctor` 与 `serve` 都在构造
+      外部 Model/MCP 前返回 `state-migrate` 指引；数据库字节不变且不会
+      自动生成备份。
+- [ ] 只含部分 Workflow 表的数据库失败关闭，不被当成可初始化空库。
 - [ ] 重启服务后，TUI Sessions 面板仍能列出并恢复此前 Thread，分叉项显示权威直接父级。
 - [ ] TUI `/name <标题>` 设置的名称在重启后仍显示，`/name` 可清除。
 - [ ] TUI `/fork [已终结-turn-id]` 创建独立子 Thread；父子后续 Turn

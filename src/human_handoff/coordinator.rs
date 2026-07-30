@@ -16,7 +16,10 @@ use super::{
     HumanHandoffStatus, MAX_HANDOFF_IDENTITY_BYTES, MAX_HANDOFF_JSON_BYTES,
     MAX_HANDOFF_QUEUE_BYTES, validate_identity,
 };
-use crate::{AuthorityContext, HarnessError, HarnessFuture, HumanHandoffId, sqlite::bounded_text};
+use crate::{
+    AuthorityContext, HarnessError, HarnessFuture, HumanHandoffId,
+    sqlite::{bounded_text, open_read_only},
+};
 
 /// Current durable Human Handoff store schema.
 pub const HUMAN_HANDOFF_SCHEMA_VERSION: u32 = 1;
@@ -443,6 +446,27 @@ pub struct SqliteHumanHandoffCoordinator {
 }
 
 impl SqliteHumanHandoffCoordinator {
+    /// Validates one existing Human Handoff database without creating or
+    /// mutating it.
+    ///
+    /// Missing paths are errors. An existing database with neither Handoff
+    /// table remains eligible for first-open bootstrap.
+    pub async fn validate_existing(path: impl AsRef<Path>) -> Result<(), HarnessError> {
+        let path = path.as_ref().to_owned();
+        task::spawn_blocking(move || {
+            let connection = open_read_only(&path)
+                .map_err(|error| HarnessError::HumanHandoff(error.to_string()))?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(sql_error)?;
+            validate_existing_store(&connection)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::HumanHandoff(format!("Human Handoff validation task failed: {error}"))
+        })?
+    }
+
     /// Opens or creates a schema-1 Human Handoff store.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();
@@ -931,6 +955,18 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), HarnessErro
                 .map_err(sql_error)?;
             transaction.commit().map_err(sql_error)
         }
+        (true, true) => validate_store(connection),
+        _ => Err(HarnessError::HumanHandoff(
+            "SQLite Human Handoff store is partial".to_owned(),
+        )),
+    }
+}
+
+fn validate_existing_store(connection: &Connection) -> Result<(), HarnessError> {
+    let has_meta = table_exists(connection, "human_handoff_store_meta")?;
+    let has_handoffs = table_exists(connection, "human_handoffs")?;
+    match (has_meta, has_handoffs) {
+        (false, false) => Ok(()),
         (true, true) => validate_store(connection),
         _ => Err(HarnessError::HumanHandoff(
             "SQLite Human Handoff store is partial".to_owned(),

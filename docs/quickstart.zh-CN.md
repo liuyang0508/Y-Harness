@@ -85,8 +85,11 @@ my-harness/
 ```
 
 它使用 no-clobber 语义：配置已经存在时直接失败，不覆盖用户内容。
-默认配置使用本地演示模型。`doctor` 验证配置版本、模型构造、凭据、
-Provider 权限和数据目录边界，但不会打开或创建数据库。
+默认配置使用本地演示模型。`doctor` 先以只读权限预检已有的五个 SQLite
+权威库，再验证配置版本、模型构造、凭据、Provider 权限和数据目录边界。
+它会将每个库报告为 `ready` 或 `will be created`，但不会创建、初始化、
+迁移数据库或生成备份。旧版、残缺、未知 Schema 会在任何外部 Model、
+MCP 或 Memory 进程启动前失败关闭，并给出对应迁移命令。
 
 ## 4. 运行 Protocol v28 服务
 
@@ -139,13 +142,20 @@ Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式
 执行 Task、Tool、补偿或消息路由。可直接复制
 `config/y-harness.temporal.example.json` 并用 `yh doctor` 检查。
 
-从旧版 Task Graph schema 1 升级时，先停止所有服务并执行：
+如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
+回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：
 
 ```bash
-yh task-migrate .y-harness/tasks.db .y-harness/tasks-v1.rollback.db
+yh state-migrate .y-harness/state.db .y-harness/state-pre-v14.rollback.db
+yh approval-migrate .y-harness/approvals.db .y-harness/approvals-pre-v3.rollback.db
+yh task-migrate .y-harness/tasks.db .y-harness/tasks-pre-v3.rollback.db
 ```
 
-迁移不会猜测历史 Graph 的租户；它们会保留为显式非租户数据。
+不要把三条命令当成固定启动步骤；只迁移 Doctor 指出的旧库。迁移工具
+不会覆盖回滚文件，也不会猜测历史 Thread、Approval 或 Graph 的租户。
+成功后再次执行 `yh doctor y-harness.json`，确认五个库均为 `ready`。
+Workflow 与 Human Handoff 当前从 Schema 1 起步，不存在可猜测的旧版
+迁移路径。
 
 终态 Thread 可以在项目之间迁移，文件只承担传输，State Engine 仍是
 唯一语义权威：

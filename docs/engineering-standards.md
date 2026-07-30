@@ -519,6 +519,14 @@ schema must not advance.
   persistable result. The Coordinator retains an exact final encoding check.
 - Process-shared SQLite coordination is not described as multi-node consensus
   or distributed high availability.
+- Diagnostic and service hosts must preflight every existing authoritative
+  SQLite store through its concrete adapter's read-only validator before
+  constructing external capabilities. Preflight never creates, bootstraps,
+  migrates, or backs up a store; mutation-capable open repeats validation and
+  remains authoritative.
+- Legacy migration is always an offline operator action with all writers
+  stopped and a fresh no-clobber rollback path. Neither `doctor` nor service
+  startup may infer backup authority or auto-migrate.
 - Approval, Task Graph, Workflow, and Human Handoff SQLite reads apply their
   declared payload and identity bounds before text materialization; index/body
   and aggregate invariants are still revalidated after decoding.

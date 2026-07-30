@@ -21,7 +21,7 @@ use crate::{
     json::{BoundedJsonError, bounded_serialized_size, to_bounded_json_vec, validate_value_shape},
     kernel::{now_ms, validate_capability_name},
     runtime::ApprovalHandler,
-    sqlite::{bounded_optional_text, bounded_text},
+    sqlite::{bounded_optional_text, bounded_text, open_read_only},
 };
 
 /// Current durable Approval Inbox record schema.
@@ -340,6 +340,26 @@ pub struct SqliteApprovalInbox {
 }
 
 impl SqliteApprovalInbox {
+    /// Validates one existing Approval database without creating or mutating it.
+    ///
+    /// Missing paths are errors. An existing empty database remains eligible
+    /// for first-open bootstrap.
+    pub async fn validate_existing(path: impl AsRef<Path>) -> Result<(), HarnessError> {
+        let path = path.as_ref().to_owned();
+        task::spawn_blocking(move || {
+            let connection =
+                open_read_only(&path).map_err(|error| HarnessError::Approval(error.to_string()))?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|error| HarnessError::Approval(error.to_string()))?;
+            validate_or_bootstrap_store(&connection)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::Approval(format!("SQLite validation task failed: {error}"))
+        })?
+    }
+
     /// Opens or creates an inbox with WAL and full synchronous durability.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();

@@ -59,6 +59,12 @@ yh doctor
 yh serve
 ```
 
+`yh doctor` performs a read-only preflight of every existing authoritative
+SQLite store before it constructs external capabilities. It reports each store
+as `ready` or `will be created`; it never creates, bootstraps, or migrates a
+database. A legacy store fails with the exact backup-first migration command
+that must be run after all writers are stopped.
+
 `yh serve` is a headless Protocol v28 JSONL service over stdin/stdout. It
 persists State, approvals, Task coordination, Workflow Runs, and Human
 Handoffs under `.y-harness/`. A
@@ -385,10 +391,11 @@ and token/byte charges.
 
 Populated schema-1 through schema-13 SQLite
 databases require an offline, backup-first migration before the current
-Runtime opens them:
+Runtime opens them. `yh doctor` detects this incompatibility without modifying
+the database:
 
 ```bash
-cargo run -- state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never

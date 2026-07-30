@@ -1,6 +1,15 @@
 //! Shared guards for values crossing the SQLite allocation boundary.
 
-use rusqlite::{Row, types::Type};
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags, Row, types::Type};
+
+/// Opens an existing SQLite database without create or write authority.
+pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.pragma_update(None, "query_only", true)?;
+    Ok(connection)
+}
 
 /// Reads one SQLite `TEXT` value only after its byte length is within policy.
 ///

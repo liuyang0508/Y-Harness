@@ -230,6 +230,13 @@ yh doctor
 yh serve
 ```
 
+`yh doctor` and `yh serve` now preflight existing State, Approval, Task,
+Workflow, and Human Handoff SQLite stores through the concrete adapters before
+constructing external capabilities. Diagnosis is read-only, reports each store
+as ready or eligible for creation, never auto-migrates, and preserves the
+explicit backup-first operator boundary. Service open repeats authoritative
+validation. This changes no durable or Protocol coordinate.
+
 ## Compatibility
 
 - Rust crate: `0.1.0`
