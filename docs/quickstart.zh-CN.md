@@ -81,7 +81,7 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v30 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v31 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
 
@@ -110,9 +110,9 @@ my-harness/
 迁移数据库或生成备份。旧版、残缺、未知 Schema 会在任何外部 Model、
 MCP 或 Memory 进程启动前失败关闭，并给出对应迁移命令。
 
-## 4. 运行 Protocol v30 服务
+## 4. 运行 Protocol v31 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v30 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v31 帧：
 
 ```bash
 yh serve y-harness.json
@@ -123,7 +123,7 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"30","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"31","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
 

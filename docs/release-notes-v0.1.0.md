@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v30 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v31 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -83,6 +83,14 @@ Workspace or executor entry, survives retry and settlement, and is
 tenant-exact. Once a Task enters bound mode, an unbound retry fails closed.
 Schema-1/schema-2 stores migrate backup-first; schema-2 tenant ownership is
 preserved and old rows cannot claim new evidence.
+Task Graph schema 4 and Protocol 31 add bounded canonical execution-capability
+requirements to immutable Task definitions. A trusted embedded Orchestrator
+claims only when its exact capability set contains every requirement. Legacy
+claim paths and protocol Workers use an empty capability set, so they cannot
+bypass specialized Tasks or self-assert authority. Schema-1/schema-2/schema-3
+stores migrate backup-first; historical ownership and attempt bindings are
+preserved, requirements remain empty without inference, and old-schema
+capability smuggling fails closed.
 State/snapshot schema 14 and Protocol 26 add optional Runtime-bound Connector
 evidence. Evidence-aware in-process Tools report only bounded source claims;
 Runtime supplies registered Tool/origin, trusted actor/tenant, and the exact
@@ -162,7 +170,7 @@ policy. Omission remains disabled; opt-in polling uses the fixed service
 Authority, skip-missed cadence, bounded health diagnostics, and
 Temporal-before-Protocol-before-MCP shutdown.
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v30. Format/store schema 1 pins immutable component snapshots and a
+Protocol v31. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its
@@ -297,10 +305,10 @@ validation. This changes no durable or Protocol coordinate.
 - optional TUI package: `0.1.0`
 - optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `30`
+- client protocol: `31`
 - State event/snapshot schema: `14` / `14`
 - Approval Inbox schema: `3`
-- Task Coordinator schema: `3`
+- Task Coordinator schema: `4`
 - Workflow Coordinator schema: `1`
 - Human Handoff Coordinator schema: `1`
 - Effect Ledger schema: `1`

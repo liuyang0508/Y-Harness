@@ -52,6 +52,7 @@ fn stdio_server_preserves_one_response_per_request_and_stdout_purity() {
                     dependencies: Default::default(),
                     priority: 0,
                     workspace: WorkspaceMode::None,
+                    required_capabilities: Default::default(),
                 }],
             },
         },
@@ -251,7 +252,7 @@ async fn task_migration_cli_preserves_legacy_graphs_as_unscoped() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(backup.is_file());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Task Graph schema 1 -> 3"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Task Graph schema 1 -> 4"));
 
     let coordinator = SqliteTaskCoordinator::open(&source)
         .await

@@ -65,7 +65,7 @@ as `ready` or `will be created`; it never creates, bootstraps, or migrates a
 database. A legacy store fails with the exact backup-first migration command
 that must be run after all writers are stopped.
 
-`yh serve` is a headless Protocol v30 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v31 JSONL service over stdin/stdout. It
 persists State, approvals, Task coordination, Workflow Runs, and Human
 Handoffs, and durable external Effects under `.y-harness/`. A
 language-neutral Task Worker example is included:
@@ -102,7 +102,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v30 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v31 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -227,7 +227,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v30 specification](docs/protocol.md).
+[client protocol v31 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -580,22 +580,26 @@ Interrupted-Turn recovery keeps durable orphaning atomic without bulk-loading
 every approval body: SQLite selects a bounded identity set, then validates and
 updates one record at a time inside the same immediate transaction.
 
-Task Graph schema 3 binds the complete Graph aggregate—including leases,
-messages, Artifacts, and append-only governed attempt evidence—to the trusted
-optional tenant. Tenant is part of the Memory/SQLite Graph key, so the same
-caller-selected Graph ID may exist in different tenant namespaces. Every
-protocol lifecycle operation uses exact tenant equality. Existing schema-1 or
-schema-2 databases require an offline, backup-first migration; schema-1
-Graphs remain explicitly unscoped and schema-2 ownership is preserved:
+Task Graph schema 4 binds the complete Graph aggregate—including leases,
+messages, Artifacts, append-only governed attempt evidence, and immutable
+bounded execution-capability requirements—to the trusted optional tenant.
+Tenant is part of the Memory/SQLite Graph key, so the same caller-selected
+Graph ID may exist in different tenant namespaces. Every protocol lifecycle
+operation uses exact tenant equality. Existing schema-1, schema-2, or schema-3
+databases require an offline, backup-first migration; historical ownership and
+schema-3 attempt bindings are preserved, while old Tasks receive empty
+capability requirements without inference:
 
 ```bash
 yh task-migrate \
   /absolute/path/tasks.db \
-  /absolute/path/tasks-v2.rollback.db
+  /absolute/path/tasks-v3.rollback.db
 ```
 
 See the [Task migration runbook](docs/task-migration.md) and
-[ADR 0119](docs/adr/0119-durable-task-graph-tenant-ownership.md).
+[ADR 0119](docs/adr/0119-durable-task-graph-tenant-ownership.md),
+[ADR 0123](docs/adr/0123-durable-task-attempt-execution-binding.md), and
+[ADR 0142](docs/adr/0142-typed-task-execution-capability-matching.md).
 
 Secret Provider API 3 receives the same trusted authority used by State,
 Policy, Tool, Approval, Task, and Effect execution. `SecretUseContext`
@@ -999,7 +1003,7 @@ Dispatch-governor semantics and their cross-store non-claims are fixed by
 [ADR 0141](docs/adr/0141-durable-effect-dispatch-governance.md).
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v30 preserves Protocol v29's 2 MiB request and 16 MiB
+protocol. Protocol v31 preserves Protocol v30's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -1040,7 +1044,10 @@ tenant-scoped idempotency uniqueness, finite worker leases, fail-closed
 unknown outcomes, explicit reconciliation, and content-free external receipts.
 Protocol 30 advertises Secret Provider API 3 and its typed Turn, Effect, and
 service use contexts; it adds no Secret-bearing client command or durable
-schema.
+schema. Protocol 31 advertises Task Graph schema 4 and its bounded immutable
+execution-capability requirements. Remote protocol workers cannot self-assert
+capabilities and therefore claim only universal Tasks; trusted embedded
+Orchestrators may install exact capability sets.
 Temporal Driver API 2 may convert expired exact leases to `unknown`; it never
 requeues or executes the effect. Steering requires the exact active Turn,
 invalidates crossed provisional Model output, and never executes
@@ -1141,7 +1148,7 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v30. The Sessions panel shows direct fork ancestry from
+through Protocol v31. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's

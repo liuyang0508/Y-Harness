@@ -24,6 +24,7 @@ async fn main() -> Result<(), HarnessError> {
                 dependencies: BTreeSet::new(),
                 priority: 0,
                 workspace: WorkspaceMode::None,
+                required_capabilities: Default::default(),
             }])?,
         )
         .await?;

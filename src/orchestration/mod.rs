@@ -28,6 +28,7 @@ pub use workspace::{
 
 const MAX_TASKS: usize = 10_000;
 const MAX_CLAIMS_PER_BATCH: usize = 64;
+const MAX_TASK_CAPABILITIES: usize = 64;
 const MAX_DEPENDENCIES_PER_TASK: usize = 1_024;
 const MAX_ARTIFACTS_PER_COMPLETION: usize = 1_024;
 const MAX_MESSAGES: usize = 100_000;
@@ -56,6 +57,7 @@ pub enum WorkspaceMode {
 
 /// Immutable Task definition inside one dependency graph.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskDefinition {
     /// Stable Task identity.
     pub id: TaskId,
@@ -67,6 +69,99 @@ pub struct TaskDefinition {
     pub priority: i32,
     /// Required workspace isolation.
     pub workspace: WorkspaceMode,
+    /// Exact execution capabilities a trusted Worker must possess.
+    #[serde(default, skip_serializing_if = "TaskCapabilitySet::is_empty")]
+    pub required_capabilities: TaskCapabilitySet,
+}
+
+/// Canonical, bounded set of Task execution capabilities.
+///
+/// Task authors use this type for requirements. Embedding hosts use the same
+/// type for trusted Worker capabilities; remote workers must not self-assert
+/// the set across an unauthenticated or ungoverned boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TaskCapabilitySet(BTreeSet<String>);
+
+impl TaskCapabilitySet {
+    /// Creates and validates one exact capability set.
+    pub fn new<I, S>(capabilities: I) -> Result<Self, HarnessError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut values = BTreeSet::new();
+        for capability in capabilities {
+            let capability = capability.into();
+            if !values.insert(capability) {
+                return Err(HarnessError::InvalidCapability(
+                    "duplicate Task execution capability".to_owned(),
+                ));
+            }
+        }
+        let capabilities = Self(values);
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+
+    /// Returns an empty set suitable for universally executable Tasks.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Returns capabilities in canonical lexical order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    /// Returns the number of distinct capabilities.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns whether this Worker set satisfies every required capability.
+    #[must_use]
+    pub fn satisfies(&self, requirements: &Self) -> bool {
+        requirements.0.is_subset(&self.0)
+    }
+
+    fn validate(&self) -> Result<(), HarnessError> {
+        if self.0.len() > MAX_TASK_CAPABILITIES {
+            return Err(HarnessError::InvalidCapability(format!(
+                "Task capability set exceeds {MAX_TASK_CAPABILITIES} entries"
+            )));
+        }
+        for capability in &self.0 {
+            validate_capability_name("Task execution capability", capability)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskCapabilitySet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = Vec::<String>::deserialize(deserializer)?;
+        let original_len = decoded.len();
+        let capabilities = Self(decoded.into_iter().collect());
+        if capabilities.len() != original_len {
+            return Err(D::Error::custom(
+                "Task capability set contains duplicate entries",
+            ));
+        }
+        capabilities.validate().map_err(D::Error::custom)?;
+        Ok(capabilities)
+    }
 }
 
 /// Fenced ownership grant for one running Task attempt.
@@ -376,6 +471,16 @@ impl TaskGraph {
     /// Returns currently schedulable Task identities in claim order.
     #[must_use]
     pub fn ready(&self) -> Vec<TaskId> {
+        self.ready_matching(None)
+    }
+
+    /// Returns currently schedulable Tasks supported by one trusted Worker.
+    #[must_use]
+    pub fn ready_for(&self, worker_capabilities: &TaskCapabilitySet) -> Vec<TaskId> {
+        self.ready_matching(Some(worker_capabilities))
+    }
+
+    fn ready_matching(&self, worker_capabilities: Option<&TaskCapabilitySet>) -> Vec<TaskId> {
         let mut ready = self
             .tasks
             .values()
@@ -385,6 +490,9 @@ impl TaskGraph {
                         self.tasks.get(dependency).is_some_and(|dependency| {
                             matches!(dependency.status, TaskStatus::Completed { .. })
                         })
+                    })
+                    && worker_capabilities.is_none_or(|capabilities| {
+                        capabilities.satisfies(&record.definition.required_capabilities)
                     })
             })
             .map(|record| (record.definition.priority, record.definition.id.clone()))
@@ -405,7 +513,35 @@ impl TaskGraph {
         lease_duration_ms: u64,
         maximum: usize,
     ) -> Result<Vec<TaskClaim>, HarnessError> {
-        self.claim_ready_with_binding(owner, now_ms, lease_duration_ms, maximum, None)
+        let capabilities = TaskCapabilitySet::empty();
+        self.claim_ready_with_binding_and_capabilities(
+            owner,
+            now_ms,
+            lease_duration_ms,
+            maximum,
+            None,
+            &capabilities,
+        )
+    }
+
+    /// Claims only Tasks whose exact requirements are satisfied by one trusted
+    /// Worker capability set.
+    pub fn claim_ready_with_capabilities(
+        &mut self,
+        owner: &str,
+        now_ms: u64,
+        lease_duration_ms: u64,
+        maximum: usize,
+        worker_capabilities: &TaskCapabilitySet,
+    ) -> Result<Vec<TaskClaim>, HarnessError> {
+        self.claim_ready_with_binding_and_capabilities(
+            owner,
+            now_ms,
+            lease_duration_ms,
+            maximum,
+            None,
+            worker_capabilities,
+        )
     }
 
     /// Releases expired leases, propagates blocked dependencies, and claims
@@ -422,7 +558,50 @@ impl TaskGraph {
         maximum: usize,
         execution_binding: Option<&ExecutionBinding>,
     ) -> Result<Vec<TaskClaim>, HarnessError> {
+        let capabilities = TaskCapabilitySet::empty();
+        self.claim_ready_with_binding_and_capabilities(
+            owner,
+            now_ms,
+            lease_duration_ms,
+            maximum,
+            execution_binding,
+            &capabilities,
+        )
+    }
+
+    /// Claims only capability-compatible work under one trusted execution
+    /// coordinate.
+    pub fn claim_ready_with_binding_and_capabilities(
+        &mut self,
+        owner: &str,
+        now_ms: u64,
+        lease_duration_ms: u64,
+        maximum: usize,
+        execution_binding: Option<&ExecutionBinding>,
+        worker_capabilities: &TaskCapabilitySet,
+    ) -> Result<Vec<TaskClaim>, HarnessError> {
+        self.claim_ready_governed(
+            owner,
+            now_ms,
+            lease_duration_ms,
+            maximum,
+            execution_binding,
+            worker_capabilities,
+        )
+        .map(|(claims, _)| claims)
+    }
+
+    pub(crate) fn claim_ready_governed(
+        &mut self,
+        owner: &str,
+        now_ms: u64,
+        lease_duration_ms: u64,
+        maximum: usize,
+        execution_binding: Option<&ExecutionBinding>,
+        worker_capabilities: &TaskCapabilitySet,
+    ) -> Result<(Vec<TaskClaim>, bool), HarnessError> {
         validate_capability_name("worker", owner)?;
+        worker_capabilities.validate()?;
         if let Some(binding) = execution_binding {
             binding.validate()?;
         }
@@ -444,6 +623,7 @@ impl TaskGraph {
                 | TaskStatus::Blocked { .. } => false,
             };
             let claimable_after_maintenance = can_enter_pending
+                && worker_capabilities.satisfies(&record.definition.required_capabilities)
                 && record.definition.dependencies.iter().all(|dependency| {
                     self.tasks.get(dependency).is_some_and(|dependency| {
                         matches!(dependency.status, TaskStatus::Completed { .. })
@@ -479,6 +659,7 @@ impl TaskGraph {
                 !blocked_ids.contains(&record.definition.id)
                     && (record.status == TaskStatus::Pending
                         || expired.contains(&record.definition.id))
+                    && worker_capabilities.satisfies(&record.definition.required_capabilities)
                     && record.definition.dependencies.iter().all(|dependency| {
                         self.tasks.get(dependency).is_some_and(|dependency| {
                             matches!(dependency.status, TaskStatus::Completed { .. })
@@ -561,8 +742,9 @@ impl TaskGraph {
                 execution_binding: execution_binding.cloned(),
             });
         }
+        let changed = !mutations.is_empty();
         self.apply_task_mutations(mutations)?;
-        Ok(claims)
+        Ok((claims, changed))
     }
 
     /// Extends the current lease while preserving its fencing token.
@@ -1255,6 +1437,7 @@ fn current_lease<'a>(
 
 fn validate_task_definition(definition: &TaskDefinition) -> Result<(), HarnessError> {
     validate_task_id(&definition.id)?;
+    definition.required_capabilities.validate()?;
     if definition.dependencies.len() > MAX_DEPENDENCIES_PER_TASK {
         return Err(HarnessError::Orchestration(format!(
             "Task {} exceeds {MAX_DEPENDENCIES_PER_TASK} dependencies",
@@ -1374,7 +1557,9 @@ fn validate_acyclic(tasks: &BTreeMap<TaskId, TaskRecord>) -> Result<(), HarnessE
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{TaskCompletion, TaskDefinition, TaskGraph, TaskStatus, WorkspaceMode};
+    use super::{
+        TaskCapabilitySet, TaskCompletion, TaskDefinition, TaskGraph, TaskStatus, WorkspaceMode,
+    };
     use crate::{ExecutionBinding, HarnessError, TaskId};
 
     fn task(id: &'static str, dependencies: &[&'static str], priority: i32) -> TaskDefinition {
@@ -1387,6 +1572,7 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             priority,
             workspace: WorkspaceMode::Isolated,
+            required_capabilities: Default::default(),
         }
     }
 
@@ -1401,6 +1587,100 @@ mod tests {
             None,
         )
         .expect("execution binding")
+    }
+
+    #[test]
+    fn capability_sets_are_canonical_bounded_and_strict() {
+        let capabilities =
+            TaskCapabilitySet::new(["browser.read", "code.rust"]).expect("capabilities");
+        assert_eq!(
+            capabilities.iter().collect::<Vec<_>>(),
+            vec!["browser.read", "code.rust"]
+        );
+        assert!(TaskCapabilitySet::new(["code.rust", "code.rust"]).is_err());
+        assert!(TaskCapabilitySet::new(["bad capability"]).is_err());
+        assert!(serde_json::from_str::<TaskCapabilitySet>(r#"["code.rust","code.rust"]"#).is_err());
+        assert!(
+            TaskCapabilitySet::new(
+                (0..=super::MAX_TASK_CAPABILITIES).map(|index| { format!("capability.{index}") })
+            )
+            .is_err()
+        );
+
+        let mut definition = task("typed", &[], 0);
+        definition.required_capabilities = capabilities;
+        let encoded = serde_json::to_value(&definition).expect("encode definition");
+        assert_eq!(
+            encoded.get("required_capabilities"),
+            Some(&serde_json::json!(["browser.read", "code.rust"]))
+        );
+        let mut unknown = encoded;
+        unknown
+            .as_object_mut()
+            .expect("Task definition object")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<TaskDefinition>(unknown).is_err());
+    }
+
+    #[test]
+    fn claims_require_every_trusted_worker_capability() {
+        let mut universal = task("universal", &[], 1);
+        universal.required_capabilities = TaskCapabilitySet::empty();
+        let mut rust = task("rust", &[], 3);
+        rust.required_capabilities =
+            TaskCapabilitySet::new(["code.rust"]).expect("Rust requirement");
+        let mut browser_rust = task("browser-rust", &[], 4);
+        browser_rust.required_capabilities = TaskCapabilitySet::new(["browser.read", "code.rust"])
+            .expect("browser and Rust requirements");
+        let mut graph = TaskGraph::new(vec![universal, rust, browser_rust]).expect("graph");
+
+        let unqualified = graph
+            .claim_ready("unqualified", 100, 50, 3)
+            .expect("unqualified claim");
+        assert_eq!(unqualified.len(), 1);
+        assert_eq!(unqualified[0].task.id.as_str(), "universal");
+
+        let rust_capabilities = TaskCapabilitySet::new(["code.rust"]).expect("worker capabilities");
+        let rust_claim = graph
+            .claim_ready_with_capabilities("rust-worker", 100, 50, 3, &rust_capabilities)
+            .expect("Rust claim");
+        assert_eq!(rust_claim.len(), 1);
+        assert_eq!(rust_claim[0].task.id.as_str(), "rust");
+
+        let all_capabilities =
+            TaskCapabilitySet::new(["browser.read", "code.rust"]).expect("worker capabilities");
+        let browser_claim = graph
+            .claim_ready_with_capabilities("browser-worker", 100, 50, 3, &all_capabilities)
+            .expect("browser claim");
+        assert_eq!(browser_claim.len(), 1);
+        assert_eq!(browser_claim[0].task.id.as_str(), "browser-rust");
+    }
+
+    #[test]
+    fn maintenance_only_claim_reports_a_durable_graph_change() {
+        let mut definition = task("specialized", &[], 0);
+        definition.required_capabilities =
+            TaskCapabilitySet::new(["code.rust"]).expect("requirement");
+        let mut graph = TaskGraph::new(vec![definition]).expect("graph");
+        let rust = TaskCapabilitySet::new(["code.rust"]).expect("capabilities");
+        let first = graph
+            .claim_ready_with_capabilities("rust-worker", 100, 10, 1, &rust)
+            .expect("first claim")
+            .remove(0);
+        assert!(matches!(
+            graph.task(&first.task.id).map(|record| &record.status),
+            Some(TaskStatus::Running { .. })
+        ));
+
+        let (claims, changed) = graph
+            .claim_ready_governed("unqualified", 111, 10, 1, None, &TaskCapabilitySet::empty())
+            .expect("maintenance");
+        assert!(claims.is_empty());
+        assert!(changed);
+        assert!(matches!(
+            graph.task(&first.task.id).map(|record| &record.status),
+            Some(TaskStatus::Pending)
+        ));
     }
 
     #[test]
@@ -1631,6 +1911,7 @@ mod tests {
             dependencies: [dependency.clone()].into_iter().collect(),
             priority: 0,
             workspace: WorkspaceMode::Isolated,
+            required_capabilities: Default::default(),
         };
         let pending = super::TaskRecord {
             definition: definition.clone(),

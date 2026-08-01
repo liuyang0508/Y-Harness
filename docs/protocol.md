@@ -1,10 +1,10 @@
-# Client protocol v30
+# Client protocol v31
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"30"` is exact. Every request carries that value, and a peer
+Protocol version `"31"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "30",
+  "protocol_version": "31",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "30",
+  "protocol_version": "31",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "30",
+  "protocol_version": "31",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "30",
+  "protocol_version": "31",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "30",
+  "protocol_version": "31",
   "body": {
     "status": "success",
     "result": {
@@ -137,7 +137,7 @@ The result type is `initialized`:
         "state_event_schema": 14,
         "state_snapshot_schema": 14,
         "approval_inbox_schema": 3,
-        "task_graph_schema": 3,
+        "task_graph_schema": 4,
         "workflow_run_schema": 1,
         "human_handoff_schema": 1,
         "effect_ledger_schema": 1,
@@ -488,13 +488,18 @@ A Task definition has this public domain shape:
   "description": "Compile the workspace",
   "dependencies": ["prepare"],
   "priority": 10,
-  "workspace": "isolated"
+  "workspace": "isolated",
+  "required_capabilities": ["code.rust"]
 }
 ```
 
 `workspace` is `none`, `isolated`, or `shared_read_only`. The graph validates
-identity uniqueness, dependency existence, and acyclicity before it is made
-durable. `get_task_graph` returns either `null` or bounded metadata:
+identity uniqueness, dependency existence, acyclicity, and at most 64 distinct
+validated execution-capability names before it is made durable.
+`required_capabilities` is optional; omission means that any authenticated
+worker may execute the Task. Matching is exact set containment rather than
+substring, prefix, or wildcard matching. `get_task_graph` returns either
+`null` or bounded metadata:
 
 ```json
 {
@@ -529,7 +534,12 @@ lowercase SHA-256 client-certificate fingerprint for mTLS. No request field can
 select or override that worker identity or author an execution binding.
 Protocol-owned claims are unbound; they fail closed rather than take over a
 Task that previously entered governed bound mode through an embedded
-Orchestrator. A successful result includes the
+Orchestrator. Protocol workers also cannot self-assert execution capabilities:
+the current protocol claim surface can claim only Tasks with an empty
+`required_capabilities` set. A trusted embedded host may configure an
+`Orchestrator` capability set; a future remote Worker Registry must bind
+capabilities to authenticated deployment evidence before exposing equivalent
+remote claims. A successful result includes the
 durable graph revision, derived worker, and fenced claims:
 
 ```json
@@ -764,7 +774,7 @@ A new command against a stale revision returns retryable `effect_conflict`.
 The ledger does not itself authorize, execute, retry, compensate, or verify a
 business action.
 
-Temporal Driver API 2 is an embedded host API, not a Protocol v30 command or
+Temporal Driver API 2 is an embedded host API, not a Protocol v31 command or
 capability. A host may invoke one bounded tick with trusted authority and time
 to discover due Workflow waits, expired Handoff claims, and expired Effect
 leases, then reuse the existing fenced domain commands. The reference
@@ -1132,7 +1142,7 @@ observable through this protocol requires the compatibility action defined in
 
 ## Bounds and retention
 
-| Boundary | Protocol v30 value |
+| Boundary | Protocol v31 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
@@ -1172,7 +1182,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"30"` |
+| `unsupported_version` | Request protocol is not exactly `"31"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |

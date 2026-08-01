@@ -52,6 +52,7 @@ fn task(id: &'static str, dependencies: &[&'static str]) -> TaskDefinition {
             .collect::<BTreeSet<_>>(),
         priority: 0,
         workspace: WorkspaceMode::Isolated,
+        required_capabilities: Default::default(),
     }
 }
 

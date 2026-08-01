@@ -51,7 +51,7 @@ use workflow::WorkflowProtocolService;
 pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "30";
+pub const PROTOCOL_VERSION: &str = "31";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -2892,12 +2892,12 @@ mod tests {
         MemoryWorkflowCoordinator, ModelContinuation, ModelEventSink, ModelOutput, ModelRequest,
         ModelResponse, ModelStream, ModelStreamEvent, OperationId, PendingEvent, PolicyDecision,
         PolicyEngine, RiskLevel, SnapshotMaintenanceConfig, StateCapacityLevel, StateEngine,
-        StateEvent, StateSnapshot, StoredEvent, TaskCompletion, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, Thread, ThreadId, Tool,
-        ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
-        ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome, WorkflowCommand,
-        WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest, WorkflowDefinition,
-        WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
+        StateEvent, StateSnapshot, StoredEvent, TaskCapabilitySet, TaskCompletion, TaskCoordinator,
+        TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, TaskStatus, Thread,
+        ThreadId, Tool, ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext,
+        ToolDescriptor, ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome,
+        WorkflowCommand, WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest,
+        WorkflowDefinition, WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -3281,11 +3281,12 @@ mod tests {
                 .collect(),
             priority: 0,
             workspace: WorkspaceMode::None,
+            required_capabilities: Default::default(),
         }
     }
 
     #[test]
-    fn protocol_thirty_wire_envelopes_and_permissions_are_stable() {
+    fn protocol_thirty_one_wire_envelopes_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -3293,14 +3294,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "30",
+                "protocol_version": "31",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "30",
+                "protocol_version": "31",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -3309,7 +3310,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "30",
+                "protocol_version": "31",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -3331,7 +3332,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "30",
+                "protocol_version": "31",
                 "body": {
                     "status": "success",
                     "result": {
@@ -3441,7 +3442,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "30",
+                "protocol_version": "31",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",
@@ -4277,6 +4278,85 @@ mod tests {
                     ..
                 }
             } if code == "invalid_request"
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_workers_cannot_self_assert_capabilities_and_persist_maintenance_only_claims()
+    {
+        let coordinator = Arc::new(MemoryTaskCoordinator::new());
+        let graph_id = TaskGraphId::from_static("graph-capability-protocol");
+        let mut definition = task_definition("task-specialized", &[]);
+        definition.required_capabilities =
+            TaskCapabilitySet::new(["code.rust"]).expect("requirements");
+        let configured =
+            handler(Arc::new(ImmediateModel)).with_task_coordinator(coordinator.clone());
+        let create_response = configured
+            .handle(request(
+                "create-specialized-graph",
+                ProtocolCommand::CreateTaskGraph {
+                    graph_id: graph_id.to_string(),
+                    definitions: vec![definition],
+                },
+            ))
+            .await;
+        assert!(matches!(
+            create_response.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TaskGraphCreated { .. }
+            }
+        ));
+        let mut running = coordinator
+            .load(&graph_id)
+            .await
+            .expect("load")
+            .expect("graph");
+        running
+            .graph_mut()
+            .claim_ready_with_capabilities(
+                "trusted-worker",
+                1,
+                1,
+                1,
+                &TaskCapabilitySet::new(["code.rust"]).expect("worker capabilities"),
+            )
+            .expect("trusted claim");
+        coordinator
+            .compare_and_swap(running)
+            .await
+            .expect("persist expired claim");
+
+        let response = configured
+            .handle(request(
+                "claim-without-server-profile",
+                ProtocolCommand::ClaimTasks {
+                    graph_id: graph_id.to_string(),
+                    lease_duration_ms: 1_000,
+                    maximum: Some(1),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            response.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TasksClaimed {
+                    revision: 3,
+                    ref claims,
+                    ..
+                }
+            } if claims.is_empty()
+        ));
+        let restored = coordinator
+            .load(&graph_id)
+            .await
+            .expect("load")
+            .expect("graph");
+        assert!(matches!(
+            restored
+                .graph()
+                .task(&TaskId::from_static("task-specialized"))
+                .map(|record| &record.status),
+            Some(TaskStatus::Pending)
         ));
     }
 
@@ -6722,6 +6802,7 @@ mod tests {
                             dependencies: BTreeSet::new(),
                             priority: 0,
                             workspace: WorkspaceMode::Isolated,
+                            required_capabilities: Default::default(),
                         }],
                     },
                 ),
@@ -6765,6 +6846,7 @@ mod tests {
                             dependencies: BTreeSet::new(),
                             priority: 0,
                             workspace: WorkspaceMode::Isolated,
+                            required_capabilities: Default::default(),
                         }],
                     },
                 ),

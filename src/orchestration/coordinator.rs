@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Current durable Task Coordinator graph schema.
-pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 3;
+pub const TASK_GRAPH_SCHEMA_VERSION: u32 = 4;
 
 /// Revisioned, durable Task Graph aggregate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -723,8 +723,8 @@ mod tests {
 
     use super::{MemoryTaskCoordinator, SqliteTaskCoordinator, TaskCoordinator};
     use crate::{
-        ActorIdentity, AuthorityContext, ExecutionBinding, HarnessError, TaskCompletion,
-        TaskDefinition, TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
+        ActorIdentity, AuthorityContext, ExecutionBinding, HarnessError, TaskCapabilitySet,
+        TaskCompletion, TaskDefinition, TaskGraph, TaskGraphId, TaskId, WorkspaceMode,
     };
 
     fn graph() -> TaskGraph {
@@ -734,6 +734,7 @@ mod tests {
             dependencies: BTreeSet::new(),
             priority: 0,
             workspace: WorkspaceMode::Isolated,
+            required_capabilities: Default::default(),
         }])
         .expect("graph")
     }
@@ -973,6 +974,51 @@ mod tests {
                 .graph()
                 .execution_binding_for_lease(&claim.lease.id),
             Some(&binding)
+        );
+        remove_database_files(&path);
+    }
+
+    #[tokio::test]
+    async fn task_capability_requirements_survive_sqlite_reopen() {
+        let path = temporary_database_path();
+        let coordinator = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("create current store");
+        let mut definition = graph()
+            .task(&TaskId::from_static("task-a"))
+            .expect("Task")
+            .definition
+            .clone();
+        definition.required_capabilities =
+            TaskCapabilitySet::new(["browser.read", "code.rust"]).expect("capability requirements");
+        let graph_id = TaskGraphId::from_static("graph-capabilities");
+        coordinator
+            .create(
+                graph_id.clone(),
+                TaskGraph::new(vec![definition]).expect("graph"),
+            )
+            .await
+            .expect("create graph");
+        drop(coordinator);
+
+        let reopened = SqliteTaskCoordinator::open(&path)
+            .await
+            .expect("reopen coordinator");
+        let restored = reopened
+            .load(&graph_id)
+            .await
+            .expect("load")
+            .expect("graph");
+        assert_eq!(
+            restored
+                .graph()
+                .task(&TaskId::from_static("task-a"))
+                .expect("Task")
+                .definition
+                .required_capabilities
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["browser.read", "code.rust"]
         );
         remove_database_files(&path);
     }

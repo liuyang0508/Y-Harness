@@ -128,7 +128,7 @@ control service must authenticate the actor and tenant, then use
 `DomainPackAuthorizer`. It must also produce truthful component inventories
 and keep installed components immutable for the binding lifetime.
 
-The current package is a Rust library, not a Protocol v30 command, CLI, remote
+The current package is a Rust library, not a Protocol v31 command, CLI, remote
 control-plane service, identity provider, registry, or automatic config
 mutator. It does not
 implement canary rollout, distributed fencing, quotas, retention, background

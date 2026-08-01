@@ -426,6 +426,7 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
                     dependencies: Default::default(),
                     priority: 0,
                     workspace: WorkspaceMode::None,
+                    required_capabilities: Default::default(),
                 }])
                 .expect("build Task Graph"),
             )
@@ -2554,6 +2555,7 @@ fn persistent_service_recovers_threads_tasks_workflows_handoffs_and_effects_afte
                         dependencies: Default::default(),
                         priority: 0,
                         workspace: WorkspaceMode::None,
+                        required_capabilities: Default::default(),
                     }],
                 },
             ),
@@ -2791,6 +2793,7 @@ fn fixed_tenant_service_binds_protocol_state_tasks_and_archives() {
                         dependencies: Default::default(),
                         priority: 0,
                         workspace: WorkspaceMode::None,
+                        required_capabilities: Default::default(),
                     }],
                 },
             ),

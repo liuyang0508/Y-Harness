@@ -11,11 +11,11 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"30"` | exact `Initialize` request/response |
+| Client protocol | `"31"` | exact `Initialize` request/response |
 | State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
 | State snapshots | `14` | cache body; incompatible caches are discarded |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
-| Task Coordinator | `3` | per-graph SQLite schema column |
+| Task Coordinator | `4` | per-graph SQLite schema column |
 | Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
 | Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
 | Effect Ledger | `1` | store metadata plus per-Effect SQLite schema column |
@@ -244,6 +244,16 @@ preserves disabled behavior. See
 [ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
 Reference-host lifecycle semantics are specified by
 [ADR 0130](adr/0130-optional-reference-service-temporal-lifecycle.md).
+Client protocol `31` preserves protocol-v30 commands, framing, authority,
+permissions, and request/response ceilings. It advertises Task Graph schema 4
+and admits the optional bounded `required_capabilities` set on each immutable
+Task definition. Protocol claims cannot self-assert Worker capabilities and
+therefore claim only Tasks with empty requirements. Trusted embedded hosts may
+configure exact Worker capabilities on `Orchestrator`; remote matching awaits
+an authenticated Worker Registry rather than trusting request text. The public
+pre-1.0 `TaskDefinition` Rust struct adds the field, so external struct literals
+must initialize it, normally with `TaskCapabilitySet::empty()`.
+
 Client protocol `30` preserves protocol-v29 commands, framing, authority,
 permissions, durable coordinates, and request/response ceilings. It advances
 the advertised Secret Provider coordinate to API 3 for typed Agent-Turn,
@@ -375,6 +385,15 @@ advertises Task schema 3. Schema-1/schema-2 SQLite stores require the explicit
 backup-first migration; schema-2 ownership is preserved without inventing
 historical attempt evidence. See
 [ADR 0123](adr/0123-durable-task-attempt-execution-binding.md).
+Task Graph schema 4 additively records a canonical set of at most 64 exact
+execution-capability requirements on every immutable Task definition. Empty
+requirements preserve the universal schema-3 behavior. Capability-aware
+claims require the Worker set to contain every Task requirement; legacy claim
+entry points use an empty set and cannot bypass specialized Tasks. The
+backup-first migration accepts schema 1, 2, or 3, preserves schema-3 attempt
+bindings exactly, assigns empty requirements without inference, and rejects
+new capability data smuggled under an old schema coordinate. See
+[ADR 0142](adr/0142-typed-task-execution-capability-matching.md).
 The optional Domain Pack crate adds an authorization port, exact action and
 request types, bounded reference roles, an exact actor/tenant grant model, an
 authorized Store adapter, and a `Forbidden` error. These are additive Rust
@@ -892,24 +911,26 @@ explicitly data-losing recovery afterward.
 See the [Approval migration runbook](approval-migration.md) and
 [ADR 0063](adr/0063-attributed-separation-of-duty-approvals.md).
 
-Task Graph schema 1 or schema 2 is independently migrated with:
+Task Graph schema 1, schema 2, or schema 3 is independently migrated with:
 
 ```bash
 yh task-migrate \
   /absolute/path/tasks.db \
-  /absolute/path/tasks-v2.rollback.db
+  /absolute/path/tasks-v3.rollback.db
 ```
 
 All Task Coordinator writers must be stopped. The migration validates and
 fingerprints every bounded Graph, creates a no-clobber backup, retains every
-lifecycle, lease, message, and artifact, and writes schema-3 aggregates.
-Schema-1 Graphs become explicitly unscoped; schema-2 tenant ownership remains
-exact. Neither path invents historical Task-attempt binding evidence. A
-schema-2 body that claims schema-3 binding evidence fails closed. The earlier
-unreleased table without a version column is accepted as the same schema-1
-source shape. Old writers must not access a migrated store, and rollback is
-supported only by restoring the backup before any schema-3 write. See the
-[Task migration runbook](task-migration.md).
+lifecycle, lease, message, artifact, and schema-3 attempt binding, and writes
+schema-4 aggregates. Schema-1 Graphs become explicitly unscoped; schema-2 and
+schema-3 tenant ownership remains exact. No path invents historical
+Task-attempt binding or capability requirements. A schema-2 body that claims
+schema-3 binding evidence, or any old-schema body that claims schema-4
+capability requirements, fails closed. The earlier unreleased table without a
+version column is accepted as the same schema-1 source shape. Old writers must
+not access a migrated store, and rollback is supported only by restoring the
+backup before any schema-4 write. See the [Task migration
+runbook](task-migration.md).
 
 Workflow Run schema 1 is a new independent store. `yh serve` creates
 `workflows.db` only when neither metadata nor Run tables exist. A partial
@@ -945,10 +966,10 @@ minor release when doing so does not preserve a security defect. Protocol and
 durable schema support windows are declared per release. State schema 14 reads
 immutable schema-1 through schema-13 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
-reads schema 1 and schema 2. Task coordination reads only schema 3 in normal
-operation; `task-migrate` alone reads schema 1, schema 2, and the earlier
-unversioned development layout. Workflow coordination reads only its first
-schema 1.
+reads schema 1 and schema 2. Task coordination reads only schema 4 in normal
+operation; `task-migrate` alone reads schema 1, schema 2, schema 3, and the
+earlier unversioned development layout. Workflow coordination reads only its
+first schema 1.
 
 The MSRV is Rust 1.88.0 and is enforced in CI. Platform support is proven only
 where the exact release commit has green jobs; configuration alone is not

@@ -950,6 +950,7 @@ mod tests {
             dependencies: BTreeSet::new(),
             priority: 0,
             workspace: WorkspaceMode::None,
+            required_capabilities: Default::default(),
         }
     }
 

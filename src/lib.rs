@@ -138,12 +138,12 @@ pub use observability::{
 pub use orchestration::{
     DenyWorkspaceProvider, GitWorktreeWorkspaceProvider, LocalDirectoryWorkspaceProvider,
     MemoryTaskCoordinator, Orchestrator, SqliteTaskCoordinator, TASK_GRAPH_SCHEMA_VERSION,
-    TaskArtifact, TaskAttemptBinding, TaskClaim, TaskCompletion, TaskCoordinator, TaskDefinition,
-    TaskExecutionRequest, TaskExecutor, TaskGraph, TaskGraphSnapshot, TaskLease, TaskMailbox,
-    TaskMessage, TaskMessagePage, TaskMigrationReport, TaskMigrationStatus, TaskRecord, TaskStatus,
-    TaskWorkspace, WORKSPACE_PROVIDER_API_VERSION, WorkspaceDisposition, WorkspaceLease,
-    WorkspaceMode, WorkspaceProvider, WorkspaceProviderDescriptor, WorkspaceProvisioning,
-    WorkspaceRequest,
+    TaskArtifact, TaskAttemptBinding, TaskCapabilitySet, TaskClaim, TaskCompletion,
+    TaskCoordinator, TaskDefinition, TaskExecutionRequest, TaskExecutor, TaskGraph,
+    TaskGraphSnapshot, TaskLease, TaskMailbox, TaskMessage, TaskMessagePage, TaskMigrationReport,
+    TaskMigrationStatus, TaskRecord, TaskStatus, TaskWorkspace, WORKSPACE_PROVIDER_API_VERSION,
+    WorkspaceDisposition, WorkspaceLease, WorkspaceMode, WorkspaceProvider,
+    WorkspaceProviderDescriptor, WorkspaceProvisioning, WorkspaceRequest,
 };
 pub use protocol::{
     CompatibilityManifest, EffectListEntry, EffectListPage, EffectSummary, EffectTransitionPage,

@@ -13,8 +13,8 @@ use tokio::{
 };
 
 use super::{
-    DenyWorkspaceProvider, TaskClaim, TaskCompletion, TaskCoordinator, TaskGraph,
-    TaskGraphSnapshot, TaskMessage, TaskMessagePage, TaskStatus, TaskWorkspace,
+    DenyWorkspaceProvider, TaskCapabilitySet, TaskClaim, TaskCompletion, TaskCoordinator,
+    TaskGraph, TaskGraphSnapshot, TaskMessage, TaskMessagePage, TaskStatus, TaskWorkspace,
     WorkspaceDisposition, WorkspaceLease, WorkspaceProvider, WorkspaceProviderDescriptor,
     WorkspaceRequest,
     workspace::{validate_provider_descriptor, validate_workspace_lease},
@@ -175,6 +175,7 @@ pub struct Orchestrator {
     workspace_descriptor: WorkspaceProviderDescriptor,
     authority: AuthorityContext,
     execution_binding: Option<ExecutionBinding>,
+    worker_capabilities: TaskCapabilitySet,
 }
 
 impl Orchestrator {
@@ -201,6 +202,7 @@ impl Orchestrator {
             workspace_descriptor,
             authority: AuthorityContext::local_process(),
             execution_binding: None,
+            worker_capabilities: TaskCapabilitySet::empty(),
         })
     }
 
@@ -227,6 +229,17 @@ impl Orchestrator {
         self.authority = authority;
         self.execution_binding = execution_binding;
         Ok(self)
+    }
+
+    /// Installs the exact capabilities this trusted Worker may use for Task
+    /// claim matching.
+    ///
+    /// The embedding host must derive this set from its deployment or worker
+    /// registry. Task-authored input and unauthenticated remote requests are
+    /// not trusted capability evidence.
+    pub fn with_worker_capabilities(mut self, capabilities: TaskCapabilitySet) -> Self {
+        self.worker_capabilities = capabilities;
+        self
     }
 
     /// Installs one frozen Workspace Provider for all claims executed by this
@@ -442,14 +455,15 @@ impl Orchestrator {
             if snapshot.graph().is_terminal() {
                 return Ok(Vec::new());
             }
-            let claimed = snapshot.graph_mut().claim_ready_with_binding(
+            let (claimed, changed) = snapshot.graph_mut().claim_ready_governed(
                 &self.worker,
                 now_ms(),
                 lease_duration_ms,
                 maximum,
                 self.execution_binding.as_ref(),
+                &self.worker_capabilities,
             )?;
-            if claimed.is_empty() {
+            if !changed {
                 return Ok(claimed);
             }
             match self
@@ -874,9 +888,10 @@ mod tests {
     use crate::{
         ActorIdentity, AuthorityContext, CancellationToken, ExecutionBinding, HarnessError,
         HarnessFuture, LocalDirectoryWorkspaceProvider, MemoryTaskCoordinator,
-        SqliteTaskCoordinator, TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraph,
-        TaskGraphId, TaskId, TaskStatus, WorkspaceDisposition, WorkspaceLease, WorkspaceMode,
-        WorkspaceProvider, WorkspaceProviderDescriptor, WorkspaceProvisioning, WorkspaceRequest,
+        SqliteTaskCoordinator, TaskCapabilitySet, TaskCompletion, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskId, TaskStatus, WorkspaceDisposition, WorkspaceLease,
+        WorkspaceMode, WorkspaceProvider, WorkspaceProviderDescriptor, WorkspaceProvisioning,
+        WorkspaceRequest,
     };
 
     fn task(id: &'static str, dependencies: &[&'static str]) -> TaskDefinition {
@@ -897,6 +912,7 @@ mod tests {
                 .collect(),
             priority: 0,
             workspace,
+            required_capabilities: Default::default(),
         }
     }
 
@@ -1190,6 +1206,99 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(completion(&request.claim.task.id)) })
         }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_claims_only_tasks_supported_by_its_trusted_capabilities() {
+        let coordinator = Arc::new(MemoryTaskCoordinator::new());
+        let graph_id = TaskGraphId::from_static("graph-capability-match");
+        let mut definition = task("task-rust", &[]);
+        definition.required_capabilities =
+            TaskCapabilitySet::new(["code.rust"]).expect("requirements");
+        coordinator
+            .create(
+                graph_id.clone(),
+                TaskGraph::new(vec![definition]).expect("graph"),
+            )
+            .await
+            .expect("create graph");
+        let executor = Arc::new(CountingExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let snapshot = Orchestrator::new(coordinator, executor.clone(), "worker-capability-match")
+            .expect("orchestrator")
+            .with_worker_capabilities(
+                TaskCapabilitySet::new(["browser.read", "code.rust"]).expect("worker capabilities"),
+            )
+            .run(&graph_id, CancellationToken::new())
+            .await
+            .expect("terminal graph");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            snapshot
+                .graph()
+                .task(&TaskId::from_static("task-rust"))
+                .map(|record| &record.status),
+            Some(TaskStatus::Completed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_never_claims_an_unsupported_task() {
+        let coordinator = Arc::new(MemoryTaskCoordinator::new());
+        let graph_id = TaskGraphId::from_static("graph-capability-mismatch");
+        let mut definition = task("task-browser", &[]);
+        definition.required_capabilities =
+            TaskCapabilitySet::new(["browser.write"]).expect("requirements");
+        coordinator
+            .create(
+                graph_id.clone(),
+                TaskGraph::new(vec![definition]).expect("graph"),
+            )
+            .await
+            .expect("create graph");
+        let executor = Arc::new(CountingExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let orchestrator = Orchestrator::new(
+            coordinator.clone(),
+            executor.clone(),
+            "worker-capability-mismatch",
+        )
+        .expect("orchestrator")
+        .with_worker_capabilities(
+            TaskCapabilitySet::new(["code.rust"]).expect("worker capabilities"),
+        )
+        .with_timing(
+            Duration::from_secs(1),
+            Duration::from_secs(7),
+            Duration::from_millis(1),
+        )
+        .expect("timing");
+        let run = tokio::spawn(async move { orchestrator.run(&graph_id, cancellation).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stop.cancel();
+        run.await
+            .expect("join")
+            .expect_err("mismatched worker remains idle");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+        let snapshot = coordinator
+            .load(&TaskGraphId::from_static("graph-capability-mismatch"))
+            .await
+            .expect("load")
+            .expect("graph");
+        assert_eq!(snapshot.revision(), 1);
+        assert!(matches!(
+            snapshot
+                .graph()
+                .task(&TaskId::from_static("task-browser"))
+                .map(|record| &record.status),
+            Some(TaskStatus::Pending)
+        ));
     }
 
     #[tokio::test]

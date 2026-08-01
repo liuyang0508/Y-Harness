@@ -244,7 +244,7 @@ binding is committed with the exact lease before Workspace/executor entry,
 retained after expiry and settlement, and required on every later retry once
 governance begins.
 
-Domain Pack lifecycle remains deliberately outside Core and the v30 client
+Domain Pack lifecycle remains deliberately outside Core and the v31 client
 protocol. The embedding control service must authenticate the trusted actor
 and tenant, select the reference RBAC policy or provide an external
 authorizer, collect truthful component inventories, and keep the binding valid

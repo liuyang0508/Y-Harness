@@ -5,9 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthorityContext, HarnessError, TaskClaim, TaskCompletion, TaskCoordinator, TaskDefinition,
-    TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, TaskLease, TaskLeaseId, TaskMessage,
-    TaskMessagePage, TaskRecord, TaskStatus,
+    AuthorityContext, HarnessError, TaskCapabilitySet, TaskClaim, TaskCompletion, TaskCoordinator,
+    TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, TaskLease, TaskLeaseId,
+    TaskMessage, TaskMessagePage, TaskRecord, TaskStatus,
     json::{BoundedJsonError, bounded_serialized_size},
     kernel::now_ms,
 };
@@ -178,13 +178,18 @@ impl TaskProtocolService {
             )));
         }
         let mut last_conflict = None;
+        let worker_capabilities = TaskCapabilitySet::empty();
         for _ in 0..MAX_TASK_CAS_ATTEMPTS {
             let mut snapshot = self.load(graph_id, authority).await?;
-            let claims =
-                snapshot
-                    .graph_mut()
-                    .claim_ready(worker, now_ms(), lease_duration_ms, maximum)?;
-            if claims.is_empty() {
+            let (claims, changed) = snapshot.graph_mut().claim_ready_governed(
+                worker,
+                now_ms(),
+                lease_duration_ms,
+                maximum,
+                None,
+                &worker_capabilities,
+            )?;
+            if !changed {
                 return Ok((snapshot.revision(), claims));
             }
             match bounded_serialized_size(&claims, MAX_TASK_RECORD_PAGE_BYTES) {
