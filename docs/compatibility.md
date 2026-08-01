@@ -20,6 +20,7 @@ upgrade support that has not been tested.
 | Human Handoff Coordinator | `1` | store metadata plus per-Handoff SQLite schema column |
 | Effect Ledger | `1` | store metadata plus per-Effect SQLite schema column |
 | Governed Effect Executor API | `1` | exact embedded Connector descriptor; not a durable or client-protocol coordinate |
+| Effect dispatch governor API / schema | `1` / `1` | embedded admission/settlement port and independent optional SQLite store |
 | Governed Effect Reconciler API | `1` | exact embedded read-only Connector descriptor; not a durable or client-protocol coordinate |
 | JSON Effect Connector protocol | `1` | exact stdin/stdout process envelopes; no negotiation or fallback |
 | Temporal Driver API | `2` | exact embedded Rust API; not a durable or client-protocol coordinate |
@@ -305,6 +306,18 @@ reconciliation declares the authoritative read-only contract. Omission retains
 the previous no-consumer behavior. This adds no Effect schema, Protocol v29
 command, or Core background task. See
 [ADR 0137](adr/0137-optional-reference-service-effect-consumer.md).
+
+Effect dispatch-governor API 1 additively introduces tenant-exact execution
+lanes, fixed-window admission, epoch-fenced circuit state, one leased half-open
+probe, and idempotent lease-bound settlement. Its SQLite schema 1 is an
+independent `effect-governance.db`; it does not alter Effect Ledger schema 1.
+`effect_consumer.execution` additively accepts an optional strict `governor`
+policy, while `EffectExecutorConfig` adds bounded governor timeout and
+unavailability retry fields. Reconciliation is intentionally unaffected. The
+public pre-1.0 `EffectExecutorAttempt` adds the serde-defaulted
+`governor_settlement_failed` fact; external Rust struct literals must add it.
+No Protocol-v30 command or JSON Effect Connector field is added. See
+[ADR 0141](adr/0141-durable-effect-dispatch-governance.md).
 
 The public pre-1.0 `ProcessBrokerDescriptor` adds
 `executable_integrity`, with serde-default `unmeasured` compatibility for
@@ -760,7 +773,8 @@ does not change client protocol or durable data.
 
 ## Read-only store preflight
 
-The concrete SQLite State, Approval, Task, Workflow, Human Handoff, and Effect adapters
+The concrete SQLite State, Approval, Task, Workflow, Human Handoff, Effect, and
+Effect dispatch-governor adapters
 add public asynchronous `validate_existing` functions. They validate an
 existing regular database through a read-only, `query_only` connection and
 perform no creation, bootstrap, migration, or backup publication.

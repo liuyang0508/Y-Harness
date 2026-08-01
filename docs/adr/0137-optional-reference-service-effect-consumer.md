@@ -89,6 +89,10 @@ turn the service into a vault, rotation controller, or proof of Connector
 honesty. ADR 0140 subsequently requires credential-bearing commands to pass a
 digest preflight before Provider resolution and retain the Broker's second
 measurement before child entry, without claiming an atomic OS exec binding.
+ADR 0141 subsequently adds durable fixed-window and circuit governance for a
+trusted `tenant + capability + operation + policy_id` execution lane. It does
+not reinterpret arbitrary Effect input as a finer recipient, account, endpoint,
+or other business target.
 
 ## Rejected alternatives
 

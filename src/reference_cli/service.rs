@@ -20,7 +20,8 @@ use y_harness::{
     ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
     CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
     ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
-    DEFAULT_MAX_PARALLEL_TOOL_CALLS, DigestLockedProcessBroker, EFFECT_LEDGER_SCHEMA_VERSION,
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS, DigestLockedProcessBroker,
+    EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION,
     EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine, EffectSecretEnvironment,
     EvaluationBaseline, EvaluationCase, EvaluationEngine, EvaluationReport, EvaluationSuite,
     EvaluationTarget, GraderDescriptor, GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError,
@@ -35,13 +36,14 @@ use y_harness::{
     ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
     SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
-    SkillTrustStore, SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEventStore,
-    SqliteHumanHandoffCoordinator, SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine,
-    StdioMcpClient, StdioMcpConfig, StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION,
-    TaskCoordinator, TemporalDriver, ThreadId, ToolBatchExecution, ToolDescriptor, ToolRegistry,
-    TurnExecutionOptions, TurnOutcome, VerificationRegistry, VerifierDescriptor,
-    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator, WorkflowEngine, decode_thread_archive,
-    encode_thread_archive, register_selected_mcp_tools, serve_jsonl,
+    SkillTrustStore, SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEffectDispatchGovernor,
+    SqliteEventStore, SqliteHumanHandoffCoordinator, SqliteTaskCoordinator,
+    SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
+    StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, TemporalDriver, ThreadId,
+    ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
+    VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
+    WorkflowEngine, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
+    serve_jsonl,
 };
 
 use y_harness::{
@@ -484,6 +486,7 @@ struct ExistingStoreReadiness {
     workflows: bool,
     human_handoffs: bool,
     effects: bool,
+    effect_governance: bool,
 }
 
 impl LoadedConfig {
@@ -1045,16 +1048,17 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
-        "stores: state={} approval={} task={} workflow={} handoff={} effect={}",
+        "stores: state={} approval={} task={} workflow={} handoff={} effect={} effect-governance={}",
         readiness_label(stores.state),
         readiness_label(stores.approvals),
         readiness_label(stores.tasks),
         readiness_label(stores.workflows),
         readiness_label(stores.human_handoffs),
-        readiness_label(stores.effects)
+        readiness_label(stores.effects),
+        readiness_label(stores.effect_governance)
     );
     println!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
@@ -1083,6 +1087,10 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         &loaded.data_directory.join("effects.db"),
         "Effect Coordinator",
     )?;
+    let effect_governance = existing_database(
+        &loaded.data_directory.join("effect-governance.db"),
+        "Effect dispatch governor",
+    )?;
 
     if state {
         SqliteEventStore::validate_existing(loaded.data_directory.join("state.db")).await?;
@@ -1107,6 +1115,12 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         SqliteEffectCoordinator::validate_existing(loaded.data_directory.join("effects.db"))
             .await?;
     }
+    if effect_governance {
+        SqliteEffectDispatchGovernor::validate_existing(
+            loaded.data_directory.join("effect-governance.db"),
+        )
+        .await?;
+    }
 
     Ok(ExistingStoreReadiness {
         state,
@@ -1115,6 +1129,7 @@ async fn validate_existing_stores(loaded: &LoadedConfig) -> CliResult<ExistingSt
         workflows,
         human_handoffs,
         effects,
+        effect_governance,
     })
 }
 
@@ -1243,12 +1258,15 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     );
     let effect_port: Arc<dyn EffectCoordinator> = effects;
     let effect_engine = EffectEngine::new(effect_port);
-    let effect_service = configured_effect_consumer
-        .map(|configured| {
-            let configured = configured.assemble(effect_engine.clone())?;
-            effect_service::start(configured, authority.clone())
-        })
-        .transpose()?;
+    let effect_service = match configured_effect_consumer {
+        Some(configured) => {
+            let configured = configured
+                .assemble(effect_engine.clone(), &loaded.data_directory)
+                .await?;
+            Some(effect_service::start(configured, authority.clone())?)
+        }
+        None => None,
+    };
     let temporal_service = loaded
         .config
         .temporal
@@ -3399,9 +3417,20 @@ mod tests {
                             "scan_limit": 8,
                             "max_concurrency": 2,
                             "policy_timeout_ms": 1_000,
+                            "governor_timeout_ms": 1_000,
+                            "governor_retry_after_ms": 100,
                             "execution_timeout_ms": 2_000,
                             "settlement_reserve_ms": 1_000,
                             "lease_duration_ms": 5_000
+                        },
+                        "governor": {
+                            "policy_id": "notification-v1",
+                            "max_dispatches_per_window": 100,
+                            "window_ms": 1_000,
+                            "failure_threshold": 3,
+                            "open_duration_ms": 5_000,
+                            "probe_lease_ms": 1_000,
+                            "admission_retention_ms": 604_800_000
                         },
                         "allow": [{
                             "capability": "notification.test",
@@ -3425,7 +3454,7 @@ mod tests {
             .expect("valid Effect consumer")
             .expect("Effect consumer enabled");
         assert!(valid.doctor_summary().contains(
-            "execution 1 dispatch-locked connector(s) / 0 credential-scoped / 0 secret variable(s) / 1 allow(s) / 100 ms poll / 100 ms backoff"
+            "execution 1 dispatch-locked connector(s) / 0 credential-scoped / 0 secret variable(s) / 1 allow(s) / governor notification-v1: 100/1000 ms, 3 failures/5000 ms, 1000 ms probe / 100 ms poll / 100 ms backoff"
         ));
 
         let mut unlocked =
@@ -3473,6 +3502,18 @@ mod tests {
                 .to_string()
                 .contains("process timeout 2001 ms exceeds executor execution timeout 2000 ms")
         );
+
+        let mut invalid_governor =
+            serde_json::to_value(configured("send", 1, 1_000)).expect("encode governor fixture");
+        invalid_governor["effect_consumer"]["execution"]["governor"]["admission_retention_ms"] =
+            serde_json::json!(1_000);
+        let invalid_governor = serde_json::from_value::<ServiceConfig>(invalid_governor)
+            .expect("decode governor fixture");
+        let error = build_effect_consumer(&loaded(invalid_governor))
+            .await
+            .err()
+            .expect("reject unsafe governor retention");
+        assert!(error.to_string().contains("admission_retention_ms"));
 
         let mut missing_secret =
             serde_json::to_value(configured("send", 1, 1_000)).expect("encode Secret fixture");

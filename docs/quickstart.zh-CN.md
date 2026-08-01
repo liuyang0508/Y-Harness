@@ -204,6 +204,15 @@ Broker 会在装配时及每次 dispatch 前，在同一个取消与总超时预
 机制不是原子 OS exec 绑定，也不覆盖解释器、参数脚本、动态库或同权限
 文件系统竞态。完整配置与边界见：
 
+执行侧还可选配持久 `governor`。它以可信的“租户 + capability + operation +
+policy_id”作为执行通道，在 durable Claim 之后、Connector 入口之前原子完成
+固定窗口限流、连续失败熔断和单一 half-open probe；状态保存在独立的
+`effect-governance.db`，重启后不会清零。它不会从任意 Effect JSON 猜测业务
+收件人或供应商目标，也不会解析 `reason_code` 来判断故障。合法的 Connector
+`Unknown` 是一次健康的协议响应；只有 Harness 能证明的 panic、错误、超时
+或非法证据才累计熔断。权威只读 reconciliation 不受执行熔断影响。详见
+[`ADR 0141`](adr/0141-durable-effect-dispatch-governance.md)。
+
 需要凭据的 Effect Connector 可选用引用式环境注入：
 
 ```json
@@ -231,6 +240,7 @@ Broker 会在装配时及每次 dispatch 前，在同一个取消与总超时预
 - [`ADR 0138`](adr/0138-dispatch-time-effect-command-digest-locks.md)
 - [`ADR 0139`](adr/0139-typed-secret-use-and-effect-credential-custody.md)
 - [`ADR 0140`](adr/0140-secret-gated-effect-command-integrity-preflight.md)
+- [`ADR 0141`](adr/0141-durable-effect-dispatch-governance.md)
 
 如果 `doctor` 报告迁移要求，先停止所有可能读写对应数据库的服务，再为
 回滚文件选择一个尚不存在的路径，并只执行诊断中对应的命令：

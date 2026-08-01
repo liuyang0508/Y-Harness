@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,12 +21,13 @@ use y_harness::{
     AllowListEffectExecutionPolicy, AllowListEffectReconciliationPolicy, AuthorityContext,
     CancellationToken, CapabilityOrigin, EFFECT_EXECUTOR_API_VERSION,
     EFFECT_RECONCILER_API_VERSION, EffectConnectorDescriptor, EffectConnectorRegistry,
-    EffectEngine, EffectExecutor, EffectExecutorAttemptOutcome, EffectExecutorConfig,
-    EffectExecutorRunRequest, EffectIdempotencyContract, EffectPageCursor, EffectReconciler,
-    EffectReconcilerAttemptOutcome, EffectReconcilerConfig, EffectReconcilerRunRequest,
-    EffectReconciliationConnectorDescriptor, EffectReconciliationConnectorRegistry,
-    EffectReconciliationContract, HarnessError, JsonCommandEffectConnector,
-    JsonCommandEffectReconciliationConnector,
+    EffectDispatchGovernorPolicy, EffectEngine, EffectExecutor, EffectExecutorAttemptOutcome,
+    EffectExecutorConfig, EffectExecutorRunRequest, EffectIdempotencyContract, EffectPageCursor,
+    EffectReconciler, EffectReconcilerAttemptOutcome, EffectReconcilerConfig,
+    EffectReconcilerRunRequest, EffectReconciliationConnectorDescriptor,
+    EffectReconciliationConnectorRegistry, EffectReconciliationContract, HarnessError,
+    JsonCommandEffectConnector, JsonCommandEffectReconciliationConnector,
+    SqliteEffectDispatchGovernor,
 };
 
 use super::{
@@ -58,6 +60,8 @@ struct ServiceEffectExecutionConfig {
     failure_backoff_ms: u64,
     #[serde(default)]
     executor: EffectExecutorConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    governor: Option<EffectDispatchGovernorPolicy>,
     allow: Vec<ServiceEffectOperationConfig>,
     connectors: Vec<ServiceEffectExecutionConnectorConfig>,
 }
@@ -116,6 +120,9 @@ impl ServiceEffectConsumerConfig {
                 execution.failure_backoff_ms,
             )?;
             execution.executor.validate()?;
+            if let Some(governor) = &execution.governor {
+                governor.validate()?;
+            }
             for connector in &execution.connectors {
                 require_command_lock("execution", &connector.capability, &connector.process)?;
             }
@@ -195,6 +202,7 @@ struct ConfiguredEffectExecutionAssembly {
     connectors: EffectConnectorRegistry,
     policy: AllowListEffectExecutionPolicy,
     executor: EffectExecutorConfig,
+    governor: Option<EffectDispatchGovernorPolicy>,
     poll_interval: Duration,
     failure_backoff: Duration,
     connector_count: usize,
@@ -216,23 +224,33 @@ struct ConfiguredEffectReconciliationAssembly {
 }
 
 impl ConfiguredEffectConsumerAssembly {
-    pub(super) fn assemble(
+    pub(super) async fn assemble(
         self,
         engine: EffectEngine,
+        data_directory: &Path,
     ) -> Result<ConfiguredEffectConsumer, HarnessError> {
-        let execution = self
-            .execution
-            .map(|configured| {
-                let executor = EffectExecutor::new(engine.clone(), configured.connectors)?
+        let execution = match self.execution {
+            Some(configured) => {
+                let mut executor = EffectExecutor::new(engine.clone(), configured.connectors)?
                     .with_policy(Arc::new(configured.policy))
                     .with_config(configured.executor)?;
-                Ok(EffectExecutionLoop {
+                if let Some(policy) = configured.governor {
+                    let governor = Arc::new(
+                        SqliteEffectDispatchGovernor::open(
+                            data_directory.join("effect-governance.db"),
+                        )
+                        .await?,
+                    );
+                    executor = executor.with_dispatch_governor(governor, policy)?;
+                }
+                Some(EffectExecutionLoop {
                     executor,
                     poll_interval: configured.poll_interval,
                     failure_backoff: configured.failure_backoff,
                 })
-            })
-            .transpose()?;
+            }
+            None => None,
+        };
         let reconciliation = self
             .reconciliation
             .map(|configured| {
@@ -256,12 +274,24 @@ impl ConfiguredEffectConsumerAssembly {
         let execution = self.execution.as_ref().map_or_else(
             || "execution disabled".to_owned(),
             |configured| {
+                let governor = configured.governor.as_ref().map_or_else(String::new, |policy| {
+                    format!(
+                        " / governor {}: {}/{} ms, {} failures/{} ms, {} ms probe",
+                        policy.policy_id,
+                        policy.max_dispatches_per_window,
+                        policy.window_ms,
+                        policy.failure_threshold,
+                        policy.open_duration_ms,
+                        policy.probe_lease_ms,
+                    )
+                });
                 format!(
-                    "execution {} dispatch-locked connector(s) / {} credential-scoped / {} secret variable(s) / {} allow(s) / {} ms poll / {} ms backoff",
+                    "execution {} dispatch-locked connector(s) / {} credential-scoped / {} secret variable(s) / {} allow(s){} / {} ms poll / {} ms backoff",
                     configured.connector_count,
                     configured.credential_connector_count,
                     configured.secret_variable_count,
                     configured.allow_count,
+                    governor,
                     configured.poll_interval.as_millis(),
                     configured.failure_backoff.as_millis()
                 )
@@ -312,6 +342,9 @@ async fn build_execution(
     configured: &ServiceEffectExecutionConfig,
 ) -> CliResult<ConfiguredEffectExecutionAssembly> {
     configured.executor.validate()?;
+    if let Some(governor) = &configured.governor {
+        governor.validate()?;
+    }
     let supported = execution_capabilities(&configured.connectors)?;
     validate_allowlist("execution", &configured.allow, &supported)?;
 
@@ -363,6 +396,7 @@ async fn build_execution(
         connectors,
         policy,
         executor: configured.executor.clone(),
+        governor: configured.governor.clone(),
         poll_interval: Duration::from_millis(configured.poll_interval_ms),
         failure_backoff: Duration::from_millis(configured.failure_backoff_ms),
         connector_count: configured.connectors.len(),
@@ -648,7 +682,10 @@ async fn run_execution(
                         let failures = report
                             .attempts
                             .iter()
-                            .filter(|attempt| execution_failure(&attempt.outcome))
+                            .filter(|attempt| {
+                                attempt.governor_settlement_failed
+                                    || execution_failure(&attempt.outcome)
+                            })
                             .count();
                         let attempted = report.attempts.len();
                         let unavailable = attempted > 0 && failures == attempted;
@@ -771,6 +808,7 @@ fn execution_failure(outcome: &EffectExecutorAttemptOutcome) -> bool {
             | EffectExecutorAttemptOutcome::PolicyUnavailable
             | EffectExecutorAttemptOutcome::ClaimFailed
             | EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim
+            | EffectExecutorAttemptOutcome::GovernorUnavailable { .. }
             | EffectExecutorAttemptOutcome::SettlementFailed
             | EffectExecutorAttemptOutcome::AttemptFailed
     )

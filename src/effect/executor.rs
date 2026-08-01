@@ -21,6 +21,10 @@ use super::EffectPage;
 use super::{
     EffectApplyOutcome, EffectCommand, EffectCommandKind, EffectEngine, EffectLease,
     EffectOperation, EffectPageCursor, EffectReceipt, EffectSnapshot, EffectStatus,
+    governor::{
+        EffectDispatchAdmissionDecision, EffectDispatchAdmissionRequest, EffectDispatchGovernor,
+        EffectDispatchGovernorPolicy, EffectDispatchSettlement,
+    },
     page::{EffectPageState, validate_effect_page},
     validate_application_time, validate_identity, validate_receipt,
 };
@@ -50,6 +54,8 @@ const MAX_RETRY_AFTER_MS: u64 = 604_800_000;
 const DEFAULT_SCAN_LIMIT: usize = 64;
 const DEFAULT_CONCURRENCY: usize = 8;
 const DEFAULT_POLICY_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_GOVERNOR_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_GOVERNOR_RETRY_AFTER_MS: u64 = 5_000;
 const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 240_000;
 const DEFAULT_SETTLEMENT_RESERVE_MS: u64 = 30_000;
 const DEFAULT_LEASE_DURATION_MS: u64 = 300_000;
@@ -363,6 +369,10 @@ pub struct EffectExecutorConfig {
     pub max_concurrency: usize,
     /// Maximum Policy duration before fail-closed denial.
     pub policy_timeout_ms: u64,
+    /// Maximum durable dispatch-governor operation duration.
+    pub governor_timeout_ms: u64,
+    /// Safe retry delay when an installed governor is unavailable.
+    pub governor_retry_after_ms: u64,
     /// Maximum Connector duration after dispatch.
     pub execution_timeout_ms: u64,
     /// Reserved lease time after the Connector deadline for settlement.
@@ -377,6 +387,8 @@ impl Default for EffectExecutorConfig {
             scan_limit: DEFAULT_SCAN_LIMIT,
             max_concurrency: DEFAULT_CONCURRENCY,
             policy_timeout_ms: DEFAULT_POLICY_TIMEOUT_MS,
+            governor_timeout_ms: DEFAULT_GOVERNOR_TIMEOUT_MS,
+            governor_retry_after_ms: DEFAULT_GOVERNOR_RETRY_AFTER_MS,
             execution_timeout_ms: DEFAULT_EXECUTION_TIMEOUT_MS,
             settlement_reserve_ms: DEFAULT_SETTLEMENT_RESERVE_MS,
             lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
@@ -400,6 +412,16 @@ impl EffectExecutorConfig {
         if !(MIN_POLICY_TIMEOUT_MS..=MAX_POLICY_TIMEOUT_MS).contains(&self.policy_timeout_ms) {
             return Err(HarnessError::Effect(format!(
                 "Effect Executor policy_timeout_ms must be {MIN_POLICY_TIMEOUT_MS}-{MAX_POLICY_TIMEOUT_MS}"
+            )));
+        }
+        if !(MIN_POLICY_TIMEOUT_MS..=MAX_POLICY_TIMEOUT_MS).contains(&self.governor_timeout_ms) {
+            return Err(HarnessError::Effect(format!(
+                "Effect Executor governor_timeout_ms must be {MIN_POLICY_TIMEOUT_MS}-{MAX_POLICY_TIMEOUT_MS}"
+            )));
+        }
+        if self.governor_retry_after_ms > MAX_RETRY_AFTER_MS {
+            return Err(HarnessError::Effect(format!(
+                "Effect Executor governor_retry_after_ms must be 0-{MAX_RETRY_AFTER_MS}"
             )));
         }
         if !(MIN_EXECUTION_TIMEOUT_MS..=MAX_EXECUTION_TIMEOUT_MS)
@@ -468,6 +490,21 @@ pub enum EffectExecutorAttemptOutcome {
     ClaimAlreadyCommitted,
     /// Trusted time failed after Claim; the lease remains authoritative.
     ClockUnavailableAfterClaim,
+    /// Durable dispatch governance was unavailable; no Connector was entered.
+    GovernorUnavailable {
+        /// Absolute trusted eligibility time durably selected for retry.
+        retry_at_ms: u64,
+    },
+    /// The execution lane exhausted its fixed-window dispatch budget.
+    RateLimited {
+        /// Absolute trusted eligibility time durably selected for retry.
+        retry_at_ms: u64,
+    },
+    /// The execution lane circuit is open or owns a half-open probe.
+    CircuitOpen {
+        /// Absolute trusted eligibility time durably selected for retry.
+        retry_at_ms: u64,
+    },
     /// External effect was authoritatively applied.
     Applied,
     /// External system authoritatively confirmed no effect and no retry.
@@ -512,8 +549,15 @@ pub struct EffectExecutorAttempt {
     /// Exact lease when a Claim was attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_id: Option<EffectLeaseId>,
+    /// An allowed dispatch completed, but durable governor health settlement failed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub governor_settlement_failed: bool,
     /// Content-free settlement.
     pub outcome: EffectExecutorAttemptOutcome,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One bounded host-driven sweep report.
@@ -542,7 +586,23 @@ pub struct EffectExecutor {
     connectors: Arc<EffectConnectorRegistry>,
     policy: Arc<dyn EffectExecutionPolicy>,
     clock: Arc<dyn EffectExecutorClock>,
+    governor: Option<ConfiguredDispatchGovernor>,
     config: EffectExecutorConfig,
+}
+
+#[derive(Clone)]
+struct ConfiguredDispatchGovernor {
+    governor: Arc<dyn EffectDispatchGovernor>,
+    policy: EffectDispatchGovernorPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct EffectSettlementContext<'a> {
+    cycle_id: &'a str,
+    prepared: &'a PreparedEffect,
+    claimed: &'a EffectSnapshot,
+    lease: &'a EffectLease,
+    authority: &'a AuthorityContext,
 }
 
 impl EffectExecutor {
@@ -558,6 +618,7 @@ impl EffectExecutor {
             connectors: Arc::new(connectors),
             policy: Arc::new(DenyAllEffectExecutions),
             clock: Arc::new(SystemEffectExecutorClock),
+            governor: None,
             config,
         })
     }
@@ -574,6 +635,17 @@ impl EffectExecutor {
     pub fn with_clock(mut self, clock: Arc<dyn EffectExecutorClock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Installs durable post-Claim dispatch governance for every execution lane.
+    pub fn with_dispatch_governor(
+        mut self,
+        governor: Arc<dyn EffectDispatchGovernor>,
+        policy: EffectDispatchGovernorPolicy,
+    ) -> Result<Self, HarnessError> {
+        policy.validate()?;
+        self.governor = Some(ConfiguredDispatchGovernor { governor, policy });
+        Ok(self)
     }
 
     /// Installs validated bounded execution policy.
@@ -716,6 +788,7 @@ impl EffectExecutor {
             observed_revision: prepared.snapshot.revision(),
             attempt: prepared.attempt,
             lease_id: None,
+            governor_settlement_failed: false,
             outcome: EffectExecutorAttemptOutcome::AttemptFailed,
         };
         let executor = self.clone();
@@ -747,6 +820,7 @@ impl EffectExecutor {
             observed_revision: prepared.snapshot.revision(),
             attempt: prepared.attempt,
             lease_id: None,
+            governor_settlement_failed: false,
             outcome,
         };
         let operation = prepared.snapshot.effect().operation();
@@ -878,6 +952,136 @@ impl EffectExecutor {
                 .await;
         }
 
+        let governed = if let Some(configured) = &self.governor {
+            let admitted_at_ms = match trusted_now(self.clock.as_ref()) {
+                Ok(now) => now,
+                Err(_) => {
+                    return EffectExecutorAttempt {
+                        lease_id: Some(prepared.lease_id),
+                        outcome: EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim,
+                        ..base(EffectExecutorAttemptOutcome::ClaimFailed)
+                    };
+                }
+            };
+            let request = EffectDispatchAdmissionRequest {
+                admission_id: prepared.lease_id.clone(),
+                operation: operation.clone(),
+                policy: configured.policy.clone(),
+                admitted_at_ms,
+            };
+            let decision =
+                match isolate_future(|| configured.governor.admit_as(request, authority), None) {
+                    Err(()) => None,
+                    Ok(future) => match timeout(
+                        Duration::from_millis(self.config.governor_timeout_ms),
+                        future,
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(decision)))
+                            if valid_governor_decision(&decision, admitted_at_ms) =>
+                        {
+                            Some(decision)
+                        }
+                        Ok(Ok(Ok(_))) => None,
+                        Ok(Ok(Err(_))) | Ok(Err(())) | Err(_) => None,
+                    },
+                };
+            match decision {
+                Some(EffectDispatchAdmissionDecision::Allow) => Some(configured.clone()),
+                Some(EffectDispatchAdmissionDecision::AllowProbe) => Some(configured.clone()),
+                Some(EffectDispatchAdmissionDecision::RateLimited { retry_at_ms }) => {
+                    return self
+                        .settle_governor_denial(
+                            EffectSettlementContext {
+                                cycle_id,
+                                prepared: &prepared,
+                                claimed: &claimed.snapshot,
+                                lease: &lease,
+                                authority,
+                            },
+                            "governor.rate_limited",
+                            retry_at_ms,
+                            EffectExecutorAttemptOutcome::RateLimited { retry_at_ms },
+                        )
+                        .await;
+                }
+                Some(EffectDispatchAdmissionDecision::CircuitOpen { retry_at_ms }) => {
+                    return self
+                        .settle_governor_denial(
+                            EffectSettlementContext {
+                                cycle_id,
+                                prepared: &prepared,
+                                claimed: &claimed.snapshot,
+                                lease: &lease,
+                                authority,
+                            },
+                            "governor.circuit_open",
+                            retry_at_ms,
+                            EffectExecutorAttemptOutcome::CircuitOpen { retry_at_ms },
+                        )
+                        .await;
+                }
+                None => {
+                    let retry_at_ms = admitted_at_ms
+                        .checked_add(self.config.governor_retry_after_ms)
+                        .unwrap_or(admitted_at_ms);
+                    return self
+                        .settle_governor_denial(
+                            EffectSettlementContext {
+                                cycle_id,
+                                prepared: &prepared,
+                                claimed: &claimed.snapshot,
+                                lease: &lease,
+                                authority,
+                            },
+                            "governor.unavailable",
+                            retry_at_ms,
+                            EffectExecutorAttemptOutcome::GovernorUnavailable { retry_at_ms },
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
+
+        if cancellation.is_cancelled() {
+            let governor_settlement_failed = if let Some(configured) = &governed {
+                match trusted_now(self.clock.as_ref()) {
+                    Ok(settled_at_ms) => {
+                        !self
+                            .settle_governor(
+                                configured,
+                                &prepared.lease_id,
+                                EffectDispatchSettlement::Abandoned,
+                                settled_at_ms,
+                                authority,
+                            )
+                            .await
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
+            let mut attempt = self
+                .settle(
+                    cycle_id,
+                    &prepared,
+                    &claimed.snapshot,
+                    &lease,
+                    EffectExecutionOutcome::NotApplied {
+                        reason_code: "executor.cancelled_before_dispatch".to_owned(),
+                        retry_after_ms: Some(0),
+                    },
+                    authority,
+                )
+                .await;
+            attempt.governor_settlement_failed = governor_settlement_failed;
+            return attempt;
+        }
+
         let connector_cancellation = CancellationToken::new();
         let execution_request = EffectExecutionRequest {
             effect_id: prepared.snapshot.id().clone(),
@@ -891,44 +1095,103 @@ impl EffectExecutor {
             lease_expires_at_ms: lease.expires_at_ms,
             cancellation: connector_cancellation.clone(),
         };
-        let outcome = match isolate_future(
+        let (outcome, dispatch_settlement) = match isolate_future(
             || registered.connector.execute(execution_request),
             Some(connector_cancellation),
         ) {
-            Err(()) => EffectExecutionOutcome::Unknown {
-                reason_code: "connector.failed".to_owned(),
-            },
+            Err(()) => (
+                EffectExecutionOutcome::Unknown {
+                    reason_code: "connector.failed".to_owned(),
+                },
+                EffectDispatchSettlement::AvailabilityFailure,
+            ),
             Ok(future) => {
                 tokio::select! {
-                    _ = cancellation.cancelled() => EffectExecutionOutcome::Unknown {
-                        reason_code: "executor.cancelled_after_dispatch".to_owned(),
-                    },
+                    _ = cancellation.cancelled() => (
+                        EffectExecutionOutcome::Unknown {
+                            reason_code: "executor.cancelled_after_dispatch".to_owned(),
+                        },
+                        EffectDispatchSettlement::Abandoned,
+                    ),
                     result = timeout(
                         Duration::from_millis(self.config.execution_timeout_ms),
                         future,
                     ) => {
                         match result {
-                            Ok(Ok(Ok(outcome))) => outcome,
-                            Ok(Ok(Err(_))) | Ok(Err(())) => EffectExecutionOutcome::Unknown {
-                                reason_code: "connector.failed".to_owned(),
-                            },
-                            Err(_) => EffectExecutionOutcome::Unknown {
-                                reason_code: "connector.timeout".to_owned(),
-                            },
+                            Ok(Ok(Ok(outcome))) => (
+                                outcome,
+                                EffectDispatchSettlement::Healthy,
+                            ),
+                            Ok(Ok(Err(_))) | Ok(Err(())) => (
+                                EffectExecutionOutcome::Unknown {
+                                    reason_code: "connector.failed".to_owned(),
+                                },
+                                EffectDispatchSettlement::AvailabilityFailure,
+                            ),
+                            Err(_) => (
+                                EffectExecutionOutcome::Unknown {
+                                    reason_code: "connector.timeout".to_owned(),
+                                },
+                                EffectDispatchSettlement::AvailabilityFailure,
+                            ),
                         }
                     }
                 }
             }
         };
-        self.settle(
-            cycle_id,
-            &prepared,
-            &claimed.snapshot,
-            &lease,
-            outcome,
-            authority,
-        )
-        .await
+        let settled_at_ms = match trusted_now(self.clock.as_ref()) {
+            Ok(now) => now,
+            Err(_) => {
+                return EffectExecutorAttempt {
+                    effect_id: prepared.snapshot.id().clone(),
+                    observed_revision: prepared.snapshot.revision(),
+                    attempt: prepared.attempt,
+                    lease_id: Some(prepared.lease_id),
+                    governor_settlement_failed: governed.is_some(),
+                    outcome: EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim,
+                };
+            }
+        };
+        let normalized = normalize_connector_outcome(outcome, settled_at_ms);
+        let dispatch_settlement = if dispatch_settlement == EffectDispatchSettlement::Healthy
+            && matches!(
+                normalized,
+                EffectExecutionOutcome::Unknown { ref reason_code }
+                    if reason_code == "connector.invalid_outcome"
+            ) {
+            EffectDispatchSettlement::AvailabilityFailure
+        } else {
+            dispatch_settlement
+        };
+        let governor_settlement_failed = if let Some(configured) = &governed {
+            !self
+                .settle_governor(
+                    configured,
+                    &prepared.lease_id,
+                    dispatch_settlement,
+                    settled_at_ms,
+                    authority,
+                )
+                .await
+        } else {
+            false
+        };
+        let mut attempt = self
+            .settle_at(
+                EffectSettlementContext {
+                    cycle_id,
+                    prepared: &prepared,
+                    claimed: &claimed.snapshot,
+                    lease: &lease,
+                    authority,
+                },
+                normalized,
+                None,
+                settled_at_ms,
+            )
+            .await;
+        attempt.governor_settlement_failed = governor_settlement_failed;
+        attempt
     }
 
     async fn settle(
@@ -940,21 +1203,57 @@ impl EffectExecutor {
         outcome: EffectExecutionOutcome,
         authority: &AuthorityContext,
     ) -> EffectExecutorAttempt {
+        let settled_at_ms = match trusted_now(self.clock.as_ref()) {
+            Ok(now) => now,
+            Err(_) => {
+                return EffectExecutorAttempt {
+                    effect_id: prepared.snapshot.id().clone(),
+                    observed_revision: prepared.snapshot.revision(),
+                    attempt: prepared.attempt,
+                    lease_id: Some(prepared.lease_id.clone()),
+                    governor_settlement_failed: false,
+                    outcome: EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim,
+                };
+            }
+        };
+        let outcome = normalize_connector_outcome(outcome, settled_at_ms);
+        self.settle_at(
+            EffectSettlementContext {
+                cycle_id,
+                prepared,
+                claimed,
+                lease,
+                authority,
+            },
+            outcome,
+            None,
+            settled_at_ms,
+        )
+        .await
+    }
+
+    async fn settle_at(
+        &self,
+        context: EffectSettlementContext<'_>,
+        outcome: EffectExecutionOutcome,
+        absolute_retry_at_ms: Option<u64>,
+        settled_at_ms: u64,
+    ) -> EffectExecutorAttempt {
+        let EffectSettlementContext {
+            cycle_id,
+            prepared,
+            claimed,
+            lease,
+            authority,
+        } = context;
         let mut attempt = EffectExecutorAttempt {
             effect_id: prepared.snapshot.id().clone(),
             observed_revision: prepared.snapshot.revision(),
             attempt: prepared.attempt,
             lease_id: Some(prepared.lease_id.clone()),
+            governor_settlement_failed: false,
             outcome: EffectExecutorAttemptOutcome::SettlementFailed,
         };
-        let settled_at_ms = match trusted_now(self.clock.as_ref()) {
-            Ok(now) => now,
-            Err(_) => {
-                attempt.outcome = EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim;
-                return attempt;
-            }
-        };
-        let outcome = normalize_connector_outcome(outcome, settled_at_ms);
         let (purpose, kind) = match &outcome {
             EffectExecutionOutcome::Applied { receipt } => (
                 "applied",
@@ -967,8 +1266,9 @@ impl EffectExecutor {
                 reason_code,
                 retry_after_ms,
             } => {
-                let retry_at_ms = match retry_after_ms {
-                    Some(delay) => match settled_at_ms.checked_add(*delay) {
+                let retry_at_ms = match (absolute_retry_at_ms, retry_after_ms) {
+                    (Some(retry_at_ms), _) => Some(retry_at_ms.max(settled_at_ms)),
+                    (None, Some(delay)) => match settled_at_ms.checked_add(*delay) {
                         Some(value) => Some(value),
                         None => {
                             return self
@@ -983,7 +1283,7 @@ impl EffectExecutor {
                                 .await;
                         }
                     },
-                    None => None,
+                    (None, None) => None,
                 };
                 (
                     "not-applied",
@@ -1041,6 +1341,74 @@ impl EffectExecutor {
         attempt
     }
 
+    async fn settle_governor_denial(
+        &self,
+        context: EffectSettlementContext<'_>,
+        reason_code: &str,
+        retry_at_ms: u64,
+        governed_outcome: EffectExecutorAttemptOutcome,
+    ) -> EffectExecutorAttempt {
+        let settled_at_ms = match trusted_now(self.clock.as_ref()) {
+            Ok(now) => now,
+            Err(_) => {
+                return EffectExecutorAttempt {
+                    effect_id: context.prepared.snapshot.id().clone(),
+                    observed_revision: context.prepared.snapshot.revision(),
+                    attempt: context.prepared.attempt,
+                    lease_id: Some(context.prepared.lease_id.clone()),
+                    governor_settlement_failed: false,
+                    outcome: EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim,
+                };
+            }
+        };
+        let mut attempt = self
+            .settle_at(
+                context,
+                EffectExecutionOutcome::NotApplied {
+                    reason_code: reason_code.to_owned(),
+                    retry_after_ms: Some(0),
+                },
+                Some(retry_at_ms),
+                settled_at_ms,
+            )
+            .await;
+        if matches!(
+            attempt.outcome,
+            EffectExecutorAttemptOutcome::RetryScheduled { .. }
+        ) {
+            attempt.outcome = governed_outcome;
+        }
+        attempt
+    }
+
+    async fn settle_governor(
+        &self,
+        configured: &ConfiguredDispatchGovernor,
+        admission_id: &EffectLeaseId,
+        settlement: EffectDispatchSettlement,
+        settled_at_ms: u64,
+        authority: &AuthorityContext,
+    ) -> bool {
+        let Ok(future) = isolate_future(
+            || {
+                configured
+                    .governor
+                    .settle_as(admission_id, settlement, settled_at_ms, authority)
+            },
+            None,
+        ) else {
+            return false;
+        };
+        matches!(
+            timeout(
+                Duration::from_millis(self.config.governor_timeout_ms),
+                future,
+            )
+            .await,
+            Ok(Ok(Ok(())))
+        )
+    }
+
     async fn settle_invalid_outcome(
         &self,
         cycle_id: &str,
@@ -1055,6 +1423,7 @@ impl EffectExecutor {
             observed_revision: prepared.snapshot.revision(),
             attempt: prepared.attempt,
             lease_id: Some(prepared.lease_id.clone()),
+            governor_settlement_failed: false,
             outcome: EffectExecutorAttemptOutcome::SettlementFailed,
         };
         let command_id = match settlement_command_id(
@@ -1236,6 +1605,21 @@ fn execution_digest(value: &ExecutionIdentity<'_>) -> Result<String, HarnessErro
         .collect())
 }
 
+fn valid_governor_decision(
+    decision: &EffectDispatchAdmissionDecision,
+    admitted_at_ms: u64,
+) -> bool {
+    match decision {
+        EffectDispatchAdmissionDecision::Allow | EffectDispatchAdmissionDecision::AllowProbe => {
+            true
+        }
+        EffectDispatchAdmissionDecision::RateLimited { retry_at_ms }
+        | EffectDispatchAdmissionDecision::CircuitOpen { retry_at_ms } => {
+            *retry_at_ms >= admitted_at_ms && validate_application_time(*retry_at_ms).is_ok()
+        }
+    }
+}
+
 fn normalize_connector_outcome(
     outcome: EffectExecutionOutcome,
     settled_at_ms: u64,
@@ -1329,7 +1713,7 @@ mod tests {
     use super::*;
     use crate::{
         ActorIdentity, EffectCommandResult, EffectCoordinator, EffectCreateRequest,
-        EffectDueScanPage, MemoryEffectCoordinator,
+        EffectDueScanPage, MemoryEffectCoordinator, MemoryEffectDispatchGovernor,
     };
 
     const NOW_MS: u64 = 100;
@@ -1349,6 +1733,23 @@ mod tests {
     impl EffectExecutorClock for FixedClock {
         fn now_ms(&self) -> Result<u64, HarnessError> {
             Ok(self.now_ms.load(Ordering::SeqCst))
+        }
+    }
+
+    struct EventuallyUnavailableClock {
+        successful_calls: usize,
+        calls: AtomicUsize,
+        now_ms: u64,
+    }
+
+    impl EffectExecutorClock for EventuallyUnavailableClock {
+        fn now_ms(&self) -> Result<u64, HarnessError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.successful_calls {
+                Ok(self.now_ms)
+            } else {
+                Err(HarnessError::Effect("clock fixture unavailable".to_owned()))
+            }
         }
     }
 
@@ -1478,6 +1879,80 @@ mod tests {
         }
     }
 
+    struct UnavailableGovernor;
+
+    impl EffectDispatchGovernor for UnavailableGovernor {
+        fn admit_as<'a>(
+            &'a self,
+            _request: EffectDispatchAdmissionRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, EffectDispatchAdmissionDecision> {
+            Box::pin(async {
+                Err(HarnessError::Effect(
+                    "governor fixture unavailable".to_owned(),
+                ))
+            })
+        }
+
+        fn settle_as<'a>(
+            &'a self,
+            _admission_id: &'a EffectLeaseId,
+            _settlement: EffectDispatchSettlement,
+            _settled_at_ms: u64,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct InvalidDecisionGovernor;
+
+    impl EffectDispatchGovernor for InvalidDecisionGovernor {
+        fn admit_as<'a>(
+            &'a self,
+            _request: EffectDispatchAdmissionRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, EffectDispatchAdmissionDecision> {
+            Box::pin(async { Ok(EffectDispatchAdmissionDecision::RateLimited { retry_at_ms: 1 }) })
+        }
+
+        fn settle_as<'a>(
+            &'a self,
+            _admission_id: &'a EffectLeaseId,
+            _settlement: EffectDispatchSettlement,
+            _settled_at_ms: u64,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct SettlementUnavailableGovernor;
+
+    impl EffectDispatchGovernor for SettlementUnavailableGovernor {
+        fn admit_as<'a>(
+            &'a self,
+            _request: EffectDispatchAdmissionRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, EffectDispatchAdmissionDecision> {
+            Box::pin(async { Ok(EffectDispatchAdmissionDecision::Allow) })
+        }
+
+        fn settle_as<'a>(
+            &'a self,
+            _admission_id: &'a EffectLeaseId,
+            _settlement: EffectDispatchSettlement,
+            _settled_at_ms: u64,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, ()> {
+            Box::pin(async {
+                Err(HarnessError::Effect(
+                    "governor settlement fixture unavailable".to_owned(),
+                ))
+            })
+        }
+    }
+
     struct DescriptorPanicConnector;
 
     impl EffectConnector for DescriptorPanicConnector {
@@ -1588,6 +2063,8 @@ mod tests {
             scan_limit: 16,
             max_concurrency,
             policy_timeout_ms: 100,
+            governor_timeout_ms: 100,
+            governor_retry_after_ms: 25,
             execution_timeout_ms,
             settlement_reserve_ms: 100,
             lease_duration_ms: 1_000,
@@ -1600,6 +2077,21 @@ mod tests {
                 .allow("channel.email", "send")
                 .expect("allow policy"),
         )
+    }
+
+    fn governor_policy(
+        max_dispatches_per_window: u32,
+        failure_threshold: u32,
+    ) -> EffectDispatchGovernorPolicy {
+        EffectDispatchGovernorPolicy {
+            policy_id: "test-v1".to_owned(),
+            max_dispatches_per_window,
+            window_ms: 1_000,
+            failure_threshold,
+            open_duration_ms: 500,
+            probe_lease_ms: 100,
+            admission_retention_ms: 604_800_000,
+        }
     }
 
     fn engine() -> EffectEngine {
@@ -1864,6 +2356,393 @@ mod tests {
             snapshot.effect().status(),
             EffectStatus::Applied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn durable_rate_limit_prevents_connector_entry_and_schedules_exact_retry() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(&engine, &authority, "effect-rate-a", serde_json::json!({})).await;
+        create_effect(&engine, &authority, "effect-rate-b", serde_json::json!({})).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine.clone(),
+            registry(Arc::new(StaticConnector {
+                calls: calls.clone(),
+                outcome: EffectExecutionOutcome::Applied {
+                    receipt: receipt("rate"),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(
+            Arc::new(MemoryEffectDispatchGovernor::new()),
+            governor_policy(1, 2),
+        )
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(request("cycle-rate"), &authority, CancellationToken::new())
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::Applied
+        );
+        assert_eq!(
+            report.attempts[1].outcome,
+            EffectExecutorAttemptOutcome::RateLimited { retry_at_ms: 1_000 }
+        );
+        let retry = engine
+            .load_as(&EffectId::from_static("effect-rate-b"), &authority)
+            .await
+            .expect("load")
+            .expect("Effect");
+        assert!(matches!(
+            retry.effect().status(),
+            EffectStatus::Pending {
+                next_attempt: 2,
+                not_before_ms: 1_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn availability_failure_opens_circuit_without_parsing_reason_strings() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-circuit-a",
+            serde_json::json!({}),
+        )
+        .await;
+        create_effect(
+            &engine,
+            &authority,
+            "effect-circuit-b",
+            serde_json::json!({}),
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine,
+            registry(Arc::new(PanicConnector {
+                calls: calls.clone(),
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(
+            Arc::new(MemoryEffectDispatchGovernor::new()),
+            governor_policy(10, 1),
+        )
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-circuit"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::Unknown {
+                reason_code: "connector.failed".to_owned(),
+            }
+        );
+        assert_eq!(
+            report.attempts[1].outcome,
+            EffectExecutorAttemptOutcome::CircuitOpen { retry_at_ms: 600 }
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_returned_unknown_is_healthy_transport_evidence() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-unknown-a",
+            serde_json::json!({}),
+        )
+        .await;
+        create_effect(
+            &engine,
+            &authority,
+            "effect-unknown-b",
+            serde_json::json!({}),
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine,
+            registry(Arc::new(StaticConnector {
+                calls: calls.clone(),
+                outcome: EffectExecutionOutcome::Unknown {
+                    reason_code: "target.uncertain".to_owned(),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(
+            Arc::new(MemoryEffectDispatchGovernor::new()),
+            governor_policy(10, 1),
+        )
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-unknown-health"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(report.attempts.iter().all(|attempt| {
+            attempt.outcome
+                == EffectExecutorAttemptOutcome::Unknown {
+                    reason_code: "target.uncertain".to_owned(),
+                }
+        }));
+    }
+
+    #[tokio::test]
+    async fn unavailable_governor_fails_closed_after_claim_without_connector_entry() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-governor-unavailable",
+            serde_json::json!({}),
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine.clone(),
+            registry(Arc::new(StaticConnector {
+                calls: calls.clone(),
+                outcome: EffectExecutionOutcome::Applied {
+                    receipt: receipt("must-not-enter"),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(Arc::new(UnavailableGovernor), governor_policy(10, 2))
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-governor-unavailable"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::GovernorUnavailable { retry_at_ms: 125 }
+        );
+        let retry = engine
+            .load_as(
+                &EffectId::from_static("effect-governor-unavailable"),
+                &authority,
+            )
+            .await
+            .expect("load")
+            .expect("Effect");
+        assert!(matches!(
+            retry.effect().status(),
+            EffectStatus::Pending {
+                next_attempt: 2,
+                not_before_ms: 125
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_governor_decision_fails_closed_without_connector_entry() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-governor-invalid",
+            serde_json::json!({}),
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine,
+            registry(Arc::new(StaticConnector {
+                calls: calls.clone(),
+                outcome: EffectExecutionOutcome::Applied {
+                    receipt: receipt("must-not-enter-invalid"),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(Arc::new(InvalidDecisionGovernor), governor_policy(10, 2))
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-governor-invalid"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::GovernorUnavailable { retry_at_ms: 125 }
+        );
+    }
+
+    #[tokio::test]
+    async fn governor_settlement_failure_is_visible_without_corrupting_effect_truth() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-governor-settlement",
+            serde_json::json!({}),
+        )
+        .await;
+        let executor = EffectExecutor::new(
+            engine.clone(),
+            registry(Arc::new(StaticConnector {
+                calls: Arc::new(AtomicUsize::new(0)),
+                outcome: EffectExecutionOutcome::Applied {
+                    receipt: receipt("settlement"),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(FixedClock::new(NOW_MS)))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(
+            Arc::new(SettlementUnavailableGovernor),
+            governor_policy(10, 2),
+        )
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-governor-settlement"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::Applied
+        );
+        assert!(report.attempts[0].governor_settlement_failed);
+        let effect = engine
+            .load_as(
+                &EffectId::from_static("effect-governor-settlement"),
+                &authority,
+            )
+            .await
+            .expect("load")
+            .expect("Effect");
+        assert!(matches!(
+            effect.effect().status(),
+            EffectStatus::Applied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn clock_failure_after_governed_dispatch_reports_unsettled_governor_health() {
+        let authority = authority();
+        let engine = engine();
+        create_effect(
+            &engine,
+            &authority,
+            "effect-governor-clock",
+            serde_json::json!({}),
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = EffectExecutor::new(
+            engine,
+            registry(Arc::new(StaticConnector {
+                calls: calls.clone(),
+                outcome: EffectExecutionOutcome::Applied {
+                    receipt: receipt("clock-failure"),
+                },
+            })),
+        )
+        .expect("executor")
+        .with_policy(allow_policy())
+        .with_clock(Arc::new(EventuallyUnavailableClock {
+            successful_calls: 3,
+            calls: AtomicUsize::new(0),
+            now_ms: NOW_MS,
+        }))
+        .with_config(config(100, 1))
+        .expect("config")
+        .with_dispatch_governor(
+            Arc::new(MemoryEffectDispatchGovernor::new()),
+            governor_policy(10, 2),
+        )
+        .expect("governor");
+
+        let report = executor
+            .run_once_as(
+                request("cycle-governor-clock"),
+                &authority,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.attempts[0].outcome,
+            EffectExecutorAttemptOutcome::ClockUnavailableAfterClaim
+        );
+        assert!(report.attempts[0].governor_settlement_failed);
     }
 
     #[tokio::test]

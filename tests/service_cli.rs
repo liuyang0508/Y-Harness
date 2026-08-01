@@ -19,14 +19,15 @@ use semver::Version;
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION, EffectCommandId,
-    EffectCreateRequest, EffectOperation, HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId,
-    HumanHandoffCreateRequest, HumanHandoffSubject, Item, ItemKind, PROTOCOL_VERSION,
-    ProtocolCommand, ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
-    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
-    SignedSkillPackage, SkillPackage, SkillSignature, SkillTransparencyReceipt, SqliteEventStore,
-    SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine, TASK_GRAPH_SCHEMA_VERSION,
-    TaskCoordinator, TaskDefinition, TaskGraph, TaskGraphId, TaskId, ThreadId, TurnStatus,
+    APPROVAL_INBOX_SCHEMA_VERSION, EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION,
+    EFFECT_LEDGER_SCHEMA_VERSION, EffectCommandId, EffectCreateRequest, EffectOperation,
+    HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId, HumanHandoffCreateRequest,
+    HumanHandoffSubject, Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand, ProtocolRequest,
+    ProtocolResponse, ProtocolResponseBody, ProtocolResult, SECRET_API_VERSION,
+    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillPackage,
+    SkillSignature, SkillTransparencyReceipt, SqliteEventStore, SqliteTaskCoordinator,
+    SqliteWorkflowCoordinator, StateEngine, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator,
+    TaskDefinition, TaskGraph, TaskGraphId, TaskId, ThreadId, TurnStatus,
     WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommand, WorkflowCommandId, WorkflowCommandKind,
     WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRunId, WorkflowStatus,
     WorkflowTransitionKind, WorkflowWaitId, WorkspaceMode, decode_thread_archive,
@@ -85,7 +86,7 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
     assert!(report.contains(&format!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("authority: local-process / unscoped"));
@@ -309,6 +310,50 @@ fn doctor_and_service_reject_a_partial_effect_store_before_model_construction() 
         );
     }
     fs::remove_dir_all(project).expect("remove partial Effect fixture");
+}
+
+#[test]
+fn doctor_and_service_reject_a_partial_effect_governor_store_without_mutation() {
+    let project = isolated_project("doctor-partial-effect-governor");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("run init");
+    assert!(initialized.status.success());
+    let database = project.join(".y-harness/effect-governance.db");
+    rusqlite::Connection::open(&database)
+        .expect("open partial governor fixture")
+        .execute_batch(
+            "CREATE TABLE effect_dispatch_governor_meta (
+                singleton INTEGER PRIMARY KEY,
+                schema_version INTEGER NOT NULL
+            );",
+        )
+        .expect("install partial governor fixture");
+    let before = fs::read(&database).expect("read partial governor fixture");
+
+    for command in ["doctor", "serve"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+            .arg(command)
+            .arg("y-harness.json")
+            .current_dir(&project)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run partial governor preflight");
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("Effect dispatch governor: SQLite store is partial"),
+            "unexpected {command} diagnostic: {diagnostic}"
+        );
+        assert_eq!(
+            fs::read(&database).expect("read partial governor after preflight"),
+            before,
+            "{command} preflight mutated the partial governor store"
+        );
+    }
+    fs::remove_dir_all(project).expect("remove partial governor fixture");
 }
 
 #[test]
@@ -556,9 +601,20 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
                 "scan_limit": 16,
                 "max_concurrency": 2,
                 "policy_timeout_ms": 1_000,
+                "governor_timeout_ms": 1_000,
+                "governor_retry_after_ms": 100,
                 "execution_timeout_ms": 10_000,
                 "settlement_reserve_ms": 5_000,
                 "lease_duration_ms": 20_000
+            },
+            "governor": {
+                "policy_id": "notification-test-v1",
+                "max_dispatches_per_window": 16,
+                "window_ms": 1_000,
+                "failure_threshold": 2,
+                "open_duration_ms": 1_000,
+                "probe_lease_ms": 500,
+                "admission_retention_ms": 604_800_000
             },
             "allow": [{
                 "capability": "notification.test",
@@ -616,8 +672,9 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
             .expect("UTF-8 Effect consumer doctor")
             .contains(
                 "effect consumer: enabled (execution 1 dispatch-locked connector(s) / \
-             1 credential-scoped / 1 secret variable(s) / 1 allow(s) / 100 ms poll / \
-             100 ms backoff; reconciliation 1 dispatch-locked connector(s) / \
+             1 credential-scoped / 1 secret variable(s) / 1 allow(s) / governor \
+             notification-test-v1: 16/1000 ms, 2 failures/1000 ms, 500 ms probe / \
+             100 ms poll / 100 ms backoff; reconciliation 1 dispatch-locked connector(s) / \
              1 credential-scoped / 1 secret variable(s) / 1 allow(s) / 100 ms poll / \
              100 ms backoff)"
             )
@@ -777,6 +834,10 @@ fn configured_effect_consumer_degrades_recovers_stops_and_does_not_replay_termin
         diagnostics.contains("Y-Harness Effect reconciliation degraded: 1 attempt(s) unavailable")
     );
     assert!(diagnostics.contains("Y-Harness Effect reconciliation recovered"));
+    assert!(
+        project.join(".y-harness/effect-governance.db").is_file(),
+        "configured durable Effect governor store was not created"
+    );
 
     let execution_before_restart =
         fs::read(project.join("execution-requests.jsonl")).expect("read execution requests");

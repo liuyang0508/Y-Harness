@@ -913,6 +913,16 @@ transitive dependency lock. The Ledger remains the only durable recovery
 authority, so restart may repeat safe scans but cannot replay a terminal
 Effect:
 
+Execution may additionally install dispatch-governor API 1. Its independent
+schema-1 `effect-governance.db` atomically enforces a fixed-window limit,
+consecutive-failure circuit, monotonic circuit epoch, and one leased half-open
+probe for the trusted `(tenant, capability, operation, policy_id)` lane. It
+runs after durable Claim and before Connector entry; denials therefore settle
+as safe retryable `NotApplied` results. It never infers a business target from
+Effect input or a failure from `reason_code`, and it does not gate authoritative
+read-only reconciliation. See
+[ADR 0141](docs/adr/0141-durable-effect-dispatch-governance.md).
+
 ```json
 {
   "effect_consumer": {
@@ -923,9 +933,20 @@ Effect:
         "scan_limit": 64,
         "max_concurrency": 8,
         "policy_timeout_ms": 5000,
+        "governor_timeout_ms": 5000,
+        "governor_retry_after_ms": 5000,
         "execution_timeout_ms": 240000,
         "settlement_reserve_ms": 30000,
         "lease_duration_ms": 300000
+      },
+      "governor": {
+        "policy_id": "notification-command-v1",
+        "max_dispatches_per_window": 1000,
+        "window_ms": 60000,
+        "failure_threshold": 5,
+        "open_duration_ms": 30000,
+        "probe_lease_ms": 10000,
+        "admission_retention_ms": 604800000
       },
       "allow": [
         {"capability": "notification.command", "operation": "send"}
@@ -974,6 +995,8 @@ entry. A racing change may still cause issuance before the second measurement
 rejects it, so this is not an atomic executable-to-`exec` claim. See
 [ADR 0139](docs/adr/0139-typed-secret-use-and-effect-credential-custody.md) and
 [ADR 0140](docs/adr/0140-secret-gated-effect-command-integrity-preflight.md).
+Dispatch-governor semantics and their cross-store non-claims are fixed by
+[ADR 0141](docs/adr/0141-durable-effect-dispatch-governance.md).
 
 The same Runtime is available through an exactly versioned, typed command
 protocol. Protocol v30 preserves Protocol v29's 2 MiB request and 16 MiB

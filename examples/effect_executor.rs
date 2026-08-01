@@ -9,10 +9,10 @@ use std::{collections::BTreeSet, sync::Arc};
 use y_harness::{
     AllowListEffectExecutionPolicy, AuthorityContext, CancellationToken, CapabilityOrigin,
     EFFECT_EXECUTOR_API_VERSION, EffectConnector, EffectConnectorDescriptor,
-    EffectConnectorRegistry, EffectCreateRequest, EffectEngine, EffectExecutionOutcome,
-    EffectExecutionRequest, EffectExecutor, EffectExecutorClock, EffectExecutorRunRequest,
-    EffectId, EffectIdempotencyContract, EffectOperation, EffectReceipt, HarnessError,
-    HarnessFuture, MemoryEffectCoordinator,
+    EffectConnectorRegistry, EffectCreateRequest, EffectDispatchGovernorPolicy, EffectEngine,
+    EffectExecutionOutcome, EffectExecutionRequest, EffectExecutor, EffectExecutorClock,
+    EffectExecutorRunRequest, EffectId, EffectIdempotencyContract, EffectOperation, EffectReceipt,
+    HarnessError, HarnessFuture, MemoryEffectCoordinator, MemoryEffectDispatchGovernor,
 };
 
 const NOW_MS: u64 = 1_000;
@@ -87,7 +87,19 @@ async fn main() -> Result<(), HarnessError> {
         AllowListEffectExecutionPolicy::deny_by_default().allow("notification.example", "send")?;
     let executor = EffectExecutor::new(engine, connectors)?
         .with_policy(Arc::new(policy))
-        .with_clock(Arc::new(ExampleClock));
+        .with_clock(Arc::new(ExampleClock))
+        .with_dispatch_governor(
+            Arc::new(MemoryEffectDispatchGovernor::new()),
+            EffectDispatchGovernorPolicy {
+                policy_id: "notification-example-v1".to_owned(),
+                max_dispatches_per_window: 100,
+                window_ms: 60_000,
+                failure_threshold: 5,
+                open_duration_ms: 30_000,
+                probe_lease_ms: 10_000,
+                admission_retention_ms: 604_800_000,
+            },
+        )?;
 
     let report = executor
         .run_once_as(

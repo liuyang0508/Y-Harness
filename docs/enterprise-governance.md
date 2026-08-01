@@ -218,6 +218,15 @@ after the first measurement can still cause issuance before the second rejects
 it; neither measurement is an atomic file-descriptor-to-`exec` or transitive
 artifact proof.
 
+ADR 0141 adds optional embedded Effect dispatch-governor API 1 and a separate
+schema-1 SQLite store. The only truthful generic lane is tenant plus exact
+Effect capability/operation plus immutable policy revision; arbitrary request
+JSON is never promoted to target authority. Admission occurs after a fenced
+Claim and before Connector entry, combining fixed-window limiting,
+epoch-fenced consecutive-failure circuit state, and one leased half-open probe
+in one transaction. Typed Harness outcomes—not reason strings—settle health,
+and authoritative reconciliation remains outside the execution circuit.
+
 ADR 0121 adds the independent `y-harness-domain-pack` control-plane crate.
 Format-1 snapshots pin exact components and a mandatory Evaluation suite.
 Store schema 1 makes release and activation identity tenant-partitioned,
@@ -248,8 +257,8 @@ tenant-fenced Graph; Y-Harness does not yet store or authorize the external
 blob addressed by that URI. Multi-principal tenant routing, general
 Secret-manager integration, tenant-partitioned MCP sessions, atomic Effect
 executable-to-exec binding and transitive artifact verification, receipt
-verification, durable per-target
-circuit breaking/rate limits, Workflow compensation planning,
+verification, typed finer-grained target coordinates and distributed
+multi-region dispatch governance, Workflow compensation planning,
 automatic Human Handoff
 channel routing/outbox delivery, quota, retention, canary rollout, and
 multi-node control-plane availability remain open.

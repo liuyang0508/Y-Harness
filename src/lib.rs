@@ -49,11 +49,14 @@ pub use context::{
 };
 pub use effect::{
     AllowListEffectExecutionPolicy, AllowListEffectReconciliationPolicy, DenyAllEffectExecutions,
-    DenyAllEffectReconciliations, EFFECT_EXECUTOR_API_VERSION, EFFECT_LEDGER_SCHEMA_VERSION,
-    EFFECT_RECONCILER_API_VERSION, Effect, EffectApplyOutcome, EffectCommand, EffectCommandKind,
-    EffectCommandResult, EffectConnector, EffectConnectorDescriptor, EffectConnectorRegistry,
-    EffectCoordinator, EffectCreateRequest, EffectDueLease, EffectDueScanPage, EffectEngine,
-    EffectExecutionDecision, EffectExecutionOutcome, EffectExecutionPolicy,
+    DenyAllEffectReconciliations, EFFECT_DISPATCH_GOVERNOR_API_VERSION,
+    EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION, EFFECT_EXECUTOR_API_VERSION,
+    EFFECT_LEDGER_SCHEMA_VERSION, EFFECT_RECONCILER_API_VERSION, Effect, EffectApplyOutcome,
+    EffectCommand, EffectCommandKind, EffectCommandResult, EffectConnector,
+    EffectConnectorDescriptor, EffectConnectorRegistry, EffectCoordinator, EffectCreateRequest,
+    EffectDispatchAdmissionDecision, EffectDispatchAdmissionRequest, EffectDispatchGovernor,
+    EffectDispatchGovernorPolicy, EffectDispatchSettlement, EffectDueLease, EffectDueScanPage,
+    EffectEngine, EffectExecutionDecision, EffectExecutionOutcome, EffectExecutionPolicy,
     EffectExecutionPolicyRequest, EffectExecutionRequest, EffectExecutor, EffectExecutorAttempt,
     EffectExecutorAttemptOutcome, EffectExecutorClock, EffectExecutorConfig,
     EffectExecutorRunReport, EffectExecutorRunRequest, EffectIdempotencyContract, EffectLease,
@@ -64,9 +67,9 @@ pub use effect::{
     EffectReconciliationConnectorRegistry, EffectReconciliationContract,
     EffectReconciliationDecision, EffectReconciliationOutcome, EffectReconciliationPolicy,
     EffectReconciliationPolicyRequest, EffectReconciliationRequest, EffectSnapshot, EffectStatus,
-    EffectTransition, EffectTransitionKind, MemoryEffectCoordinator, RegisteredEffectConnector,
-    RegisteredEffectReconciliationConnector, SqliteEffectCoordinator, SystemEffectExecutorClock,
-    SystemEffectReconcilerClock,
+    EffectTransition, EffectTransitionKind, MemoryEffectCoordinator, MemoryEffectDispatchGovernor,
+    RegisteredEffectConnector, RegisteredEffectReconciliationConnector, SqliteEffectCoordinator,
+    SqliteEffectDispatchGovernor, SystemEffectExecutorClock, SystemEffectReconcilerClock,
 };
 pub use evaluation::{
     BaselineComparison, BaselineFailure, BaselineRequirement, EVALUATION_FORMAT_VERSION,

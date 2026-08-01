@@ -8,6 +8,7 @@
 mod coordinator;
 mod engine;
 mod executor;
+mod governor;
 mod page;
 mod reconciler;
 
@@ -34,6 +35,12 @@ pub use executor::{
     EffectExecutionRequest, EffectExecutor, EffectExecutorAttempt, EffectExecutorAttemptOutcome,
     EffectExecutorClock, EffectExecutorConfig, EffectExecutorRunReport, EffectExecutorRunRequest,
     EffectIdempotencyContract, RegisteredEffectConnector, SystemEffectExecutorClock,
+};
+pub use governor::{
+    EFFECT_DISPATCH_GOVERNOR_API_VERSION, EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION,
+    EffectDispatchAdmissionDecision, EffectDispatchAdmissionRequest, EffectDispatchGovernor,
+    EffectDispatchGovernorPolicy, EffectDispatchSettlement, MemoryEffectDispatchGovernor,
+    SqliteEffectDispatchGovernor,
 };
 pub use reconciler::{
     AllowListEffectReconciliationPolicy, DenyAllEffectReconciliations,

@@ -13,9 +13,20 @@
         "scan_limit": 64,
         "max_concurrency": 8,
         "policy_timeout_ms": 5000,
+        "governor_timeout_ms": 5000,
+        "governor_retry_after_ms": 5000,
         "execution_timeout_ms": 240000,
         "settlement_reserve_ms": 30000,
         "lease_duration_ms": 300000
+      },
+      "governor": {
+        "policy_id": "notification-command-v1",
+        "max_dispatches_per_window": 1000,
+        "window_ms": 60000,
+        "failure_threshold": 5,
+        "open_duration_ms": 30000,
+        "probe_lease_ms": 10000,
+        "admission_retention_ms": 604800000
       },
       "allow": [
         {
