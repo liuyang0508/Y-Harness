@@ -4,6 +4,15 @@ All notable changes to Y-Harness are documented in this file.
 
 ## Unreleased
 
+- advanced client Protocol to v37, State event/snapshot schemas to 16/16,
+  Thread archive format to 6, and embedded Temporal Driver API to 3; added an
+  independently versioned schema-1 Agent Loop wait projection, bounded
+  tenant-keyset timeout and accepted-denial convergence, exact event-evidence
+  settlement, backup-first projection migration, deterministic duplicate/CAS
+  handling across SQLite processes, and opt-in reference-service lifecycle;
+  Core still starts no scheduler, and Inbox repair, general HumanInput/batch
+  waiting, finite worker leases, frozen Context capsules, and cross-process
+  resume receipts remain open;
 - advanced Secret Provider API to 3 and client Protocol to v30 with typed
   Agent-Turn, Governed-Effect, and service-use contexts; added optional
   authority-aware Effect `secret_environment` references, content-free startup
@@ -96,9 +105,9 @@ All notable changes to Y-Harness are documented in this file.
   private prompt-file cleanup, exact Model/effort/Turn controls, and truthful
   observed-Model and complete-cost evidence.
 
-## 0.1.0 - 2026-07-25
+### 2026-07-25 pre-release baseline
 
-Initial public baseline:
+Initial pre-release baseline; no immutable `v0.1.0` tag was published:
 
 - eleven-layer, provider-neutral Agent Harness Runtime;
 - bounded Agent Loop with durable State, policy, approval, verification,

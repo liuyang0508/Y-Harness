@@ -7,4 +7,4 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec cargo install --locked --force --features https-mcp,https-model,https-skill --path "$repo_root" "$@"
+exec cargo install --locked --force --features http-probe,https-mcp,https-model,https-skill --path "$repo_root" "$@"

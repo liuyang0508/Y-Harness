@@ -1,4 +1,4 @@
 /target/
 /.y-harness/
+/.y-harness-*/
 .DS_Store
-

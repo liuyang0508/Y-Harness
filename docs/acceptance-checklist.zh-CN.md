@@ -31,7 +31,7 @@ yh doctor "$project/y-harness.json"
 
 - [ ] `y-harness.json`、`.gitignore` 和 `.y-harness/` 已创建。
 - [ ] 对同一路径再次执行 `yh init` 失败，原配置字节不变。
-- [ ] `doctor` 输出 Protocol、schema、模型、数据目录、六库
+- [ ] `doctor` 输出 Protocol、schema、模型、数据目录、七类持久库
       `ready`/`will be created` 状态和 `status: ok`。
 - [ ] 把旧版 State 测试库放入数据目录后，`doctor` 与 `serve` 都在构造
       外部 Model/MCP 前返回 `state-migrate` 指引；数据库字节不变且不会
@@ -51,7 +51,7 @@ yh doctor "$project/y-harness.json"
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"31","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"37","command":{"method":"initialize"}}' \
   | yh serve "$project/y-harness.json"
 ```
 
@@ -67,13 +67,38 @@ printf '%s\n' \
       Claim/续租/释放/结算要求精确 revision、当前 actor 与 claim fence，
       同一 command ID 被其他 actor 或不同内容复用时失败。
 - [ ] 嵌入宿主可用同一租户 Authority 与可信时间调用有限 Temporal tick，
-      推进到期 Workflow 等待、过期 Claim 和 Effect 租约；Effect 进入
-      `unknown` 而非重试，Core 不会自行启动后台轮询。
+      推进到期 Workflow 等待、过期 Claim、Effect 租约和 Agent Loop
+      持久等待；后者使用租户级 keyset due 索引与精确 State stream fence，
+      Effect 进入 `unknown` 而非重试，Core 不会自行启动后台轮询。
 - [ ] `yh serve` 未配置 `temporal` 时不轮询；显式配置后使用同一固定
       Authority，限制 cadence/scan、跳过漏拍，并在 stdio 关闭时先停止。
+- [ ] Protocol `get_service_status` 对同一 Handler 返回 `ready`、容量满时
+      `at_capacity`、单向停机后 `draining`；不把外部依赖状态混入结果。
+- [ ] 使用 `--all-features` 和显式 `http_probe` 配置时，`/livez` 在三种
+      admission 状态都只证明进程可回答，`/readyz` 仅在 `ready` 返回 200；
+      未配置时不监听，零默认构建对该配置明确报错而非静默忽略。
+- [ ] Unix 下保持 `yh serve` 的 stdin 管道打开并发送 SIGTERM，进程仍在
+      5 秒内成功退出；信号前已接收的协议帧返回完整响应，正常 EOF 路径不回归。
 - [ ] `recover_thread` 只有 `thread.recover` 权限可调用，并要求精确
       `expected_turn_id`；同一 Host 仍有活跃 Operation、过期 Turn ID
       或新的 running Turn 时均不修改 State。
+- [ ] `initialize` 返回 Protocol 37、State/Snapshot 16 和 Thread Archive
+      6，并且只在 Runtime 具备持久 Approval Handler 时授权
+      `turn.wait.get/resume/cancel`。
+- [ ] 带 `approval_wait_ttl_ms` 的单个非 batch Tool `ask` 先把完整
+      `WaitStarted` 写入 State，再以 `OperationStatus::waiting` 释放 Worker；
+      重启后可用 `get_turn_execution` 发现同一 `wait_id`、revision、原始
+      Authority、Generation 和剩余 active timeout。
+- [ ] 审批通过后，`resume_turn_wait` 只接受精确 wait/revision，按
+      `Waiting → Ready → Executing` 的 State CAS 前进；两个并发 Worker
+      只有一个 Claim 成功，`Executing` 不允许盲目重放。
+- [ ] 审批拒绝在一个 State CAS 中记录决定并终结 Turn，不先 Claim；
+      `cancel_turn_wait` 使用稳定 `command_id` 可在响应丢失后精确重试，
+      但拒绝关闭 `Executing`。
+- [ ] 验收报告明确区分：Core 不自启调度线程；显式配置 `temporal` 的宿主
+      已能通过租户级 due 索引推进到期等待；Inbox repair outbox/tombstone、
+      batch wait release、`HumanInput`、Worker Lease、`NeedsReconciliation`、
+      冻结 Context capsule 和跨进程 Resume receipt 仍未实现。
 
 自动化证据：
 
@@ -148,13 +173,20 @@ yh skill verify "$project/y-harness.json"
       `.signed-skill.json` 存储，并保持 `External` 来源。
 - [ ] `install-https` 要求精确公共 HTTPS URL、`name@version`、内容
       SHA-256 和预先验证通过的发布者信任配置。
+- [ ] Catalog 搜索/安装要求 Catalog 原始字节 SHA-256；递归依赖只服从
+      签名包内的精确 manifest，完整闭包验证成功后仍保持 inactive。
+- [ ] 私有 Registry 的 Catalog 与 Package 请求逐次解析 Bearer；Package
+      origin 在凭据解析与联网前命中白名单，私有 CA 排除环境根信任。
+- [ ] `doctor`、Protocol v37 Runtime Catalog/Service Status、TUI、缓存、回执与项目文件
+      均不包含 Secret 引用、环境变量名、Bearer 值、Header 或 CA 字节。
 - [ ] 发布者签名、有效期、撤销以及必需/已提供的透明度收据在首次写盘前
       通过验证；`doctor` 输出发布者和日志锁。
 - [ ] 安装不等于激活；只有显式列入 `external_package_files` 和
       `activate` 的精确包进入 Context。
 - [ ] 发布者或日志被实时撤销后，后续 `list`、`verify` 和 Context 编译
       失败；取消配置引用后，包仍能被移入可恢复垃圾目录。
-- [ ] 不会自动更新、递归下载依赖、执行包内代码或把网络包降级为本地信任。
+- [ ] 不会后台更新、采用隐式 `latest`、执行包内代码或把网络包降级为
+      本地信任；镜像联邦、OAuth、npm/git 来源仍明确标为未实现。
 
 ## I. 回归、安全与兼容性
 

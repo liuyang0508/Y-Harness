@@ -66,6 +66,7 @@ jobs:
           cargo check --locked --no-default-features --features https-model
           cargo check --locked --no-default-features --features https-mcp
           cargo check --locked --no-default-features --features https-skill
+          cargo check --locked --no-default-features --features http-probe
           cargo check --locked --no-default-features --features tls-host
       - name: All-feature tests
         run: cargo test --locked --workspace --all-targets --all-features

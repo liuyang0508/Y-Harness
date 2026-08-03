@@ -21,10 +21,19 @@ Observability reads State evidence; it does not mutate execution
 - State is the authoritative execution record; JSONL and later telemetry are
   derived views.
 - Built-in and external capabilities use the same typed registration rules.
+- Executable registration and Model disclosure are separate contracts. Every
+  Model step uses one immutable Tool Capability View, and a registered Tool
+  absent from that View must fail before Tool-call State, Policy, Approval, or
+  execution. A multi-call decision fails atomically when any member is hidden.
 - Provider selection is exact and explicit; a registry never silently replaces
   an identity or performs implicit failover. An operator-configured Model route
   is bounded, ordered, attempt-deadlined, and records the actual settled
   identity and origin.
+- Loop liveness is governed from durable structured evidence, never hidden
+  reasoning. A no-progress stop is evaluated only at a safe boundary after
+  pending user input is applied; successful repeated observations are not
+  treated as failures, and external-effect idempotency remains a separate
+  contract.
 - Untrusted executable extensions will not run in process.
 - Raw evidence, runtime state, compiled context, and durable knowledge remain
   distinct data classes.
@@ -395,9 +404,17 @@ schema must not advance.
   completion independently. Never call a forced task stop successful
   cancellation; unresolved durable running Turns require exclusive recovery
   evidence.
+- Process signals belong to the Host. A cooperative transport may stop waiting
+  only between complete protocol frames; once accepted, a frame and response
+  remain atomic. Do not use an uncancellable Runtime blocking-pool stdin read or
+  `process::exit` as a substitute for resource settlement.
 - Process-local Operation retention has a safe finite default and a validated
   operator maximum. Capacity never silently evicts running or unobserved
   terminal results; clients explicitly forget terminal records.
+- Deployment liveness and readiness adapters translate the authoritative
+  Handler admission projection. Liveness means the process can answer;
+  readiness means one new Turn can enter. They never open State independently,
+  restart a live saturated process, or infer generic dependency health.
 - Durable event pages are bounded by count and encoded bytes. When the byte
   ceiling wins, `has_more` and `next_after_sequence` preserve lossless cursor
   progress.

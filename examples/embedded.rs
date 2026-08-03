@@ -93,7 +93,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tools,
         Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
         StateEngine::new(Arc::new(MemoryEventStore::new())),
-    )?;
+    )?
+    .with_model_visible_tools(["echo"])?;
     let thread = runtime.create_thread().await?;
     let outcome = runtime.run_turn(&thread.id, "hello Harness").await?;
     let tool_completed = outcome.turn.items.iter().any(|item| {

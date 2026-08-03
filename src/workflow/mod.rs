@@ -19,11 +19,27 @@ pub use coordinator::{
 };
 pub use engine::WorkflowEngine;
 
-const MAX_WORKFLOW_TRANSITIONS: usize = 4_096;
-const MAX_WORKFLOW_JSON_BYTES: usize = 16_777_216;
+const MAX_WORKFLOW_WORK_TRANSITIONS: usize = 4_096;
+const WORKFLOW_SETTLEMENT_TRANSITION_RESERVE: usize = 2;
+const MAX_WORKFLOW_TRANSITIONS: usize =
+    MAX_WORKFLOW_WORK_TRANSITIONS + WORKFLOW_SETTLEMENT_TRANSITION_RESERVE;
+const MAX_WORKFLOW_WORK_JSON_BYTES: usize = 16_777_216;
 const MAX_WORKFLOW_COMMAND_JSON_BYTES: usize = 131_072;
 const MAX_WORKFLOW_TEXT_BYTES: usize = 65_536;
 const MAX_WORKFLOW_IDEMPOTENCY_BYTES: usize = 256;
+// One recovery transition plus one terminal transition can duplicate a maximum
+// escaped terminal text in both the current projection and immutable evidence;
+// 16 KiB covers both actor, fence, digest, sequence, and JSON envelopes.
+const WORKFLOW_SETTLEMENT_JSON_BYTE_RESERVE: usize = MAX_WORKFLOW_COMMAND_JSON_BYTES * 2 + 16_384;
+const MAX_WORKFLOW_JSON_BYTES: usize =
+    MAX_WORKFLOW_WORK_JSON_BYTES + WORKFLOW_SETTLEMENT_JSON_BYTE_RESERVE;
+const _: () = assert!(WORKFLOW_SETTLEMENT_JSON_BYTE_RESERVE < MAX_WORKFLOW_WORK_JSON_BYTES);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowCapacityClass {
+    Work,
+    Settlement,
+}
 
 /// Exact immutable Workflow implementation coordinate.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -220,6 +236,22 @@ pub enum WorkflowCommandKind {
     },
 }
 
+impl WorkflowCommandKind {
+    fn capacity_class(&self) -> WorkflowCapacityClass {
+        match self {
+            Self::DeliverSignal { .. }
+            | Self::WakeDue { .. }
+            | Self::Complete { .. }
+            | Self::Fail { .. }
+            | Self::Cancel { .. } => WorkflowCapacityClass::Settlement,
+            Self::WaitForSignal { .. }
+            | Self::WaitUntil { .. }
+            | Self::ScheduleRetry { .. }
+            | Self::MigrateDefinition { .. } => WorkflowCapacityClass::Work,
+        }
+    }
+}
+
 /// Durable reason why a time-owned wait resumed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -308,6 +340,21 @@ pub enum WorkflowTransitionKind {
         /// Bounded cancellation reason.
         reason: String,
     },
+}
+
+impl WorkflowTransitionKind {
+    fn capacity_class(&self) -> WorkflowCapacityClass {
+        match self {
+            Self::SignalDelivered { .. }
+            | Self::WaitDue { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Cancelled { .. } => WorkflowCapacityClass::Settlement,
+            Self::Created { .. } | Self::WaitStarted { .. } | Self::DefinitionMigrated { .. } => {
+                WorkflowCapacityClass::Work
+            }
+        }
+    }
 }
 
 /// Whether a Workflow command changed durable state.
@@ -450,11 +497,8 @@ impl WorkflowRun {
         validate_application_time(applied_at_ms)?;
         authority.validate_current("Workflow command authority")?;
         let digest = command_digest(&command)?;
-        if self.transitions.len() >= MAX_WORKFLOW_TRANSITIONS {
-            return Err(HarnessError::Workflow(format!(
-                "Workflow Run exceeds {MAX_WORKFLOW_TRANSITIONS} transitions"
-            )));
-        }
+        let capacity_class = command.kind.capacity_class();
+        validate_transition_capacity(self.transitions.len(), capacity_class)?;
         if self
             .transitions
             .last()
@@ -479,7 +523,7 @@ impl WorkflowRun {
             kind: transition_kind,
         });
         next.validate()?;
-        next.materialization_charge_bytes = encoded_size(&next)?;
+        next.materialization_charge_bytes = encoded_size_for(&next, capacity_class)?;
         *self = next;
         Ok(WorkflowApplyOutcome::Applied)
     }
@@ -779,6 +823,8 @@ impl WorkflowRun {
         let mut projected_status = None;
         let mut projected_task_graph = None;
         let mut previous_applied_at_ms = 0_u64;
+        let work_transition_limit = u64::try_from(MAX_WORKFLOW_WORK_TRANSITIONS)
+            .map_err(|_| HarnessError::Workflow("Workflow capacity overflow".to_owned()))?;
         for transition in &self.transitions {
             if transition.sequence != expected_sequence {
                 return Err(HarnessError::Workflow(
@@ -804,6 +850,13 @@ impl WorkflowRun {
             if transition.command_sha256 != transition_digest(transition)? {
                 return Err(HarnessError::Workflow(
                     "Workflow transition command digest differs from its content".to_owned(),
+                ));
+            }
+            if transition.sequence > work_transition_limit
+                && transition.kind.capacity_class() == WorkflowCapacityClass::Work
+            {
+                return Err(HarnessError::Workflow(
+                    "Workflow work transition consumed the settlement reserve".to_owned(),
                 ));
             }
             if command_ids
@@ -1218,14 +1271,54 @@ fn command_digest(value: &impl Serialize) -> Result<String, HarnessError> {
         .collect())
 }
 
-fn encoded_size(run: &WorkflowRun) -> Result<usize, HarnessError> {
-    let encoded = serde_json::to_vec(run)
-        .map_err(|_| HarnessError::Workflow("cannot encode Workflow Run".to_owned()))?;
-    if encoded.len() > MAX_WORKFLOW_JSON_BYTES {
+fn validate_transition_capacity(
+    current_transitions: usize,
+    capacity_class: WorkflowCapacityClass,
+) -> Result<(), HarnessError> {
+    if current_transitions >= MAX_WORKFLOW_TRANSITIONS {
+        return Err(HarnessError::Workflow(format!(
+            "Workflow Run exceeds {MAX_WORKFLOW_TRANSITIONS} transitions"
+        )));
+    }
+    if capacity_class == WorkflowCapacityClass::Work
+        && current_transitions >= MAX_WORKFLOW_WORK_TRANSITIONS
+    {
+        return Err(HarnessError::Workflow(
+            "Workflow Run has only its settlement transition reserve remaining".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_materialization_capacity(
+    encoded_bytes: usize,
+    capacity_class: WorkflowCapacityClass,
+) -> Result<(), HarnessError> {
+    if encoded_bytes > MAX_WORKFLOW_JSON_BYTES {
         return Err(HarnessError::Workflow(format!(
             "Workflow Run exceeds {MAX_WORKFLOW_JSON_BYTES} encoded bytes"
         )));
     }
+    if capacity_class == WorkflowCapacityClass::Work && encoded_bytes > MAX_WORKFLOW_WORK_JSON_BYTES
+    {
+        return Err(HarnessError::Workflow(
+            "Workflow Run has only its settlement encoded-byte reserve remaining".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn encoded_size(run: &WorkflowRun) -> Result<usize, HarnessError> {
+    encoded_size_for(run, WorkflowCapacityClass::Settlement)
+}
+
+fn encoded_size_for(
+    run: &WorkflowRun,
+    capacity_class: WorkflowCapacityClass,
+) -> Result<usize, HarnessError> {
+    let encoded = serde_json::to_vec(run)
+        .map_err(|_| HarnessError::Workflow("cannot encode Workflow Run".to_owned()))?;
+    validate_materialization_capacity(encoded.len(), capacity_class)?;
     Ok(encoded.len())
 }
 
@@ -1253,11 +1346,105 @@ mod tests {
         }
     }
 
-    fn command(id: &'static str, kind: WorkflowCommandKind) -> WorkflowCommand {
+    fn command(id: &str, kind: WorkflowCommandKind) -> WorkflowCommand {
         WorkflowCommand {
-            id: WorkflowCommandId::from_static(id),
+            id: WorkflowCommandId::from_string(id.to_owned()),
             kind,
         }
+    }
+
+    fn append_fixture_transition(
+        run: &mut WorkflowRun,
+        command: WorkflowCommand,
+        applied_at_ms: u64,
+        authority: &AuthorityContext,
+    ) {
+        let command_sha256 = command_digest(&command).expect("fixture command digest");
+        let WorkflowCommand { id, kind } = command;
+        let transition_kind = run
+            .apply_kind(kind, applied_at_ms)
+            .expect("fixture transition");
+        let sequence = u64::try_from(run.transitions.len())
+            .expect("fixture sequence")
+            .checked_add(1)
+            .expect("fixture sequence increment");
+        run.transitions.push(WorkflowTransition {
+            sequence,
+            command_id: id,
+            command_sha256,
+            applied_at_ms,
+            actor: authority.actor().clone(),
+            kind: transition_kind,
+        });
+    }
+
+    fn running_one_slot_before_work_capacity(authority: &AuthorityContext) -> (WorkflowRun, u64) {
+        let mut run = WorkflowRun::new(create(), 10, authority).expect("run");
+        let cycles = (MAX_WORKFLOW_WORK_TRANSITIONS - 2) / 2;
+        let mut applied_at_ms = 10_u64;
+        for index in 0..cycles {
+            let wait_id = WorkflowWaitId::from_string(format!("capacity-wait-{index}"));
+            applied_at_ms = applied_at_ms.checked_add(1).expect("fixture time");
+            let due_at_ms = applied_at_ms.checked_add(1).expect("fixture due time");
+            append_fixture_transition(
+                &mut run,
+                command(
+                    &format!("capacity-wait-command-{index}"),
+                    WorkflowCommandKind::WaitUntil {
+                        wait_id: wait_id.clone(),
+                        due_at_ms,
+                    },
+                ),
+                applied_at_ms,
+                authority,
+            );
+            append_fixture_transition(
+                &mut run,
+                command(
+                    &format!("capacity-wake-command-{index}"),
+                    WorkflowCommandKind::WakeDue { wait_id },
+                ),
+                due_at_ms,
+                authority,
+            );
+            applied_at_ms = due_at_ms;
+        }
+        assert_eq!(run.transition_count(), MAX_WORKFLOW_WORK_TRANSITIONS - 1);
+        assert_eq!(run.status(), &WorkflowStatus::Running);
+        run.validate().expect("fixture projection");
+        run.materialization_charge_bytes = encoded_size(&run).expect("fixture size");
+        (run, applied_at_ms)
+    }
+
+    fn escaped_identity(suffix: char) -> String {
+        let mut value = "\\".repeat(MAX_WORKFLOW_IDEMPOTENCY_BYTES - suffix.len_utf8());
+        value.push(suffix);
+        value
+    }
+
+    fn largest_escaped_failure_command(id: &str) -> WorkflowCommand {
+        let mut accepted = 1_usize;
+        let mut rejected = MAX_WORKFLOW_TEXT_BYTES + 1;
+        while accepted + 1 < rejected {
+            let candidate = accepted + (rejected - accepted) / 2;
+            let command = command(
+                id,
+                WorkflowCommandKind::Fail {
+                    reason: "\\".repeat(candidate),
+                },
+            );
+            if command_digest(&command).is_ok() {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        command(
+            id,
+            WorkflowCommandKind::Fail {
+                reason: "\\".repeat(accepted),
+            },
+        )
     }
 
     #[test]
@@ -1461,5 +1648,221 @@ mod tests {
         encoded["transitions"][0]["command_sha256"] = serde_json::json!("b".repeat(64));
         let error = serde_json::from_value::<WorkflowRun>(encoded).expect_err("tamper");
         assert!(error.to_string().contains("digest differs"));
+    }
+
+    #[test]
+    fn final_work_slot_can_wait_then_wake_and_settle() {
+        let authority = AuthorityContext::local_process();
+        let (mut waiting, previous_at_ms) = running_one_slot_before_work_capacity(&authority);
+        let wait_id = WorkflowWaitId::from_static("final-capacity-wait");
+        let wait_at_ms = previous_at_ms.checked_add(1).expect("wait time");
+        let due_at_ms = wait_at_ms.checked_add(1).expect("due time");
+        waiting
+            .apply(
+                command(
+                    "final-capacity-wait-command",
+                    WorkflowCommandKind::WaitUntil {
+                        wait_id: wait_id.clone(),
+                        due_at_ms,
+                    },
+                ),
+                wait_at_ms,
+                &authority,
+            )
+            .expect("last work slot enters Waiting");
+        assert_eq!(waiting.transition_count(), MAX_WORKFLOW_WORK_TRANSITIONS);
+        assert!(matches!(waiting.status(), WorkflowStatus::Waiting { .. }));
+        waiting =
+            serde_json::from_slice(&serde_json::to_vec(&waiting).expect("encode old work ceiling"))
+                .expect("old work ceiling remains wire-compatible");
+
+        let before_rejected_work = waiting.clone();
+        let rejected_work = waiting
+            .apply(
+                command(
+                    "capacity-migration",
+                    WorkflowCommandKind::MigrateDefinition {
+                        definition: definition("2.0.0", 'b'),
+                    },
+                ),
+                due_at_ms,
+                &authority,
+            )
+            .expect_err("work cannot consume settlement reserve");
+        assert!(
+            rejected_work
+                .to_string()
+                .contains("settlement transition reserve")
+        );
+        assert_eq!(waiting, before_rejected_work);
+
+        let mut woken_and_failed = waiting.clone();
+        woken_and_failed
+            .apply(
+                command(
+                    "capacity-wake",
+                    WorkflowCommandKind::WakeDue {
+                        wait_id: wait_id.clone(),
+                    },
+                ),
+                due_at_ms,
+                &authority,
+            )
+            .expect("reserved wake");
+        assert_eq!(
+            woken_and_failed.transition_count(),
+            MAX_WORKFLOW_WORK_TRANSITIONS + 1
+        );
+        assert_eq!(woken_and_failed.status(), &WorkflowStatus::Running);
+        let failure = command(
+            "capacity-fail",
+            WorkflowCommandKind::Fail {
+                reason: "capacity exhausted".to_owned(),
+            },
+        );
+        woken_and_failed
+            .apply(failure.clone(), due_at_ms + 1, &authority)
+            .expect("reserved terminal failure");
+        assert_eq!(
+            woken_and_failed.transition_count(),
+            MAX_WORKFLOW_TRANSITIONS
+        );
+        assert!(matches!(
+            woken_and_failed.status(),
+            WorkflowStatus::Failed { .. }
+        ));
+        assert_eq!(
+            woken_and_failed
+                .apply(failure, due_at_ms + 2, &authority)
+                .expect("duplicate at hard boundary"),
+            WorkflowApplyOutcome::Duplicate
+        );
+        let hard_error = woken_and_failed
+            .apply(
+                command(
+                    "beyond-hard-capacity",
+                    WorkflowCommandKind::Cancel {
+                        reason: "too late".to_owned(),
+                    },
+                ),
+                due_at_ms + 3,
+                &authority,
+            )
+            .expect_err("hard transition boundary");
+        assert!(
+            hard_error
+                .to_string()
+                .contains(&format!("{MAX_WORKFLOW_TRANSITIONS} transitions"))
+        );
+
+        let mut cancelled = waiting;
+        cancelled
+            .apply(
+                command(
+                    "capacity-cancel",
+                    WorkflowCommandKind::Cancel {
+                        reason: "operator stopped the run".to_owned(),
+                    },
+                ),
+                due_at_ms,
+                &authority,
+            )
+            .expect("reserved cancellation from Waiting");
+        assert!(matches!(
+            cancelled.status(),
+            WorkflowStatus::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn settlement_byte_reserve_has_a_finite_hard_boundary() {
+        validate_materialization_capacity(
+            MAX_WORKFLOW_WORK_JSON_BYTES,
+            WorkflowCapacityClass::Work,
+        )
+        .expect("last work byte");
+        assert!(
+            validate_materialization_capacity(
+                MAX_WORKFLOW_WORK_JSON_BYTES + 1,
+                WorkflowCapacityClass::Work,
+            )
+            .expect_err("work byte overflow")
+            .to_string()
+            .contains("settlement encoded-byte reserve")
+        );
+        validate_materialization_capacity(
+            MAX_WORKFLOW_WORK_JSON_BYTES + 1,
+            WorkflowCapacityClass::Settlement,
+        )
+        .expect("settlement reserve begins");
+        validate_materialization_capacity(
+            MAX_WORKFLOW_JSON_BYTES,
+            WorkflowCapacityClass::Settlement,
+        )
+        .expect("last hard byte");
+        assert!(
+            validate_materialization_capacity(
+                MAX_WORKFLOW_JSON_BYTES + 1,
+                WorkflowCapacityClass::Settlement,
+            )
+            .expect_err("hard byte overflow")
+            .to_string()
+            .contains(&MAX_WORKFLOW_JSON_BYTES.to_string())
+        );
+    }
+
+    #[test]
+    fn settlement_byte_reserve_covers_maximum_supported_recovery_and_failure() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "\\".repeat(256),
+                subject: "\\".repeat(256),
+            },
+            None,
+        )
+        .expect("maximum actor");
+        let mut run = WorkflowRun::new(create(), 10, &authority).expect("run");
+        let wait_id = WorkflowWaitId::from_string(escaped_identity('w'));
+        run.apply(
+            command(
+                &escaped_identity('a'),
+                WorkflowCommandKind::WaitForSignal {
+                    wait_id: wait_id.clone(),
+                    name: "event.name".to_owned(),
+                    source: "source.name".to_owned(),
+                    expires_at_ms: Some(100),
+                },
+            ),
+            20,
+            &authority,
+        )
+        .expect("wait");
+        let work_boundary_shape = run.materialization_charge_bytes();
+        run.apply(
+            command(
+                &escaped_identity('d'),
+                WorkflowCommandKind::DeliverSignal {
+                    wait_id,
+                    signal_id: WorkflowSignalId::from_string(escaped_identity('s')),
+                    name: "event.name".to_owned(),
+                    source: "source.name".to_owned(),
+                    idempotency_key: "\\".repeat(MAX_WORKFLOW_IDEMPOTENCY_BYTES),
+                },
+            ),
+            30,
+            &authority,
+        )
+        .expect("maximum recovery transition");
+        run.apply(
+            largest_escaped_failure_command(&escaped_identity('f')),
+            40,
+            &authority,
+        )
+        .expect("maximum terminal transition");
+        let reserved_growth = run
+            .materialization_charge_bytes()
+            .checked_sub(work_boundary_shape)
+            .expect("settlement grows the aggregate");
+        assert!(reserved_growth <= WORKFLOW_SETTLEMENT_JSON_BYTE_RESERVE);
     }
 }

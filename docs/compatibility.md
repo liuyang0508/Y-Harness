@@ -11,9 +11,10 @@ upgrade support that has not been tested.
 | Rust crate | Cargo `0.1.0` | Cargo SemVer |
 | Optional TUI package | Cargo `0.1.0` | Cargo SemVer plus exact client protocol |
 | Service configuration | `1` | strict root `schema_version`; no permissive fallback |
-| Client protocol | `"31"` | exact `Initialize` request/response |
-| State events | `14` | per-event durable envelope; reads schemas 1 through 14 |
-| State snapshots | `14` | cache body; incompatible caches are discarded |
+| Client protocol | `"37"` | exact `Initialize` request/response |
+| State events | `16` | per-event durable envelope; reads schemas 1 through 16 |
+| State snapshots | `16` | cache body; incompatible caches are discarded |
+| Agent Loop wait projection | `1` | independent disposable due-index coordinate; rebuilt from schema-16 lifecycle events by backup-first migration |
 | Approval Inbox | `3` | per-record durable body after explicit migration |
 | Task Coordinator | `4` | per-graph SQLite schema column |
 | Workflow Coordinator | `1` | store metadata plus per-Run SQLite schema column |
@@ -23,12 +24,12 @@ upgrade support that has not been tested.
 | Effect dispatch governor API / schema | `1` / `1` | embedded admission/settlement port and independent optional SQLite store |
 | Governed Effect Reconciler API | `1` | exact embedded read-only Connector descriptor; not a durable or client-protocol coordinate |
 | JSON Effect Connector protocol | `1` | exact stdin/stdout process envelopes; no negotiation or fallback |
-| Temporal Driver API | `2` | exact embedded Rust API; not a durable or client-protocol coordinate |
+| Temporal Driver API | `3` | exact embedded Rust API; optional State due-wait source; not a durable or client-protocol coordinate |
 | Memory Provider API | `1` | exact descriptor registration |
 | Token Counter API | `1` | exact descriptor registration |
 | Conversation Compactor API | `1` | exact descriptor registration |
 | Thread handoff request format | `1` | canonical bounded summarizer-input envelope |
-| Thread archive format | `4` | exact bounded archive root plus digest |
+| Thread archive format | `6` | exact bounded archive root plus digest |
 | Evaluation artifacts | `2` | exact self-described suite/baseline/report roots; not a client-protocol surface |
 | Workspace Provider API | `"1"` | exact embedded provider installation and `Initialize` coordinate |
 | Secret Provider API | `3` | exact descriptor registration, typed use context, and trusted-authority resolution |
@@ -42,9 +43,38 @@ Evaluation artifacts are not client-protocol surfaces. Capabilities are
 separately negotiated; a disabled capability is not implied by its schema
 coordinate.
 
+### Current durable Approval wait coordinate
+
+[ADR 0158](adr/0158-durable-agent-loop-waiting-and-resume.md) assigns State
+event/snapshot schema 16, Thread archive format 6, and exact Client Protocol 37
+to the same-journal `AgentLoopExecution` and bounded Approval wait control
+plane. The implemented slice releases a worker only for an opted-in single
+non-batch Tool `ask`; it provides exact wait discovery, resume, cancellation,
+bounded host-driven timeout, and atomic denial without a worker claim.
+
+The implemented backup-first migration preserves immutable schema-1 through schema-15 event
+JSON and never synthesizes Waiting, remaining budget, generation, Resume, or
+Claim evidence. In particular, a legacy `Running` Turn is not inferred to be a
+wait from its final Items, a pending Approval record, or worker absence; it
+retains the existing explicit exclusive recovery-to-`Interrupted` boundary.
+Mixed schema-15/schema-16 writers and old-reader/new-writer operation remain
+unsupported. An independent `agent_loop_wait_projection_schema = 1` coordinate
+is required beside State/snapshot schema 16; older two-key schema-16 metadata
+requires explicit backup-first projection migration. General `HumanInput`,
+batch release, Inbox repair outbox/tombstone, finite worker leases,
+`NeedsReconciliation`, a self-contained frozen Context capsule, and
+cross-process resume receipts are not implied by these coordinates.
+
 Service configuration schema 1 is bounded to 65,536 bytes, rejects unknown
 fields, and keeps credentials as environment-backed secret references. Its
-optional service-assembly fields add direct OpenAI Responses, brokered
+additive `provider_profiles` plus `provider_model` shape binds reusable native
+OpenAI Responses, OpenAI Chat Completions-compatible, Anthropic Messages, or
+Gemini `generateContent` protocol and transport policy separately from concrete
+Model identities. The Chat-compatible Profile additionally selects its exact
+token-limit field, streaming-usage behavior, and an explicit literal-loopback-
+IP HTTP exception; public endpoints remain HTTPS-only. Existing direct
+`open_ai_responses` Model entries retain their exact meaning. Its other
+optional service-assembly fields add brokered
 shell-free JSON Models and Tools, exact-selected stdio or authenticated HTTPS
 JSON-response MCP Tools, Agent Memory Hub Context, and explicitly activated
 project-local declarative Skills. The `json_command` Model variant is additive,
@@ -57,7 +87,14 @@ may add separate signed
 `external_package_files` plus publisher/log public keys, validity,
 transparency, and immutable revocation policy; the existing unsigned
 `package_files` keep their operator-trusted meaning. A trust-only staged object
-may leave package and activation lists empty. The configuration also supports
+may leave package and activation lists empty. The default-empty
+`skill_registries` list additively configures named Registries. Each entry
+fixes one exact HTTPS Catalog endpoint, one sorted unique package-origin
+allowlist, optional request-scoped Bearer Secret mapping, and an optional
+project-contained exclusive CA bundle. Registry commands still require the
+exact Catalog digest and exact target `name@version`; installation remains
+inactive. This is a service-schema-1 host feature, not Registry federation or
+executable plugin authority. The configuration also supports
 a mutually exclusive `models` catalog plus explicit `model_route` alternative
 to the existing single `model`; no existing field changes meaning. MCP entries
 may be explicitly disabled and may pin the configured command file by SHA-256.
@@ -76,6 +113,51 @@ exposes the same builder, constants, derived Turn-bound query, and
 error enum require a source update. State, Client Protocol, snapshots, and
 Model Gateway formats do not change. See
 [ADR 0114](adr/0114-bounded-runtime-model-attempts-per-step.md).
+The Runtime now defaults to ADR 0156's bounded exact Progress Governor. It
+stops only a fully settled, failure-bearing Tool cycle of period one through
+four after five exact repetitions at a pre-Model or terminal step-budget safe
+boundary; successful cycles and applied external input reset the relevant history. The additive
+embedded Rust surface exposes `ProgressPolicy`, its bounds, the
+`with_progress_policy` builder, and `HarnessError::NoProgress`. Exhaustive
+matches on the public pre-1.0 error enum require a source update. No existing
+State Item, State/snapshot/archive schema, service configuration, Protocol, or
+Model Gateway shape changes. Schema-15 completion includes the selected
+repetition threshold in its Runtime-governance digest; that measurement does
+not by itself attest every extension or remote dependency.
+State event/snapshot schema 15 and Protocol v36 add the format-1 deterministic
+`CompletionReceipt` boundary specified by
+[ADR 0157](adr/0157-generation-bound-completion-receipt.md). A Model text
+message remains a candidate until Runtime binds its exact request, candidate
+Item and evidence prefix to the frozen Model route, Tool Capability View,
+Verifier manifest, Runtime governance, optional `ExecutionBinding`, and
+candidate-bound Verifier outcomes. State validates that proof against one exact
+running projection and commits `TurnCompleted { turn_id, receipt }` atomically;
+schema-15 writers cannot create a receipt-free successful Turn.
+
+Receipt-free successful Turns from supported schema-1 through schema-14
+history remain readable as `legacy/unverified`. Migration never fabricates a
+receipt or implies that current completion gates ran. Thread archive format 5
+preserves receipt bytes. Forked and imported history therefore carries an
+inherited proof of completion in the source Thread, authorized by validated
+lineage/import provenance; it is not represented as a fresh execution of the
+completion gates in the target Thread. Protocol-v36 terminal Operation status
+includes the SHA-256 of the authoritative receipt so clients can correlate
+process-local settlement with durable State.
+
+State event/snapshot schema 16 and Protocol v37 add the bounded durable
+Approval-wait slice. Schema 16 persists `WaitStarted`, resume acceptance,
+single-worker claim, cancellation/observed-expiry closure, and atomic denial in
+the same Turn journal; Thread archive format 6 preserves those bytes. Protocol
+37 adds optional `start_turn.approval_wait_ttl_ms`, `get_turn_execution`,
+`resume_turn_wait`, `cancel_turn_wait`, and `OperationStatus::waiting`. The
+wire projection is content-light coordination evidence and does not expose
+Tool input or Model Context. Turns that omit the wait TTL and multi-Tool
+batches retain the prior blocking behavior.
+
+Format 1 proves only the candidate and completion evidence represented inside
+the owning Turn. Its Artifact, Effect, and business-delivery requirements must
+all be explicitly `not_required`; it does not prove cross-aggregate Artifact
+contents, Effect truth, channel delivery, or post-terminal work.
 The Rust API additively exposes `HarnessError::ModelProvider` and bounded
 `ModelProviderFailure` evidence, plus `ModelRetryPolicy`. Existing providers
 may continue returning `HarnessError::Model(String)`; only exhaustive matches
@@ -244,6 +326,67 @@ preserves disabled behavior. See
 [ADR 0129](adr/0129-host-driven-bounded-temporal-driver.md).
 Reference-host lifecycle semantics are specified by
 [ADR 0130](adr/0130-optional-reference-service-temporal-lifecycle.md).
+Client protocol `37` preserves protocol-v36 framing, authority, permissions,
+request/response ceilings, CompletionReceipt digest, and older commands. It
+advances State event/snapshot coordinates to 16 and Thread archive format to
+6. It additively introduces optional `start_turn.approval_wait_ttl_ms`, exact
+wait discovery/resume/cancellation commands, and a terminal process-local
+`waiting` Operation status whose owning Turn remains durably Running. Protocol
+v36 clients fail exact initialization rather than silently discard execution
+coordination evidence.
+
+Client protocol `36` preserves protocol-v35 commands, framing, authority,
+permissions, and request/response ceilings. It advances the advertised State
+event/snapshot coordinates to 15, advertises Thread archive format 5 in the
+compatibility manifest, projects the atomic `turn_completed` event, and adds
+`completion_receipt_sha256` to successful terminal Operation status. The
+digest is a reference to the receipt committed in State; it is not a client-
+authored completion claim and does not expand the format-1 proof boundary.
+Protocol-v35 clients fail exact initialization rather than silently discard
+completion evidence.
+
+Client protocol `35` preserves protocol-v34 framing, authority, durable schema
+coordinates, and request/response ceilings. Protocol v32 introduced the
+conditional `runtime.catalog` capability and `get_runtime_catalog` command.
+Protocol v33 additively included configured Skill Registry identities,
+credential-free endpoints and package origins, authentication classes, and
+exclusive-CA presence. Protocol v34 added the independent `service.status`
+permission, `get_service_status` command, and content-free `ready`,
+`at_capacity`, or `draining` admission projection with bounded process-local
+Operation counts. Protocol v35 adds bounded `tool_trace_request` and
+`tool_trace_response` operation events plus credential-free MCP endpoint/tool
+registration projections for the TUI Tool Trace panel. It changes no durable
+schema and makes no external-dependency health claim. Secret references,
+environment names, credential values,
+headers, and CA bytes remain excluded. Configuration mutation and reload remain
+host lifecycle operations; clients cannot inject a replacement Runtime through
+the protocol. See
+[ADR 0148](adr/0148-request-scoped-private-skill-registry.md) and
+[ADR 0150](adr/0150-authoritative-protocol-service-admission-status.md), and
+[ADR 0153](adr/0153-bounded-model-tool-trace-operation-events.md).
+
+The optional `http-probe` feature and strict reference-service `http_probe`
+configuration add no Client Protocol or durable-schema coordinate. Omission
+preserves the previous zero-listener host. When configured, a binary without
+the feature fails during configuration validation; an enabled adapter maps the
+same v34 status to content-free `GET /livez` and `GET /readyz` responses. See
+[ADR 0151](adr/0151-bounded-http-deployment-probes.md).
+
+Signal-driven reference-service shutdown and cancellation-aware JSONL helpers
+also add no Client Protocol or durable-schema coordinate. Existing EOF-only
+embedders retain their behavior; opt-in cancellation is observed between
+complete frames. See
+[ADR 0152](adr/0152-signal-driven-reference-service-drain.md).
+
+The reference CLI's optional `https-skill` surface now accepts digest-pinned
+format-1 catalogs for bounded search and exact signed dependency acquisition.
+Catalog bytes and source receipts are project-local cache artifacts, not State
+or Client Protocol records. `install-catalog` grants no activation authority;
+`upgrade-catalog` explicitly composes acquisition with the existing preflighted
+configuration mutation. This changes no Skill API, service configuration,
+Protocol, or durable schema coordinate. See
+[ADR 0145](adr/0145-digest-pinned-skill-catalog-resolution.md).
+
 Client protocol `31` preserves protocol-v30 commands, framing, authority,
 permissions, and request/response ceilings. It advertises Task Graph schema 4
 and admits the optional bounded `required_capabilities` set on each immutable
@@ -272,12 +415,14 @@ Coordinators share exact idempotency uniqueness, tenant fencing, bounded
 identity paging, and expired-lease scans. Effect schema 1 is a new independent
 store with no inferred migration or mixed-version writer support.
 
-Temporal Driver API 2 additively composes an optional Effect Engine. It scans
+Temporal Driver API 3 additively composes optional Effect and State Engines. It scans
 the same bounded tenant-local identity space and applies only the existing
-`expire_lease` command after complete cross-source validation. The cursor and
-report add an Effect coordinate, so exhaustive Rust construction requires a
-source update. The API still owns no background task or scheduler database.
-See [ADR 0133](adr/0133-durable-effect-ledger.md).
+`expire_lease`, Agent Loop timeout, or denial-convergence command after complete
+cross-source validation. The cursor and report add Effect and Agent Loop due
+coordinates, so exhaustive Rust construction requires a source update. The API
+still owns no background task or scheduler database. See
+[ADR 0133](adr/0133-durable-effect-ledger.md) and
+[ADR 0159](adr/0159-bounded-indexed-durable-agent-loop-wait-expiry.md).
 
 Governed Effect Executor API 1 is an additive embedded Rust surface over the
 same schema-1 Ledger. Connector descriptors must declare the exact API
@@ -652,6 +797,24 @@ every projection. Schema-14 readers accept immutable schema-1 through
 schema-13 history after explicit migration, and the schema-14 writer emits
 only schema 14.
 
+State event schema `15` adds `TurnCompleted { turn_id, receipt }` as the only
+new-writer path to successful terminal settlement. The bounded deterministic
+receipt is revalidated against the exact projected running Turn and stored on
+that Turn atomically with `Completed`. Schema-15 readers accept immutable
+schema-1 through schema-14 history after explicit migration; receipt-free
+historical success remains legacy/unverified, and the schema-15 writer emits
+only schema 15.
+
+State event schema `16` adds the one-per-live-wait `AgentLoopExecution`
+projection and model-hidden evidence for wait start, exact Approval resume,
+worker claim, cancellation/observed-expiry closure, and atomic denial. A
+schema-16 writer emits only schema 16 while reading immutable schema-1 through
+schema-15 history after explicit migration. Legacy Running Turns receive no
+synthetic wait projection. Thread archive format 6 preserves this evidence;
+archive format 5 remains the historical CompletionReceipt format. The current
+serialized execution states are `waiting`, `ready`, and `executing`; no
+`HumanInput`, lease, or `NeedsReconciliation` shape is implied.
+
 State event schema `12` adds optional tenant ownership to the authoritative
 `thread_created` event. SQLite persists a nullable same-transaction
 `streams.tenant_id` lookup projection and validates it against the journal on
@@ -812,12 +975,12 @@ Task 3, Workflow 1, or Human Handoff 1. See
 
 ## Migration discipline
 
-State schemas 1 through 13 are supported migration sources. Populated SQLite
+State schemas 1 through 15 are supported migration sources. Populated SQLite
 stores at any of those coordinates require the explicit backup-first command
-below before a schema-14 Runtime can open them:
+below before a schema-16 Runtime can open them:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v16.rollback.db
 ```
 
 All writers must be stopped. The migration checks exact source versions and
@@ -826,17 +989,20 @@ adds the nullable Thread-name projection for pre-v8 sources, adds the nullable
 Thread-tenant projection without inferring legacy ownership, drops disposable
 old snapshots, and advances
 event/snapshot writer metadata in one immediate transaction. Historical event
-JSON and schema labels are never rewritten. An interrupted schema-1 through
-schema-13 run can reuse its validated backup.
+JSON and schema labels are never rewritten, and receipt-free historical
+completion is not upgraded into a synthetic proof, and a legacy Running Turn
+does not gain synthetic Waiting, budget, generation, resume, or claim
+evidence. An interrupted schema-1 through schema-15 run can reuse its
+validated backup.
 
-The schema-14 reader/new writer decision is asymmetric:
+The schema-16 reader/new writer decision is asymmetric:
 
 - new reader + old data: supported only after explicit migration; historical
-  schema-1 through schema-13 events remain readable;
-- old reader + new writer: unsupported and fails on schema-14 metadata or
+  schema-1 through schema-15 events remain readable;
+- old reader + new writer: unsupported and fails on schema-16 metadata or
   events;
 - old and new writers together: unsupported; and
-- downgrade: supported only by restoring the backup before any schema-14 event
+- downgrade: supported only by restoring the backup before any schema-16 event
   is written.
 
 See the [State migration runbook](state-migration.md) and
@@ -885,11 +1051,14 @@ execution evidence, archive format 3, and Protocol v24, plus
 schema 3 governed attempt evidence and Protocol v25.
 See [ADR 0126](adr/0126-runtime-bound-connector-evidence.md) for schema-14
 Runtime-bound Connector evidence, archive format 4, and Protocol v26.
+See [ADR 0157](adr/0157-generation-bound-completion-receipt.md) for schema-15
+atomic successful completion, archive format 5, and Protocol v36.
+See [ADR 0158](adr/0158-durable-agent-loop-waiting-and-resume.md) for schema-16
+durable Agent Loop waits, archive format 6, and Protocol v37.
 See [ADR 0127](adr/0127-durable-fenced-workflow-runs.md) for Workflow Run
 schema 1 and Protocol v27.
 See [ADR 0128](adr/0128-durable-lease-fenced-human-handoff.md) for Human
 Handoff schema 1 and Protocol v28.
-
 Approval Inbox schema 1 or schema 2 is independently migrated with:
 
 ```bash
@@ -963,8 +1132,8 @@ authorization. A snapshot never counts as a backup.
 
 Before 1.0, a deprecated public API is retained for at least one subsequent
 minor release when doing so does not preserve a security defect. Protocol and
-durable schema support windows are declared per release. State schema 14 reads
-immutable schema-1 through schema-13 history after explicit store migration.
+durable schema support windows are declared per release. State schema 16 reads
+immutable schema-1 through schema-15 history after explicit store migration.
 Approval reads only schema 3 in normal operation; its migration tool alone
 reads schema 1 and schema 2. Task coordination reads only schema 4 in normal
 operation; `task-migrate` alone reads schema 1, schema 2, schema 3, and the

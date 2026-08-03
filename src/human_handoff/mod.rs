@@ -20,14 +20,30 @@ pub use coordinator::{
 };
 pub use engine::{HumanHandoffEngine, HumanHandoffSubjectResolver};
 
-const MAX_HANDOFF_TRANSITIONS: usize = 4_096;
-const MAX_HANDOFF_JSON_BYTES: usize = 16_777_216;
+const MAX_HANDOFF_WORK_TRANSITIONS: usize = 4_096;
+const HANDOFF_SETTLEMENT_TRANSITION_RESERVE: usize = 2;
+const MAX_HANDOFF_TRANSITIONS: usize =
+    MAX_HANDOFF_WORK_TRANSITIONS + HANDOFF_SETTLEMENT_TRANSITION_RESERVE;
+const MAX_HANDOFF_WORK_JSON_BYTES: usize = 16_777_216;
 const MAX_HANDOFF_COMMAND_JSON_BYTES: usize = 131_072;
 const MAX_HANDOFF_TEXT_BYTES: usize = 65_536;
 const MAX_HANDOFF_IDENTITY_BYTES: usize = 256;
 const MAX_HANDOFF_QUEUE_BYTES: usize = 64;
 const MIN_HANDOFF_LEASE_MS: u64 = 1_000;
 const MAX_HANDOFF_LEASE_MS: u64 = 604_800_000;
+// One queue-recovery transition plus one terminal transition can duplicate a
+// maximum escaped resolution summary in both projection and transition data;
+// 16 KiB covers both actor, fence, digest, sequence, and JSON envelopes.
+const HANDOFF_SETTLEMENT_JSON_BYTE_RESERVE: usize = MAX_HANDOFF_COMMAND_JSON_BYTES * 2 + 16_384;
+const MAX_HANDOFF_JSON_BYTES: usize =
+    MAX_HANDOFF_WORK_JSON_BYTES + HANDOFF_SETTLEMENT_JSON_BYTE_RESERVE;
+const _: () = assert!(HANDOFF_SETTLEMENT_JSON_BYTE_RESERVE < MAX_HANDOFF_WORK_JSON_BYTES);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HumanHandoffCapacityClass {
+    Work,
+    Settlement,
+}
 
 /// Authoritative Engine resource whose conversational or process ownership is
 /// being transferred.
@@ -165,6 +181,18 @@ pub enum HumanHandoffCommandKind {
     },
 }
 
+impl HumanHandoffCommandKind {
+    fn capacity_class(&self) -> HumanHandoffCapacityClass {
+        match self {
+            Self::ReleaseClaim { .. }
+            | Self::ExpireClaim { .. }
+            | Self::Resolve { .. }
+            | Self::Cancel { .. } => HumanHandoffCapacityClass::Settlement,
+            Self::Claim { .. } | Self::RenewClaim { .. } => HumanHandoffCapacityClass::Work,
+        }
+    }
+}
+
 /// Whether a Human Handoff command changed durable state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,6 +278,20 @@ pub enum HumanHandoffTransitionKind {
         /// Content-free cancellation classification.
         reason_code: String,
     },
+}
+
+impl HumanHandoffTransitionKind {
+    fn capacity_class(&self) -> HumanHandoffCapacityClass {
+        match self {
+            Self::ClaimReleased { .. }
+            | Self::ClaimExpired { .. }
+            | Self::Resolved { .. }
+            | Self::Cancelled { .. } => HumanHandoffCapacityClass::Settlement,
+            Self::Created { .. } | Self::Claimed { .. } | Self::ClaimRenewed { .. } => {
+                HumanHandoffCapacityClass::Work
+            }
+        }
+    }
 }
 
 /// Pure serializable Human Handoff aggregate.
@@ -438,11 +480,8 @@ impl HumanHandoff {
         }
         validate_application_time(applied_at_ms)?;
         authority.validate_current("Human Handoff command authority")?;
-        if self.transitions.len() >= MAX_HANDOFF_TRANSITIONS {
-            return Err(HarnessError::HumanHandoff(format!(
-                "Human Handoff exceeds {MAX_HANDOFF_TRANSITIONS} transitions"
-            )));
-        }
+        let capacity_class = command.kind.capacity_class();
+        validate_transition_capacity(self.transitions.len(), capacity_class)?;
         if self
             .transitions
             .last()
@@ -470,7 +509,7 @@ impl HumanHandoff {
             kind: transition_kind,
         });
         next.validate()?;
-        next.materialization_charge_bytes = encoded_size(&next)?;
+        next.materialization_charge_bytes = encoded_size_for(&next, capacity_class)?;
         *self = next;
         Ok(HumanHandoffApplyOutcome::Applied)
     }
@@ -619,6 +658,8 @@ impl HumanHandoff {
         let mut projected_requested_at = None;
         let mut projected_status = None;
         let mut previous_applied_at_ms = 0_u64;
+        let work_transition_limit = u64::try_from(MAX_HANDOFF_WORK_TRANSITIONS)
+            .map_err(|_| HarnessError::HumanHandoff("Handoff capacity overflow".to_owned()))?;
         for transition in &self.transitions {
             if transition.sequence != expected_sequence {
                 return Err(HarnessError::HumanHandoff(
@@ -641,6 +682,13 @@ impl HumanHandoff {
             if transition.command_sha256 != transition_digest(transition)? {
                 return Err(HarnessError::HumanHandoff(
                     "Human Handoff command digest differs from transition content".to_owned(),
+                ));
+            }
+            if transition.sequence > work_transition_limit
+                && transition.kind.capacity_class() == HumanHandoffCapacityClass::Work
+            {
+                return Err(HarnessError::HumanHandoff(
+                    "Human Handoff work transition consumed the settlement reserve".to_owned(),
                 ));
             }
             if !command_ids.insert(transition.command_id.as_str()) {
@@ -1099,14 +1147,55 @@ fn validate_application_time(value: u64) -> Result<(), HarnessError> {
     }
 }
 
-fn encoded_size(handoff: &HumanHandoff) -> Result<usize, HarnessError> {
-    let size = bounded_serialized_size(handoff, MAX_HANDOFF_JSON_BYTES)
-        .map_err(|error| bounded_error("aggregate", MAX_HANDOFF_JSON_BYTES, error))?;
-    if size > MAX_HANDOFF_JSON_BYTES {
+fn validate_transition_capacity(
+    current_transitions: usize,
+    capacity_class: HumanHandoffCapacityClass,
+) -> Result<(), HarnessError> {
+    if current_transitions >= MAX_HANDOFF_TRANSITIONS {
+        return Err(HarnessError::HumanHandoff(format!(
+            "Human Handoff exceeds {MAX_HANDOFF_TRANSITIONS} transitions"
+        )));
+    }
+    if capacity_class == HumanHandoffCapacityClass::Work
+        && current_transitions >= MAX_HANDOFF_WORK_TRANSITIONS
+    {
+        return Err(HarnessError::HumanHandoff(
+            "Human Handoff has only its settlement transition reserve remaining".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_materialization_capacity(
+    encoded_bytes: usize,
+    capacity_class: HumanHandoffCapacityClass,
+) -> Result<(), HarnessError> {
+    if encoded_bytes > MAX_HANDOFF_JSON_BYTES {
         return Err(HarnessError::HumanHandoff(format!(
             "Human Handoff exceeds {MAX_HANDOFF_JSON_BYTES} encoded bytes"
         )));
     }
+    if capacity_class == HumanHandoffCapacityClass::Work
+        && encoded_bytes > MAX_HANDOFF_WORK_JSON_BYTES
+    {
+        return Err(HarnessError::HumanHandoff(
+            "Human Handoff has only its settlement encoded-byte reserve remaining".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn encoded_size(handoff: &HumanHandoff) -> Result<usize, HarnessError> {
+    encoded_size_for(handoff, HumanHandoffCapacityClass::Settlement)
+}
+
+fn encoded_size_for(
+    handoff: &HumanHandoff,
+    capacity_class: HumanHandoffCapacityClass,
+) -> Result<usize, HarnessError> {
+    let size = bounded_serialized_size(handoff, MAX_HANDOFF_JSON_BYTES)
+        .map_err(|error| bounded_error("aggregate", MAX_HANDOFF_JSON_BYTES, error))?;
+    validate_materialization_capacity(size, capacity_class)?;
     Ok(size)
 }
 
@@ -1152,6 +1241,111 @@ mod tests {
             id: HumanHandoffCommandId::from_string(id.to_owned()),
             kind,
         }
+    }
+
+    fn append_fixture_transition(
+        handoff: &mut HumanHandoff,
+        command: HumanHandoffCommand,
+        applied_at_ms: u64,
+        authority: &AuthorityContext,
+    ) {
+        let command_sha256 =
+            attributed_digest(authority.actor(), &command).expect("fixture command digest");
+        let HumanHandoffCommand { id, kind } = command;
+        let transition_kind = handoff
+            .apply_kind(kind, applied_at_ms, authority.actor())
+            .expect("fixture transition");
+        let sequence = u64::try_from(handoff.transitions.len())
+            .expect("fixture sequence")
+            .checked_add(1)
+            .expect("fixture sequence increment");
+        handoff.transitions.push(HumanHandoffTransition {
+            sequence,
+            command_id: id,
+            command_sha256,
+            applied_at_ms,
+            actor: authority.actor().clone(),
+            kind: transition_kind,
+        });
+    }
+
+    fn queued_one_slot_before_work_capacity(authority: &AuthorityContext) -> (HumanHandoff, u64) {
+        let mut handoff = HumanHandoff::new(create(), 10, authority).expect("create");
+        let cycles = (MAX_HANDOFF_WORK_TRANSITIONS - 2) / 2;
+        let mut applied_at_ms = 10_u64;
+        for index in 0..cycles {
+            let claim_id = HumanHandoffClaimId::from_string(format!("capacity-claim-{index}"));
+            applied_at_ms = applied_at_ms.checked_add(1).expect("fixture time");
+            append_fixture_transition(
+                &mut handoff,
+                command(
+                    &format!("capacity-claim-command-{index}"),
+                    HumanHandoffCommandKind::Claim {
+                        claim_id: claim_id.clone(),
+                        lease_duration_ms: MIN_HANDOFF_LEASE_MS,
+                    },
+                ),
+                applied_at_ms,
+                authority,
+            );
+            applied_at_ms = applied_at_ms.checked_add(1).expect("fixture time");
+            append_fixture_transition(
+                &mut handoff,
+                command(
+                    &format!("capacity-release-command-{index}"),
+                    HumanHandoffCommandKind::ReleaseClaim {
+                        claim_id,
+                        reason_code: "fixture.release".to_owned(),
+                    },
+                ),
+                applied_at_ms,
+                authority,
+            );
+        }
+        assert_eq!(handoff.transition_count(), MAX_HANDOFF_WORK_TRANSITIONS - 1);
+        assert_eq!(handoff.status(), &HumanHandoffStatus::Queued);
+        handoff.validate().expect("fixture projection");
+        handoff.materialization_charge_bytes = encoded_size(&handoff).expect("fixture size");
+        (handoff, applied_at_ms)
+    }
+
+    fn escaped_identity(suffix: char) -> String {
+        let mut value = "\\".repeat(MAX_HANDOFF_IDENTITY_BYTES - suffix.len_utf8());
+        value.push(suffix);
+        value
+    }
+
+    fn largest_escaped_resolution_command(
+        id: &str,
+        claim_id: &HumanHandoffClaimId,
+        actor: &ActorIdentity,
+    ) -> HumanHandoffCommand {
+        let mut accepted = 1_usize;
+        let mut rejected = MAX_HANDOFF_TEXT_BYTES + 1;
+        while accepted + 1 < rejected {
+            let candidate = accepted + (rejected - accepted) / 2;
+            let command = command(
+                id,
+                HumanHandoffCommandKind::Resolve {
+                    claim_id: claim_id.clone(),
+                    outcome_code: "a".repeat(64),
+                    summary: "\\".repeat(candidate),
+                },
+            );
+            if attributed_digest(actor, &command).is_ok() {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        command(
+            id,
+            HumanHandoffCommandKind::Resolve {
+                claim_id: claim_id.clone(),
+                outcome_code: "a".repeat(64),
+                summary: "\\".repeat(accepted),
+            },
+        )
     }
 
     #[test]
@@ -1370,5 +1564,216 @@ mod tests {
                 .to_string()
                 .contains("digest differs")
         );
+    }
+
+    #[test]
+    fn final_work_slot_can_claim_then_expire_cancel_or_resolve() {
+        let alice = actor("alice");
+        let queue_worker = actor("queue-worker");
+        let (mut claimed, previous_at_ms) = queued_one_slot_before_work_capacity(&alice);
+        let claim_at_ms = previous_at_ms.checked_add(1).expect("claim time");
+        let claim_id = HumanHandoffClaimId::from_static("final-capacity-claim");
+        claimed
+            .apply(
+                command(
+                    "final-capacity-claim-command",
+                    HumanHandoffCommandKind::Claim {
+                        claim_id: claim_id.clone(),
+                        lease_duration_ms: MIN_HANDOFF_LEASE_MS,
+                    },
+                ),
+                claim_at_ms,
+                &alice,
+            )
+            .expect("last work slot enters Claimed");
+        assert_eq!(claimed.transition_count(), MAX_HANDOFF_WORK_TRANSITIONS);
+        let HumanHandoffStatus::Claimed { claim } = claimed.status() else {
+            panic!("handoff must be claimed");
+        };
+        let expires_at_ms = claim.expires_at_ms;
+        claimed =
+            serde_json::from_slice(&serde_json::to_vec(&claimed).expect("encode old work ceiling"))
+                .expect("old work ceiling remains wire-compatible");
+
+        let before_rejected_work = claimed.clone();
+        let rejected_work = claimed
+            .apply(
+                command(
+                    "capacity-renew",
+                    HumanHandoffCommandKind::RenewClaim {
+                        claim_id: claim_id.clone(),
+                        lease_duration_ms: MIN_HANDOFF_LEASE_MS * 2,
+                    },
+                ),
+                claim_at_ms + 1,
+                &alice,
+            )
+            .expect_err("renewal cannot consume settlement reserve");
+        assert!(
+            rejected_work
+                .to_string()
+                .contains("settlement transition reserve")
+        );
+        assert_eq!(claimed, before_rejected_work);
+
+        let mut expired_and_cancelled = claimed.clone();
+        expired_and_cancelled
+            .apply(
+                command(
+                    "capacity-expire",
+                    HumanHandoffCommandKind::ExpireClaim {
+                        claim_id: claim_id.clone(),
+                    },
+                ),
+                expires_at_ms,
+                &queue_worker,
+            )
+            .expect("reserved expiration");
+        assert_eq!(
+            expired_and_cancelled.transition_count(),
+            MAX_HANDOFF_WORK_TRANSITIONS + 1
+        );
+        assert_eq!(expired_and_cancelled.status(), &HumanHandoffStatus::Queued);
+        let cancellation = command(
+            "capacity-cancel",
+            HumanHandoffCommandKind::Cancel {
+                reason_code: "capacity.exhausted".to_owned(),
+            },
+        );
+        expired_and_cancelled
+            .apply(cancellation.clone(), expires_at_ms + 1, &queue_worker)
+            .expect("reserved terminal cancellation");
+        assert_eq!(
+            expired_and_cancelled.transition_count(),
+            MAX_HANDOFF_TRANSITIONS
+        );
+        assert!(matches!(
+            expired_and_cancelled.status(),
+            HumanHandoffStatus::Cancelled { .. }
+        ));
+        assert_eq!(
+            expired_and_cancelled
+                .apply(cancellation, expires_at_ms + 2, &queue_worker)
+                .expect("duplicate at hard boundary"),
+            HumanHandoffApplyOutcome::Duplicate
+        );
+        let hard_error = expired_and_cancelled
+            .apply(
+                command(
+                    "beyond-hard-capacity",
+                    HumanHandoffCommandKind::Cancel {
+                        reason_code: "too.late".to_owned(),
+                    },
+                ),
+                expires_at_ms + 3,
+                &queue_worker,
+            )
+            .expect_err("hard transition boundary");
+        assert!(
+            hard_error
+                .to_string()
+                .contains(&format!("{MAX_HANDOFF_TRANSITIONS} transitions"))
+        );
+
+        let mut resolved = claimed;
+        resolved
+            .apply(
+                command(
+                    "capacity-resolve",
+                    HumanHandoffCommandKind::Resolve {
+                        claim_id,
+                        outcome_code: "handled".to_owned(),
+                        summary: "resolved at the work boundary".to_owned(),
+                    },
+                ),
+                claim_at_ms + 1,
+                &alice,
+            )
+            .expect("reserved resolution");
+        assert!(matches!(
+            resolved.status(),
+            HumanHandoffStatus::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn settlement_byte_reserve_has_a_finite_hard_boundary() {
+        validate_materialization_capacity(
+            MAX_HANDOFF_WORK_JSON_BYTES,
+            HumanHandoffCapacityClass::Work,
+        )
+        .expect("last work byte");
+        assert!(
+            validate_materialization_capacity(
+                MAX_HANDOFF_WORK_JSON_BYTES + 1,
+                HumanHandoffCapacityClass::Work,
+            )
+            .expect_err("work byte overflow")
+            .to_string()
+            .contains("settlement encoded-byte reserve")
+        );
+        validate_materialization_capacity(
+            MAX_HANDOFF_WORK_JSON_BYTES + 1,
+            HumanHandoffCapacityClass::Settlement,
+        )
+        .expect("settlement reserve begins");
+        validate_materialization_capacity(
+            MAX_HANDOFF_JSON_BYTES,
+            HumanHandoffCapacityClass::Settlement,
+        )
+        .expect("last hard byte");
+        assert!(
+            validate_materialization_capacity(
+                MAX_HANDOFF_JSON_BYTES + 1,
+                HumanHandoffCapacityClass::Settlement,
+            )
+            .expect_err("hard byte overflow")
+            .to_string()
+            .contains(&MAX_HANDOFF_JSON_BYTES.to_string())
+        );
+    }
+
+    #[test]
+    fn settlement_byte_reserve_covers_maximum_supported_resolution() {
+        let authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "\\".repeat(256),
+                subject: "\\".repeat(256),
+            },
+            None,
+        )
+        .expect("maximum actor");
+        let mut handoff = HumanHandoff::new(create(), 10, &authority).expect("create");
+        let claim_id = HumanHandoffClaimId::from_string(escaped_identity('c'));
+        handoff
+            .apply(
+                command(
+                    &escaped_identity('a'),
+                    HumanHandoffCommandKind::Claim {
+                        claim_id: claim_id.clone(),
+                        lease_duration_ms: MIN_HANDOFF_LEASE_MS,
+                    },
+                ),
+                20,
+                &authority,
+            )
+            .expect("claim");
+        let work_boundary_shape = handoff.materialization_charge_bytes();
+        handoff
+            .apply(
+                largest_escaped_resolution_command(
+                    &escaped_identity('r'),
+                    &claim_id,
+                    authority.actor(),
+                ),
+                30,
+                &authority,
+            )
+            .expect("maximum resolution");
+        let reserved_growth = handoff
+            .materialization_charge_bytes()
+            .checked_sub(work_boundary_shape)
+            .expect("settlement grows the aggregate");
+        assert!(reserved_growth <= HANDOFF_SETTLEMENT_JSON_BYTE_RESERVE);
     }
 }

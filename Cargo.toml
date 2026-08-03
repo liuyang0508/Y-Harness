@@ -2,6 +2,7 @@
 members = [
     "clients/tui",
     "control/domain-pack",
+    "domains/aquaculture",
     "tools/benchmark-runner",
     "tools/fault-fixture",
 ]
@@ -32,6 +33,7 @@ https-mcp = [
     "rmcp/transport-streamable-http-client",
 ]
 https-skill = ["dep:reqwest"]
+http-probe = []
 tls-host = ["dep:rustls", "dep:tokio-rustls"]
 
 [lib]
@@ -59,7 +61,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "=0.11.0"
 sse-stream = { version = "=0.2.5", optional = true }
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"], optional = true }
 zeroize = "=1.9.0"
 

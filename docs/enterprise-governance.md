@@ -36,6 +36,8 @@ reason to duplicate Runtime or State.
 | Existing primitive | It does not yet prove |
 |---|---|
 | optional immutable Domain Pack snapshots plus exact actor/tenant role authorization, tenant-fenced promotion, activation, rollback, schema-13 Turn binding, schema-14 Runtime-bound Connector evidence, and schema-3 embedded Task-attempt binding | remote control-plane/binding-evidence exposure, external IAM integration, canary rollout, or multi-node control-plane HA |
+| frozen Runtime-generation Tool Capability View plus view-bound single/batch/approval-resume execution fence | intent-aware per-step projection, Tool/Skill search, on-demand MCP schema discovery, or a complete Capability-generation digest |
+| bounded replayable Progress Governor over exact failure-bearing Tool cycles, evaluated after durable Steering at pre-Model and terminal-step-budget safe boundaries | semantic error equivalence, trusted awaiting-external classification, automatic strategy repair, Tool quarantine, or cross-Turn circuit breaking |
 | transport Principal plus durable Thread/Operation/Approval/Task and optional Domain Pack ownership | external Artifact blob authorization, quota, retention, or tenant-partitioned MCP sessions |
 | authority-aware Secret Provider API, exact embedded tenant/reference adapter, and fixed one-process/one-tenant reference-service assembly | multi-principal tenant credential routing or a general Secret-manager backend |
 | durable Task DAG and fenced workers plus schema-1 Workflow signal/timer/retry waits, safe-boundary definition migration, and a bounded host-driven due-wait tick | a resident timer service, automatic Task execution/retry, or durable compensation plan |
@@ -143,8 +145,9 @@ attempt; expiration becomes `unknown`, never a blind retry. Only a receipt or
 explicit reconciliation of the exact attempt/lease can settle it as applied
 or authoritatively not applied. Memory/SQLite parity, revision CAS,
 actor/content-bound commands, bounded scans, read-only service preflight, and
-restart recovery are executable. Temporal Driver API 2 optionally advances
-expired Effect leases through the same fenced command boundary. No Core loop
+restart recovery are executable. Temporal Driver API 3 optionally advances
+expired Effect leases and due Agent Loop waits through their existing fenced
+command boundaries. No Core loop
 executes pending Effects or verifies external receipt truth.
 
 ADR 0134 adds optional embedded Governed Effect Executor API 1 without moving

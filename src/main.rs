@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             reject_extra_argument(args.next())?;
             reference_cli::run_task_migrate(database, backup).await
         }
-        Some("skill") => match args.next().as_deref() {
+        Some("skill" | "package") => match args.next().as_deref() {
             Some("install") => {
                 let package = required_argument(args.next(), "Skill package")?;
                 let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
@@ -77,21 +77,118 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 reference_cli::run_skill_install_https(endpoint, identity, expected_sha256, config)
                     .await
             }
+            Some("search-https") => {
+                let endpoint = required_argument(args.next(), "HTTPS Skill catalog URL")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let query = required_argument(args.next(), "Skill catalog query or *")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_search_catalog(endpoint, expected_sha256, query, config)
+                    .await
+            }
+            Some("install-catalog") => {
+                let endpoint = required_argument(args.next(), "HTTPS Skill catalog URL")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_install_catalog(
+                    endpoint,
+                    expected_sha256,
+                    identity,
+                    config,
+                )
+                .await
+            }
+            Some("upgrade-catalog") => {
+                let endpoint = required_argument(args.next(), "HTTPS Skill catalog URL")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_upgrade_catalog(
+                    endpoint,
+                    expected_sha256,
+                    identity,
+                    config,
+                )
+                .await
+            }
+            Some("registry-search") => {
+                let registry = required_argument(args.next(), "Skill Registry identity")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let query = required_argument(args.next(), "Skill catalog query or *")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_search_registry(registry, expected_sha256, query, config)
+                    .await
+            }
+            Some("registry-install") => {
+                let registry = required_argument(args.next(), "Skill Registry identity")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_install_registry(
+                    registry,
+                    expected_sha256,
+                    identity,
+                    config,
+                )
+                .await
+            }
+            Some("registry-upgrade") => {
+                let registry = required_argument(args.next(), "Skill Registry identity")?;
+                let expected_sha256 = required_argument(args.next(), "Skill catalog SHA-256")?;
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_upgrade_registry(
+                    registry,
+                    expected_sha256,
+                    identity,
+                    config,
+                )
+                .await
+            }
             Some("list") => {
                 let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
                 reject_extra_argument(args.next())?;
                 reference_cli::run_skill_list(config)
+            }
+            Some("activate") => {
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_activate(identity, config).await
+            }
+            Some("deactivate") => {
+                let identity = required_argument(args.next(), "Skill identity name@version")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_deactivate(identity, config).await
             }
             Some("verify") => {
                 let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
                 reject_extra_argument(args.next())?;
                 reference_cli::run_skill_verify(config)
             }
+            Some("history") => {
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_history(config)
+            }
+            Some("rollback") => {
+                let revision = required_argument(args.next(), "configuration revision SHA-256")?;
+                let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
+                reject_extra_argument(args.next())?;
+                reference_cli::run_skill_rollback(revision, config).await
+            }
             Some("remove") => {
                 let identity = required_argument(args.next(), "Skill identity name@version")?;
                 let config = args.next().unwrap_or_else(|| "y-harness.json".to_owned());
                 reject_extra_argument(args.next())?;
-                reference_cli::run_skill_remove(identity, config)
+                reference_cli::run_skill_remove(identity, config).await
             }
             Some(command) => {
                 Err(format!("unknown skill command {command:?}; run `yh --help`").into())

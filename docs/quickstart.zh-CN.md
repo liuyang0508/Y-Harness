@@ -16,7 +16,7 @@ yh --version
 ```
 
 安装脚本只包装标准的
-`cargo install --locked --features https-mcp,https-model,https-skill`，
+`cargo install --locked --features http-probe,https-mcp,https-model,https-skill`，
 不会安装后台服务或修改系统配置。`https-mcp` 和 `https-skill` 只用于
 操作员显式配置的远程 MCP 或签名包获取；作为库嵌入时仍可不编译这些
 Feature。也可以不安装，直接把下文的 `yh` 替换为
@@ -66,7 +66,8 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 `/fork` 从当前已结算末尾创建独立子 Thread；`/fork <terminal-turn-id>`
 可从更早的已终结 Turn 分叉。也可使用 `/new`、`/sessions`、
 `/thread <id>`、`/graph <id>`、`/events`、
-`/approvals`、`/tasks`、`/refresh`、`/cancel`、`/help` 和 `/quit`。
+`/approvals`、`/tasks`、`/runtime`、`/trace`、`/refresh`、`/cancel`、
+`/resume`、`/cancelwait`、`/help` 和 `/quit`。
 连接真实配置时执行 `yh-tui --config y-harness.json`。
 
 如果出现 `Engine protocol ... did not match TUI protocol ...`，说明独立
@@ -81,9 +82,24 @@ Sessions 面板列出最近 64 个权威 Thread，并显示分叉 Thread 的直�
 演示使用内置确定性模型和 `echo` Tool，不访问网络。State 写入当前目录
 的 `.y-harness/state.db`，派生 Trace 写入 `.y-harness/traces/`。
 
-`yh-tui` 只通过 Protocol v31 调用 `yh`：它不读取 SQLite，不构造
+`yh-tui` 只通过 Protocol v37 调用 `yh`：它不读取 SQLite，不构造
 Model/Tool/Policy，也不拥有权威状态。Desktop、Web、IM 等后续产品遵守
 同一边界并独立选装。
+
+TUI 默认给 Turn 配置有限的持久 Approval 等待时间。当前只有“模型本轮只
+提出一个 Tool call，且 Policy 返回 `ask`”时会释放执行 Worker：Header
+显示 `WAITING`，原进程 Operation 可以被忘记，而 Turn 仍以 State 中的
+`Waiting` 坐标保持 `Running`。审批必须由另一个经过认证、具备审批权限的
+主体结算；随后输入 `/resume` 会按 `thread_id + turn_id + wait_id +
+revision` 精确恢复，`/cancelwait` 会取消尚未 Claim 的 `Waiting` 或
+`Ready`。等待期间输入普通文本不会偷偷创建第二个 Turn。Engine 重启后，
+TUI 会通过 `get_turn_execution` 重新发现该坐标。
+
+这不是通用工作流调度器：批量 Tool call、`HumanInput`、Approval Inbox
+修复队列/墓碑、跨进程 Worker Lease、未知副作用 `NeedsReconciliation`
+和跨进程 Resume 结果回执仍未实现。等待到期会在 Resume 路径重新校验，
+也可由显式配置 `temporal` 的参考宿主通过租户级有界 due 索引主动结算；
+Core 和 Protocol 请求处理器本身不启动调度线程。
 
 ## 3. 初始化持久化服务项目
 
@@ -110,9 +126,9 @@ my-harness/
 迁移数据库或生成备份。旧版、残缺、未知 Schema 会在任何外部 Model、
 MCP 或 Memory 进程启动前失败关闭，并给出对应迁移命令。
 
-## 4. 运行 Protocol v31 服务
+## 4. 运行 Protocol v37 服务
 
-`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v31 帧：
+`serve` 通过 stdin/stdout 读写一行一个 JSON 的 Protocol v37 帧：
 
 ```bash
 yh serve y-harness.json
@@ -123,9 +139,35 @@ yh serve y-harness.json
 
 ```bash
 printf '%s\n' \
-  '{"id":"init-1","protocol_version":"31","command":{"method":"initialize"}}' \
+  '{"id":"init-1","protocol_version":"37","command":{"method":"initialize"}}' \
   | yh serve y-harness.json
 ```
+
+需要容器/Kubernetes 探针时，可在配置中显式加入：
+
+```json
+{
+  "http_probe": {
+    "bind_address": "127.0.0.1:8081",
+    "max_connections": 64,
+    "request_timeout_ms": 2000,
+    "status_timeout_ms": 1000,
+    "shutdown_timeout_ms": 5000
+  }
+}
+```
+
+`GET /livez` 只证明同一进程内的 Handler 能返回权威状态；`GET /readyz`
+只在仍可接收一个新 Turn 的 `ready` 状态返回 200，容量耗尽和单向停机均
+返回 503。两者都不会探测或担保 Model、MCP、Memory、Registry、Effect
+目标或多节点仲裁。未配置时没有 HTTP 监听器；不含 `http-probe` Feature
+的自定义最小构建会明确拒绝这段配置。
+
+进程主管停止 `yh serve` 时无需先关闭 stdin：Unix 的 SIGTERM/SIGINT 与
+Windows 的 Ctrl-C 会停止接收下一条完整协议帧，随后进入同一个单向 drain
+和有界资源结算流程。已经接收的帧仍会写完完整响应。该信号策略只属于参考
+Host；嵌入式宿主可用 `serve_jsonl_until_cancelled` 接入自己的生命周期。
+SIGKILL 等不可捕获终止不在优雅停机承诺内。
 
 首次服务启动后会创建：
 
@@ -143,8 +185,10 @@ printf '%s\n' \
 校验。服务重启后 Thread、Task Graph、Workflow Run 与 Human Handoff
 以及 Effect 均可恢复。Human Handoff 只记录人工所有权生命周期；它不会隐式暂停
 Turn、路由 IM、唤醒对话或执行业务操作。库级 Temporal Driver 可以由
-嵌入宿主显式调用来推进到期 Workflow 等待、过期 Claim 和过期 Effect
-执行租约。Effect 租约到期只进入 `unknown`，绝不自动重试。Reference
+嵌入宿主显式调用来推进到期 Workflow 等待、过期 Claim、过期 Effect
+执行租约，以及 Agent Loop 的持久 Approval 等待；Agent Loop 等待通过
+租户级有界 due 索引和精确 stream fence 收敛，不扫描完整 Thread。Effect
+租约到期只进入 `unknown`，绝不自动重试。Reference
 Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式加入：
 
 ```json
@@ -306,9 +350,12 @@ yh doctor y-harness.json
 yh-tui --config y-harness.json
 ```
 
-配置只保存 Secret 引用和环境变量名，不保存 API Key。Provider 固定
-访问 OpenAI 官方 HTTPS Responses endpoint，禁用 redirect、proxy、
-retry 和 referer，发送 `store: false`，并把响应 Token 使用量和
+配置只保存 Secret 引用和环境变量名，不保存 API Key。省略 `endpoint`
+时访问 OpenAI 官方 HTTPS Responses endpoint；也可复制
+[`y-harness.responses-compatible.example.json`](../config/y-harness.responses-compatible.example.json)
+显式指定实现相同 Responses wire contract 的 HTTPS 端点，从而在不改
+Rust 的情况下增加兼容 Provider。适配器禁用 redirect、proxy、retry 和
+referer，发送 `store: false`，并把响应 Token 使用量和
 `x-request-id` 作为可观测证据返回。
 
 流式文本经过有界 SSE 解码进入 TUI，但最终 Response 才是权威结果。
@@ -330,6 +377,52 @@ State 权威仍全部属于 Y-Harness。若函数调用携带无法重放的 rea
 
 没有 `OPENAI_API_KEY` 和明确模型 ID 时，Y-Harness 不猜测凭据或默认
 模型，也不会把 demo 响应伪装成真实调用。
+
+### Chat Completions、原生 Anthropic/Gemini 与共享 Provider Profile
+
+复制多 Provider 模板，并把其中的四个模型占位符替换为账号实际可用的
+明确模型 ID：
+
+```bash
+cp /path/to/Y-Harness/config/y-harness.provider-profiles.example.json y-harness.json
+export OPENAI_API_KEY='replace-with-real-secret'
+export ANTHROPIC_API_KEY='replace-with-real-secret'
+export GEMINI_API_KEY='replace-with-real-secret'
+yh doctor y-harness.json
+yh-tui --config y-harness.json
+```
+
+`provider_profiles` 把协议族、Secret 引用、环境变量、HTTPS endpoint、
+API 版本、超时、响应字节、并发和输出 Token 上限绑定一次；
+`provider_model` 只选择稳定 Harness ID、Profile ID 和厂商模型 ID。因此
+同一厂商增加模型、调整路由或更换 API Key 映射只需修改配置，不需增加
+Rust 代码。Profile 本身不授予 Tool 权限，也不会把 Secret 暴露到 Runtime
+Catalog、State 或 Protocol。
+
+`open_ai_chat_completions` 覆盖广泛实现的 Chat Completions 兼容协议族，
+支持 SSE 文本与 Tool delta 交错、并行 Tool 调用、usage-only 终止块、
+`max_completion_tokens`/旧式 `max_tokens` 选择，以及 Tool 后续请求所需的
+assistant Tool 消息精确回放。公网 endpoint 始终要求 HTTPS；本地
+Ollama、vLLM 等可显式设置 `allow_loopback_http: true`，但只接受
+`127.0.0.0/8` 或 `::1` 的字面 IP，不接受主机名、跳转或环境代理。
+可直接复制
+[`y-harness.openai-chat-local.example.json`](../config/y-harness.openai-chat-local.example.json)，
+把 endpoint、模型 ID 与 `LOCAL_MODEL_API_KEY` 调整为本机服务的明确值。
+
+`anthropic_messages` 使用原生 `/v1/messages`、`x-api-key` 和固定
+`anthropic-version`；原生 `tool_use/tool_result`、并行 Tool 请求、SSE 事件
+与 usage 都有独立解码。`gemini_generate_content` 使用原生
+`generateContent`/`streamGenerateContent` 和 `x-goog-api-key`；
+`functionCall/functionResponse`、并行调用、`usageMetadata` 以及 Gemini
+要求后续回放的 `thoughtSignature` 都保留在来源绑定的 continuation 中。
+两者都只让 Provider **提出** Tool 调用，Policy、Approval、执行、State、
+重试与完成条件仍由 Y-Harness 负责。
+
+Provider Profile 是配置复用与治理边界，不是“万能兼容层”。当前一等
+协议族是 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages
+和 Gemini `generateContent`；其他协议继续通过精确 Gateway、JSON-command
+Broker 或嵌入式 `LanguageModel` 适配，不能仅靠改 endpoint 冒充已支持
+协议。
 
 ### 通过任意语言的 JSON command 接入 Provider
 
@@ -475,11 +568,13 @@ yh skill install \
   y-harness.json
 yh skill list y-harness.json
 yh skill verify y-harness.json
+yh package activate concise-assistant@1.0.0 y-harness.json
 ```
 
 `install` 会校验包并按内容摘要规范化存入项目 `skills/` 目录，但不会
-自动激活。请把命令打印的相对路径和精确 `name@version` 分别加入
-`skills.package_files` 与 `skills.activate`；也可以参考：
+自动激活。`skill` 与 `package` 是同一治理入口的别名。`activate` 会
+自动纳入精确依赖闭包，完整预检 Model、Tool、MCP、签名、预算和 Skill
+图，然后原子更新配置；也可以参考：
 
 ```bash
 cp /path/to/Y-Harness/config/y-harness.skill.example.json y-harness.json
@@ -544,25 +639,95 @@ yh skill install-https \
   y-harness.json
 ```
 
-两条路径都会在首次写盘前验证内容摘要、发布者签名、有效期、撤销以及
-必需或已提供的透明度收据，并以
-`<digest>.signed-skill.json` 保存完整签名信封。随后仍需把打印的路径
-加入 `skills.external_package_files`，并把精确身份加入
-`skills.activate`。服务启动、依赖解析、资源读取和每次 Context 编译
-都会重检实时信任；`doctor` 会输出 publisher 与 transparency 锁。
-不会自动修改配置、获取依赖或执行包内代码。
-
-移除前必须先从配置的 `activate` 以及对应的 `package_files` 或
-`external_package_files` 撤销授权；随后执行：
+如果发布方提供 Y-Harness Catalog format 1，可先由独立可信渠道取得
+Catalog **原始文件**的 SHA-256，再做只读搜索：
 
 ```bash
-yh skill remove concise-assistant@1.0.0 y-harness.json
+yh package search-https \
+  https://skills.example.com/catalog.json \
+  <64位小写Catalog-SHA-256> \
+  research \
+  y-harness.json
 ```
 
-包会移入 `.y-harness/skill-trash/`，可恢复而非直接删除。当前 CLI
-支持精确公共 HTTPS 安装，但没有自动更新、依赖下载、市场、私有注册
-表认证或热加载；修改配置或包后需重启服务。即使发布者已经被撤销，
-在取消配置引用后仍可执行移除，清理路径不会被信任失败锁死。
+安装一个精确版本及其由包清单实际声明的精确依赖闭包：
+
+```bash
+yh package install-catalog \
+  https://skills.example.com/catalog.json \
+  <64位小写Catalog-SHA-256> \
+  research-helper@1.0.0 \
+  y-harness.json
+```
+
+该命令要求 Catalog 条目按 `name@version` 唯一排序、每个包都有独立
+HTTPS URL 和内容摘要；下载后再以**包内真实 manifest** 解析依赖，拒绝
+Catalog 缺项、摘要冲突、未安装的 yanked 依赖、循环、超过 256 个包或
+64 MiB 的闭包。所有包必须携带配置已信任的 External 签名信封。完整
+闭包验证成功后才写入 `skills/`，仍保持 inactive；Catalog 原始字节和
+确定性来源回执分别缓存到
+`.y-harness/package-cache/catalogs/` 与 `receipts/`，相同内容身份发生
+漂移会失败。
+
+显式升级到一个审核过的目标版本可用：
+
+```bash
+yh package upgrade-catalog \
+  https://skills.example.com/catalog.json \
+  <64位小写Catalog-SHA-256> \
+  research-helper@1.1.0 \
+  y-harness.json
+```
+
+`upgrade-catalog` 不采用 `latest` 或隐式 SemVer 范围；它先完成相同的
+精确闭包获取，再调用普通 `activate` 完整预检并原子更新配置。失败时
+已经验证并写入的内容最多作为 inactive 缓存存在，不会获得 Context、
+Tool 或执行权限。
+
+公共 Catalog 之外还可以配置具名私有 Registry。以下命令仍要求操作员
+从独立可信渠道提供 Catalog 原始字节的 SHA-256：
+
+```bash
+export YH_SKILL_REGISTRY_TOKEN='<运行时凭据>'
+yh package registry-search company/internal <64位小写Catalog-SHA-256> research y-harness.json
+yh package registry-install company/internal <64位小写Catalog-SHA-256> research-helper@1.0.0 y-harness.json
+yh package registry-upgrade company/internal <64位小写Catalog-SHA-256> research-helper@1.1.0 y-harness.json
+```
+
+Registry 配置固定一个精确 Catalog URL、允许下载包的 HTTPS origin 列表、
+可选 Bearer Secret 引用与可选项目内独占 CA 文件。凭据在每次 Catalog 或
+Package 请求前重新解析，不写入配置、缓存、来源回执、Runtime Catalog 或
+TUI；Package URL 在解析凭据和发起网络请求前必须命中 origin 白名单。
+安装仍保持 inactive，只有显式 activate/upgrade 才可能改变下一代 Runtime。
+配置样例见
+[`y-harness.skill-registry.example.json`](../config/y-harness.skill-registry.example.json)。
+
+当前仍不声称支持 npm/git 安装、Registry 联邦、镜像协商、OAuth 或任意
+可执行扩展。公共格式样例见
+[`y-harness.skill-catalog.example.json`](../config/y-harness.skill-catalog.example.json)。
+
+两条路径都会在首次写盘前验证内容摘要、发布者签名、有效期、撤销以及
+必需或已提供的透明度收据，并以
+`<digest>.signed-skill.json` 保存完整签名信封。随后执行
+`yh package activate <name@version> y-harness.json`。服务启动、依赖解析、
+资源读取和每次 Context 编译
+都会重检实时信任；`doctor` 会输出 publisher 与 transparency 锁。
+不会自动下载缺失依赖或执行包内代码。
+
+先停用，再移除：
+
+```bash
+yh package deactivate concise-assistant@1.0.0 y-harness.json
+yh package remove concise-assistant@1.0.0 y-harness.json
+```
+
+每次激活、停用、移除或回滚都会先把旧配置按 SHA-256 保存到
+`.y-harness/config-history/`。`yh package history` 列出可回滚版本，
+`yh package rollback <config-sha256>` 在完整预检后原子恢复。包会移入
+`.y-harness/skill-trash/`，可恢复而非直接删除。安装新版后激活同名新
+版本即可完成受治理更新，旧包和配置版本仍可用于回滚。当前 CLI 仍不
+包含依赖下载、市场或私有注册表认证。TUI 中使用 `/doctor` 预检，使用
+`/reload` 在无运行 Turn 时切换 Engine 代际并重新挂载同一 Thread。
 
 演示模型保持确定性，不用于证明模型遵循 instructions；真实 Provider
 会通过普通 `ModelRequest.context` 接收已解析 Skill。
@@ -714,18 +879,20 @@ yh serve y-harness.json
 
 Gateway 必须实现
 [`protocol.md`](protocol.md) 所述的精确 Model Gateway v7 契约。
-除明确实现的 OpenAI Responses Provider 外，Y-Harness 不伪装不同
-厂商 API 具有相同语义；其他厂商适配应放在 Gateway 或宿主 Provider
-中。
+每个直接适配器只接受自己声明的 wire contract；配置自定义 endpoint
+不代表不同厂商原生 API 语义相同。未支持协议仍应放在 Gateway、JSON
+command Broker 或宿主 Provider 中。
 
 无需修改 Rust 代码即可配置多个已支持的 Provider/Model。复制
-`config/y-harness.route.example.json`，在 `models` 中为每个模型设置
-唯一 `id`、明确的 Provider 参数及各自的环境变量名，再在
+`config/y-harness.provider-profiles.example.json`，先在
+`provider_profiles` 中声明可复用的协议与 Secret/传输边界，再在
+`models` 中为每个模型设置唯一 `id`、Profile 引用和明确模型 ID，最后在
 `model_route.models` 中按尝试顺序列出这些 ID：
 
 ```bash
 export OPENAI_API_KEY='replace-with-real-secret'
-export YH_MODEL_TOKEN='replace-with-real-secret'
+export ANTHROPIC_API_KEY='replace-with-real-secret'
+export GEMINI_API_KEY='replace-with-real-secret'
 yh doctor y-harness.json
 ```
 
@@ -747,8 +914,11 @@ attempt deadline 明确判定的超时；普通 Provider 字符串错误不会�
 Model 调用。此边界不虚构对 Compactor、Verifier、Tool 或 MCP
 实现内部隐藏模型调用的可见性。
 `yh doctor` 会在 Provider 构造和服务启动前报告目录、精确 Route、
-冷却值和重试边界。修改目录或 Route 后需要受控重启服务；当前没有
-热加载、自动发现、通用错误熔断或按价格/负载猜测路由。
+冷却值和重试边界。TUI `/runtime` 显示无凭据的活动目录；`/reload` 先
+执行 doctor，再在已结算 Turn 边界优雅替换 Engine 进程并恢复同一持久
+Thread；`/doctor` 会把有界、终端控制字符清理后的预检报告加载到
+Runtime 面板，`/packages` 是活动 Skill 锁视图的入口。当前没有运行中
+Turn 的实现替换、自动发现、通用错误熔断或按价格/负载猜测路由。
 
 ## 13. 作为 Rust 引擎嵌入
 

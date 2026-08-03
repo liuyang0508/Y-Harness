@@ -5,8 +5,8 @@ mod https_source;
 
 #[cfg(feature = "https-skill")]
 pub use https_source::{
-    HttpSkillRequest, HttpSkillResponse, HttpSkillTransport, HttpsSkillSource,
-    HttpsSkillSourceConfig, ReqwestHttpSkillTransport,
+    HttpSkillAuthorization, HttpSkillRequest, HttpSkillResponse, HttpSkillTransport,
+    HttpsSkillSource, HttpsSkillSourceConfig, ReqwestHttpSkillTransport,
 };
 
 use std::{

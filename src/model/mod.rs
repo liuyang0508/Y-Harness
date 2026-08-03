@@ -1,7 +1,16 @@
 //! Production-facing model adapters kept outside the kernel contract.
 
+mod anthropic_messages;
+mod gemini_generate_content;
+mod native_http;
+mod openai_chat_completions;
 mod openai_responses;
 
+pub use anthropic_messages::{AnthropicMessagesModel, AnthropicMessagesModelConfig};
+pub use gemini_generate_content::{GeminiGenerateContentModel, GeminiGenerateContentModelConfig};
+pub use openai_chat_completions::{
+    ChatCompletionTokenLimitField, OpenAiChatCompletionsModel, OpenAiChatCompletionsModelConfig,
+};
 pub use openai_responses::{OpenAiResponsesModel, OpenAiResponsesModelConfig};
 
 use std::{fmt, sync::Arc, time::Duration};

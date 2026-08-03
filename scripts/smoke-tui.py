@@ -39,7 +39,8 @@ def read_until(master: int, process: subprocess.Popen[bytes], output: bytearray,
             break
     if needle not in output:
         raise RuntimeError(
-            f"TUI exited before emitting {needle!r}; status={process.poll()}"
+            f"TUI exited before emitting {needle!r}; status={process.poll()}; "
+            f"terminal tail={bytes(output[-4096:])!r}"
         )
 
 
@@ -95,6 +96,15 @@ def main() -> None:
             read_until(master, process, output, b"observed tool output", deadline)
             os.write(master, b"/fork\r")
             read_until(master, process, output, b"fork of ", deadline)
+            os.write(master, b"/runtime\r")
+            read_until(master, process, output, b"MODEL ROUTE", deadline)
+            os.write(master, b"\t/packages\r")
+            read_until(master, process, output, b"SKILLS", deadline)
+            if options.configured:
+                os.write(master, b"\t/doctor\r")
+                read_until(master, process, output, b"ENGINE DOCTOR", deadline)
+            os.write(master, b"\t/reload\r")
+            read_until(master, process, output, b"settled-Turn", deadline)
             os.write(master, b"/quit\r")
             read_until(master, process, output, b"\x1b[?1049l", deadline)
             process.wait(timeout=max(0.1, deadline - time.monotonic()))

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "provider_profiles": [
+    {
+      "type": "open_ai_chat_completions",
+      "id": "local/chat",
+      "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+      "api_key_secret_reference": "provider/local-chat",
+      "api_key_environment": "LOCAL_MODEL_API_KEY",
+      "max_output_tokens": 8192,
+      "token_limit_field": "max_tokens",
+      "stream_usage": false,
+      "allow_loopback_http": true,
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 2000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 4
+    }
+  ],
+  "models": [
+    {
+      "type": "provider_model",
+      "id": "local/primary",
+      "provider_profile": "local/chat",
+      "model": "replace-with-the-model-served-locally"
+    }
+  ],
+  "model_route": {
+    "models": [
+      "local/primary"
+    ],
+    "attempt_timeout_ms": 30000,
+    "timeout_cooldown_ms": 0
+  }
+}

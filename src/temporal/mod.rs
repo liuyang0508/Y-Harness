@@ -2,24 +2,27 @@
 //!
 //! The Temporal Driver owns no authoritative scheduler database and starts no
 //! background task. A host supplies trusted time and calls [`TemporalDriver::tick_as`].
-//! Workflow, Human Handoff, and Effect aggregates remain the durable source of
-//! truth; their existing revisions and fences settle concurrent ticks.
+//! Workflow, Human Handoff, Effect, and Agent Loop wait aggregates remain the
+//! durable source of truth; their existing revisions and fences settle
+//! concurrent ticks.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::state::agent_loop_due_command_id;
 use crate::{
-    ActorIdentity, AuthorityContext, EffectApplyOutcome, EffectCommand, EffectCommandId,
+    ActorIdentity, AgentLoopDueCursor, AgentLoopDuePhase, AgentLoopDueScanPage, AgentLoopDueWait,
+    AgentLoopWaitId, AuthorityContext, EffectApplyOutcome, EffectCommand, EffectCommandId,
     EffectCommandKind, EffectDueLease, EffectDueScanPage, EffectEngine, EffectId, EffectLeaseId,
-    HarnessError, HumanHandoffApplyOutcome, HumanHandoffClaimId, HumanHandoffCommand,
-    HumanHandoffCommandId, HumanHandoffCommandKind, HumanHandoffDueClaim, HumanHandoffDueScanPage,
-    HumanHandoffEngine, HumanHandoffId, WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandId,
-    WorkflowCommandKind, WorkflowDueScanPage, WorkflowDueWait, WorkflowEngine, WorkflowRunId,
-    WorkflowWaitId,
+    EventAppendDisposition, HarnessError, HumanHandoffApplyOutcome, HumanHandoffClaimId,
+    HumanHandoffCommand, HumanHandoffCommandId, HumanHandoffCommandKind, HumanHandoffDueClaim,
+    HumanHandoffDueScanPage, HumanHandoffEngine, HumanHandoffId, StateEngine, ThreadId, TurnId,
+    WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandId, WorkflowCommandKind,
+    WorkflowDueScanPage, WorkflowDueWait, WorkflowEngine, WorkflowRunId, WorkflowWaitId,
 };
 
 /// Exact embedded Temporal Driver API coordinate.
-pub const TEMPORAL_DRIVER_API_VERSION: u32 = 2;
+pub const TEMPORAL_DRIVER_API_VERSION: u32 = 3;
 /// Maximum authoritative identities visited per configured source and tick.
 pub const MAX_TEMPORAL_SCAN_LIMIT: usize = 256;
 
@@ -42,6 +45,9 @@ pub struct TemporalTickCursor {
     /// Last visited Effect while that source still has more records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_after_effect_id: Option<EffectId>,
+    /// Last visited Agent Loop due-index coordinate while that source has more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_loop_wait_after: Option<AgentLoopDueCursor>,
 }
 
 /// One bounded deterministic tick request.
@@ -108,6 +114,23 @@ pub enum TemporalTarget {
         /// Exclusive expiration boundary.
         expires_at_ms: u64,
     },
+    /// One due non-effecting Agent Loop wait lifecycle.
+    AgentLoopWait {
+        /// Current lifecycle phase, which selects timeout or denial convergence.
+        phase: AgentLoopDuePhase,
+        /// Owning Thread.
+        thread_id: ThreadId,
+        /// Owning running Turn.
+        turn_id: TurnId,
+        /// Exact wait fence.
+        wait_id: AgentLoopWaitId,
+        /// Lifecycle revision observed with the due row.
+        revision: u64,
+        /// State stream version observed atomically with the due row.
+        observed_stream_version: u64,
+        /// Inclusive deterministic settlement boundary.
+        due_at_ms: u64,
+    },
 }
 
 /// Content-free settlement of one temporal command.
@@ -123,6 +146,11 @@ pub enum TemporalAttemptOutcome {
         /// Revision found by the authoritative coordinator.
         actual_revision: u64,
     },
+    /// A concurrent State append changed the owning Thread stream first.
+    StreamFenced {
+        /// Stream version found by the authoritative Event Store.
+        actual_stream_version: u64,
+    },
     /// The authoritative source rejected or could not persist the command.
     ///
     /// Coordinator diagnostics are deliberately excluded from this bounded
@@ -137,7 +165,7 @@ pub enum TemporalAttemptOutcome {
 pub struct TemporalAttempt {
     /// Exact durable fence observed by the scan.
     pub target: TemporalTarget,
-    /// Stable actor-and-fence-derived command identity.
+    /// Stable command identity used by the authoritative source transition.
     pub command_id: String,
     /// Content-free settlement.
     pub outcome: TemporalAttemptOutcome,
@@ -155,6 +183,8 @@ pub struct TemporalTickReport {
     pub human_handoffs: TemporalScanProgress,
     /// Effect scan evidence, or zeros when that source is not installed.
     pub effects: TemporalScanProgress,
+    /// Agent Loop wait scan evidence, or zeros when State is not installed.
+    pub agent_loop_waits: TemporalScanProgress,
     /// Continuation for the next tick; completed source sweeps reset to `None`.
     pub next_cursor: TemporalTickCursor,
     /// Deterministically source-then-identity ordered advancement attempts.
@@ -167,6 +197,7 @@ pub struct TemporalDriver {
     workflows: Option<WorkflowEngine>,
     human_handoffs: Option<HumanHandoffEngine>,
     effects: Option<EffectEngine>,
+    state: Option<StateEngine>,
 }
 
 impl TemporalDriver {
@@ -194,6 +225,13 @@ impl TemporalDriver {
     #[must_use]
     pub fn with_effect_engine(mut self, engine: EffectEngine) -> Self {
         self.effects = Some(engine);
+        self
+    }
+
+    /// Installs bounded Agent Loop wait expiry and denial convergence.
+    #[must_use]
+    pub fn with_state_engine(mut self, engine: StateEngine) -> Self {
+        self.state = Some(engine);
         self
     }
 
@@ -255,9 +293,22 @@ impl TemporalDriver {
         } else {
             empty_effect_page()
         };
+        let agent_loop_wait_page = if let Some(state) = &self.state {
+            state
+                .scan_due_agent_loop_waits_as(
+                    request.at_ms,
+                    request.cursor.agent_loop_wait_after.as_ref(),
+                    request.scan_limit,
+                    authority,
+                )
+                .await?
+        } else {
+            empty_agent_loop_wait_page()
+        };
         validate_workflow_scan_page(&workflow_page, &request, authority)?;
         validate_handoff_scan_page(&handoff_page, &request, authority)?;
         validate_effect_scan_page(&effect_page, &request, authority)?;
+        validate_agent_loop_wait_scan_page(&agent_loop_wait_page, &request, authority)?;
 
         // Precompute every fallible command identity before the first durable
         // mutation. Later provider failures become per-attempt settlements.
@@ -333,12 +384,18 @@ impl TemporalDriver {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let agent_loop_wait_commands = agent_loop_wait_page
+            .due
+            .iter()
+            .map(|due| agent_loop_due_command_id(due).map(|id| (due.clone(), id)))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut attempts = Vec::with_capacity(
             workflow_commands
                 .len()
                 .saturating_add(handoff_commands.len())
-                .saturating_add(effect_commands.len()),
+                .saturating_add(effect_commands.len())
+                .saturating_add(agent_loop_wait_commands.len()),
         );
         if let Some(engine) = &self.workflows {
             for (due, command_id, command) in workflow_commands {
@@ -424,12 +481,38 @@ impl TemporalDriver {
                 });
             }
         }
+        if let Some(state) = &self.state {
+            for (due, command_id) in agent_loop_wait_commands {
+                let outcome = match state
+                    .settle_due_agent_loop_wait_as(&due, request.at_ms, authority)
+                    .await
+                {
+                    Ok(result) => match result.disposition {
+                        EventAppendDisposition::Applied => TemporalAttemptOutcome::Applied,
+                        EventAppendDisposition::Duplicate => TemporalAttemptOutcome::Duplicate,
+                        EventAppendDisposition::Unknown => TemporalAttemptOutcome::Failed,
+                    },
+                    Err(HarnessError::StateConflict { actual, .. }) => {
+                        TemporalAttemptOutcome::StreamFenced {
+                            actual_stream_version: actual,
+                        }
+                    }
+                    Err(_) => TemporalAttemptOutcome::Failed,
+                };
+                attempts.push(TemporalAttempt {
+                    target: agent_loop_wait_target(due),
+                    command_id,
+                    outcome,
+                });
+            }
+        }
 
         Ok(TemporalTickReport {
             at_ms: request.at_ms,
             workflows: progress(&workflow_page),
             human_handoffs: handoff_progress(&handoff_page),
             effects: effect_progress(&effect_page),
+            agent_loop_waits: agent_loop_wait_progress(&agent_loop_wait_page),
             next_cursor: TemporalTickCursor {
                 workflow_after_run_id: workflow_page
                     .has_more
@@ -442,6 +525,10 @@ impl TemporalDriver {
                 effect_after_effect_id: effect_page
                     .has_more
                     .then_some(effect_page.next_after_effect_id)
+                    .flatten(),
+                agent_loop_wait_after: agent_loop_wait_page
+                    .has_more
+                    .then_some(agent_loop_wait_page.next_cursor)
                     .flatten(),
             },
             attempts,
@@ -475,6 +562,9 @@ fn validate_request(
     if let Some(effect_id) = &request.cursor.effect_after_effect_id {
         validate_temporal_identity("Effect continuation", effect_id.as_str())?;
     }
+    if let Some(after) = &request.cursor.agent_loop_wait_after {
+        validate_agent_loop_wait_cursor(after)?;
+    }
     Ok(())
 }
 
@@ -495,6 +585,11 @@ fn validate_installed_cursors(
     if driver.effects.is_none() && cursor.effect_after_effect_id.is_some() {
         return Err(HarnessError::Temporal(
             "Effect cursor supplied without an Effect Engine".to_owned(),
+        ));
+    }
+    if driver.state.is_none() && cursor.agent_loop_wait_after.is_some() {
+        return Err(HarnessError::Temporal(
+            "Agent Loop wait cursor supplied without a State Engine".to_owned(),
         ));
     }
     Ok(())
@@ -684,6 +779,32 @@ fn validate_effect_scan_page(
     Ok(())
 }
 
+fn validate_agent_loop_wait_scan_page(
+    page: &AgentLoopDueScanPage,
+    request: &TemporalTickRequest,
+    authority: &AuthorityContext,
+) -> Result<(), HarnessError> {
+    page.validate(
+        request.at_ms,
+        request.cursor.agent_loop_wait_after.as_ref(),
+        request.scan_limit,
+        authority.tenant_id(),
+    )
+    .map_err(|error| invalid_scan("Agent Loop wait", &error.to_string()))
+}
+
+fn validate_agent_loop_wait_cursor(cursor: &AgentLoopDueCursor) -> Result<(), HarnessError> {
+    if cursor.due_at_ms == 0 {
+        return Err(invalid_scan(
+            "Agent Loop wait",
+            "cursor due time must be positive",
+        ));
+    }
+    validate_temporal_identity("Agent Loop Thread continuation", cursor.thread_id.as_str())?;
+    validate_temporal_identity("Agent Loop Turn continuation", cursor.turn_id.as_str())?;
+    validate_temporal_identity("Agent Loop wait continuation", cursor.wait_id.as_str())
+}
+
 fn validate_scan_progress(
     kind: &str,
     scanned: usize,
@@ -770,6 +891,18 @@ fn effect_target(due: EffectDueLease) -> TemporalTarget {
     }
 }
 
+fn agent_loop_wait_target(due: AgentLoopDueWait) -> TemporalTarget {
+    TemporalTarget::AgentLoopWait {
+        phase: due.phase,
+        thread_id: due.thread_id,
+        turn_id: due.turn_id,
+        wait_id: due.wait_id,
+        revision: due.revision,
+        observed_stream_version: due.expected_stream_version,
+        due_at_ms: due.due_at_ms,
+    }
+}
+
 fn progress(page: &WorkflowDueScanPage) -> TemporalScanProgress {
     TemporalScanProgress {
         scanned: page.scanned,
@@ -787,6 +920,14 @@ fn handoff_progress(page: &HumanHandoffDueScanPage) -> TemporalScanProgress {
 }
 
 fn effect_progress(page: &EffectDueScanPage) -> TemporalScanProgress {
+    TemporalScanProgress {
+        scanned: page.scanned,
+        due: page.due.len(),
+        has_more: page.has_more,
+    }
+}
+
+fn agent_loop_wait_progress(page: &AgentLoopDueScanPage) -> TemporalScanProgress {
     TemporalScanProgress {
         scanned: page.scanned,
         due: page.due.len(),
@@ -821,20 +962,35 @@ fn empty_effect_page() -> EffectDueScanPage {
     }
 }
 
+fn empty_agent_loop_wait_page() -> AgentLoopDueScanPage {
+    AgentLoopDueScanPage {
+        due: Vec::new(),
+        next_cursor: None,
+        has_more: false,
+        scanned: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
     use semver::Version;
 
     use super::*;
     use crate::{
-        EffectCreateRequest, EffectOperation, EffectStatus, HarnessFuture,
-        HumanHandoffCreateRequest, HumanHandoffStatus, HumanHandoffSubject,
-        HumanHandoffSubjectResolver, MemoryEffectCoordinator, MemoryHumanHandoffCoordinator,
-        MemoryTaskCoordinator, MemoryWorkflowCoordinator, TaskCoordinator, TaskDefinition,
-        TaskGraph, TaskGraphId, TaskId, WorkflowCoordinator, WorkflowDefinition, WorkflowStatus,
-        WorkspaceMode,
+        AgentLoopResumeCommandId, AgentLoopWaitStartCommand, ApprovalDecision, ApprovalId,
+        ApprovalRecord, ApprovalRecordStatus, ApprovalRequest, CapabilityOrigin,
+        CompletionAssurance, CompletionGeneration, EffectCreateRequest, EffectOperation,
+        EffectStatus, HarnessFuture, HumanHandoffCreateRequest, HumanHandoffStatus,
+        HumanHandoffSubject, HumanHandoffSubjectResolver, Item, ItemKind, MemoryEffectCoordinator,
+        MemoryEventStore, MemoryHumanHandoffCoordinator, MemoryTaskCoordinator,
+        MemoryWorkflowCoordinator, PolicyDecision, RiskLevel, TaskCoordinator, TaskDefinition,
+        TaskGraph, TaskGraphId, TaskId, ToolAuthorization, ToolDescriptor, Turn, TurnStatus,
+        WorkflowCoordinator, WorkflowDefinition, WorkflowStatus, WorkspaceMode,
+        completion_model_request_sha256, completion_model_route_sha256,
+        completion_runtime_governance_sha256, completion_tool_view_sha256,
+        completion_verifier_manifest_sha256,
     };
 
     struct ExistingSubject;
@@ -932,6 +1088,87 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum AgentLoopApplyMutation {
+        Settle,
+        Append,
+    }
+
+    struct AgentLoopMutatingWorkflow {
+        inner: Arc<MemoryWorkflowCoordinator>,
+        state: StateEngine,
+        due: AgentLoopDueWait,
+        turn: Turn,
+        mutation: AgentLoopApplyMutation,
+    }
+
+    impl WorkflowCoordinator for AgentLoopMutatingWorkflow {
+        fn create_as<'a>(
+            &'a self,
+            run_id: WorkflowRunId,
+            request: crate::WorkflowCreateRequest,
+            applied_at_ms: u64,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, crate::WorkflowRunSnapshot> {
+            self.inner
+                .create_as(run_id, request, applied_at_ms, authority)
+        }
+
+        fn load_as<'a>(
+            &'a self,
+            run_id: &'a WorkflowRunId,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, Option<crate::WorkflowRunSnapshot>> {
+            self.inner.load_as(run_id, authority)
+        }
+
+        fn scan_due_as<'a>(
+            &'a self,
+            at_ms: u64,
+            after_run_id: Option<&'a WorkflowRunId>,
+            scan_limit: usize,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, WorkflowDueScanPage> {
+            self.inner
+                .scan_due_as(at_ms, after_run_id, scan_limit, authority)
+        }
+
+        fn apply_as<'a>(
+            &'a self,
+            run_id: &'a WorkflowRunId,
+            expected_revision: u64,
+            command: WorkflowCommand,
+            applied_at_ms: u64,
+            authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, crate::WorkflowCommandResult> {
+            Box::pin(async move {
+                if matches!(&command.kind, WorkflowCommandKind::WakeDue { .. }) {
+                    match self.mutation {
+                        AgentLoopApplyMutation::Settle => {
+                            self.state
+                                .settle_due_agent_loop_wait_as(&self.due, applied_at_ms, authority)
+                                .await?;
+                        }
+                        AgentLoopApplyMutation::Append => {
+                            self.state
+                                .append_item_as(
+                                    &self.turn,
+                                    Item::new(ItemKind::UserMessage {
+                                        content: "concurrent State mutation".to_owned(),
+                                    }),
+                                    authority,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                self.inner
+                    .apply_as(run_id, expected_revision, command, applied_at_ms, authority)
+                    .await
+            })
+        }
+    }
+
     fn authority(subject: &str) -> AuthorityContext {
         AuthorityContext::new(
             ActorIdentity::Authenticated {
@@ -976,6 +1213,339 @@ mod tests {
             reason_code: "agent.escalation".to_owned(),
             priority: 7,
         }
+    }
+
+    async fn agent_loop_wait_fixture(
+        state: &StateEngine,
+        authority: &AuthorityContext,
+        suffix: &str,
+    ) -> (Turn, ApprovalRequest, AgentLoopWaitId) {
+        let thread = state
+            .create_thread_as(authority)
+            .await
+            .expect("create Agent Loop wait Thread");
+        let turn = state
+            .start_turn_as(&thread.id, authority)
+            .await
+            .expect("start Agent Loop wait Turn");
+        let call_id = format!("temporal-call-{suffix}");
+        let descriptor = ToolDescriptor {
+            name: "write_record".to_owned(),
+            description: "Writes one bounded test record".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"]
+            }),
+        };
+        let input = serde_json::json!({"value": 7});
+        state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::ToolCall {
+                    model_id: Some("test/model".to_owned()),
+                    model_origin: Some(CapabilityOrigin::BuiltIn),
+                    call_id: call_id.clone(),
+                    name: descriptor.name.clone(),
+                    input: input.clone(),
+                    batch: None,
+                }),
+                authority,
+            )
+            .await
+            .expect("append Agent Loop ToolCall");
+        state
+            .append_item_as(
+                &turn,
+                Item::new(ItemKind::PolicyDecision {
+                    call_id: call_id.clone(),
+                    tool_origin: Some(CapabilityOrigin::BuiltIn),
+                    decision: PolicyDecision::Ask {
+                        reason: "operator confirmation required".to_owned(),
+                        risk: RiskLevel::High,
+                    },
+                }),
+                authority,
+            )
+            .await
+            .expect("append Agent Loop Policy decision");
+        let request = ApprovalRequest {
+            id: ApprovalId::generate(),
+            requested_by: authority.actor().clone(),
+            authorization: ToolAuthorization {
+                thread_id: thread.id,
+                turn_id: turn.id.clone(),
+                call_id,
+                descriptor,
+                origin: CapabilityOrigin::BuiltIn,
+                input,
+            },
+            reason: "operator confirmation required".to_owned(),
+            risk: RiskLevel::High,
+        };
+        let model_request_sha256 = completion_model_request_sha256(&serde_json::json!({
+            "turn": turn.id.as_str(),
+            "approval": request.id.as_str()
+        }))
+        .expect("Model request digest");
+        let generation = CompletionGeneration::new(
+            &model_request_sha256,
+            completion_model_route_sha256(&["test/model"]).expect("Model route digest"),
+            completion_tool_view_sha256(&Vec::<String>::new()).expect("Tool view digest"),
+            completion_verifier_manifest_sha256(&[]).expect("Verifier manifest digest"),
+            completion_runtime_governance_sha256(&serde_json::json!({"max_steps": 16}))
+                .expect("Runtime governance digest"),
+            None,
+            CompletionAssurance::RuntimeMeasured,
+        )
+        .expect("completion generation");
+        let wait_id = AgentLoopWaitId::from_string(format!("temporal-wait-{suffix}"));
+        state
+            .start_approval_wait_as(
+                &turn,
+                AgentLoopWaitStartCommand::new(
+                    wait_id.clone(),
+                    request.clone(),
+                    generation,
+                    Some(Duration::from_secs(60)),
+                    Some(30_000),
+                ),
+                authority,
+            )
+            .await
+            .expect("start durable Agent Loop wait");
+        (turn, request, wait_id)
+    }
+
+    fn denied_approval(request: ApprovalRequest, tenant_id: Option<String>) -> ApprovalRecord {
+        let settled_at_ms = crate::kernel::now_ms();
+        ApprovalRecord {
+            schema_version: crate::APPROVAL_INBOX_SCHEMA_VERSION,
+            request,
+            tenant_id,
+            status: ApprovalRecordStatus::Settled {
+                decision: ApprovalDecision::Deny {
+                    reason: "operator rejected".to_owned(),
+                },
+                decided_by: ActorIdentity::Authenticated {
+                    authority: "test-approver".to_owned(),
+                    subject: "operator-7".to_owned(),
+                },
+            },
+            revision: 2,
+            requested_at_ms: settled_at_ms.saturating_sub(1),
+            settled_at_ms: Some(settled_at_ms),
+        }
+    }
+
+    #[test]
+    fn temporal_api_three_names_the_agent_loop_source() {
+        assert_eq!(TEMPORAL_DRIVER_API_VERSION, 3);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_wait_tick_times_out_the_exact_due_fence() {
+        let authority = authority("maintenance");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let (turn, _, wait_id) = agent_loop_wait_fixture(&state, &authority, "timeout").await;
+        let report = TemporalDriver::new()
+            .with_state_engine(state.clone())
+            .tick_as(
+                TemporalTickRequest {
+                    at_ms: u64::MAX,
+                    scan_limit: 16,
+                    cursor: TemporalTickCursor::default(),
+                },
+                &authority,
+            )
+            .await
+            .expect("settle due Agent Loop wait");
+
+        assert_eq!(report.agent_loop_waits.scanned, 1);
+        assert_eq!(report.agent_loop_waits.due, 1);
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(report.attempts[0].outcome, TemporalAttemptOutcome::Applied);
+        assert!(
+            report.attempts[0]
+                .command_id
+                .starts_with("agent-loop-timeout-")
+        );
+        assert!(matches!(
+            &report.attempts[0].target,
+            TemporalTarget::AgentLoopWait {
+                phase: AgentLoopDuePhase::Waiting,
+                wait_id: observed,
+                ..
+            } if observed == &wait_id
+        ));
+        let thread = state
+            .load_thread_as(&turn.thread_id, &authority)
+            .await
+            .expect("load timed-out Thread")
+            .expect("timed-out Thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn ready_denial_tick_preserves_denial_instead_of_timing_out() {
+        let authority = authority("maintenance");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let (turn, request, wait_id) = agent_loop_wait_fixture(&state, &authority, "deny").await;
+        state
+            .accept_resume_as(
+                &turn,
+                &wait_id,
+                1,
+                AgentLoopResumeCommandId::from_static("temporal-denial-resume"),
+                &denied_approval(request, authority.tenant_id().map(str::to_owned)),
+                &authority,
+            )
+            .await
+            .expect("accept denial");
+
+        let report = TemporalDriver::new()
+            .with_state_engine(state.clone())
+            .tick_as(
+                TemporalTickRequest {
+                    at_ms: u64::MAX,
+                    scan_limit: 16,
+                    cursor: TemporalTickCursor::default(),
+                },
+                &authority,
+            )
+            .await
+            .expect("converge accepted denial");
+        assert!(matches!(
+            &report.attempts[0].target,
+            TemporalTarget::AgentLoopWait {
+                phase: AgentLoopDuePhase::ReadyDeny,
+                wait_id: observed,
+                ..
+            } if observed == &wait_id
+        ));
+        assert_eq!(report.attempts[0].outcome, TemporalAttemptOutcome::Applied);
+        assert!(
+            report.attempts[0]
+                .command_id
+                .starts_with("agent-loop-denial-")
+        );
+        let thread = state
+            .load_thread_as(&turn.thread_id, &authority)
+            .await
+            .expect("load denied Thread")
+            .expect("denied Thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::Failed);
+        assert!(
+            thread.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::AgentLoopWaitDenied { .. }))
+        );
+        assert!(
+            thread.turns[0]
+                .items
+                .iter()
+                .all(|item| !matches!(item.kind, ItemKind::AgentLoopWaitClosed { .. }))
+        );
+    }
+
+    async fn agent_loop_attempt_after_workflow_mutation(
+        mutation: AgentLoopApplyMutation,
+    ) -> TemporalTickReport {
+        let authority = authority("maintenance");
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let (turn, _, _) = agent_loop_wait_fixture(&state, &authority, "race").await;
+        let due = state
+            .scan_due_agent_loop_waits_as(u64::MAX, None, 16, &authority)
+            .await
+            .expect("scan Agent Loop fixture")
+            .due
+            .into_iter()
+            .next()
+            .expect("due Agent Loop wait");
+
+        let tasks = Arc::new(MemoryTaskCoordinator::new());
+        let graph_id = TaskGraphId::from_static("agent-loop-race-graph");
+        tasks
+            .create_as(
+                graph_id.clone(),
+                TaskGraph::new(vec![task()]).expect("graph"),
+                &authority,
+            )
+            .await
+            .expect("create graph");
+        let coordinator: Arc<dyn WorkflowCoordinator> = Arc::new(AgentLoopMutatingWorkflow {
+            inner: Arc::new(MemoryWorkflowCoordinator::new()),
+            state: state.clone(),
+            due,
+            turn,
+            mutation,
+        });
+        let workflow_engine = WorkflowEngine::new(coordinator, tasks);
+        let run_id = WorkflowRunId::from_static("agent-loop-race-run");
+        workflow_engine
+            .create_as(run_id.clone(), workflow_create(graph_id), 10, &authority)
+            .await
+            .expect("create Workflow");
+        workflow_engine
+            .apply_as(
+                &run_id,
+                1,
+                WorkflowCommand {
+                    id: WorkflowCommandId::from_static("agent-loop-race-wait"),
+                    kind: WorkflowCommandKind::WaitUntil {
+                        wait_id: WorkflowWaitId::from_static("agent-loop-race-timer"),
+                        due_at_ms: 100,
+                    },
+                },
+                20,
+                &authority,
+            )
+            .await
+            .expect("install Workflow wait");
+
+        TemporalDriver::new()
+            .with_workflow_engine(workflow_engine)
+            .with_state_engine(state)
+            .tick_as(
+                TemporalTickRequest {
+                    at_ms: u64::MAX,
+                    scan_limit: 16,
+                    cursor: TemporalTickCursor::default(),
+                },
+                &authority,
+            )
+            .await
+            .expect("tick after all source scans")
+    }
+
+    #[tokio::test]
+    async fn agent_loop_disposition_and_conflict_map_exactly_after_all_scans() {
+        let duplicate =
+            agent_loop_attempt_after_workflow_mutation(AgentLoopApplyMutation::Settle).await;
+        assert_eq!(duplicate.attempts.len(), 2);
+        assert_eq!(
+            duplicate.attempts[0].outcome,
+            TemporalAttemptOutcome::Applied
+        );
+        assert!(matches!(
+            duplicate.attempts[1].target,
+            TemporalTarget::AgentLoopWait { .. }
+        ));
+        assert_eq!(
+            duplicate.attempts[1].outcome,
+            TemporalAttemptOutcome::Duplicate
+        );
+
+        let fenced =
+            agent_loop_attempt_after_workflow_mutation(AgentLoopApplyMutation::Append).await;
+        assert_eq!(fenced.attempts.len(), 2);
+        assert_eq!(
+            fenced.attempts[1].outcome,
+            TemporalAttemptOutcome::StreamFenced {
+                actual_stream_version: 6
+            }
+        );
     }
 
     #[tokio::test]
@@ -1293,11 +1863,32 @@ mod tests {
                     workflow_after_run_id: Some(WorkflowRunId::from_static("run")),
                     handoff_after_handoff_id: None,
                     effect_after_effect_id: None,
+                    agent_loop_wait_after: None,
                 },
             })
             .await
             .expect_err("uninstalled cursor");
         assert!(error.to_string().contains("without a Workflow Engine"));
+
+        let error = TemporalDriver::new()
+            .tick(TemporalTickRequest {
+                at_ms: 10,
+                scan_limit: 1,
+                cursor: TemporalTickCursor {
+                    workflow_after_run_id: None,
+                    handoff_after_handoff_id: None,
+                    effect_after_effect_id: None,
+                    agent_loop_wait_after: Some(AgentLoopDueCursor {
+                        due_at_ms: 1,
+                        thread_id: ThreadId::from_static("thread"),
+                        turn_id: TurnId::from_static("turn"),
+                        wait_id: AgentLoopWaitId::from_static("wait"),
+                    }),
+                },
+            })
+            .await
+            .expect_err("uninstalled State cursor");
+        assert!(error.to_string().contains("without a State Engine"));
     }
 
     #[tokio::test]

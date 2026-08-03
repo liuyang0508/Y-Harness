@@ -7,7 +7,7 @@ built around:
 Agent = LLM × Harness = X × Y
 ```
 
-It ships an embeddable Rust Core/Runtime, Protocol v31 service, thin engine CLI,
+It ships an embeddable Rust Core/Runtime, Protocol v37 service, thin engine CLI,
 an independently installable full-screen TUI, an optional Domain Pack
 control-plane library, durable SQLite State/Approval/Task coordination,
 governed extension contracts, evaluation gates, and executable examples.
@@ -121,7 +121,7 @@ idempotency coordinate is committed before execution. A finite worker lease
 owns one exact attempt; expiry becomes `unknown` and cannot be retried without
 authoritative reconciliation. Content-free receipts, actor/content-bound
 commands, revision CAS, Memory/SQLite parity, bounded paging, and restart
-recovery live in `effects.db`. Temporal Driver API 2 may expire the exact lease
+recovery live in `effects.db`. Temporal Driver API 3 may expire the exact lease
 to `unknown`, but it never performs the external operation.
 Embedded Governed Effect Executor API 1 optionally consumes those pending
 intents through exact-versioned registered Connectors. It freezes explicit
@@ -159,18 +159,23 @@ deadline. Protocol 30 advertises API 3 without adding a Secret-bearing command.
 Values do not enter Effect input, JSON Connector envelopes, State, or
 diagnostics; racing post-preflight issuance, atomic executable binding, and
 operating-system/child-process copies remain outside the claim.
-Embedded Temporal Driver API 2 composes optional Workflow, Handoff, and Effect
-Engines behind one bounded host-driven tick. It uses trusted host time and
-authority, tenant-local 1–256-record identity scans per source, disposable
-cursors, deterministic actor-and-fence command identities, and existing CAS
+Embedded Temporal Driver API 3 composes optional Workflow, Handoff, Effect,
+and State Engines behind one bounded host-driven tick. It uses trusted host
+time and authority, tenant-local 1–256-record keyset scans per source,
+disposable cursors, deterministic fence command identities, and existing CAS
 transitions to settle each attempt as applied, duplicate, fenced, or failed.
-It starts no background task and adds no scheduler database.
+Agent Loop maintenance reads only its due projection and one or two exact
+lifecycle events. It starts no background task and adds no scheduler database.
 Reference-service config schema 1 additively accepts an optional `temporal`
 policy. Omission remains disabled; opt-in polling uses the fixed service
 Authority, skip-missed cadence, bounded health diagnostics, and
 Temporal-before-Protocol-before-MCP shutdown.
+The reference service now also converts Unix SIGTERM/SIGINT and Windows Ctrl-C
+into its existing one-way drain. Public cancellation-aware JSONL helpers stop
+only between frames, and a bounded detached stdin bridge prevents an open pipe
+from pinning Tokio's blocking pool during process shutdown (ADR 0152).
 The optional `y-harness-domain-pack` crate remains above Core and outside
-Protocol v31. Format/store schema 1 pins immutable component snapshots and a
+Protocol v36. Format/store schema 1 pins immutable component snapshots and a
 mandatory Evaluation suite, records terminal evaluation and independent
 approval, tenant-fences release/activation identity, and supports SQLite CAS,
 bounded rollback, and execution-time inventory/revision binding. Its
@@ -217,6 +222,76 @@ storage; `external_package_files` preserves the signed envelope and External
 origin; startup and Context keep live trust checks; doctor reports publisher
 and log provenance; revoked packages remain recoverably removable after
 deactivation.
+Digest-pinned format-1 Catalog commands now search, recursively acquire, and
+explicitly upgrade exact signed Skill dependency closures while retaining
+immutable Catalog bytes and source receipts. Named private Registries add an
+exact Catalog endpoint, package-origin allowlist, request-scoped Bearer Secret
+resolution, and optional exclusive project-pinned CA. The real private-TLS CLI
+test proves both requests are authenticated, installation remains inactive,
+and the credential does not enter the resulting project tree. Protocol v33
+adds only credential-free Registry metadata to Runtime Catalog; Registry
+federation, mirrors, OAuth, npm/git sources, and executable extensions remain
+outside this release.
+Protocol v34 adds an independently authorized, content-free service admission
+projection. It reports `ready`, exact Operation `at_capacity`, or one-way
+`draining` plus bounded running/retained counts from the same Handler state
+that gates new Turns. A successful response proves Protocol-process liveness;
+it does not claim external dependency health.
+Protocol v35 adds bounded Model Tool Trace attempt events and credential-free
+MCP registration projections. They improve client diagnostics without moving
+prompts, Tool inputs/results, schema bodies, credentials, or execution authority
+out of the Runtime.
+State/snapshot schema 15 and Protocol v36 add deterministic format-1
+`CompletionReceipt` settlement. A Model text message is only a candidate;
+Runtime records its exact Model-request digest, runs the frozen candidate-bound
+Verifier manifest, fences pending Steering, and asks State to validate and
+atomically commit `TurnCompleted { turn_id, receipt }` against the exact
+running projection. The receipt binds the candidate and evidence prefix,
+Model route, Tool Capability View, Verifier identities/origins/contracts and
+outcomes, Runtime governance, trusted authority, and an optional
+`ExecutionBinding`. A successful terminal Operation exposes only the SHA-256
+of that durable receipt for correlation.
+
+Receipt-free completed Turns from schema 1 through 14 remain readable as
+`legacy/unverified`; migration does not synthesize proof. Thread archive format
+5 preserves the original receipt bytes. Fork/import lineage proves that the
+target inherited source history, while `source_thread_id` continues to identify
+the Thread in which completion was actually performed. It does not claim the
+target reran completion gates. Format 1 requires Artifact, Effect, and business
+delivery to be explicitly `not_required`; it does not prove cross-aggregate
+Artifact contents, Effect truth, channel delivery, or post-terminal derived
+jobs. See [ADR 0157](adr/0157-generation-bound-completion-receipt.md).
+State/snapshot schema 16, Thread archive format 6, and Protocol v37 add the
+first durable Agent Loop wait slice. An opted-in single non-batch Tool `ask`
+persists a complete authority/generation/active-time envelope and releases its
+worker. Exact Approval evidence advances `Waiting` to `Ready`; one State-CAS
+claim advances to `Executing`. Denial fails the Turn atomically without a
+claim, while exact cancellation and deterministic timeout share the terminal
+State boundary. Independent wait-projection schema 1 transactionally indexes
+expiring waits and immediately due accepted denials; Temporal API 3 provides
+bounded host-driven convergence. Protocol and the TUI support bounded
+discovery, resume, cancel, and restart recovery. Batch release, `HumanInput`,
+Inbox repair outbox/tombstone, finite leases, `NeedsReconciliation`, frozen
+Context capsules, and cross-process resume receipts remain out of scope. See
+[ADR 0158](adr/0158-durable-agent-loop-waiting-and-resume.md) and
+[ADR 0159](adr/0159-bounded-indexed-durable-agent-loop-wait-expiry.md).
+The explicit backup-first State migration now accepts schema 1 through 15 and
+projection-less schema 16, retains every historical event and schema label,
+preserves current snapshots during projection-only migration, never infers a
+wait from legacy Running state, and advances writers to State/snapshot schema
+16 plus wait-projection schema 1.
+The embedded Runtime also adds ADR 0156's bounded Progress Governor. It rebuilds
+from existing Turn Items, ignores fresh call and batch identities, detects exact
+failure-bearing cycles of period one through four, and by default stops after
+five repetitions. Pending durable Steering is applied under the Turn-control
+lock before the stop verdict. This adds `ProgressPolicy` and
+`HarnessError::NoProgress`, but no State, archive, service-config, or Protocol
+shape.
+An optional `http-probe` feature now exposes bounded Kubernetes-style
+`/livez` and `/readyz` routes from that same in-process status. The reference
+service accepts a strict opt-in configuration, while zero-default binaries
+reject it explicitly. The adapter has no durable state, dependency-health
+claim, TLS, or general Agent HTTP API.
 Stores that implement the bounded recent-Thread index advertise
 `thread.list`; the TUI uses it to list and resume the latest 64 authoritative
 Threads without opening Engine storage. Protocol 16 includes optional direct
@@ -305,8 +380,10 @@ validation. This changes no durable or Protocol coordinate.
 - optional TUI package: `0.1.0`
 - optional Domain Pack control-plane package: `0.1.0`
 - service configuration: `1`
-- client protocol: `31`
-- State event/snapshot schema: `14` / `14`
+- client protocol: `37`
+- State event/snapshot schema: `16` / `16`
+- Agent Loop wait projection schema: `1`
+- Thread archive format: `6`
 - Approval Inbox schema: `3`
 - Task Coordinator schema: `4`
 - Workflow Coordinator schema: `1`
@@ -314,7 +391,7 @@ validation. This changes no durable or Protocol coordinate.
 - Effect Ledger schema: `1`
 - Governed Effect Executor/Reconciler API: `1` / `1` (embedded only)
 - JSON Effect Connector protocol: `1`
-- Temporal Driver API: `2` (embedded only)
+- Temporal Driver API: `3` (embedded only)
 - Secret Provider API: `3`
 - Domain Pack format/store schema: `1` / `1`
 - HTTPS Model Gateway API: `7`
@@ -328,11 +405,12 @@ the documented backup-first migration commands.
   tested strong OS sandbox broker.
 - Network protocol exposure requires the mandatory-mTLS host; the stdio JSONL
   service is not a raw Internet server.
-- OpenAI Responses is the only direct vendor model adapter. Its mapping and
-  transport tests are local; a live API pass remains environment-gated.
-  Schema-5 origin-bound continuation handles replayable encrypted reasoning;
-  a function call whose reasoning state is not replayable still fails before
-  Tool execution.
+- Native OpenAI Responses and Chat Completions, Anthropic Messages, and Gemini
+  `generateContent` adapters are included. Their deterministic mapping and
+  transport tests are local; live API passes remain environment-gated.
+  Schema-5 origin-bound continuation preserves replay-required provider state;
+  a function call whose required continuation is unavailable still fails
+  before Tool execution.
 - SQLite offers single-host durability and multi-process CAS, not multi-node
   consensus or distributed high availability.
 - Workspace cleanup cannot guarantee recovery after power loss or hostile

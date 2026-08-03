@@ -210,6 +210,20 @@ impl ToolRegistry {
             .map(|registered| registered.descriptor.clone())
             .collect()
     }
+
+    /// Returns credential-free Tool names and trust origins in deterministic order.
+    #[must_use]
+    pub fn registrations(&self) -> Vec<(String, CapabilityOrigin)> {
+        self.tools
+            .values()
+            .map(|registered| {
+                (
+                    registered.descriptor.name.clone(),
+                    registered.origin.clone(),
+                )
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn capture_capability_metadata<T>(

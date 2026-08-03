@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo",
+    "id": "local/demo"
+  },
+  "http_probe": {
+    "bind_address": "127.0.0.1:8081",
+    "max_connections": 64,
+    "request_timeout_ms": 2000,
+    "status_timeout_ms": 1000,
+    "shutdown_timeout_ms": 5000
+  }
+}

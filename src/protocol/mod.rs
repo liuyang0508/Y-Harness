@@ -25,20 +25,23 @@ use tokio::{
 
 use crate::isolation::isolate_future;
 use crate::{
-    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, ApprovalDecision, ApprovalId, ApprovalInbox,
-    ApprovalRecord, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-    EFFECT_LEDGER_SCHEMA_VERSION, EffectApplyOutcome, EffectCommand, EffectCommandKind,
-    EffectCreateRequest, EffectEngine, EffectId, EffectPageCursor, HUMAN_HANDOFF_SCHEMA_VERSION,
-    HarnessError, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffCommand,
-    HumanHandoffCommandKind, HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffEngine,
-    HumanHandoffId, MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope, ModelEventSink,
-    ModelStreamEvent, OperationId, SECRET_API_VERSION, SKILL_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId,
-    StoredEvent, TASK_GRAPH_SCHEMA_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim, TaskCompletion,
-    TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
+    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, AgentLoopCloseCommandId, AgentLoopExecution,
+    AgentLoopWaitId, ApprovalDecision, ApprovalDeliveryOperation, ApprovalId, ApprovalInbox,
+    ApprovalRecord, ApprovalWait, ApprovalWaitStatus, AuthorityContext,
+    CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, EFFECT_LEDGER_SCHEMA_VERSION,
+    EffectApplyOutcome, EffectCommand, EffectCommandKind, EffectCreateRequest, EffectEngine,
+    EffectId, EffectPageCursor, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessRuntime,
+    HumanHandoffApplyOutcome, HumanHandoffCommand, HumanHandoffCommandKind,
+    HumanHandoffCreateRequest, HumanHandoffCursor, HumanHandoffEngine, HumanHandoffId,
+    MEMORY_API_VERSION, MODEL_GATEWAY_API_VERSION, MemoryScope, ModelEventSink, ModelStreamEvent,
+    OperationId, SECRET_API_VERSION, SKILL_API_VERSION, STATE_EVENT_SCHEMA_VERSION,
+    STATE_SNAPSHOT_SCHEMA_VERSION, StateCapacity, SteeringId, StoredEvent,
+    TASK_GRAPH_SCHEMA_VERSION, THREAD_ARCHIVE_FORMAT_VERSION, TOKEN_COUNTER_API_VERSION, TaskClaim,
+    TaskCompletion, TaskCoordinator, TaskDefinition, TaskGraphId, TaskId, TaskLeaseId, TaskMessage,
     TaskMessagePage, Thread, ThreadId, ThreadSummary, TurnContextInput, TurnExecutionOptions,
-    TurnId, WORKFLOW_RUN_SCHEMA_VERSION, WORKSPACE_PROVIDER_API_VERSION, WorkflowApplyOutcome,
-    WorkflowCommand, WorkflowCommandKind, WorkflowCreateRequest, WorkflowEngine, WorkflowRunId,
+    TurnExecutionResult, TurnId, TurnOutcome, WORKFLOW_RUN_SCHEMA_VERSION,
+    WORKSPACE_PROVIDER_API_VERSION, WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandKind,
+    WorkflowCreateRequest, WorkflowEngine, WorkflowRunId,
 };
 
 use effect::EffectProtocolService;
@@ -51,7 +54,7 @@ use workflow::WorkflowProtocolService;
 pub use workflow::{WorkflowRunSummary, WorkflowTransitionPage};
 
 /// Current Y-Harness client protocol version.
-pub const PROTOCOL_VERSION: &str = "31";
+pub const PROTOCOL_VERSION: &str = "37";
 
 const MAX_REQUEST_FRAME_BYTES: usize = 2_097_152;
 const MAX_RESPONSE_FRAME_BYTES: usize = 16_777_216;
@@ -82,8 +85,10 @@ const MAX_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3_600);
 const DEFAULT_OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROTOCOL_PERMISSIONS: usize = 64;
 
-const PROTOCOL_PERMISSIONS: [&str; 49] = [
+const PROTOCOL_PERMISSIONS: [&str; 54] = [
     "initialize",
+    "runtime.catalog",
+    "service.status",
     "operation.cancel",
     "operation.events",
     "operation.forget",
@@ -98,6 +103,9 @@ const PROTOCOL_PERMISSIONS: [&str; 49] = [
     "thread.recover",
     "turn.start",
     "turn.steer",
+    "turn.wait.cancel",
+    "turn.wait.get",
+    "turn.wait.resume",
     "approval.get",
     "approval.pending",
     "approval.settle",
@@ -152,6 +160,10 @@ pub struct ProtocolRequest {
 pub enum ProtocolCommand {
     /// Negotiates the exact protocol and returns server capabilities.
     Initialize {},
+    /// Reads a bounded, credential-free catalog of the active Runtime generation.
+    GetRuntimeCatalog {},
+    /// Reads content-free process-local Protocol admission status.
+    GetServiceStatus {},
     /// Creates a new Thread.
     CreateThread {},
     /// Forks one terminal parent boundary under a caller-chosen child identity.
@@ -209,6 +221,49 @@ pub enum ProtocolCommand {
         context: Vec<TurnContextInput>,
         /// Optional total external-work deadline.
         timeout_ms: Option<u64>,
+        /// Optional durable Approval lifetime. When present, the Runtime may
+        /// release its worker at a single pre-Tool Approval boundary.
+        #[serde(default)]
+        approval_wait_ttl_ms: Option<u64>,
+    },
+    /// Reads the authoritative live durable-wait coordinate for one Turn.
+    GetTurnExecution {
+        /// Existing Thread identity.
+        thread_id: String,
+        /// Exact running Turn identity.
+        turn_id: String,
+    },
+    /// Starts one asynchronous attempt to resume an exact durable wait.
+    ResumeTurnWait {
+        /// Existing Thread identity.
+        thread_id: String,
+        /// Exact running Turn identity.
+        turn_id: String,
+        /// Exact wait identity observed by the caller.
+        wait_id: String,
+        /// Exact wait revision observed by the caller.
+        expected_revision: u64,
+        /// Original memory isolation scope. Runtime verifies the reconstructed
+        /// Model request rather than trusting this value as new authority.
+        #[serde(default)]
+        memory_scope: MemoryScope,
+        /// Original non-authoritative Turn context. Runtime verifies the
+        /// reconstructed Model request before crossing the Tool boundary.
+        #[serde(default)]
+        context: Vec<TurnContextInput>,
+    },
+    /// Atomically cancels one exact unclaimed durable wait.
+    CancelTurnWait {
+        /// Existing Thread identity.
+        thread_id: String,
+        /// Exact running Turn identity.
+        turn_id: String,
+        /// Exact wait identity observed by the caller.
+        wait_id: String,
+        /// Exact wait revision observed by the caller.
+        expected_revision: u64,
+        /// Caller-stable idempotency identity reused on network retries.
+        command_id: String,
     },
     /// Queues durable additional input for one exact active Turn.
     SteerTurn {
@@ -485,6 +540,8 @@ impl ProtocolCommand {
     fn permission(&self) -> &'static str {
         match self {
             Self::Initialize {} => "initialize",
+            Self::GetRuntimeCatalog {} => "runtime.catalog",
+            Self::GetServiceStatus {} => "service.status",
             Self::CreateThread {} => "thread.create",
             Self::ForkThread { .. } => "thread.fork",
             Self::ListThreads { .. } => "thread.list",
@@ -494,6 +551,9 @@ impl ProtocolCommand {
             Self::GetThreadCapacity { .. } => "thread.capacity",
             Self::StartTurn { .. } => "turn.start",
             Self::SteerTurn { .. } => "turn.steer",
+            Self::GetTurnExecution { .. } => "turn.wait.get",
+            Self::ResumeTurnWait { .. } => "turn.wait.resume",
+            Self::CancelTurnWait { .. } => "turn.wait.cancel",
             Self::GetOperation { .. } => "operation.get",
             Self::GetOperationEvents { .. } => "operation.events",
             Self::CancelOperation { .. } => "operation.cancel",
@@ -748,6 +808,16 @@ pub enum ProtocolResult {
         /// Exact engine and persistence compatibility coordinates.
         compatibility: CompatibilityManifest,
     },
+    /// Active credential-free Runtime capability projection.
+    RuntimeCatalog {
+        /// Immutable catalog for the active Engine generation.
+        catalog: RuntimeCatalog,
+    },
+    /// Content-free process-local service admission projection.
+    ServiceStatus {
+        /// Current authoritative Protocol admission status.
+        status: ProtocolServiceStatus,
+    },
     /// Newly created Thread.
     ThreadCreated {
         /// Projected Thread.
@@ -791,6 +861,24 @@ pub enum ProtocolResult {
     TurnStarted {
         /// Pollable operation identity.
         operation_id: OperationId,
+    },
+    /// Authoritative bounded durable-wait projection or explicit absence.
+    TurnExecution {
+        /// Live execution when the Turn remains at a durable wait boundary.
+        execution: Option<TurnExecutionProjection>,
+    },
+    /// Successful exact cancellation of one unclaimed durable wait.
+    TurnWaitCancelled {
+        /// Owning Thread.
+        thread_id: ThreadId,
+        /// Terminal Turn.
+        turn_id: TurnId,
+        /// Closed wait identity.
+        wait_id: AgentLoopWaitId,
+        /// Caller-stable command identity accepted by State.
+        command_id: AgentLoopCloseCommandId,
+        /// Terminal wait lifecycle revision.
+        revision: u64,
     },
     /// Durable steering submission acknowledgement.
     TurnSteered {
@@ -1013,6 +1101,72 @@ pub enum ProtocolResult {
     },
 }
 
+/// Durable Agent Loop lifecycle visible without exposing Tool input or model context.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnExecutionState {
+    /// Approval has not yet been accepted by State.
+    Waiting,
+    /// Approval settlement is durable and an execution worker has not claimed it.
+    Ready,
+    /// One worker won the execution claim; blind replay is forbidden.
+    Executing,
+}
+
+/// Bounded, credential-free coordinate for one authoritative durable wait.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnExecutionProjection {
+    /// Owning Thread.
+    pub thread_id: ThreadId,
+    /// Owning running Turn.
+    pub turn_id: TurnId,
+    /// Stable wait identity.
+    pub wait_id: AgentLoopWaitId,
+    /// Current optimistic lifecycle revision.
+    pub revision: u64,
+    /// Current authoritative lifecycle state.
+    pub state: TurnExecutionState,
+    /// Optional server-issued wall-clock expiry in Unix milliseconds.
+    pub expires_at_ms: Option<u64>,
+    /// Frozen active execution timeout restored only after a successful claim.
+    pub remaining_active_timeout_ms: Option<u64>,
+    /// Correlated Approval Inbox identity.
+    pub approval_id: ApprovalId,
+}
+
+/// Cross-domain operation requiring an idempotent Approval Inbox retry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDeliveryAction {
+    /// Submit or repair the immutable Approval request.
+    Submit,
+    /// Reload the current Approval record.
+    Read,
+}
+
+/// Bounded process observation accompanying a durable wait release.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApprovalDeliveryStatus {
+    /// The request is durably pending.
+    Pending,
+    /// A terminal Inbox settlement was observed.
+    Settled,
+    /// The Inbox permanently orphaned the request.
+    Orphaned {
+        /// Bounded operator-facing explanation.
+        reason: String,
+    },
+    /// State remains authoritative while Inbox convergence is retried.
+    Retry {
+        /// Exact cross-domain operation to retry.
+        action: ApprovalDeliveryAction,
+        /// Bounded operator-facing diagnostic.
+        message: String,
+    },
+}
+
 /// Pollable asynchronous Turn state.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1022,6 +1176,13 @@ pub enum OperationStatus {
         /// Target Thread.
         thread_id: ThreadId,
     },
+    /// Runtime released its worker at a durable Approval boundary.
+    Waiting {
+        /// Authoritative bounded State coordinate.
+        execution: TurnExecutionProjection,
+        /// Latest bounded Inbox delivery observation.
+        approval_delivery: ApprovalDeliveryStatus,
+    },
     /// Turn completed successfully.
     Completed {
         /// Target Thread.
@@ -1030,6 +1191,8 @@ pub enum OperationStatus {
         turn_id: TurnId,
         /// Final assistant text.
         final_text: String,
+        /// SHA-256 of the authoritative generation-bound completion receipt.
+        completion_receipt_sha256: String,
     },
     /// Turn failed for a non-control reason.
     Failed {
@@ -1077,6 +1240,8 @@ pub struct CompatibilityManifest {
     pub state_event_schema: u32,
     /// Disposable State snapshot schema accepted and written.
     pub state_snapshot_schema: u32,
+    /// Portable integrity-bound Thread archive format.
+    pub thread_archive_format: u32,
     /// Durable Approval Inbox record schema accepted and written.
     pub approval_inbox_schema: u32,
     /// Durable Task Coordinator graph schema accepted and written.
@@ -1101,6 +1266,86 @@ pub struct CompatibilityManifest {
     pub model_gateway_api: String,
     /// Exact Workspace Provider API version.
     pub workspace_provider_api: String,
+}
+
+/// Credential-free active capability projection supplied by the Engine host.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCatalog {
+    /// SHA-256 of the exact active service configuration bytes.
+    pub configuration_sha256: String,
+    /// Ordered Model failover route.
+    pub model_route: Vec<String>,
+    /// Configured Model adapters in deterministic identity order.
+    pub models: Vec<RuntimeModelCatalogEntry>,
+    /// Registered model-visible Tool names.
+    pub tools: Vec<String>,
+    /// Exact active declarative Skill locks.
+    pub skills: Vec<RuntimeSkillCatalogEntry>,
+    /// Configured credential-free Skill Registry projections.
+    pub skill_registries: Vec<RuntimeSkillRegistryCatalogEntry>,
+    /// Configured MCP transports, including disabled registrations.
+    pub mcp_servers: Vec<RuntimeMcpCatalogEntry>,
+    /// Host-defined safe reconfiguration boundary.
+    pub reload_strategy: String,
+}
+
+/// One credential-free configured Model projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeModelCatalogEntry {
+    /// Stable Model registry identity.
+    pub id: String,
+    /// Adapter or wire-protocol family.
+    pub adapter: String,
+    /// Optional HTTPS endpoint; credentials and process commands are excluded.
+    pub endpoint: Option<String>,
+}
+
+/// One exact active declarative Skill lock.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSkillCatalogEntry {
+    /// Stable Skill name.
+    pub name: String,
+    /// Exact semantic version.
+    pub version: String,
+    /// Verified package content digest.
+    pub content_sha256: String,
+    /// Trusted-local or signed-external envelope classification.
+    pub trust: String,
+}
+
+/// One credential-free configured Skill Registry projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSkillRegistryCatalogEntry {
+    /// Stable Registry identity selected by package commands.
+    pub id: String,
+    /// Exact credential-free catalog endpoint.
+    pub catalog_endpoint: String,
+    /// Canonical HTTPS origins from which package bytes may be acquired.
+    pub package_origins: Vec<String>,
+    /// Authentication class such as `public` or `bearer`; never a credential.
+    pub authentication: String,
+    /// Whether this Registry replaces ambient roots with a project-pinned CA.
+    pub exclusive_root_ca: bool,
+}
+
+/// One configured MCP transport projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMcpCatalogEntry {
+    /// Stable server registration identity.
+    pub id: String,
+    /// Transport family such as `stdio` or `https`.
+    pub transport: String,
+    /// Credential-free HTTPS endpoint; absent for supervised stdio processes.
+    pub endpoint: Option<String>,
+    /// Whether the registration participates in this generation.
+    pub enabled: bool,
+    /// Namespaced Tools successfully discovered, selected, and registered.
+    pub registered_tools: Vec<String>,
 }
 
 struct ManagedOperation {
@@ -1135,6 +1380,32 @@ pub struct ProtocolShutdownReport {
     pub remaining_operations: u64,
     /// Whether Runtime snapshot maintenance also drained within the deadline.
     pub background_work_drained: bool,
+}
+
+/// Process-local lifecycle relevant to new Protocol Turn admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolAdmissionState {
+    /// The host accepts new Turns and retains free Operation capacity.
+    Ready,
+    /// The host is live but all retained Operation slots are occupied.
+    AtCapacity,
+    /// One-way shutdown has begun and new Turns are permanently rejected.
+    Draining,
+}
+
+/// Bounded, content-free status derived from the authoritative Protocol host.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolServiceStatus {
+    /// Readiness for new Turn admission; successful reads also establish liveness.
+    pub admission: ProtocolAdmissionState,
+    /// Running process-local Turn Operations across the authorized host.
+    pub running_operations: u64,
+    /// Running and terminal Operations retained until clients forget them.
+    pub retained_operations: u64,
+    /// Configured finite retention/admission ceiling.
+    pub operation_retention_limit: u64,
 }
 
 #[derive(Default)]
@@ -1183,6 +1454,10 @@ impl ModelEventSink for OperationEventBuffer {
         let bytes = match event {
             ModelStreamEvent::TextDelta { delta, .. } => delta.len(),
             ModelStreamEvent::StepInvalidated { .. } => 0,
+            ModelStreamEvent::ToolTraceRequest { .. }
+            | ModelStreamEvent::ToolTraceResponse { .. } => serde_json::to_vec(event)
+                .map_err(|_| "cannot encode Tool Trace event".to_owned())?
+                .len(),
         };
         let sequence = inner
             .next_sequence
@@ -1206,6 +1481,10 @@ impl ModelEventSink for OperationEventBuffer {
             let evicted_bytes = match &evicted.event {
                 ModelStreamEvent::TextDelta { delta, .. } => delta.len(),
                 ModelStreamEvent::StepInvalidated { .. } => 0,
+                ModelStreamEvent::ToolTraceRequest { .. }
+                | ModelStreamEvent::ToolTraceResponse { .. } => {
+                    serde_json::to_vec(&evicted.event).map_or(0, |encoded| encoded.len())
+                }
             };
             inner.retained_bytes = inner.retained_bytes.saturating_sub(evicted_bytes);
             inner.dropped_through_sequence = Some(evicted.sequence);
@@ -1227,6 +1506,7 @@ pub struct ProtocolHandler {
     operations: Arc<Mutex<BTreeMap<OperationId, ManagedOperation>>>,
     lifecycle: Arc<OperationLifecycle>,
     operation_retention_limit: usize,
+    runtime_catalog: Option<Arc<RuntimeCatalog>>,
 }
 
 impl ProtocolHandler {
@@ -1244,6 +1524,7 @@ impl ProtocolHandler {
             operations: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle: Arc::new(OperationLifecycle::new()),
             operation_retention_limit: DEFAULT_OPERATION_RETENTION_LIMIT,
+            runtime_catalog: None,
         }
     }
 
@@ -1289,6 +1570,13 @@ impl ProtocolHandler {
         self
     }
 
+    /// Exposes one immutable, credential-free active Runtime projection.
+    #[must_use]
+    pub fn with_runtime_catalog(mut self, catalog: RuntimeCatalog) -> Self {
+        self.runtime_catalog = Some(Arc::new(catalog));
+        self
+    }
+
     /// Sets the maximum number of running and terminal Operations retained.
     ///
     /// Clients must forget terminal Operations to release capacity.
@@ -1300,6 +1588,121 @@ impl ProtocolHandler {
         }
         self.operation_retention_limit = limit;
         Ok(self)
+    }
+
+    async fn admit_turn_operation(
+        &self,
+        thread_id: &ThreadId,
+        authority: &AuthorityContext,
+    ) -> Result<(OperationId, CancellationToken, Arc<OperationEventBuffer>), HarnessError> {
+        if !self.lifecycle.accepting.load(Ordering::Acquire) {
+            return Err(HarnessError::Protocol(
+                "protocol handler is shutting down".to_owned(),
+            ));
+        }
+        let operation_id = OperationId::generate();
+        let cancellation = CancellationToken::new();
+        let events = Arc::new(OperationEventBuffer::default());
+        let mut operations = self.operations.lock().await;
+        if !self.lifecycle.accepting.load(Ordering::Acquire) {
+            return Err(HarnessError::Protocol(
+                "protocol handler is shutting down".to_owned(),
+            ));
+        }
+        if operations.len() >= self.operation_retention_limit {
+            return Err(HarnessError::Protocol(format!(
+                "operation capacity {} reached; forget terminal operations",
+                self.operation_retention_limit
+            )));
+        }
+        operations.insert(
+            operation_id.clone(),
+            ManagedOperation {
+                tenant_id: authority.tenant_id().map(str::to_owned),
+                status: OperationStatus::Running {
+                    thread_id: thread_id.clone(),
+                },
+                cancellation: cancellation.clone(),
+                events: events.clone(),
+            },
+        );
+        Ok((operation_id, cancellation, events))
+    }
+
+    fn monitor_turn_operation<F>(&self, operation_id: OperationId, future: F)
+    where
+        F: std::future::Future<Output = Result<TurnExecutionResult, HarnessError>> + Send + 'static,
+    {
+        let worker = tokio::spawn(future);
+        let operations = self.operations.clone();
+        let lifecycle = self.lifecycle.clone();
+        tokio::spawn(async move {
+            let status = match worker.await {
+                Ok(Ok(TurnExecutionResult::Completed(outcome))) => operation_completed(*outcome),
+                Ok(Ok(TurnExecutionResult::Waiting(wait))) => operation_waiting(*wait),
+                Ok(Err(error @ HarnessError::Cancelled { .. })) => OperationStatus::Cancelled {
+                    error: bounded_error(&error.to_string()),
+                },
+                Ok(Err(error @ HarnessError::TimedOut { .. })) => OperationStatus::TimedOut {
+                    error: bounded_error(&error.to_string()),
+                },
+                Ok(Err(error)) => OperationStatus::Failed {
+                    error: bounded_error(&error.to_string()),
+                },
+                Err(error) if error.is_panic() => OperationStatus::Failed {
+                    error: "operation task panicked before protocol settlement".to_owned(),
+                },
+                Err(_) => OperationStatus::Failed {
+                    error: "operation task stopped before protocol settlement".to_owned(),
+                },
+            };
+            if let Some(operation) = operations.lock().await.get_mut(&operation_id) {
+                operation.status = status;
+            }
+            lifecycle.settled.notify_waiters();
+        });
+    }
+
+    /// Returns the content-free status used by typed clients and deployment
+    /// adapters as their single admission source of truth.
+    ///
+    /// A successful call proves that this process can answer through the
+    /// handler. `Ready` additionally means that one new Turn can enter the
+    /// process-local Operation registry. It does not claim that an external
+    /// Model, MCP server, Effect target, or other dependency is healthy.
+    pub async fn service_status(&self) -> ProtocolServiceStatus {
+        let operations = self.operations.lock().await;
+        let retained_operations = u64::try_from(operations.len()).unwrap_or(u64::MAX);
+        let running_operations = operations
+            .values()
+            .filter(|operation| matches!(operation.status, OperationStatus::Running { .. }))
+            .fold(0_u64, |count, _| count.saturating_add(1));
+        let operation_retention_limit =
+            u64::try_from(self.operation_retention_limit).unwrap_or(u64::MAX);
+        let admission = if !self.lifecycle.accepting.load(Ordering::Acquire) {
+            ProtocolAdmissionState::Draining
+        } else if operations.len() >= self.operation_retention_limit {
+            ProtocolAdmissionState::AtCapacity
+        } else {
+            ProtocolAdmissionState::Ready
+        };
+        ProtocolServiceStatus {
+            admission,
+            running_operations,
+            retained_operations,
+            operation_retention_limit,
+        }
+    }
+
+    /// Irreversibly closes new-Turn admission without waiting for accepted
+    /// Operations to settle.
+    ///
+    /// Hosts call this at the start of a larger shutdown sequence so probes
+    /// and protocol clients can observe `draining` before optional background
+    /// services finish. [`shutdown`](Self::shutdown) remains responsible for
+    /// requesting Operation cancellation and bounded Runtime maintenance.
+    pub fn begin_draining(&self) {
+        self.lifecycle.accepting.store(false, Ordering::Release);
     }
 
     /// Stops accepting new Turns, requests cancellation of every running
@@ -1319,7 +1722,7 @@ impl ProtocolHandler {
                 MAX_OPERATION_SHUTDOWN_TIMEOUT.as_secs()
             )));
         }
-        self.lifecycle.accepting.store(false, Ordering::Release);
+        self.begin_draining();
         let cancellation_requests = {
             let operations = self.operations.lock().await;
             let mut count = 0_u64;
@@ -1423,6 +1826,7 @@ impl ProtocolHandler {
                     "operation.events".to_owned(),
                     "operation.forget".to_owned(),
                     "operation.get".to_owned(),
+                    "service.status".to_owned(),
                     "thread.capacity".to_owned(),
                     "thread.create".to_owned(),
                     "thread.events".to_owned(),
@@ -1432,8 +1836,18 @@ impl ProtocolHandler {
                     "turn.start".to_owned(),
                     "turn.steer".to_owned(),
                 ];
+                if self.runtime.supports_durable_wait() {
+                    capabilities.extend([
+                        "turn.wait.cancel".to_owned(),
+                        "turn.wait.get".to_owned(),
+                        "turn.wait.resume".to_owned(),
+                    ]);
+                }
                 if self.runtime.supports_thread_listing() {
                     capabilities.push("thread.list".to_owned());
+                }
+                if self.runtime_catalog.is_some() {
+                    capabilities.push("runtime.catalog".to_owned());
                 }
                 if self.runtime.supports_thread_fork() {
                     capabilities.push("thread.fork".to_owned());
@@ -1501,6 +1915,7 @@ impl ProtocolHandler {
                         engine_version: env!("CARGO_PKG_VERSION").to_owned(),
                         state_event_schema: STATE_EVENT_SCHEMA_VERSION,
                         state_snapshot_schema: STATE_SNAPSHOT_SCHEMA_VERSION,
+                        thread_archive_format: THREAD_ARCHIVE_FORMAT_VERSION,
                         approval_inbox_schema: APPROVAL_INBOX_SCHEMA_VERSION,
                         task_graph_schema: TASK_GRAPH_SCHEMA_VERSION,
                         workflow_run_schema: WORKFLOW_RUN_SCHEMA_VERSION,
@@ -1516,6 +1931,17 @@ impl ProtocolHandler {
                     },
                 })
             }
+            ProtocolCommand::GetRuntimeCatalog {} => {
+                let catalog = self.runtime_catalog.as_ref().ok_or_else(|| {
+                    HarnessError::Protocol("Runtime catalog is not enabled by this host".to_owned())
+                })?;
+                Ok(ProtocolResult::RuntimeCatalog {
+                    catalog: catalog.as_ref().clone(),
+                })
+            }
+            ProtocolCommand::GetServiceStatus {} => Ok(ProtocolResult::ServiceStatus {
+                status: self.service_status().await,
+            }),
             ProtocolCommand::CreateThread {} => {
                 let thread = self.runtime.create_thread_as(authority).await?;
                 Ok(ProtocolResult::ThreadCreated { thread })
@@ -1610,6 +2036,17 @@ impl ProtocolHandler {
                             "expected recovery Turn {expected_turn_id} does not belong to thread {thread_id}"
                         ))
                     })?;
+                if let Some(execution) = self
+                    .runtime
+                    .agent_loop_execution_as(&thread_id, &expected_turn_id, authority)
+                    .await?
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "thread {thread_id} Turn {expected_turn_id} has durable wait {} in {:?} state; use turn.wait.* control or explicit effect reconciliation",
+                        execution.wait_id(),
+                        turn_execution_projection(&execution).state
+                    )));
+                }
                 let running_turns = current
                     .turns
                     .iter()
@@ -1646,6 +2083,7 @@ impl ProtocolHandler {
                 memory_scope,
                 context,
                 timeout_ms,
+                approval_wait_ttl_ms,
             } => {
                 if !self.lifecycle.accepting.load(Ordering::Acquire) {
                     return Err(HarnessError::Protocol(
@@ -1663,6 +2101,27 @@ impl ProtocolHandler {
                         "timeout_ms must be greater than zero".to_owned(),
                     ));
                 }
+                if let Some(wait_ttl_ms) = approval_wait_ttl_ms {
+                    if !(1..=crate::MAX_AGENT_LOOP_WAIT_MS).contains(&wait_ttl_ms) {
+                        return Err(HarnessError::Protocol(format!(
+                            "approval_wait_ttl_ms must be 1-{}",
+                            crate::MAX_AGENT_LOOP_WAIT_MS
+                        )));
+                    }
+                    if timeout_ms
+                        .is_some_and(|timeout_ms| timeout_ms > crate::MAX_AGENT_LOOP_WAIT_MS)
+                    {
+                        return Err(HarnessError::Protocol(format!(
+                            "timeout_ms for a durable wait must not exceed {}",
+                            crate::MAX_AGENT_LOOP_WAIT_MS
+                        )));
+                    }
+                    if !self.runtime.supports_durable_wait() {
+                        return Err(HarnessError::Protocol(
+                            "durable Approval waits are not configured by this Runtime".to_owned(),
+                        ));
+                    }
+                }
                 crate::context::validate_turn_context_inputs(&context)
                     .map_err(|error| HarnessError::Protocol(error.to_string()))?;
                 let thread_id = ThreadId::from_string(thread_id);
@@ -1676,88 +2135,163 @@ impl ProtocolHandler {
                         "thread {thread_id} does not exist"
                     )));
                 }
-                let operation_id = OperationId::generate();
-                let cancellation = CancellationToken::new();
-                let events = Arc::new(OperationEventBuffer::default());
-                let mut operations = self.operations.lock().await;
-                if !self.lifecycle.accepting.load(Ordering::Acquire) {
+                let (operation_id, cancellation, events) =
+                    self.admit_turn_operation(&thread_id, authority).await?;
+                let runtime = self.runtime.clone();
+                let authority = authority.clone();
+                self.monitor_turn_operation(operation_id.clone(), async move {
+                    let options = TurnExecutionOptions {
+                        authority,
+                        memory_scope,
+                        context,
+                        execution_binding: None,
+                        timeout: timeout_ms.map(Duration::from_millis),
+                        cancellation,
+                        model_event_sink: Some(events),
+                    };
+                    if let Some(wait_ttl_ms) = approval_wait_ttl_ms {
+                        runtime
+                            .run_turn_until_wait_with_options(
+                                &thread_id,
+                                prompt,
+                                Duration::from_millis(wait_ttl_ms),
+                                options,
+                            )
+                            .await
+                    } else {
+                        runtime
+                            .run_turn_with_options(&thread_id, prompt, options)
+                            .await
+                            .map(|outcome| TurnExecutionResult::Completed(Box::new(outcome)))
+                    }
+                });
+                Ok(ProtocolResult::TurnStarted { operation_id })
+            }
+            ProtocolCommand::GetTurnExecution { thread_id, turn_id } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                validate_opaque_id("turn_id", &turn_id)?;
+                if !self.runtime.supports_durable_wait() {
                     return Err(HarnessError::Protocol(
-                        "protocol handler is shutting down".to_owned(),
+                        "durable Approval waits are not configured by this Runtime".to_owned(),
                     ));
                 }
-                if operations.len() >= self.operation_retention_limit {
+                let execution = self
+                    .runtime
+                    .agent_loop_execution_as(
+                        &ThreadId::from_string(thread_id),
+                        &TurnId::from_string(turn_id),
+                        authority,
+                    )
+                    .await?
+                    .map(|execution| turn_execution_projection(&execution));
+                Ok(ProtocolResult::TurnExecution { execution })
+            }
+            ProtocolCommand::ResumeTurnWait {
+                thread_id,
+                turn_id,
+                wait_id,
+                expected_revision,
+                memory_scope,
+                context,
+            } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                validate_opaque_id("turn_id", &turn_id)?;
+                validate_opaque_id("wait_id", &wait_id)?;
+                if expected_revision == 0 {
+                    return Err(HarnessError::Protocol(
+                        "expected_revision must be greater than zero".to_owned(),
+                    ));
+                }
+                if !self.runtime.supports_durable_wait() {
+                    return Err(HarnessError::Protocol(
+                        "durable Approval waits are not configured by this Runtime".to_owned(),
+                    ));
+                }
+                crate::context::validate_turn_context_inputs(&context)
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                let thread_id = ThreadId::from_string(thread_id);
+                let turn_id = TurnId::from_string(turn_id);
+                let wait_id = AgentLoopWaitId::from_string(wait_id);
+                if self
+                    .runtime
+                    .load_thread_as(&thread_id, authority)
+                    .await?
+                    .is_none()
+                {
                     return Err(HarnessError::Protocol(format!(
-                        "operation capacity {} reached; forget terminal operations",
-                        self.operation_retention_limit
+                        "thread {thread_id} does not exist"
                     )));
                 }
-                operations.insert(
-                    operation_id.clone(),
-                    ManagedOperation {
-                        tenant_id: authority.tenant_id().map(str::to_owned),
-                        status: OperationStatus::Running {
-                            thread_id: thread_id.clone(),
-                        },
-                        cancellation: cancellation.clone(),
-                        events: events.clone(),
-                    },
-                );
-                drop(operations);
+                let (operation_id, cancellation, events) =
+                    self.admit_turn_operation(&thread_id, authority).await?;
                 let runtime = self.runtime.clone();
-                let operations = self.operations.clone();
-                let lifecycle = self.lifecycle.clone();
-                let operation_for_task = operation_id.clone();
                 let authority = authority.clone();
-                let worker = tokio::spawn(async move {
+                self.monitor_turn_operation(operation_id.clone(), async move {
                     runtime
-                        .run_turn_with_options(
+                        .resume_wait_exact_with_options(
                             &thread_id,
-                            prompt,
+                            &turn_id,
+                            &wait_id,
+                            expected_revision,
                             TurnExecutionOptions {
                                 authority,
                                 memory_scope,
                                 context,
                                 execution_binding: None,
-                                timeout: timeout_ms.map(Duration::from_millis),
+                                timeout: None,
                                 cancellation,
                                 model_event_sink: Some(events),
                             },
                         )
                         .await
                 });
-                tokio::spawn(async move {
-                    let status = match worker.await {
-                        Ok(Ok(outcome)) => OperationStatus::Completed {
-                            thread_id: outcome.turn.thread_id,
-                            turn_id: outcome.turn.id,
-                            final_text: outcome.final_text,
-                        },
-                        Ok(Err(error @ HarnessError::Cancelled { .. })) => {
-                            OperationStatus::Cancelled {
-                                error: bounded_error(&error.to_string()),
-                            }
-                        }
-                        Ok(Err(error @ HarnessError::TimedOut { .. })) => {
-                            OperationStatus::TimedOut {
-                                error: bounded_error(&error.to_string()),
-                            }
-                        }
-                        Ok(Err(error)) => OperationStatus::Failed {
-                            error: bounded_error(&error.to_string()),
-                        },
-                        Err(error) if error.is_panic() => OperationStatus::Failed {
-                            error: "operation task panicked before protocol settlement".to_owned(),
-                        },
-                        Err(_) => OperationStatus::Failed {
-                            error: "operation task stopped before protocol settlement".to_owned(),
-                        },
-                    };
-                    if let Some(operation) = operations.lock().await.get_mut(&operation_for_task) {
-                        operation.status = status;
-                    }
-                    lifecycle.settled.notify_waiters();
-                });
                 Ok(ProtocolResult::TurnStarted { operation_id })
+            }
+            ProtocolCommand::CancelTurnWait {
+                thread_id,
+                turn_id,
+                wait_id,
+                expected_revision,
+                command_id,
+            } => {
+                validate_opaque_id("thread_id", &thread_id)?;
+                validate_opaque_id("turn_id", &turn_id)?;
+                validate_opaque_id("wait_id", &wait_id)?;
+                validate_opaque_id("command_id", &command_id)?;
+                if expected_revision == 0 {
+                    return Err(HarnessError::Protocol(
+                        "expected_revision must be greater than zero".to_owned(),
+                    ));
+                }
+                if !self.runtime.supports_durable_wait() {
+                    return Err(HarnessError::Protocol(
+                        "durable Approval waits are not configured by this Runtime".to_owned(),
+                    ));
+                }
+                let revision = expected_revision
+                    .checked_add(1)
+                    .ok_or_else(|| HarnessError::Protocol("wait revision overflow".to_owned()))?;
+                let thread_id = ThreadId::from_string(thread_id);
+                let turn_id = TurnId::from_string(turn_id);
+                let wait_id = AgentLoopWaitId::from_string(wait_id);
+                let command_id = AgentLoopCloseCommandId::from_string(command_id);
+                self.runtime
+                    .cancel_wait_exact_as(
+                        &thread_id,
+                        &turn_id,
+                        &wait_id,
+                        expected_revision,
+                        command_id.clone(),
+                        authority,
+                    )
+                    .await?;
+                Ok(ProtocolResult::TurnWaitCancelled {
+                    thread_id,
+                    turn_id,
+                    wait_id,
+                    command_id,
+                    revision,
+                })
             }
             ProtocolCommand::SteerTurn {
                 thread_id,
@@ -2521,6 +3055,31 @@ where
     serve_jsonl_as(handler, &ProtocolPrincipal::LocalProcess, input, output).await
 }
 
+/// Serves local-process frames until EOF or cooperative host cancellation.
+///
+/// Cancellation is observed only while waiting for the next frame. A frame
+/// already accepted from `input` is handled and its complete response is
+/// written before cancellation is checked again.
+pub async fn serve_jsonl_until_cancelled<R, W>(
+    handler: &ProtocolHandler,
+    input: R,
+    output: W,
+    shutdown: CancellationToken,
+) -> Result<(), HarnessError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_jsonl_as_until_cancelled(
+        handler,
+        &ProtocolPrincipal::LocalProcess,
+        input,
+        output,
+        shutdown,
+    )
+    .await
+}
+
 /// Serves frames as one identity established by the calling transport.
 pub async fn serve_jsonl_as<R, W>(
     handler: &ProtocolHandler,
@@ -2532,7 +3091,34 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    serve_jsonl_with_limits(handler, principal, input, output, None, None).await
+    serve_jsonl_with_limits(handler, principal, input, output, None, None, None).await
+}
+
+/// Serves authenticated frames until EOF or cooperative host cancellation.
+///
+/// The calling transport remains responsible for establishing `principal`.
+/// Cancellation never interrupts handling or writing an accepted frame.
+pub async fn serve_jsonl_as_until_cancelled<R, W>(
+    handler: &ProtocolHandler,
+    principal: &ProtocolPrincipal,
+    input: R,
+    output: W,
+    shutdown: CancellationToken,
+) -> Result<(), HarnessError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_jsonl_with_limits(
+        handler,
+        principal,
+        input,
+        output,
+        None,
+        None,
+        Some(&shutdown),
+    )
+    .await
 }
 
 pub(crate) async fn serve_jsonl_with_limits<R, W>(
@@ -2542,6 +3128,7 @@ pub(crate) async fn serve_jsonl_with_limits<R, W>(
     mut output: W,
     idle_timeout: Option<Duration>,
     maximum_frames: Option<usize>,
+    shutdown: Option<&CancellationToken>,
 ) -> Result<(), HarnessError>
 where
     R: AsyncBufRead + Unpin,
@@ -2554,16 +3141,23 @@ where
                 "connection frame limit reached".to_owned(),
             ));
         }
-        let frame = match idle_timeout {
-            Some(idle_timeout) => tokio::time::timeout(
-                idle_timeout,
-                read_bounded_frame(&mut input, MAX_REQUEST_FRAME_BYTES),
-            )
-            .await
-            .map_err(|_| HarnessError::Protocol("connection idle timeout elapsed".to_owned()))?,
-            None => read_bounded_frame(&mut input, MAX_REQUEST_FRAME_BYTES).await,
-        }
-        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let reading = read_protocol_frame(&mut input, idle_timeout);
+        let frame = match shutdown {
+            Some(shutdown) => {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        output
+                            .flush()
+                            .await
+                            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                        return Ok(());
+                    }
+                    frame = reading => frame?,
+                }
+            }
+            None => reading.await?,
+        };
         match frame {
             FrameRead::Eof => {
                 output
@@ -2606,6 +3200,25 @@ where
             }
         }
     }
+}
+
+async fn read_protocol_frame<R>(
+    input: &mut R,
+    idle_timeout: Option<Duration>,
+) -> Result<FrameRead, HarnessError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    match idle_timeout {
+        Some(idle_timeout) => tokio::time::timeout(
+            idle_timeout,
+            read_bounded_frame(input, MAX_REQUEST_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| HarnessError::Protocol("connection idle timeout elapsed".to_owned()))?,
+        None => read_bounded_frame(input, MAX_REQUEST_FRAME_BYTES).await,
+    }
+    .map_err(|error| HarnessError::Protocol(error.to_string()))
 }
 
 enum FrameRead {
@@ -2844,6 +3457,79 @@ fn error_response(id: Option<String>, error: ProtocolError) -> ProtocolResponse 
     }
 }
 
+fn operation_completed(outcome: TurnOutcome) -> OperationStatus {
+    let Some(receipt) = outcome.turn.completion_receipt.as_ref() else {
+        return OperationStatus::Failed {
+            error: "Runtime returned Completed without a completion receipt".to_owned(),
+        };
+    };
+    let receipt_sha256 = match crate::completion::completion_receipt_sha256(receipt) {
+        Ok(receipt_sha256) => receipt_sha256,
+        Err(error) => {
+            return OperationStatus::Failed {
+                error: bounded_error(&format!("invalid completion receipt: {error}")),
+            };
+        }
+    };
+    OperationStatus::Completed {
+        thread_id: outcome.turn.thread_id,
+        turn_id: outcome.turn.id,
+        final_text: outcome.final_text,
+        completion_receipt_sha256: receipt_sha256,
+    }
+}
+
+fn operation_waiting(wait: ApprovalWait) -> OperationStatus {
+    OperationStatus::Waiting {
+        execution: turn_execution_projection(&AgentLoopExecution::Waiting {
+            envelope: wait.envelope,
+        }),
+        approval_delivery: approval_delivery_status(wait.status),
+    }
+}
+
+fn turn_execution_projection(execution: &AgentLoopExecution) -> TurnExecutionProjection {
+    let envelope = execution.envelope();
+    let approval_id = match &envelope.wait_kind {
+        crate::WaitKind::Approval { request, .. } => request.id.clone(),
+    };
+    let state = match execution {
+        AgentLoopExecution::Waiting { .. } => TurnExecutionState::Waiting,
+        AgentLoopExecution::Ready { .. } => TurnExecutionState::Ready,
+        AgentLoopExecution::Executing { .. } => TurnExecutionState::Executing,
+    };
+    TurnExecutionProjection {
+        thread_id: envelope.thread_id.clone(),
+        turn_id: envelope.turn_id.clone(),
+        wait_id: envelope.wait_id.clone(),
+        revision: execution.revision(),
+        state,
+        expires_at_ms: envelope.expires_at_ms,
+        remaining_active_timeout_ms: envelope.remaining_active_timeout_ms,
+        approval_id,
+    }
+}
+
+fn approval_delivery_status(status: ApprovalWaitStatus) -> ApprovalDeliveryStatus {
+    match status {
+        ApprovalWaitStatus::Pending => ApprovalDeliveryStatus::Pending,
+        ApprovalWaitStatus::Settled => ApprovalDeliveryStatus::Settled,
+        ApprovalWaitStatus::Orphaned { reason } => ApprovalDeliveryStatus::Orphaned {
+            reason: bounded_error(&reason),
+        },
+        ApprovalWaitStatus::DeliveryRetry { operation, message } => {
+            let action = match operation {
+                ApprovalDeliveryOperation::Submit => ApprovalDeliveryAction::Submit,
+                ApprovalDeliveryOperation::Read => ApprovalDeliveryAction::Read,
+            };
+            ApprovalDeliveryStatus::Retry {
+                action,
+                message: bounded_error(&message),
+            }
+        }
+    }
+}
+
 fn bounded_error(message: &str) -> String {
     let mut chars = message.chars();
     let bounded = chars.by_ref().take(MAX_ERROR_CHARS).collect::<String>();
@@ -2868,22 +3554,23 @@ mod tests {
 
     use semver::Version;
     use serde_json::json;
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
     use super::{
-        FingerprintProtocolAuthorizer, FrameRead, MAX_OPERATION_STREAM_EVENTS,
-        MAX_RESPONSE_FRAME_BYTES, OperationEventBuffer, OperationStatus, PROTOCOL_VERSION,
-        ProtocolAuthorizer, ProtocolCommand, ProtocolError, ProtocolHandler, ProtocolPrincipal,
-        ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult, TaskGraphSummary,
-        read_bounded_frame, write_response,
+        ApprovalDeliveryStatus, FingerprintProtocolAuthorizer, FrameRead,
+        MAX_OPERATION_STREAM_EVENTS, MAX_RESPONSE_FRAME_BYTES, OperationEventBuffer,
+        OperationStatus, PROTOCOL_VERSION, ProtocolAuthorizer, ProtocolCommand, ProtocolError,
+        ProtocolHandler, ProtocolPrincipal, ProtocolRequest, ProtocolResponse,
+        ProtocolResponseBody, ProtocolResult, TaskGraphSummary, TurnExecutionState,
+        read_bounded_frame, serve_jsonl_until_cancelled, write_response,
     };
     use crate::{
         AllowListPolicy, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalInbox,
-        ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CapabilityOrigin,
-        ConnectorEvidence, ConnectorEvidenceClaim, EffectApplyOutcome, EffectCommand,
-        EffectCommandId, EffectCommandKind, EffectCreateRequest, EffectEngine, EffectId,
-        EffectLeaseId, EffectOperation, EffectStatus, EventStore, ExecutionBinding, HarnessError,
-        HarnessFuture, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffClaimId,
+        ApprovalRecordStatus, ApprovalRequest, AuthorityContext, CancellationToken,
+        CapabilityOrigin, ConnectorEvidence, ConnectorEvidenceClaim, EffectApplyOutcome,
+        EffectCommand, EffectCommandId, EffectCommandKind, EffectCreateRequest, EffectEngine,
+        EffectId, EffectLeaseId, EffectOperation, EffectStatus, EventStore, ExecutionBinding,
+        HarnessError, HarnessFuture, HarnessRuntime, HumanHandoffApplyOutcome, HumanHandoffClaimId,
         HumanHandoffCommand, HumanHandoffCommandId, HumanHandoffCommandKind,
         HumanHandoffCreateRequest, HumanHandoffEngine, HumanHandoffSubject,
         HumanHandoffSubjectResolver, InboxApprovalHandler, Item, ItemId, ItemKind, LanguageModel,
@@ -2895,9 +3582,10 @@ mod tests {
         StateEvent, StateSnapshot, StoredEvent, TaskCapabilitySet, TaskCompletion, TaskCoordinator,
         TaskDefinition, TaskGraph, TaskGraphId, TaskGraphSnapshot, TaskId, TaskStatus, Thread,
         ThreadId, Tool, ToolAuthorization, ToolCallBatch, ToolCallBatchId, ToolContext,
-        ToolDescriptor, ToolRegistry, TurnContextInput, TurnId, TurnStatus, WorkflowApplyOutcome,
-        WorkflowCommand, WorkflowCommandId, WorkflowCommandKind, WorkflowCreateRequest,
-        WorkflowDefinition, WorkflowEngine, WorkflowSignalId, WorkflowWaitId, WorkspaceMode,
+        ToolDescriptor, ToolRegistry, TurnContextInput, TurnId, TurnOutcome, TurnStatus,
+        WorkflowApplyOutcome, WorkflowCommand, WorkflowCommandId, WorkflowCommandKind,
+        WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowSignalId,
+        WorkflowWaitId, WorkspaceMode,
     };
 
     struct ImmediateModel;
@@ -2942,6 +3630,8 @@ mod tests {
 
     struct ApprovalToolCallModel;
 
+    struct ApprovalThenMessageModel;
+
     struct PanickingTaskCoordinator;
 
     impl TaskCoordinator for PanickingTaskCoordinator {
@@ -2983,6 +3673,33 @@ mod tests {
                     name: "approval-tool".to_owned(),
                     input: json!({}),
                 })
+            })
+        }
+    }
+
+    impl LanguageModel for ApprovalThenMessageModel {
+        fn id(&self) -> &str {
+            "test/approval-then-message"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                if request.items.iter().any(|item| {
+                    matches!(
+                        &item.kind,
+                        ItemKind::ToolResult { call_id, .. } if call_id == "approval-call"
+                    )
+                }) {
+                    Ok(ModelOutput::Message {
+                        content: "approved result".to_owned(),
+                    })
+                } else {
+                    Ok(ModelOutput::ToolCall {
+                        call_id: "approval-call".to_owned(),
+                        name: "approval-tool".to_owned(),
+                        input: json!({}),
+                    })
+                }
             })
         }
     }
@@ -3271,6 +3988,41 @@ mod tests {
         }
     }
 
+    async fn wait_for_operation(
+        handler: &ProtocolHandler,
+        operation_id: &OperationId,
+    ) -> OperationStatus {
+        wait_for_operation_as(handler, &ProtocolPrincipal::LocalProcess, operation_id).await
+    }
+
+    async fn wait_for_operation_as(
+        handler: &ProtocolHandler,
+        principal: &ProtocolPrincipal,
+        operation_id: &OperationId,
+    ) -> OperationStatus {
+        for _ in 0..200 {
+            let response = handler
+                .handle_as(
+                    principal,
+                    request(
+                        "poll-operation",
+                        ProtocolCommand::GetOperation {
+                            operation_id: operation_id.to_string(),
+                        },
+                    ),
+                )
+                .await;
+            match response.body {
+                ProtocolResponseBody::Success {
+                    result: ProtocolResult::Operation { operation },
+                } if !matches!(&operation, OperationStatus::Running { .. }) => return operation,
+                ProtocolResponseBody::Success { .. } => tokio::task::yield_now().await,
+                other => panic!("unexpected operation response: {other:?}"),
+            }
+        }
+        panic!("operation did not settle")
+    }
+
     fn task_definition(id: &str, dependencies: &[&str]) -> TaskDefinition {
         TaskDefinition {
             id: TaskId::from_string(id.to_owned()),
@@ -3286,7 +4038,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_thirty_one_wire_envelopes_and_permissions_are_stable() {
+    fn protocol_thirty_seven_wire_envelopes_and_permissions_are_stable() {
         let request_value =
             serde_json::to_value(request("request-1", ProtocolCommand::Initialize {}))
                 .expect("encode request");
@@ -3294,14 +4046,14 @@ mod tests {
             request_value,
             json!({
                 "id": "request-1",
-                "protocol_version": "31",
+                "protocol_version": "37",
                 "command": { "method": "initialize" }
             })
         );
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "31",
+                "protocol_version": "37",
                 "command": { "method": "initialize" },
                 "unexpected": true
             }))
@@ -3310,7 +4062,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-1",
-                "protocol_version": "31",
+                "protocol_version": "37",
                 "command": {
                     "method": "initialize",
                     "unexpected": true
@@ -3332,7 +4084,7 @@ mod tests {
             serde_json::to_value(response).expect("encode response"),
             json!({
                 "id": "request-1",
-                "protocol_version": "31",
+                "protocol_version": "37",
                 "body": {
                     "status": "success",
                     "result": {
@@ -3442,7 +4194,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ProtocolRequest>(json!({
                 "id": "request-task-binding",
-                "protocol_version": "31",
+                "protocol_version": "37",
                 "command": {
                     "method": "claim_tasks",
                     "graph_id": "graph-a",
@@ -3666,9 +4418,11 @@ mod tests {
                 text: "bounded handoff".to_owned(),
             }],
             timeout_ms: Some(1_000),
+            approval_wait_ttl_ms: None,
         })
         .expect("encode Turn context");
         assert_eq!(turn_context["context"][0]["source"], "branch-handoff");
+        assert!(turn_context["approval_wait_ttl_ms"].is_null());
         assert_eq!(
             turn_context["context"][0]["reference"],
             "thread:source/turn:terminal"
@@ -3692,9 +4446,48 @@ mod tests {
             serde_json::from_value::<ProtocolCommand>(untrusted_binding).is_err(),
             "Protocol clients cannot author trusted execution bindings"
         );
+        let durable_start = serde_json::to_value(ProtocolCommand::StartTurn {
+            thread_id: "thread-fixture".to_owned(),
+            prompt: "continue".to_owned(),
+            memory_scope: MemoryScope::default(),
+            context: Vec::new(),
+            timeout_ms: Some(1_000),
+            approval_wait_ttl_ms: Some(60_000),
+        })
+        .expect("encode durable StartTurn");
+        assert_eq!(durable_start["approval_wait_ttl_ms"], 60_000);
+        let resume = serde_json::to_value(ProtocolCommand::ResumeTurnWait {
+            thread_id: "thread-fixture".to_owned(),
+            turn_id: "turn-fixture".to_owned(),
+            wait_id: "wait-fixture".to_owned(),
+            expected_revision: 2,
+            memory_scope: MemoryScope::default(),
+            context: Vec::new(),
+        })
+        .expect("encode ResumeTurnWait");
+        assert!(resume.get("timeout_ms").is_none());
+        let mut resume_with_timeout = resume;
+        resume_with_timeout
+            .as_object_mut()
+            .expect("ResumeTurnWait object")
+            .insert("timeout_ms".to_owned(), json!(1_000));
+        assert!(
+            serde_json::from_value::<ProtocolCommand>(resume_with_timeout).is_err(),
+            "Protocol clients cannot replace the frozen active timeout"
+        );
 
         let commands = [
             (ProtocolCommand::Initialize {}, "initialize", "initialize"),
+            (
+                ProtocolCommand::GetRuntimeCatalog {},
+                "get_runtime_catalog",
+                "runtime.catalog",
+            ),
+            (
+                ProtocolCommand::GetServiceStatus {},
+                "get_service_status",
+                "service.status",
+            ),
             (
                 ProtocolCommand::CreateThread {},
                 "create_thread",
@@ -3754,9 +4547,41 @@ mod tests {
                     memory_scope: MemoryScope::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
                 "start_turn",
                 "turn.start",
+            ),
+            (
+                ProtocolCommand::GetTurnExecution {
+                    thread_id: "thread-fixture".to_owned(),
+                    turn_id: "turn-fixture".to_owned(),
+                },
+                "get_turn_execution",
+                "turn.wait.get",
+            ),
+            (
+                ProtocolCommand::ResumeTurnWait {
+                    thread_id: "thread-fixture".to_owned(),
+                    turn_id: "turn-fixture".to_owned(),
+                    wait_id: "agent-loop-wait-fixture".to_owned(),
+                    expected_revision: 1,
+                    memory_scope: MemoryScope::default(),
+                    context: Vec::new(),
+                },
+                "resume_turn_wait",
+                "turn.wait.resume",
+            ),
+            (
+                ProtocolCommand::CancelTurnWait {
+                    thread_id: "thread-fixture".to_owned(),
+                    turn_id: "turn-fixture".to_owned(),
+                    wait_id: "agent-loop-wait-fixture".to_owned(),
+                    expected_revision: 1,
+                    command_id: "agent-loop-close-fixture".to_owned(),
+                },
+                "cancel_turn_wait",
+                "turn.wait.cancel",
             ),
             (
                 ProtocolCommand::SteerTurn {
@@ -4143,6 +4968,23 @@ mod tests {
                 Some(&json!(method))
             );
         }
+    }
+
+    #[test]
+    fn receipt_free_runtime_success_is_not_exposed_as_completed() {
+        let thread = Thread::new();
+        let mut turn = crate::Turn::new(thread.id);
+        turn.status = TurnStatus::Completed;
+        let operation = super::operation_completed(TurnOutcome {
+            turn,
+            final_text: "unverified".to_owned(),
+        });
+
+        assert!(matches!(
+            operation,
+            OperationStatus::Failed { ref error }
+                if error.contains("without a completion receipt")
+        ));
     }
 
     #[tokio::test]
@@ -5497,6 +6339,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -5785,6 +6628,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -5809,9 +6653,15 @@ mod tests {
                 polled.body,
                 ProtocolResponseBody::Success {
                     result: ProtocolResult::Operation {
-                        operation: OperationStatus::Completed { .. }
+                        operation: OperationStatus::Completed {
+                            ref completion_receipt_sha256,
+                            ..
+                        }
                     }
-                }
+                } if completion_receipt_sha256.len() == 64
+                    && completion_receipt_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             ) {
                 completed = true;
                 break;
@@ -5870,6 +6720,563 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_wait_is_discoverable_forgettable_and_exactly_resumable() {
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let approval_handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(CapabilityOrigin::BuiltIn, Arc::new(ApprovalTool))
+            .expect("register tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(ApprovalThenMessageModel),
+                tools,
+                Arc::new(AskPolicy),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_approval_handler(approval_handler),
+        );
+        let handler = ProtocolHandler::new(runtime).with_approval_inbox(inbox.clone());
+        let initialized = handler
+            .handle(request("init-wait", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { ref capabilities, .. }
+            } if capabilities.contains(&"turn.wait.get".to_owned())
+                && capabilities.contains(&"turn.wait.resume".to_owned())
+                && capabilities.contains(&"turn.wait.cancel".to_owned())
+        ));
+        let thread_id = match handler
+            .handle(request("create-wait", ProtocolCommand::CreateThread {}))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let original_context = vec![TurnContextInput {
+            source: "protocol-test".to_owned(),
+            reference: "case:42".to_owned(),
+            text: "frozen context".to_owned(),
+        }];
+        let operation_id = match handler
+            .handle(request(
+                "start-wait",
+                ProtocolCommand::StartTurn {
+                    thread_id: thread_id.to_string(),
+                    prompt: "protected action".to_owned(),
+                    memory_scope: MemoryScope::default(),
+                    context: original_context.clone(),
+                    timeout_ms: Some(5_000),
+                    approval_wait_ttl_ms: Some(60_000),
+                },
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected start response: {other:?}"),
+        };
+        let waiting = wait_for_operation(&handler, &operation_id).await;
+        let execution = match waiting {
+            OperationStatus::Waiting {
+                execution,
+                approval_delivery: ApprovalDeliveryStatus::Pending,
+            } => execution,
+            other => panic!("operation did not release at Approval: {other:?}"),
+        };
+        assert_eq!(execution.thread_id, thread_id);
+        assert_eq!(execution.state, TurnExecutionState::Waiting);
+        assert_eq!(execution.revision, 1);
+        assert!(execution.expires_at_ms.is_some());
+        assert!(execution.remaining_active_timeout_ms.is_some());
+
+        let discovered = handler
+            .handle(request(
+                "discover-wait",
+                ProtocolCommand::GetTurnExecution {
+                    thread_id: thread_id.to_string(),
+                    turn_id: execution.turn_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            discovered.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnExecution {
+                    execution: Some(ref current)
+                }
+            } if current == &execution
+        ));
+        let service = handler
+            .handle(request("wait-status", ProtocolCommand::GetServiceStatus {}))
+            .await;
+        assert!(matches!(
+            service.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ServiceStatus { status }
+            } if status.running_operations == 0 && status.retained_operations == 1
+        ));
+        assert!(matches!(
+            handler
+                .handle(request(
+                    "forget-wait",
+                    ProtocolCommand::ForgetOperation {
+                        operation_id: operation_id.to_string(),
+                    },
+                ))
+                .await
+                .body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::OperationForgotten { .. }
+            }
+        ));
+
+        let approval = inbox
+            .get(&execution.approval_id)
+            .await
+            .expect("read approval")
+            .expect("approval");
+        inbox
+            .settle(
+                &approval.request.id,
+                approval.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+        let drifted_operation = match handler
+            .handle(request(
+                "resume-wait-drifted-context",
+                ProtocolCommand::ResumeTurnWait {
+                    thread_id: thread_id.to_string(),
+                    turn_id: execution.turn_id.to_string(),
+                    wait_id: execution.wait_id.to_string(),
+                    expected_revision: execution.revision,
+                    memory_scope: MemoryScope::default(),
+                    context: vec![TurnContextInput {
+                        text: "changed context".to_owned(),
+                        ..original_context[0].clone()
+                    }],
+                },
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected drifted resume response: {other:?}"),
+        };
+        assert!(matches!(
+            wait_for_operation(&handler, &drifted_operation).await,
+            OperationStatus::Failed { ref error } if error.contains("Model request changed")
+        ));
+        let resumed_operation = match handler
+            .handle(request(
+                "resume-wait",
+                ProtocolCommand::ResumeTurnWait {
+                    thread_id: thread_id.to_string(),
+                    turn_id: execution.turn_id.to_string(),
+                    wait_id: execution.wait_id.to_string(),
+                    expected_revision: execution.revision,
+                    memory_scope: MemoryScope::default(),
+                    context: original_context,
+                },
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected resume response: {other:?}"),
+        };
+        assert!(matches!(
+            wait_for_operation(&handler, &resumed_operation).await,
+            OperationStatus::Completed { ref final_text, .. } if final_text == "approved result"
+        ));
+        assert!(matches!(
+            handler
+                .handle(request(
+                    "discover-closed-wait",
+                    ProtocolCommand::GetTurnExecution {
+                        thread_id: thread_id.to_string(),
+                        turn_id: execution.turn_id.to_string(),
+                    },
+                ))
+                .await
+                .body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnExecution { execution: None }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_wait_cancel_requires_exact_fence_and_stable_command() {
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let approval_handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(CapabilityOrigin::BuiltIn, Arc::new(ApprovalTool))
+            .expect("register tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(ApprovalThenMessageModel),
+                tools,
+                Arc::new(AskPolicy),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_approval_handler(approval_handler),
+        );
+        let handler = ProtocolHandler::new(runtime).with_approval_inbox(inbox);
+        let thread_id = match handler
+            .handle(request(
+                "create-cancel-wait",
+                ProtocolCommand::CreateThread {},
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let operation_id = match handler
+            .handle(request(
+                "start-cancel-wait",
+                ProtocolCommand::StartTurn {
+                    thread_id: thread_id.to_string(),
+                    prompt: "cancel this".to_owned(),
+                    memory_scope: MemoryScope::default(),
+                    context: Vec::new(),
+                    timeout_ms: None,
+                    approval_wait_ttl_ms: Some(60_000),
+                },
+            ))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected start response: {other:?}"),
+        };
+        let execution = match wait_for_operation(&handler, &operation_id).await {
+            OperationStatus::Waiting { execution, .. } => execution,
+            other => panic!("expected wait: {other:?}"),
+        };
+        let legacy_recovery = handler
+            .handle(request(
+                "legacy-recover-wait",
+                ProtocolCommand::RecoverThread {
+                    thread_id: thread_id.to_string(),
+                    expected_turn_id: execution.turn_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            legacy_recovery.body,
+            ProtocolResponseBody::Error { ref error }
+                if error.message.contains("durable wait")
+                    && error.message.contains("turn.wait.*")
+        ));
+        let cancel = || ProtocolCommand::CancelTurnWait {
+            thread_id: thread_id.to_string(),
+            turn_id: execution.turn_id.to_string(),
+            wait_id: execution.wait_id.to_string(),
+            expected_revision: execution.revision,
+            command_id: "client-cancel-1".to_owned(),
+        };
+        let first = handler.handle(request("cancel-wait", cancel())).await;
+        assert!(matches!(
+            first.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnWaitCancelled { revision: 2, .. }
+            }
+        ));
+        let retry = handler.handle(request("cancel-wait-retry", cancel())).await;
+        assert!(matches!(
+            retry.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnWaitCancelled { revision: 2, .. }
+            }
+        ));
+        let changed = handler
+            .handle(request(
+                "cancel-wait-changed",
+                ProtocolCommand::CancelTurnWait {
+                    thread_id: thread_id.to_string(),
+                    turn_id: execution.turn_id.to_string(),
+                    wait_id: execution.wait_id.to_string(),
+                    expected_revision: execution.revision,
+                    command_id: "client-cancel-2".to_owned(),
+                },
+            ))
+            .await;
+        assert!(matches!(changed.body, ProtocolResponseBody::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_wait_configuration_fails_before_operation_admission() {
+        let handler = handler(Arc::new(ImmediateModel));
+        let initialized = handler
+            .handle(request("init-no-wait", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { ref capabilities, .. }
+            } if !capabilities.iter().any(|capability| capability.starts_with("turn.wait."))
+        ));
+        let thread_id = match handler
+            .handle(request("create-no-wait", ProtocolCommand::CreateThread {}))
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        for (id, wait_ttl, timeout) in [
+            ("zero-wait", Some(0), None),
+            (
+                "oversized-wait",
+                Some(crate::MAX_AGENT_LOOP_WAIT_MS + 1),
+                None,
+            ),
+            ("unsupported-wait", Some(1_000), None),
+            (
+                "oversized-active-timeout",
+                Some(1_000),
+                Some(crate::MAX_AGENT_LOOP_WAIT_MS + 1),
+            ),
+        ] {
+            let response = handler
+                .handle(request(
+                    id,
+                    ProtocolCommand::StartTurn {
+                        thread_id: thread_id.to_string(),
+                        prompt: "invalid durable config".to_owned(),
+                        memory_scope: MemoryScope::default(),
+                        context: Vec::new(),
+                        timeout_ms: timeout,
+                        approval_wait_ttl_ms: wait_ttl,
+                    },
+                ))
+                .await;
+            assert!(matches!(response.body, ProtocolResponseBody::Error { .. }));
+        }
+        let status = handler.service_status().await;
+        assert_eq!(status.running_operations, 0);
+        assert_eq!(status.retained_operations, 0);
+        let thread = handler
+            .runtime
+            .load_thread(&thread_id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert!(thread.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_wait_control_is_fenced_by_requester_and_tenant() {
+        let tenant_a = ProtocolPrincipal::from_mtls_certificate(b"wait-tenant-a");
+        let tenant_a_other = ProtocolPrincipal::from_mtls_certificate(b"wait-tenant-a-other");
+        let tenant_b = ProtocolPrincipal::from_mtls_certificate(b"wait-tenant-b");
+        let authorizer = TenantMapAuthorizer {
+            tenants: BTreeMap::from([
+                (
+                    tenant_a.mtls_sha256().expect("tenant A").to_owned(),
+                    "tenant-a".to_owned(),
+                ),
+                (
+                    tenant_a_other
+                        .mtls_sha256()
+                        .expect("tenant A other")
+                        .to_owned(),
+                    "tenant-a".to_owned(),
+                ),
+                (
+                    tenant_b.mtls_sha256().expect("tenant B").to_owned(),
+                    "tenant-b".to_owned(),
+                ),
+            ]),
+        };
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let approval_handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(CapabilityOrigin::BuiltIn, Arc::new(ApprovalTool))
+            .expect("register tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(ApprovalThenMessageModel),
+                tools,
+                Arc::new(AskPolicy),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_approval_handler(approval_handler),
+        );
+        let handler = ProtocolHandler::new(runtime)
+            .with_approval_inbox(inbox)
+            .with_authorizer(Arc::new(authorizer));
+        let thread_id = match handler
+            .handle_as(
+                &tenant_a,
+                request("create-tenant-wait", ProtocolCommand::CreateThread {}),
+            )
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let operation_id = match handler
+            .handle_as(
+                &tenant_a,
+                request(
+                    "start-tenant-wait",
+                    ProtocolCommand::StartTurn {
+                        thread_id: thread_id.to_string(),
+                        prompt: "tenant protected action".to_owned(),
+                        memory_scope: MemoryScope::default(),
+                        context: Vec::new(),
+                        timeout_ms: None,
+                        approval_wait_ttl_ms: Some(60_000),
+                    },
+                ),
+            )
+            .await
+            .body
+        {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected start response: {other:?}"),
+        };
+        let execution = match wait_for_operation_as(&handler, &tenant_a, &operation_id).await {
+            OperationStatus::Waiting { execution, .. } => execution,
+            other => panic!("expected wait: {other:?}"),
+        };
+        for command in [
+            ProtocolCommand::GetTurnExecution {
+                thread_id: thread_id.to_string(),
+                turn_id: execution.turn_id.to_string(),
+            },
+            ProtocolCommand::ResumeTurnWait {
+                thread_id: thread_id.to_string(),
+                turn_id: execution.turn_id.to_string(),
+                wait_id: execution.wait_id.to_string(),
+                expected_revision: execution.revision,
+                memory_scope: MemoryScope::default(),
+                context: Vec::new(),
+            },
+            ProtocolCommand::CancelTurnWait {
+                thread_id: thread_id.to_string(),
+                turn_id: execution.turn_id.to_string(),
+                wait_id: execution.wait_id.to_string(),
+                expected_revision: execution.revision,
+                command_id: "cross-tenant-cancel".to_owned(),
+            },
+        ] {
+            let denied = handler
+                .handle_as(&tenant_b, request("cross-tenant-wait", command))
+                .await;
+            assert!(matches!(denied.body, ProtocolResponseBody::Error { .. }));
+        }
+        let visible = handler
+            .handle_as(
+                &tenant_a,
+                request(
+                    "same-tenant-wait",
+                    ProtocolCommand::GetTurnExecution {
+                        thread_id: thread_id.to_string(),
+                        turn_id: execution.turn_id.to_string(),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            visible.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnExecution {
+                    execution: Some(ref current)
+                }
+            } if current.wait_id == execution.wait_id
+        ));
+        let substituted_resume = handler
+            .handle_as(
+                &tenant_a_other,
+                request(
+                    "substituted-requester-resume",
+                    ProtocolCommand::ResumeTurnWait {
+                        thread_id: thread_id.to_string(),
+                        turn_id: execution.turn_id.to_string(),
+                        wait_id: execution.wait_id.to_string(),
+                        expected_revision: execution.revision,
+                        memory_scope: MemoryScope::default(),
+                        context: Vec::new(),
+                    },
+                ),
+            )
+            .await;
+        let substituted_operation = match substituted_resume.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected substituted resume response: {other:?}"),
+        };
+        assert!(matches!(
+            wait_for_operation_as(&handler, &tenant_a_other, &substituted_operation).await,
+            OperationStatus::Failed { ref error } if error.contains("frozen original authority")
+        ));
+        let substituted_cancel = handler
+            .handle_as(
+                &tenant_a_other,
+                request(
+                    "substituted-requester-cancel",
+                    ProtocolCommand::CancelTurnWait {
+                        thread_id: thread_id.to_string(),
+                        turn_id: execution.turn_id.to_string(),
+                        wait_id: execution.wait_id.to_string(),
+                        expected_revision: execution.revision,
+                        command_id: "substituted-requester".to_owned(),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            substituted_cancel.body,
+            ProtocolResponseBody::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn steering_protocol_requires_the_exact_running_turn_and_persists_acceptance() {
         let handler = handler(Arc::new(PendingModel));
         let thread_id = match handler
@@ -5891,6 +7298,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(10_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await
@@ -6045,6 +7453,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await
@@ -6089,6 +7498,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -6115,6 +7525,7 @@ mod tests {
                         memory_scope: Default::default(),
                         context: Vec::new(),
                         timeout_ms: Some(1_000),
+                        approval_wait_ttl_ms: None,
                     },
                 ))
                 .await
@@ -6151,6 +7562,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -6225,6 +7637,7 @@ mod tests {
                 && compatibility.engine_version == env!("CARGO_PKG_VERSION")
                 && compatibility.state_event_schema == crate::STATE_EVENT_SCHEMA_VERSION
                 && compatibility.state_snapshot_schema == crate::STATE_SNAPSHOT_SCHEMA_VERSION
+                && compatibility.thread_archive_format == crate::THREAD_ARCHIVE_FORMAT_VERSION
                 && compatibility.approval_inbox_schema
                     == crate::APPROVAL_INBOX_SCHEMA_VERSION
                 && compatibility.task_graph_schema == crate::TASK_GRAPH_SCHEMA_VERSION
@@ -6400,6 +7813,7 @@ mod tests {
                             text: "derived branch context".to_owned(),
                         }],
                         timeout_ms: None,
+                        approval_wait_ttl_ms: None,
                     },
                 ),
             )
@@ -6491,6 +7905,18 @@ mod tests {
             .await;
         assert!(matches!(
             denied.body,
+            ProtocolResponseBody::Error { error }
+                if error.code == "forbidden" && !error.retryable
+        ));
+
+        let status_denied = handler
+            .handle_as(
+                &principal,
+                request("status", ProtocolCommand::GetServiceStatus {}),
+            )
+            .await;
+        assert!(matches!(
+            status_denied.body,
             ProtocolResponseBody::Error { error }
                 if error.code == "forbidden" && !error.retryable
         ));
@@ -6671,6 +8097,7 @@ mod tests {
                         memory_scope: Default::default(),
                         context: Vec::new(),
                         timeout_ms: Some(1_000),
+                        approval_wait_ttl_ms: None,
                     },
                 ),
             )
@@ -6911,6 +8338,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -6960,6 +8388,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_status_reports_ready_capacity_and_one_way_draining() {
+        let handler = handler(Arc::new(PendingModel))
+            .with_operation_retention_limit(1)
+            .expect("Operation retention limit");
+        let initialized = handler
+            .handle(request("initialize", ProtocolCommand::Initialize {}))
+            .await;
+        assert!(matches!(
+            initialized.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Initialized { capabilities, .. }
+            } if capabilities.contains(&"service.status".to_owned())
+        ));
+
+        let initial = handler
+            .handle(request(
+                "status-ready",
+                ProtocolCommand::GetServiceStatus {},
+            ))
+            .await;
+        assert!(matches!(
+            initial.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ServiceStatus {
+                    status: super::ProtocolServiceStatus {
+                        admission: super::ProtocolAdmissionState::Ready,
+                        running_operations: 0,
+                        retained_operations: 0,
+                        operation_retention_limit: 1,
+                    }
+                }
+            }
+        ));
+
+        let created = handler
+            .handle(request("create-status", ProtocolCommand::CreateThread {}))
+            .await;
+        let thread_id = match created.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ThreadCreated { thread },
+            } => thread.id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let started = handler
+            .handle(request(
+                "start-status",
+                ProtocolCommand::StartTurn {
+                    thread_id: thread_id.to_string(),
+                    prompt: "wait".to_owned(),
+                    memory_scope: Default::default(),
+                    context: Vec::new(),
+                    timeout_ms: None,
+                    approval_wait_ttl_ms: None,
+                },
+            ))
+            .await;
+        let operation_id = match started.body {
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::TurnStarted { operation_id },
+            } => operation_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let saturated = handler
+            .handle(request(
+                "status-capacity",
+                ProtocolCommand::GetServiceStatus {},
+            ))
+            .await;
+        assert!(matches!(
+            saturated.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ServiceStatus {
+                    status: super::ProtocolServiceStatus {
+                        admission: super::ProtocolAdmissionState::AtCapacity,
+                        running_operations: 1,
+                        retained_operations: 1,
+                        operation_retention_limit: 1,
+                    }
+                }
+            }
+        ));
+
+        let cancelled = handler
+            .handle(request(
+                "cancel-status",
+                ProtocolCommand::CancelOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            cancelled.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::Cancellation { accepted: true, .. }
+            }
+        ));
+        for _ in 0..100 {
+            if handler.service_status().await.running_operations == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handler.service_status().await.running_operations, 0);
+
+        handler.begin_draining();
+        assert_eq!(
+            handler.service_status().await.admission,
+            super::ProtocolAdmissionState::Draining
+        );
+        handler
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("drain status fixture");
+        let draining = handler
+            .handle(request(
+                "status-draining",
+                ProtocolCommand::GetServiceStatus {},
+            ))
+            .await;
+        assert!(matches!(
+            draining.body,
+            ProtocolResponseBody::Success {
+                result: ProtocolResult::ServiceStatus {
+                    status: super::ProtocolServiceStatus {
+                        admission: super::ProtocolAdmissionState::Draining,
+                        running_operations: 0,
+                        retained_operations: 1,
+                        operation_retention_limit: 1,
+                    }
+                }
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn shutdown_rejects_new_turns_and_drains_running_operations() {
         let handler = handler(Arc::new(PendingModel));
         assert!(handler.shutdown(Duration::ZERO).await.is_err());
@@ -6984,6 +8548,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -7027,6 +8592,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -7072,6 +8638,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -7135,6 +8702,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: None,
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -7210,6 +8778,7 @@ mod tests {
                     memory_scope: Default::default(),
                     context: Vec::new(),
                     timeout_ms: Some(1_000),
+                    approval_wait_ttl_ms: None,
                 },
             ))
             .await;
@@ -7266,13 +8835,16 @@ mod tests {
                     has_more: true,
                     dropped_through_sequence: None,
                 }
-            } if events == &[super::OperationStreamEvent {
-                sequence: 1,
-                event: ModelStreamEvent::TextDelta {
-                    model_step: 1,
-                    delta: "hel".to_owned(),
-                },
-            }]
+            } if events.len() == 1
+                && events[0].sequence == 1
+                && matches!(
+                    events[0].event,
+                    ModelStreamEvent::ToolTraceRequest {
+                        model_step: 1,
+                        attempt: 1,
+                        ..
+                    }
+                )
         ));
     }
 
@@ -7317,7 +8889,7 @@ mod tests {
                 .expect("large bounded event");
         }
         state
-            .finish_turn(&turn, TurnStatus::Completed)
+            .finish_turn(&turn, TurnStatus::Interrupted)
             .await
             .expect("finish");
 
@@ -7382,6 +8954,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cooperative_jsonl_shutdown_preserves_completed_frames_and_does_not_require_eof() {
+        let handler = Arc::new(handler(Arc::new(ImmediateModel)));
+        let shutdown = CancellationToken::new();
+        let (client, server) = duplex(16_384);
+        let (client_reader, mut client_writer) = split(client);
+        let (server_reader, server_writer) = split(server);
+        let server_handler = handler.clone();
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            serve_jsonl_until_cancelled(
+                &server_handler,
+                BufReader::new(server_reader),
+                server_writer,
+                server_shutdown,
+            )
+            .await
+        });
+
+        let encoded = serde_json::to_vec(&request(
+            "cooperative-frame",
+            ProtocolCommand::Initialize {},
+        ))
+        .expect("encode request");
+        client_writer
+            .write_all(&encoded)
+            .await
+            .expect("write request");
+        client_writer
+            .write_all(b"\n")
+            .await
+            .expect("write delimiter");
+        client_writer.flush().await.expect("flush request");
+
+        let mut client_reader = BufReader::new(client_reader);
+        let mut response = String::new();
+        client_reader
+            .read_line(&mut response)
+            .await
+            .expect("read response");
+        let response: ProtocolResponse = serde_json::from_str(&response).expect("decode response");
+        assert_eq!(response.id.as_deref(), Some("cooperative-frame"));
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("server ignored cancellation while stdin remained open")
+            .expect("server task")
+            .expect("cooperative serve");
+    }
+
+    #[tokio::test]
     async fn rejects_version_mismatch_and_oversized_frames() {
         let handler = handler(Arc::new(ImmediateModel));
         let mut invalid = request("version", ProtocolCommand::Initialize {});
@@ -7407,6 +9030,7 @@ mod tests {
                         thread_id: ThreadId::from_static("thread-test"),
                         turn_id: TurnId::from_static("turn-test"),
                         final_text: "x".repeat(MAX_RESPONSE_FRAME_BYTES),
+                        completion_receipt_sha256: "0".repeat(64),
                     },
                 },
             },
@@ -7433,6 +9057,7 @@ mod tests {
                         thread_id: ThreadId::from_static("thread-model-limit"),
                         turn_id: TurnId::from_static("turn-model-limit"),
                         final_text: "x".repeat(1_048_576),
+                        completion_receipt_sha256: "0".repeat(64),
                     },
                 },
             },

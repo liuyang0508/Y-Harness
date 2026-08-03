@@ -471,6 +471,64 @@ fixed-output record is checked in under
 [`evidence/2026-07-28-hermes-fixed-output`](evidence/2026-07-28-hermes-fixed-output).
 It remains `claim_eligible: false`; there is no comparative Hermes run.
 
+The SWE-agent adapter consumes the released single-instance `.traj` artifact:
+
+```json
+{
+  "format_version": 10,
+  "run_id": "swe-agent-probe-001",
+  "benchmark_version": "adapter-conformance-v1",
+  "case_id": "issue-1",
+  "program": "/absolute/path/to/sweagent",
+  "expected_cli_version": "1.1.0",
+  "expected_product_executable_sha256": "<64 lowercase hex bytes>",
+  "expected_source_commit": "<40 lowercase hex bytes>",
+  "expected_swe_rex_version": "1.2.1",
+  "source_root": "/absolute/path/to/SWE-agent",
+  "config": "/absolute/path/to/SWE-agent/config/default.yaml",
+  "expected_config_sha256": "<64 lowercase hex bytes>",
+  "workspace": "/absolute/path/to/software-repository",
+  "workspace_snapshot": "repo-fixture-v1",
+  "profile": "bare",
+  "provider": "yh-loopback-openai-compatible",
+  "provider_base_url": "http://127.0.0.1:12345/v1",
+  "model": "openai/test-model",
+  "system_prompt": "Solve the issue with the configured tools.",
+  "prompt": "Implement the requested fix and submit the patch.",
+  "timeout_ms": 1800000,
+  "max_budget_usd": 3.0,
+  "max_model_calls": 30,
+  "inherit_environment": [
+    "OPENAI_API_KEY",
+    "PATH"
+  ],
+  "home": "/absolute/empty/platform-home",
+  "output_dir": "/absolute/empty/trajectory-output",
+  "temp_dir": "/absolute/empty/temp"
+}
+```
+
+```bash
+cargo run --locked -p y-harness-benchmark-runner -- \
+  swe-agent /absolute/path/to/spec.json > external-run.json
+```
+
+Format 10 supports only `bare`. It points `PYTHONPATH`, config resolution, Tool
+resolution, trajectory output, home, and temp discovery at explicit roots;
+passes the problem statement through a private file; forces the Model and
+loopback API base; sets model-call/cost limits; and disables opening a PR or
+applying the patch back to the host checkout. The source commit, SWE-agent
+version, and SWE-ReX version must be observed in the resulting `.traj`; the
+selected config is independently SHA-256 pinned.
+
+The adapter retains SWE-agent's real configured ACI Tools. Consequently this
+is a software-engineering loop probe, unlike the Tool-disabled Pi adapter, but
+it is not a Y-Harness governance result. The product's command blocklist is a
+retry policy, the call/cost limits are checked after a Model call, the
+SWE-ReX/container coordinate is not settled by `.traj`, and the source commit
+does not prove a clean checkout. No live record is checked in yet, so format
+10 remains `adapter_conformance` with `claim_eligible: false`.
+
 The checked-in
 [`2026-07-28-harness-control-preflight`](evidence/2026-07-28-harness-control-preflight/)
 record reuses the format-1 Claude Code and format-2 Codex adapters against one

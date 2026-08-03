@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "provider_profiles": [
+    {
+      "type": "open_ai_responses",
+      "id": "openai/production",
+      "endpoint": "https://api.openai.com/v1/responses",
+      "api_key_secret_reference": "provider/openai",
+      "api_key_environment": "OPENAI_API_KEY",
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 16
+    },
+    {
+      "type": "open_ai_chat_completions",
+      "id": "openai/chat-compatible",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "api_key_secret_reference": "provider/openai-chat",
+      "api_key_environment": "OPENAI_API_KEY",
+      "max_output_tokens": 8192,
+      "token_limit_field": "max_completion_tokens",
+      "stream_usage": true,
+      "allow_loopback_http": false,
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 16
+    },
+    {
+      "type": "anthropic_messages",
+      "id": "anthropic/production",
+      "endpoint": "https://api.anthropic.com/v1/messages",
+      "api_version": "2023-06-01",
+      "api_key_secret_reference": "provider/anthropic",
+      "api_key_environment": "ANTHROPIC_API_KEY",
+      "max_output_tokens": 8192,
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 16
+    },
+    {
+      "type": "gemini_generate_content",
+      "id": "google/production",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "api_version": "v1beta",
+      "api_key_secret_reference": "provider/gemini",
+      "api_key_environment": "GEMINI_API_KEY",
+      "max_output_tokens": 8192,
+      "request_timeout_ms": 120000,
+      "connect_timeout_ms": 10000,
+      "max_response_bytes": 4194304,
+      "max_concurrency": 16
+    }
+  ],
+  "models": [
+    {
+      "type": "provider_model",
+      "id": "openai/primary",
+      "provider_profile": "openai/production",
+      "model": "replace-with-an-available-openai-model"
+    },
+    {
+      "type": "provider_model",
+      "id": "anthropic/fallback",
+      "provider_profile": "anthropic/production",
+      "model": "replace-with-an-available-claude-model"
+    },
+    {
+      "type": "provider_model",
+      "id": "compatible/chat-fallback",
+      "provider_profile": "openai/chat-compatible",
+      "model": "replace-with-an-openai-chat-compatible-model"
+    },
+    {
+      "type": "provider_model",
+      "id": "google/fallback",
+      "provider_profile": "google/production",
+      "model": "replace-with-an-available-gemini-model"
+    }
+  ],
+  "model_route": {
+    "models": [
+      "openai/primary",
+      "anthropic/fallback",
+      "compatible/chat-fallback",
+      "google/fallback"
+    ],
+    "attempt_timeout_ms": 30000,
+    "timeout_cooldown_ms": 60000,
+    "retry": {
+      "max_retries": 2,
+      "initial_delay_ms": 250,
+      "max_delay_ms": 5000
+    }
+  }
+}
