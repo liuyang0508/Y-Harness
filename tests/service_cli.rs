@@ -524,6 +524,9 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
         "healthy Temporal service emitted diagnostics: {}",
         String::from_utf8_lossy(&settled.stderr)
     );
+    // Windows cannot delete database files while this test still holds them open.
+    drop(workflow);
+    drop(runtime);
     fs::remove_dir_all(project).expect("remove Temporal service fixture");
 }
 
