@@ -152,11 +152,23 @@ async fn cancelling_a_live_stdio_mcp_call_invalidates_its_session() {
     let cancellation = CancellationToken::new();
     let cancel_from_thread = cancellation.clone();
     let journal_path = directory.join("journal.jsonl");
+    let prepared_len = fs::metadata(&journal_path)
+        .expect("prepared journal metadata")
+        .len();
     let canceller = std::thread::spawn(move || {
         for _ in 0..500 {
-            let committed = fs::read_to_string(&journal_path)
-                .is_ok_and(|journal| journal.contains("\"type\":\"effect_committed\""));
+            // Windows mandatory range locks deny reads while the fixture holds
+            // its journal, so growth past the prepared baseline is the commit
+            // signal there; the two invocation records are appended in one
+            // synchronous handler pass, so a short grace covers the second.
+            let committed = match fs::read_to_string(&journal_path) {
+                Ok(journal) => journal.contains("\"type\":\"effect_committed\""),
+                Err(_) => {
+                    fs::metadata(&journal_path).is_ok_and(|metadata| metadata.len() > prepared_len)
+                }
+            };
             if committed {
+                std::thread::sleep(Duration::from_millis(100));
                 cancel_from_thread.cancel();
                 return true;
             }
