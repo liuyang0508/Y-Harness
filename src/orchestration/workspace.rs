@@ -1159,6 +1159,8 @@ mod tests {
         run(&["init", "-q"]);
         run(&["config", "user.name", "Y Harness"]);
         run(&["config", "user.email", "y-harness@example.invalid"]);
+        // Windows Git defaults to autocrlf and would rewrite the fixture newline.
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::write(repository.join("fixture.txt"), "workspace fixture\n")
             .expect("fixture file");
         run(&["add", "fixture.txt"]);
