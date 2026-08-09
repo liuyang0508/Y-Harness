@@ -81,13 +81,16 @@ commit.
 
 ## Open release blockers
 
-- The clean local candidate has no configured Git remote. A read-only check on
-  2026-07-28 confirms that GitHub CLI is authenticated as `liuyang0508` and
-  `liuyang0508/Y-Harness` does not exist. Creating that external repository,
-  choosing its visibility, pushing, and tagging are publication actions rather
-  than local build steps; they have not been performed without explicit
-  publication authorization. Consequently no remote Ubuntu/macOS/Windows CI or
-  release-archive evidence exists yet.
+None. The public repository `liuyang0508/Y-Harness` exists with `main` as its
+default branch, and the checked-in CI workflow ran green on the candidate
+commit lineage on 2026-08-09 after six hosted-runner hardening fixes: all five
+jobs (Ubuntu quality gates and regression evaluation, macOS tests, Windows
+tests, RustSec audit, and the release-mode SQLite performance smoke gate)
+passed. The Windows job exposed and drove fixes for read-only backup fsync
+handles, drive-relative fixture paths, verbatim path prefixes handed to Git,
+autocrlf rewriting of digest-bound evidence, open SQLite handles during
+fixture cleanup, and mandatory journal locks blocking a test probe; these are
+recorded in the commit history between `95366f8` and the release candidate.
 
 ## Declared non-blocking scope limitations
 

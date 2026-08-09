@@ -2,7 +2,10 @@
 
 All notable changes to Y-Harness are documented in this file.
 
-## Unreleased
+## 0.1.0 - 2026-08-09
+
+First tagged release. Everything below, including the initial baseline,
+ships as v0.1.0.
 
 - advanced Secret Provider API to 3 and client Protocol to v30 with typed
   Agent-Turn, Governed-Effect, and service-use contexts; added optional
@@ -96,9 +99,7 @@ All notable changes to Y-Harness are documented in this file.
   private prompt-file cleanup, exact Model/effort/Turn controls, and truthful
   observed-Model and complete-cost evidence.
 
-## 0.1.0 - 2026-07-25
-
-Initial public baseline:
+### Initial baseline - 2026-07-25
 
 - eleven-layer, provider-neutral Agent Harness Runtime;
 - bounded Agent Loop with durable State, policy, approval, verification,
