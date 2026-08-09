@@ -1,0 +1,4 @@
+# Digest-bound immutable evidence must never be rewritten at checkout.
+tools/benchmark-runner/evidence/** -text
+evals/** -text
+tests/fixtures/** -text
