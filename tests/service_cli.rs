@@ -4,14 +4,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader},
     os::unix::fs::PermissionsExt,
-    time::Duration,
 };
 
 use ed25519_dalek::{Signer, SigningKey};

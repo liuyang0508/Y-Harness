@@ -460,9 +460,9 @@ impl MacOsSeatbeltPolicy {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (writable_roots, network_access);
-            return Err(HarnessError::InvalidConfiguration(
+            Err(HarnessError::InvalidConfiguration(
                 "macOS Seatbelt is unavailable on this platform".to_owned(),
-            ));
+            ))
         }
         #[cfg(target_os = "macos")]
         {
@@ -577,9 +577,9 @@ impl MacOsSeatbeltBroker {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (maximum_concurrency, writable_roots, network_access);
-            return Err(HarnessError::InvalidConfiguration(
+            Err(HarnessError::InvalidConfiguration(
                 "macOS Seatbelt is unavailable on this platform".to_owned(),
-            ));
+            ))
         }
         #[cfg(target_os = "macos")]
         {

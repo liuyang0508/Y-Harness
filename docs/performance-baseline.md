@@ -155,9 +155,11 @@ cargo run --release --bin yh-state-bench
 
 The benchmark exits unsuccessfully when a supplied threshold is exceeded.
 These numbers are not a product SLA. Hosted CI runs the same workload with
-wider 350 ms append, 15 ms full-projection, 50 ms fork/export/import, 50 ms
-64-Thread list, and 15 ms snapshot-load smoke thresholds; those thresholds
-detect catastrophic regressions but are not used for comparative benchmarking.
+wider 900 ms append, 15 ms full-projection, 50 ms fork/export/import, 50 ms
+64-Thread list, and 15 ms snapshot-load smoke thresholds; a shared GitHub
+runner measured a 515 ms append median under `synchronous=FULL` fsync on
+2026-08-03, so the hosted append bound only detects catastrophic regressions
+and none of the hosted thresholds are used for comparative benchmarking.
 
 ## State schema migration workload
 
