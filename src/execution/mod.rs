@@ -604,7 +604,7 @@ impl ProcessBroker for MacOsSeatbeltBroker {
 
     fn execute<'a>(
         &'a self,
-        mut request: ProcessRequest,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut request: ProcessRequest,
         cancellation: CancellationToken,
     ) -> HarnessFuture<'a, ProcessOutput> {
         Box::pin(async move {
@@ -1914,10 +1914,12 @@ mod tests {
 
     #[test]
     fn process_request_reserves_the_larger_stdin_budget_for_evaluation() {
+        // Drive-relative "/fixture" is not absolute on Windows.
+        let absolute_root = std::env::temp_dir();
         let mut request = ProcessRequest {
-            program: PathBuf::from("/fixture"),
+            program: absolute_root.join("fixture"),
             args: Vec::new(),
-            current_dir: PathBuf::from("/"),
+            current_dir: absolute_root,
             environment: BTreeMap::new(),
             secret_environment: BTreeMap::new(),
             stdin: vec![0; super::MAX_STDIN_BYTES + 1],

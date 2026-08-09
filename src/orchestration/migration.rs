@@ -849,7 +849,11 @@ fn create_or_validate_backup(
         )
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
     drop(backup);
-    File::open(&partial_path)
+    // Windows FlushFileBuffers requires a writable handle.
+    File::options()
+        .read(true)
+        .write(true)
+        .open(&partial_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
     fs::hard_link(&partial_path, backup_path).map_err(|error| {
@@ -971,6 +975,7 @@ fn partial_backup_path(backup_path: &Path) -> PathBuf {
     backup_path.with_file_name(name)
 }
 
+#[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), HarnessError> {
     let parent = path
         .parent()
@@ -979,6 +984,11 @@ fn sync_parent_directory(path: &Path) -> Result<(), HarnessError> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| HarnessError::Orchestration(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), HarnessError> {
+    Ok(())
 }
 
 fn injected_stop(phase: &str) -> HarnessError {

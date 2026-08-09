@@ -962,9 +962,11 @@ fn require_not_cancelled(cancellation: &CancellationToken) -> Result<(), Harness
 }
 
 fn path_text(path: &Path) -> Result<&str, HarnessError> {
-    path.to_str().ok_or_else(|| {
+    let text = path.to_str().ok_or_else(|| {
         HarnessError::InvalidConfiguration("Git Workspace path must be valid UTF-8".to_owned())
-    })
+    })?;
+    // Git rejects Windows verbatim paths produced by canonicalize.
+    Ok(text.strip_prefix(r"\\?\").unwrap_or(text))
 }
 
 #[cfg(test)]

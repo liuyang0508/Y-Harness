@@ -898,7 +898,11 @@ fn create_or_validate_backup(
         )
         .map_err(|error| HarnessError::Approval(error.to_string()))?;
     drop(backup);
-    File::open(&partial_path)
+    // Windows FlushFileBuffers requires a writable handle.
+    File::options()
+        .read(true)
+        .write(true)
+        .open(&partial_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| HarnessError::Approval(error.to_string()))?;
     fs::hard_link(&partial_path, backup_path).map_err(|error| {
