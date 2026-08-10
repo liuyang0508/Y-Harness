@@ -1,10 +1,9 @@
-//! Bounded Protocol v31 client over a supervised `yh` child process.
+//! Bounded Protocol v37 client over a supervised `yh` child process.
 
 use std::{
     error::Error,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
-    path::Path,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -22,22 +21,35 @@ use y_harness::{
 
 const MAX_RESPONSE_BYTES: usize = 16_777_216;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// Match the reference service's bounded shutdown budget. Reload only begins at
+// a settled-Turn boundary, but optional MCP, Temporal, or Effect integrations
+// may still need time to drain their own supervised tasks cleanly.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_SETTLE: Duration = Duration::from_millis(25);
 const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 16_384;
+const MAX_DOCTOR_REPORT_BYTES: usize = 65_536;
 
 pub(crate) type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+type SpawnedEngine = (
+    Child,
+    ChildStdin,
+    BufReader<ChildStdout>,
+    Arc<Mutex<EngineDiagnostics>>,
+);
 
 /// Engine process startup mode selected by the operator.
-pub(crate) enum EngineMode<'a> {
+#[derive(Clone)]
+pub(crate) enum EngineMode {
     Demo,
-    Config(&'a Path),
+    Config(std::path::PathBuf),
 }
 
 /// One request-at-a-time JSONL client.
 ///
 /// The child Engine remains the sole execution and durable-state authority.
 pub(crate) struct ProtocolClient {
+    engine: OsString,
+    mode: EngineMode,
     child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
@@ -46,53 +58,113 @@ pub(crate) struct ProtocolClient {
 }
 
 impl ProtocolClient {
-    pub(crate) fn spawn(engine: &OsStr, mode: EngineMode<'_>) -> ClientResult<Self> {
-        let mut command = Command::new(engine);
-        match mode {
-            EngineMode::Demo => {
-                command.arg("serve-demo");
-            }
-            EngineMode::Config(config) => {
-                if !config.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "Engine config does not exist: {}. Run `yh init <directory>` or use `yh-tui --demo`",
-                            config.display()
-                        ),
-                    )
-                    .into());
-                }
-                command.arg("serve").arg(config);
-            }
+    pub(crate) fn spawn(engine: &OsStr, mode: EngineMode) -> ClientResult<Self> {
+        let (child, input, output, diagnostics) = spawn_engine(engine, &mode)?;
+        Ok(Self {
+            engine: engine.to_os_string(),
+            mode,
+            child,
+            input: Some(input),
+            output,
+            diagnostics,
+            next_request_id: 1,
+        })
+    }
+
+    /// Revalidates configuration, drains the current generation, and starts a
+    /// fresh Engine process over the same durable stores.
+    pub(crate) async fn reload(&mut self) -> ClientResult<()> {
+        self.preflight_reload().await?;
+        self.stop_engine().await?;
+        let (child, input, output, diagnostics) = spawn_engine(&self.engine, &self.mode)?;
+        self.child = child;
+        self.input = Some(input);
+        self.output = output;
+        self.diagnostics = diagnostics;
+        self.next_request_id = 1;
+        Ok(())
+    }
+
+    async fn preflight_reload(&self) -> ClientResult<()> {
+        if matches!(&self.mode, EngineMode::Demo) {
+            return Ok(());
         }
-        let mut child = command
-            .stdin(Stdio::piped())
+        self.doctor_report().await.map(|_| ())
+    }
+
+    /// Runs the same non-mutating Engine preflight used before reloading.
+    pub(crate) async fn diagnose(&self) -> ClientResult<String> {
+        if matches!(&self.mode, EngineMode::Demo) {
+            return Err(io::Error::other(
+                "Engine doctor requires --config; demo mode has no service configuration",
+            )
+            .into());
+        }
+        self.doctor_report().await
+    }
+
+    async fn doctor_report(&self) -> ClientResult<String> {
+        let EngineMode::Config(config) = &self.mode else {
+            return Err(io::Error::other("Engine doctor requires configured mode").into());
+        };
+        let mut child = Command::new(&self.engine)
+            .arg("doctor")
+            .arg(config)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("Engine stdin was not created"))?;
-        let output = child
+        let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::other("Engine stdout was not created"))?;
+            .ok_or_else(|| io::Error::other("Engine doctor stdout is unavailable"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| io::Error::other("Engine stderr was not created"))?;
-        let diagnostics = Arc::new(Mutex::new(EngineDiagnostics::default()));
-        tokio::spawn(drain_engine_diagnostics(stderr, diagnostics.clone()));
-        Ok(Self {
-            child,
-            input: Some(input),
-            output: BufReader::new(output),
-            diagnostics,
-            next_request_id: 1,
-        })
+            .ok_or_else(|| io::Error::other("Engine doctor stderr is unavailable"))?;
+        let operation = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                child.wait(),
+                read_bounded_output(stdout, MAX_DOCTOR_REPORT_BYTES),
+                read_bounded_output(stderr, MAX_ENGINE_DIAGNOSTIC_BYTES)
+            )?;
+            Ok::<_, io::Error>((status, stdout, stderr))
+        };
+        let (status, stdout, stderr) = timeout(Duration::from_secs(30), operation)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Engine doctor timed out"))??;
+        if !status.success() {
+            let diagnostic = String::from_utf8_lossy(&stderr);
+            return Err(
+                io::Error::other(format!("Engine doctor failed: {}", diagnostic.trim())).into(),
+            );
+        }
+        String::from_utf8(stdout)
+            .map_err(|_| io::Error::other("Engine doctor output is not UTF-8").into())
+    }
+
+    async fn stop_engine(&mut self) -> ClientResult<()> {
+        self.input.take();
+        match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+            Ok(status) => {
+                let status = status?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("Engine exited with status {status}")).into())
+                }
+            }
+            Err(_) => {
+                self.child.kill().await?;
+                let _ = self.child.wait().await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Engine did not stop after its protocol input closed",
+                )
+                .into())
+            }
+        }
     }
 
     pub(crate) async fn call(&mut self, command: ProtocolCommand) -> ClientResult<ProtocolResult> {
@@ -168,27 +240,75 @@ impl ProtocolClient {
     }
 
     pub(crate) async fn shutdown(mut self) -> ClientResult<()> {
-        self.input.take();
-        match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
-            Ok(status) => {
-                let status = status?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!("Engine exited with status {status}")).into())
-                }
-            }
-            Err(_) => {
-                self.child.kill().await?;
-                let _ = self.child.wait().await;
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Engine did not stop after its protocol input closed",
+        self.stop_engine().await
+    }
+}
+
+async fn read_bounded_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    maximum: usize,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(maximum.min(8_192));
+    let mut buffer = [0_u8; 4_096];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let next = output
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| io::Error::other("Engine doctor output size overflow"))?;
+        if next > maximum {
+            return Err(io::Error::other(format!(
+                "Engine doctor output exceeded {maximum} bytes"
+            )));
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn spawn_engine(engine: &OsStr, mode: &EngineMode) -> ClientResult<SpawnedEngine> {
+    let mut command = Command::new(engine);
+    match mode {
+        EngineMode::Demo => {
+            command.arg("serve-demo");
+        }
+        EngineMode::Config(config) => {
+            if !config.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Engine config does not exist: {}. Run `yh init <directory>` or use `yh-tui --demo`",
+                        config.display()
+                    ),
                 )
-                .into())
+                .into());
             }
+            command.arg("serve").arg(config);
         }
     }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let input = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("Engine stdin was not created"))?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Engine stdout was not created"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Engine stderr was not created"))?;
+    let diagnostics = Arc::new(Mutex::new(EngineDiagnostics::default()));
+    tokio::spawn(drain_engine_diagnostics(stderr, diagnostics.clone()));
+    Ok((child, input, BufReader::new(output), diagnostics))
 }
 
 fn protocol_mismatch(engine_protocol: &str) -> io::Error {
@@ -304,8 +424,19 @@ mod tests {
 
     use super::{
         EngineDiagnostics, EngineMode, MAX_ENGINE_DIAGNOSTIC_BYTES, ProtocolClient,
-        protocol_mismatch, read_bounded_line_with_limit,
+        protocol_mismatch, read_bounded_line_with_limit, read_bounded_output,
     };
+
+    #[tokio::test]
+    async fn doctor_output_is_bounded_without_silent_truncation() -> super::ClientResult<()> {
+        assert_eq!(read_bounded_output(&b"healthy"[..], 7).await?, b"healthy");
+
+        let error = read_bounded_output(&b"oversized"[..], 8)
+            .await
+            .expect_err("oversized doctor output must fail closed");
+        assert!(error.to_string().contains("exceeded 8 bytes"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn response_limit_excludes_the_jsonl_delimiter() -> super::ClientResult<()> {
@@ -325,7 +456,7 @@ mod tests {
     fn missing_config_fails_before_engine_spawn() -> super::ClientResult<()> {
         let error = match ProtocolClient::spawn(
             OsStr::new("engine-that-must-not-run"),
-            EngineMode::Config(Path::new("missing-y-harness.json")),
+            EngineMode::Config(Path::new("missing-y-harness.json").to_owned()),
         ) {
             Ok(_) => return Err("missing config was accepted".into()),
             Err(error) => error,
@@ -351,7 +482,7 @@ mod tests {
     fn protocol_mismatch_names_both_coordinates_and_the_reinstall_path() {
         let diagnostic = protocol_mismatch("23").to_string();
         assert!(diagnostic.contains("Engine protocol \"23\""));
-        assert!(diagnostic.contains("TUI protocol 31"));
+        assert!(diagnostic.contains(&format!("TUI protocol {}", y_harness::PROTOCOL_VERSION)));
         assert!(diagnostic.contains("./scripts/install.sh"));
         assert!(diagnostic.contains("./scripts/install-tui.sh"));
     }

@@ -101,6 +101,12 @@ id_type!(ItemId, "item");
 id_type!(EventId, "event");
 id_type!(CheckpointId, "checkpoint");
 id_type!(ApprovalId, "approval");
+id_type!(AgentLoopWaitId, "agent-loop-wait");
+id_type!(AgentLoopResumeCommandId, "agent-loop-resume");
+id_type!(AgentLoopClaimId, "agent-loop-claim");
+id_type!(AgentLoopWorkerId, "agent-loop-worker");
+id_type!(AgentLoopCloseCommandId, "agent-loop-close");
+id_type!(AgentLoopDenyCommandId, "agent-loop-deny");
 id_type!(TaskGraphId, "task-graph");
 id_type!(TaskId, "task");
 id_type!(TaskLeaseId, "lease");
@@ -201,6 +207,10 @@ pub struct Turn {
     pub status: TurnStatus,
     /// Ordered items recorded during the turn.
     pub items: Vec<Item>,
+    /// Deterministic evidence-bound settlement, present only after a
+    /// `TurnCompleted` event has been projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_receipt: Option<crate::completion::CompletionReceipt>,
 }
 
 impl Turn {
@@ -212,6 +222,7 @@ impl Turn {
             thread_id,
             status: TurnStatus::Running,
             items: Vec::new(),
+            completion_receipt: None,
         }
     }
 }
@@ -232,6 +243,227 @@ pub enum TurnStatus {
     TimedOut,
     /// Recovery found execution unfinished after a runtime interruption.
     Interrupted,
+}
+
+/// Durable reason that an Agent Loop relinquished its in-process worker.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WaitKind {
+    /// Policy requires an authoritative Approval Inbox settlement.
+    Approval {
+        /// Complete immutable approval request, including Tool coordinates and input.
+        request: ApprovalRequest,
+        /// SHA-256 of the exact Model request that produced the Tool call.
+        model_request_sha256: String,
+    },
+}
+
+/// Complete, self-digested suspension capsule for one running Turn.
+///
+/// State creates this value with server time. Consumers must treat the wait
+/// identity, revision, tenant, requester, timeout budget, and completion
+/// generation as one indivisible resume authority.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnWaitEnvelope {
+    /// Stable identity shared by every transition in this wait lifecycle.
+    pub wait_id: AgentLoopWaitId,
+    /// Optimistic wait revision. A newly started wait is revision one.
+    pub revision: u64,
+    /// Owning Thread.
+    pub thread_id: ThreadId,
+    /// Owning running Turn.
+    pub turn_id: TurnId,
+    /// Immutable tenant boundary copied from trusted Thread authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Original authenticated requester that owns the suspended Turn.
+    pub requested_by: ApprovalActor,
+    /// Server-observed wait start in Unix milliseconds.
+    pub server_started_at_ms: u64,
+    /// Optional server-derived expiry in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// Active Turn timeout remaining when the worker suspended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_active_timeout_ms: Option<u64>,
+    /// Full frozen generation needed to continue and later complete safely.
+    pub completion_generation: crate::completion::CompletionGeneration,
+    /// Exact bounded wait reason and correlation coordinates.
+    pub wait_kind: WaitKind,
+    /// Lowercase SHA-256 over every preceding envelope field.
+    pub envelope_sha256: String,
+}
+
+/// Complete Approval Inbox settlement copied into the State journal.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSettlementEvidence {
+    /// Approval Inbox record schema.
+    pub inbox_schema_version: u32,
+    /// Exact immutable request originally submitted to the Inbox.
+    pub request: ApprovalRequest,
+    /// Immutable tenant boundary recorded by the Inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Immutable approval outcome.
+    pub decision: ApprovalDecision,
+    /// Authenticated actor that settled the request.
+    pub decided_by: ApprovalActor,
+    /// Terminal Inbox revision observed by State.
+    pub inbox_revision: u64,
+    /// Inbox submission time in Unix milliseconds.
+    pub requested_at_ms: u64,
+    /// Inbox settlement time in Unix milliseconds.
+    pub settled_at_ms: u64,
+}
+
+/// Evidence that State accepted one exact settlement as a resume command.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeEvidence {
+    /// Wait identity being resumed.
+    pub wait_id: AgentLoopWaitId,
+    /// CAS revision consumed by this command.
+    pub previous_revision: u64,
+    /// New ready revision produced by this command.
+    pub revision: u64,
+    /// Stable caller-supplied idempotency identity.
+    pub command_id: AgentLoopResumeCommandId,
+    /// Lowercase digest of the exact actor-bound command, excluding server time.
+    pub command_sha256: String,
+    /// Complete durable Approval Inbox settlement.
+    pub settlement: ApprovalSettlementEvidence,
+    /// Server acceptance time in Unix milliseconds.
+    pub accepted_at_ms: u64,
+}
+
+/// Evidence that one worker won the CAS claim on a ready execution.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionClaimEvidence {
+    /// Wait identity being claimed.
+    pub wait_id: AgentLoopWaitId,
+    /// CAS revision consumed by this claim.
+    pub previous_revision: u64,
+    /// New executing revision produced by this claim.
+    pub revision: u64,
+    /// Resume command whose settlement made the wait ready.
+    pub resume_command_id: AgentLoopResumeCommandId,
+    /// Stable claimant-supplied identity; a different identity cannot win later.
+    pub claim_id: AgentLoopClaimId,
+    /// Stable worker coordinate that won the claim.
+    ///
+    /// This is deliberately distinct from the user or Turn authority used to
+    /// authorize State access.
+    pub worker_id: AgentLoopWorkerId,
+    /// Lowercase digest of the exact authority- and worker-bound claim,
+    /// excluding server time.
+    pub claim_sha256: String,
+    /// Server claim time in Unix milliseconds.
+    pub claimed_at_ms: u64,
+}
+
+/// Evidence that State atomically closed an unclaimed durable wait and Turn.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitClosureEvidence {
+    /// Wait identity being closed.
+    pub wait_id: AgentLoopWaitId,
+    /// CAS revision consumed by the close command.
+    pub previous_revision: u64,
+    /// Final closed revision produced by the command.
+    pub revision: u64,
+    /// Stable caller-supplied idempotency identity.
+    pub command_id: AgentLoopCloseCommandId,
+    /// Terminal Turn status; only `Cancelled` or `TimedOut` is valid.
+    pub status: TurnStatus,
+    /// Stop reason that must exactly correspond to `status`.
+    pub reason: TurnStopReason,
+    /// Lowercase digest of the exact authority-bound close command,
+    /// excluding server time.
+    pub command_sha256: String,
+    /// Server close time in Unix milliseconds.
+    pub closed_at_ms: u64,
+}
+
+/// Evidence that State atomically consumed a denial and failed a waiting Turn.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitDenialEvidence {
+    /// Wait identity being denied.
+    pub wait_id: AgentLoopWaitId,
+    /// CAS revision consumed by the denial command.
+    pub previous_revision: u64,
+    /// Final denied revision produced by the command.
+    pub revision: u64,
+    /// Stable caller-supplied idempotency identity.
+    pub command_id: AgentLoopDenyCommandId,
+    /// Lowercase digest of the exact authority-bound denial command.
+    pub command_sha256: String,
+    /// Complete immutable Approval Inbox denial copied into State.
+    pub settlement: ApprovalSettlementEvidence,
+    /// Server acceptance and terminal-settlement time in Unix milliseconds.
+    pub denied_at_ms: u64,
+}
+
+/// Deterministic live projection of the latest durable Agent Loop wait.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentLoopExecution {
+    /// No settlement has been accepted for the durable wait.
+    Waiting {
+        /// Immutable suspension capsule.
+        envelope: TurnWaitEnvelope,
+    },
+    /// A settlement was accepted but no worker has claimed execution.
+    Ready {
+        /// Immutable suspension capsule.
+        envelope: TurnWaitEnvelope,
+        /// Exact accepted resume command.
+        resume: ResumeEvidence,
+    },
+    /// One worker claimed execution; this state is never replayed after ambiguity.
+    Executing {
+        /// Immutable suspension capsule.
+        envelope: TurnWaitEnvelope,
+        /// Exact accepted resume command.
+        resume: ResumeEvidence,
+        /// Unique winning execution claim.
+        claim: ExecutionClaimEvidence,
+    },
+}
+
+impl AgentLoopExecution {
+    /// Returns the stable wait identity shared by this lifecycle.
+    #[must_use]
+    pub fn wait_id(&self) -> &AgentLoopWaitId {
+        match self {
+            Self::Waiting { envelope }
+            | Self::Ready { envelope, .. }
+            | Self::Executing { envelope, .. } => &envelope.wait_id,
+        }
+    }
+
+    /// Returns the current optimistic lifecycle revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        match self {
+            Self::Waiting { envelope } => envelope.revision,
+            Self::Ready { resume, .. } => resume.revision,
+            Self::Executing { claim, .. } => claim.revision,
+        }
+    }
+
+    /// Returns the immutable wait envelope.
+    #[must_use]
+    pub fn envelope(&self) -> &TurnWaitEnvelope {
+        match self {
+            Self::Waiting { envelope }
+            | Self::Ready { envelope, .. }
+            | Self::Executing { envelope, .. } => envelope,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -606,6 +838,10 @@ pub enum ItemKind {
         /// Trust-bearing model origin, absent only on legacy imported events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_origin: Option<crate::CapabilityOrigin>,
+        /// SHA-256 of the exact provider-neutral request that produced this
+        /// candidate, absent only on legacy imported events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_request_sha256: Option<String>,
         /// Message text.
         content: String,
     },
@@ -677,6 +913,31 @@ pub enum ItemKind {
         call_id: String,
         /// Approval outcome.
         decision: ApprovalDecision,
+    },
+    /// Model-hidden evidence that a worker atomically entered a durable wait.
+    AgentLoopWaitStarted {
+        /// Complete self-digested suspension capsule.
+        envelope: Box<TurnWaitEnvelope>,
+    },
+    /// Model-hidden evidence that State atomically accepted a resume settlement.
+    AgentLoopResumeAccepted {
+        /// Exact command and Approval Inbox settlement evidence.
+        evidence: Box<ResumeEvidence>,
+    },
+    /// Model-hidden evidence that one worker atomically claimed ready execution.
+    AgentLoopReadyClaimed {
+        /// Unique CAS claim evidence.
+        evidence: Box<ExecutionClaimEvidence>,
+    },
+    /// Model-hidden evidence that State atomically closed a Waiting or Ready Turn.
+    AgentLoopWaitClosed {
+        /// Exact revision-fenced close command evidence.
+        evidence: Box<WaitClosureEvidence>,
+    },
+    /// Model-hidden evidence that State consumed a denial and failed the Turn.
+    AgentLoopWaitDenied {
+        /// Exact revision-fenced denial and Inbox settlement evidence.
+        evidence: Box<WaitDenialEvidence>,
     },
     /// Tool execution settlement.
     ToolResult {
@@ -752,6 +1013,15 @@ pub enum ItemKind {
     VerificationResult {
         /// Registered verifier name.
         verifier: String,
+        /// Exact assistant candidate evaluated by this result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_item_id: Option<ItemId>,
+        /// Trust-bearing verifier origin, absent only on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verifier_origin: Option<crate::CapabilityOrigin>,
+        /// SHA-256 of the frozen verifier contract and origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verifier_binding_sha256: Option<String>,
         /// Completion-condition outcome.
         outcome: VerificationOutcome,
     },
@@ -1324,6 +1594,44 @@ pub struct ModelResponse {
     pub continuation: Option<ModelContinuation>,
 }
 
+/// Provider-neutral policy for selecting a Tool on the initial Model request.
+///
+/// `Required` and `Specific` apply only until the conversation contains a
+/// durable Tool result. Subsequent Agent Loop steps return to `Auto` so a
+/// successful diagnostic call can settle with an ordinary assistant message.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelToolChoice {
+    /// Let the Model choose between assistant text and a Tool call.
+    #[default]
+    Auto,
+    /// Prevent the Model from selecting a Tool.
+    None,
+    /// Require any advertised Tool.
+    Required,
+    /// Require one exact advertised Tool name.
+    Specific {
+        /// Exact registered Tool name.
+        name: String,
+    },
+}
+
+/// Bounded result classification retained by one Tool Trace attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelToolTraceOutcome {
+    /// Provider returned an ordinary assistant message.
+    Message,
+    /// Provider returned one or more structured Tool calls.
+    ToolCall,
+    /// Provider attempt failed before an authoritative Model decision.
+    Failure,
+    /// Owning Turn cancelled the provider attempt.
+    Cancelled,
+    /// Provider attempt exceeded its deadline.
+    TimedOut,
+}
+
 /// Provisional model output emitted before the authoritative response settles.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1339,6 +1647,54 @@ pub enum ModelStreamEvent {
     StepInvalidated {
         /// One-based Agent Loop model-step number.
         model_step: u32,
+    },
+    /// Exact credential-free Tool contract prepared for one Model attempt.
+    ToolTraceRequest {
+        /// One-based Agent Loop model-step number.
+        model_step: u32,
+        /// One-based attempt number within this Model step.
+        attempt: u32,
+        /// Registered Model route identity.
+        model_id: String,
+        /// SHA-256 of the exact provider-neutral Model request.
+        request_sha256: String,
+        /// Bounded prefix of registered Tool names advertised to the Model.
+        tools: Vec<String>,
+        /// Total number of Tool descriptors advertised to the Model.
+        advertised_tool_count: u32,
+        /// Whether `tools` omits names beyond the trace retention bound.
+        tools_truncated: bool,
+        /// Effective Tool selection policy for this attempt.
+        tool_choice: ModelToolChoice,
+    },
+    /// Credential-free settlement evidence for one traced Model attempt.
+    ToolTraceResponse {
+        /// One-based Agent Loop model-step number.
+        model_step: u32,
+        /// One-based attempt number within this Model step.
+        attempt: u32,
+        /// Registered Model route identity.
+        model_id: String,
+        /// Attempt duration in microseconds.
+        duration_micros: u64,
+        /// Bounded settlement classification.
+        outcome: ModelToolTraceOutcome,
+        /// Count of structured Tool calls decoded from the provider response.
+        structured_tool_calls: u32,
+        /// Whether assistant text resembled a serialized Tool call.
+        tool_syntax_in_text: bool,
+        /// Optional Provider-reported Model identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_model: Option<String>,
+        /// Optional opaque Provider request identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_request_id: Option<String>,
+        /// Optional typed provider failure class.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_failure_kind: Option<ModelProviderFailureKind>,
+        /// Optional provider HTTP status code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_status_code: Option<u16>,
     },
 }
 
@@ -1470,6 +1826,60 @@ pub enum StateEvent {
         turn_id: TurnId,
         /// Ordered Tool-call items sharing one batch identity.
         calls: Vec<Item>,
+    },
+    /// Atomically records the original Approval request and durable wait transition.
+    WaitStarted {
+        /// Target running Turn.
+        turn_id: TurnId,
+        /// Original model-hidden Approval request item.
+        approval_requested: Item,
+        /// Model-hidden transition item carrying the complete wait envelope.
+        transition: Item,
+    },
+    /// Atomically records an Approval decision and accepted resume command.
+    AcceptResume {
+        /// Target running Turn.
+        turn_id: TurnId,
+        /// Approval decision copied into ordinary Turn history.
+        approval_decision: Item,
+        /// Model-hidden transition item carrying full settlement evidence.
+        transition: Item,
+    },
+    /// Atomically lets exactly one worker claim a ready execution.
+    ClaimReady {
+        /// Target running Turn.
+        turn_id: TurnId,
+        /// Model-hidden transition item carrying unique claim evidence.
+        transition: Item,
+    },
+    /// Atomically appends stop and closure evidence and settles the Turn.
+    WaitClosed {
+        /// Target Waiting or Ready Turn.
+        turn_id: TurnId,
+        /// Ordinary Turn stop evidence with Approval phase.
+        stopped: Item,
+        /// Model-hidden revision-fenced closure evidence.
+        transition: Item,
+        /// Terminal status corresponding exactly to the stop reason.
+        status: TurnStatus,
+    },
+    /// Atomically records an Approval denial and settles its Turn as failed.
+    DenyWait {
+        /// Target Waiting or denial-ready Turn.
+        turn_id: TurnId,
+        /// Ordinary denial copied into Turn audit history.
+        approval_decision: Item,
+        /// Model-hidden revision-fenced denial and closure evidence.
+        transition: Item,
+    },
+    /// Atomically settles a running Turn as completed with deterministic,
+    /// evidence-bound proof. Failure, cancellation and interruption continue
+    /// to use `TurnFinished` because they do not claim successful completion.
+    TurnCompleted {
+        /// Target Turn.
+        turn_id: TurnId,
+        /// Completion proof validated against the pre-transition running Turn.
+        receipt: crate::completion::CompletionReceipt,
     },
     /// Settles a running turn.
     TurnFinished {
@@ -1815,6 +2225,14 @@ pub enum HarnessError {
     Trace(String),
     /// Agent Loop exhausted its configured step budget.
     MaxSteps(usize),
+    /// Agent Loop repeated an equivalent failure-bearing Tool
+    /// decision/observation cycle without new external information.
+    NoProgress {
+        /// Number of Tool decisions in the repeated cycle.
+        cycle_period: u8,
+        /// Number of complete cycle repetitions observed before settlement.
+        repetitions: u8,
+    },
     /// One Agent Loop step exhausted its Model Provider-call budget.
     MaxModelAttempts(usize),
     /// A caller cancelled the Turn during an external operation.
@@ -1936,6 +2354,13 @@ impl Display for HarnessError {
             ),
             Self::Trace(message) => write!(formatter, "trace error: {message}"),
             Self::MaxSteps(max) => write!(formatter, "agent loop exceeded {max} steps"),
+            Self::NoProgress {
+                cycle_period,
+                repetitions,
+            } => write!(
+                formatter,
+                "agent loop repeated an equivalent failure-bearing Tool cycle of period {cycle_period} {repetitions} times without new information"
+            ),
             Self::MaxModelAttempts(max) => {
                 write!(formatter, "model step exceeded {max} Provider attempts")
             }

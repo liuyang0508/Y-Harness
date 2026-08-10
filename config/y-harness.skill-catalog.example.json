@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "entries": [
+    {
+      "name": "concise-assistant",
+      "version": "1.0.0",
+      "description": "Example concise response instructions",
+      "endpoint": "https://skills.example.com/concise-assistant-1.0.0.signed-skill.json",
+      "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "yanked": false,
+      "tags": [
+        "assistant",
+        "writing"
+      ]
+    },
+    {
+      "name": "research-helper",
+      "version": "1.0.0",
+      "description": "Example evidence-oriented research instructions",
+      "endpoint": "https://skills.example.com/research-helper-1.0.0.signed-skill.json",
+      "content_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "yanked": false,
+      "tags": [
+        "research",
+        "writing"
+      ]
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 
 mod control;
 mod policy;
+mod progress;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -11,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use serde::Serialize;
 use serde_json::Value;
 use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 
@@ -20,20 +22,29 @@ use control::{
     controlled, controlled_with_settlement_cancellation, controlled_with_settlement_grace, deadline,
 };
 pub use policy::{AllowListPolicy, ApprovalHandler, DenyAllApprovals, PolicyEngine};
+pub use progress::{
+    DEFAULT_MAX_FAILURE_CYCLE_REPETITIONS, MAX_FAILURE_CYCLE_REPETITIONS, ProgressPolicy,
+};
+use progress::{ProgressGovernor, ProgressVerdict};
 
 pub use crate::kernel::{LanguageModel, Tool};
 
 use crate::{
-    ActorIdentity, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext,
-    CapabilityOrigin, ConnectorEvidence, ContextBlock, ContextEngine, ContextSource,
-    ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemKind,
-    MemoryContextRecordStatus, MemoryContextStatus, MemoryScope, ModelContinuation, ModelOutput,
-    ModelProviderFailureKind, ModelRegistry, ModelRequest, ModelResponse, ModelStream,
-    ModelToolCall, Observability, ObservationOutcome, PhaseObservation, PolicyDecision,
-    StateCapacity, StateEngine, SteeringId, StoredEvent, Thread, ThreadArchive, ThreadId,
-    ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
-    ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, VerificationOutcome,
-    VerificationRegistry, VerificationRequest,
+    ActorIdentity, AgentLoopClaimId, AgentLoopCloseCommandId, AgentLoopDenyCommandId,
+    AgentLoopExecution, AgentLoopReadyClaimCommand, AgentLoopResumeCommandId,
+    AgentLoopWaitCloseCommand, AgentLoopWaitId, AgentLoopWaitStartCommand, AgentLoopWorkerId,
+    ApprovalDecision, ApprovalId, ApprovalRecord, ApprovalRecordStatus, ApprovalRequest,
+    AuthorityContext, CapabilityOrigin, CompletionAssurance, CompletionContract,
+    CompletionGeneration, ConnectorEvidence, ContextBlock, ContextEngine, ContextSource,
+    ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemId, ItemKind,
+    MAX_AGENT_LOOP_WAIT_MS, MemoryContextRecordStatus, MemoryContextStatus, MemoryScope,
+    ModelContinuation, ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest,
+    ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelToolTraceOutcome,
+    Observability, ObservationOutcome, PhaseObservation, PolicyDecision, ResumeEvidence,
+    StateCapacity, StateEngine, StateEvent, SteeringId, StoredEvent, Thread, ThreadArchive,
+    ThreadId, ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
+    ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, TurnWaitEnvelope,
+    VerificationOutcome, VerificationRegistry, VerificationRequest, WaitKind,
     context::{model_visible_items, validate_turn_context_inputs},
     kernel::{validate_capability_origin, validate_model_id},
 };
@@ -72,6 +83,11 @@ pub const MAX_PARALLEL_TOOL_CALLS: usize = 64;
 const MIN_RUNTIME_GENERAL_EVENTS: u64 = 4;
 const MAX_PENDING_STEERING: usize = 64;
 const MAX_PENDING_STEERING_BYTES: usize = 1_048_576;
+const MAX_TOOL_TRACE_NAMES: usize = 64;
+#[cfg(not(test))]
+const DURABLE_APPROVAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DURABLE_APPROVAL_DELIVERY_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Durable acknowledgement for one Turn steering submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +96,59 @@ pub struct SteeringReceipt {
     pub steering_id: SteeringId,
     /// Exact active Turn that accepted the input.
     pub turn_id: TurnId,
+}
+
+/// Result of an Agent Loop invocation that may release its worker at Approval.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TurnExecutionResult {
+    /// The Turn reached its ordinary successful terminal outcome.
+    Completed(Box<TurnOutcome>),
+    /// The Turn remains running but no in-process worker is retained.
+    Waiting(Box<ApprovalWait>),
+}
+
+/// Descriptive alias for [`TurnExecutionResult`].
+pub type TurnRunProgress = TurnExecutionResult;
+
+/// Durable Approval wait returned after the Runtime releases its worker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalWait {
+    /// Latest authoritative running Turn projection observed by this worker.
+    pub turn: Turn,
+    /// Complete State-authored authority, generation, timeout, and correlation envelope.
+    pub envelope: TurnWaitEnvelope,
+    /// Current cross-domain delivery or Inbox settlement observation.
+    pub status: ApprovalWaitStatus,
+}
+
+/// Runtime observation of the Approval Inbox associated with a durable wait.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalWaitStatus {
+    /// The immutable Approval request is present and awaits a decision.
+    Pending,
+    /// The Inbox already contains a terminal decision ready for explicit resume.
+    Settled,
+    /// The Inbox can no longer settle this request.
+    Orphaned {
+        /// Bounded explanation supplied by the Approval Inbox.
+        reason: String,
+    },
+    /// State is authoritative for the wait, but Inbox convergence must be retried.
+    DeliveryRetry {
+        /// Cross-domain operation that did not complete successfully.
+        operation: ApprovalDeliveryOperation,
+        /// Bounded diagnostic suitable for operator logs.
+        message: String,
+    },
+}
+
+/// Cross-domain Approval Inbox operation requiring an idempotent retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDeliveryOperation {
+    /// Submit or repair the immutable Approval request.
+    Submit,
+    /// Reload the current Approval record.
+    Read,
 }
 
 /// Explicit bounded policy for retrying one Model before Route failover.
@@ -159,6 +228,116 @@ struct ToolCapabilityInvocation {
     call: ModelToolCall,
 }
 
+#[derive(Serialize)]
+struct CompletionModelRouteSnapshot<'a> {
+    entries: Vec<CompletionModelRouteEntry<'a>>,
+    attempt_timeout_ms: Option<u64>,
+    timeout_cooldown_ms: Option<u64>,
+    retry: Option<CompletionModelRetrySnapshot>,
+}
+
+#[derive(Serialize)]
+struct CompletionModelRouteEntry<'a> {
+    model_id: &'a str,
+    origin: &'a CapabilityOrigin,
+}
+
+#[derive(Serialize)]
+struct CompletionModelRetrySnapshot {
+    max_retries: u8,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+}
+
+#[derive(Serialize)]
+struct CompletionToolViewSnapshot<'a> {
+    tools: Vec<CompletionToolBindingSnapshot<'a>>,
+}
+
+#[derive(Serialize)]
+struct CompletionToolBindingSnapshot<'a> {
+    descriptor: &'a crate::ToolDescriptor,
+    origin: &'a CapabilityOrigin,
+    batch_execution: ToolBatchExecution,
+    cancellation_settlement_timeout_ms: u64,
+}
+
+#[derive(Serialize)]
+struct CompletionRuntimeGovernanceSnapshot {
+    max_steps: usize,
+    max_model_attempts_per_step: usize,
+    max_parallel_tool_calls: usize,
+    max_concurrent_turns: usize,
+    max_failure_cycle_repetitions: u8,
+}
+
+#[derive(Clone, Debug)]
+struct ToolCapabilityView {
+    descriptors: Vec<crate::ToolDescriptor>,
+    names: BTreeSet<String>,
+}
+
+impl ToolCapabilityView {
+    fn expose_all(tools: &ToolRegistry) -> Self {
+        let descriptors = tools.descriptors();
+        let names = descriptors
+            .iter()
+            .map(|descriptor| descriptor.name.clone())
+            .collect();
+        Self { descriptors, names }
+    }
+
+    fn select(
+        tools: &ToolRegistry,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<Self, HarnessError> {
+        let mut selected = BTreeSet::new();
+        for name in names {
+            if !selected.insert(name.clone()) {
+                return Err(HarnessError::InvalidConfiguration(format!(
+                    "model-visible Tool {name:?} is selected more than once"
+                )));
+            }
+            if tools.get(&name).is_none() {
+                return Err(HarnessError::InvalidConfiguration(format!(
+                    "model-visible Tool {name:?} is not registered"
+                )));
+            }
+        }
+        let descriptors = tools
+            .descriptors()
+            .into_iter()
+            .filter(|descriptor| selected.contains(&descriptor.name))
+            .collect();
+        Ok(Self {
+            descriptors,
+            names: selected,
+        })
+    }
+
+    fn require(&self, name: &str) -> Result<(), HarnessError> {
+        if self.names.contains(name) {
+            return Ok(());
+        }
+        Err(HarnessError::Model(format!(
+            "model requested Tool {name:?} that was not disclosed in the current capability view"
+        )))
+    }
+
+    fn validate_output(&self, output: &ModelOutput) -> Result<(), HarnessError> {
+        match output {
+            ModelOutput::Message { .. } => Ok(()),
+            ModelOutput::ToolCall { name, .. } => self.require(name),
+            ModelOutput::ToolCalls { calls } => {
+                for call in calls {
+                    self.require(&call.name)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 struct ActiveTurnControl {
     turn_id: TurnId,
     authority: AuthorityContext,
@@ -171,6 +350,7 @@ struct ActiveTurnControl {
 pub struct HarnessRuntime {
     models: ModelRoute,
     tools: ToolRegistry,
+    tool_view: ToolCapabilityView,
     policy: Arc<dyn PolicyEngine>,
     approvals: Arc<dyn ApprovalHandler>,
     state: StateEngine,
@@ -179,9 +359,11 @@ pub struct HarnessRuntime {
     observability: Observability,
     active_threads: Mutex<BTreeSet<ThreadId>>,
     turn_controls: Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
+    worker_id: AgentLoopWorkerId,
     max_concurrent_turns: usize,
     max_parallel_tool_calls: usize,
     max_model_attempts_per_step: usize,
+    progress_policy: ProgressPolicy,
     max_steps: usize,
 }
 
@@ -197,9 +379,11 @@ impl HarnessRuntime {
         policy: Arc<dyn PolicyEngine>,
         state: StateEngine,
     ) -> Self {
+        let tool_view = ToolCapabilityView::expose_all(&tools);
         Self {
             models: ModelRoute::built_in(model),
             tools,
+            tool_view,
             policy,
             approvals: Arc::new(DenyAllApprovals),
             state,
@@ -208,9 +392,11 @@ impl HarnessRuntime {
             observability: Observability::new(),
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
+            worker_id: AgentLoopWorkerId::generate(),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+            progress_policy: ProgressPolicy::default(),
             max_steps: DEFAULT_MAX_AGENT_STEPS,
         }
     }
@@ -240,9 +426,11 @@ impl HarnessRuntime {
         policy: Arc<dyn PolicyEngine>,
         state: StateEngine,
     ) -> Result<Self, HarnessError> {
+        let tool_view = ToolCapabilityView::expose_all(&tools);
         Ok(Self {
             models: ModelRoute::from_registry(models, model_ids)?,
             tools,
+            tool_view,
             policy,
             approvals: Arc::new(DenyAllApprovals),
             state,
@@ -251,9 +439,11 @@ impl HarnessRuntime {
             observability: Observability::new(),
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
+            worker_id: AgentLoopWorkerId::generate(),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+            progress_policy: ProgressPolicy::default(),
             max_steps: DEFAULT_MAX_AGENT_STEPS,
         })
     }
@@ -286,10 +476,43 @@ impl HarnessRuntime {
         self
     }
 
+    /// Freezes the exact registered Tool subset disclosed to every Model step.
+    ///
+    /// Registration remains the executable capability catalog; this view only
+    /// narrows model disclosure and never grants authority. Runtime rejects a
+    /// Model call that is registered but absent from this view before Policy,
+    /// Approval, or Tool execution. An empty view is valid for text-only
+    /// runtimes. Dynamic per-step projection can build on the same execution
+    /// fence without mutating the registry.
+    pub fn with_model_visible_tools<I, S>(mut self, names: I) -> Result<Self, HarnessError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tool_view =
+            ToolCapabilityView::select(&self.tools, names.into_iter().map(Into::into))?;
+        Ok(self)
+    }
+
     #[must_use]
     /// Sets the hard model-step budget within the supported bounded range.
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps.clamp(1, MAX_AGENT_STEPS);
+        self
+    }
+
+    #[must_use]
+    /// Installs the bounded no-progress policy for repeated failure-bearing Tool cycles.
+    ///
+    /// Equivalence covers only structured Tool names, inputs, results, and
+    /// error flags. It never reads or persists model reasoning. New user
+    /// steering, an assistant candidate, verification evidence, or a fully
+    /// successful Tool decision resets failure history. A changed proposal or
+    /// result changes that decision's fingerprint but can still participate in
+    /// a repeated multi-decision cycle. Successful polling remains subject only
+    /// to ordinary Turn budgets.
+    pub fn with_progress_policy(mut self, policy: ProgressPolicy) -> Self {
+        self.progress_policy = policy;
         self
     }
 
@@ -660,6 +883,7 @@ impl HarnessRuntime {
             thread_id: thread_id.clone(),
             status: TurnStatus::Running,
             items: Vec::new(),
+            completion_receipt: None,
         };
         self.state.append_item_as(&turn, queued, authority).await?;
         control.pending_steering_bytes += content.len();
@@ -772,6 +996,26 @@ impl HarnessRuntime {
             .await
     }
 
+    /// Whether the configured Approval boundary can release and later resume
+    /// a worker without retaining an in-process polling task.
+    #[must_use]
+    pub fn supports_durable_wait(&self) -> bool {
+        self.approvals.supports_durable_wait()
+    }
+
+    /// Loads the authoritative live durable-wait lifecycle inside one trusted
+    /// tenant boundary.
+    pub async fn agent_loop_execution_as(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        authority: &AuthorityContext,
+    ) -> Result<Option<AgentLoopExecution>, HarnessError> {
+        self.state
+            .agent_loop_execution_as(thread_id, turn_id, authority)
+            .await
+    }
+
     /// Runs one Turn with an empty memory scope.
     pub async fn run_turn(
         &self,
@@ -807,8 +1051,182 @@ impl HarnessRuntime {
         prompt: impl Into<String>,
         options: TurnExecutionOptions,
     ) -> Result<TurnOutcome, HarnessError> {
-        self.execute_turn(thread_id, TurnEntry::Start(prompt.into()), options)
-            .await
+        completed_turn(
+            self.execute_turn(
+                thread_id,
+                TurnEntry::Start(prompt.into()),
+                options,
+                TurnExecutionMode::Blocking,
+            )
+            .await?,
+        )
+    }
+
+    /// Runs one Turn until completion or a durable Approval worker-release boundary.
+    ///
+    /// `wait_ttl` is the independent wall-clock lifetime of an Approval wait.
+    /// The active Turn timeout in `options` is frozen while the returned wait is
+    /// pending and is restored only after a successful execution claim.
+    /// Worker release currently applies only to one non-batch `ToolCall`;
+    /// `ToolCalls` batches retain the legacy blocking Approval behavior.
+    pub async fn run_turn_until_wait(
+        &self,
+        thread_id: &ThreadId,
+        prompt: impl Into<String>,
+        wait_ttl: Duration,
+    ) -> Result<TurnExecutionResult, HarnessError> {
+        self.run_turn_until_wait_with_options(
+            thread_id,
+            prompt,
+            wait_ttl,
+            TurnExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// Runs one explicitly configured Turn until completion or durable Approval wait.
+    pub async fn run_turn_until_wait_with_options(
+        &self,
+        thread_id: &ThreadId,
+        prompt: impl Into<String>,
+        wait_ttl: Duration,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnExecutionResult, HarnessError> {
+        let wait_ttl = normalize_runtime_wait_ttl(wait_ttl)?;
+        validate_durable_active_timeout(options.timeout)?;
+        self.execute_turn(
+            thread_id,
+            TurnEntry::Start(prompt.into()),
+            options,
+            TurnExecutionMode::Durable {
+                wait_ttl: Some(wait_ttl),
+            },
+        )
+        .await
+    }
+
+    /// Reloads and advances one durable Approval wait if exact settlement exists.
+    ///
+    /// The supplied authority must exactly equal the original authority frozen
+    /// in the State-authored wait envelope. `options.timeout` must be `None`: a
+    /// claimed worker receives only the active timeout remainder stored at
+    /// suspension, never a caller-authored replacement budget.
+    pub async fn resume_wait_with_options(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnExecutionResult, HarnessError> {
+        self.execute_turn(
+            thread_id,
+            TurnEntry::ResumeWait {
+                turn_id: turn_id.clone(),
+                exact: None,
+            },
+            options,
+            TurnExecutionMode::Durable { wait_ttl: None },
+        )
+        .await
+    }
+
+    /// Resumes only the exact durable-wait coordinate observed by a remote
+    /// client, with the lifecycle fence revalidated on every State reload.
+    ///
+    /// A Ready execution accepts either its current revision (the ordinary
+    /// restart-discovery path) or the source Waiting revision (an idempotent
+    /// retry whose first response may have been lost). The wait identity must
+    /// always match. The caller cannot replace the stored active timeout.
+    pub async fn resume_wait_exact_with_options(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        wait_id: &AgentLoopWaitId,
+        expected_revision: u64,
+        options: TurnExecutionOptions,
+    ) -> Result<TurnExecutionResult, HarnessError> {
+        if expected_revision == 0 {
+            return Err(HarnessError::InvalidConfiguration(
+                "durable wait expected revision must be greater than zero".to_owned(),
+            ));
+        }
+        self.execute_turn(
+            thread_id,
+            TurnEntry::ResumeWait {
+                turn_id: turn_id.clone(),
+                exact: Some(DurableWaitResumeFence {
+                    wait_id: wait_id.clone(),
+                    expected_revision,
+                }),
+            },
+            options,
+            TurnExecutionMode::Durable { wait_ttl: None },
+        )
+        .await
+    }
+
+    /// Atomically cancels one exact Waiting or non-denial Ready execution.
+    ///
+    /// The caller supplies the stable close command so a lost protocol reply
+    /// can retry after the Turn is already terminal. State is committed before
+    /// bounded best-effort Inbox cleanup. Executing waits and Ready denials are
+    /// rejected by the authoritative State transition.
+    pub async fn cancel_wait_exact_as(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        wait_id: &AgentLoopWaitId,
+        expected_revision: u64,
+        command_id: AgentLoopCloseCommandId,
+        authority: &AuthorityContext,
+    ) -> Result<StoredEvent, HarnessError> {
+        authority.validate_current("durable wait cancellation authority")?;
+        if expected_revision == 0 {
+            return Err(HarnessError::InvalidConfiguration(
+                "durable wait expected revision must be greater than zero".to_owned(),
+            ));
+        }
+        let thread = self
+            .load_thread_as(thread_id, authority)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let turn = thread
+            .turns
+            .iter()
+            .find(|turn| &turn.id == turn_id)
+            .ok_or_else(|| HarnessError::State(format!("turn {turn_id} does not exist")))?;
+        let envelope = turn_wait_envelope(turn, wait_id)?;
+        if wait_authority(envelope)? != *authority {
+            return Err(HarnessError::Approval(
+                "durable wait cancellation authority differs from the frozen original authority"
+                    .to_owned(),
+            ));
+        }
+        let stored = self
+            .state
+            .close_wait_as(
+                turn,
+                AgentLoopWaitCloseCommand::new(
+                    wait_id.clone(),
+                    expected_revision,
+                    command_id,
+                    TurnStatus::Cancelled,
+                    TurnStopReason::Cancelled,
+                ),
+                authority,
+            )
+            .await?;
+
+        // State is authoritative. Cleanup cannot roll back the terminal CAS
+        // and is independently bounded by the Approval delivery deadline.
+        let _ = self
+            .abandon_durable_approval(
+                thread_id,
+                turn_id,
+                "authoritative durable wait was cancelled before settlement consumption",
+                authority,
+            )
+            .await;
+        Ok(stored)
     }
 
     /// Resumes a running Turn stopped at the durable pre-Tool approval boundary.
@@ -823,12 +1241,15 @@ impl HarnessRuntime {
         turn_id: &TurnId,
         options: TurnExecutionOptions,
     ) -> Result<TurnOutcome, HarnessError> {
-        self.execute_turn(
-            thread_id,
-            TurnEntry::ResumeApproval(turn_id.clone()),
-            options,
+        completed_turn(
+            self.execute_turn(
+                thread_id,
+                TurnEntry::ResumeApproval(turn_id.clone()),
+                options,
+                TurnExecutionMode::Blocking,
+            )
+            .await?,
         )
-        .await
     }
 
     async fn execute_turn(
@@ -836,12 +1257,125 @@ impl HarnessRuntime {
         thread_id: &ThreadId,
         entry: TurnEntry,
         options: TurnExecutionOptions,
-    ) -> Result<TurnOutcome, HarnessError> {
-        self.models.validate()?;
-        let execution_binding = options.validated_execution_binding()?;
-        let memory_scope = options.validated_memory_scope()?;
-        validate_turn_context_inputs(&options.context)?;
-        let deadline = deadline(options.timeout)?;
+        mut mode: TurnExecutionMode,
+    ) -> Result<TurnExecutionResult, HarnessError> {
+        let mut durable_handler_required = mode.is_durable();
+        if let TurnEntry::ResumeWait { turn_id, exact } = &entry {
+            if options.timeout.is_some() {
+                return Err(HarnessError::InvalidConfiguration(
+                    "durable wait resume cannot replace the stored active timeout".to_owned(),
+                ));
+            }
+            let execution = self
+                .state
+                .agent_loop_execution_as(thread_id, turn_id, &options.authority)
+                .await?
+                .ok_or_else(|| {
+                    HarnessError::State(format!(
+                        "turn {turn_id} has no live durable wait in thread {thread_id}"
+                    ))
+                })?;
+            if let Some(exact) = exact {
+                validate_exact_wait_resume(&execution, exact)?;
+            }
+            let envelope = execution.envelope();
+            if envelope.thread_id != *thread_id || envelope.turn_id != *turn_id {
+                return Err(HarnessError::State(
+                    "durable wait coordinates differ from the requested Turn".to_owned(),
+                ));
+            }
+            let original_authority = wait_authority(envelope)?;
+            if options.authority != original_authority {
+                return Err(HarnessError::Approval(
+                    "durable wait resume authority differs from the frozen original authority"
+                        .to_owned(),
+                ));
+            }
+            mode.set_wait_ttl(wait_ttl_from_envelope(envelope)?);
+            durable_handler_required = matches!(execution, AgentLoopExecution::Waiting { .. });
+            let state_accepted_denial = matches!(
+                &execution,
+                AgentLoopExecution::Ready { resume, .. }
+                    if matches!(&resume.settlement.decision, ApprovalDecision::Deny { .. })
+            );
+            let closure = if state_accepted_denial {
+                None
+            } else if options.cancellation.is_cancelled() {
+                Some((
+                    TurnStatus::Cancelled,
+                    TurnStopReason::Cancelled,
+                    HarnessError::Cancelled {
+                        phase: ExecutionPhase::Approval,
+                    },
+                ))
+            } else if envelope
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| crate::kernel::now_ms() >= expires_at_ms)
+            {
+                Some((
+                    TurnStatus::TimedOut,
+                    TurnStopReason::TimedOut,
+                    HarnessError::TimedOut {
+                        phase: ExecutionPhase::Approval,
+                    },
+                ))
+            } else {
+                None
+            };
+            if let Some((status, reason, error)) = closure {
+                if matches!(execution, AgentLoopExecution::Executing { .. }) {
+                    return Err(HarnessError::State(
+                        "an already claimed durable wait cannot use unclaimed closure".to_owned(),
+                    ));
+                }
+                let thread = self
+                    .load_thread_as(thread_id, &options.authority)
+                    .await?
+                    .ok_or_else(|| {
+                        HarnessError::State(format!("thread {thread_id} does not exist"))
+                    })?;
+                let turn = thread
+                    .turns
+                    .iter()
+                    .find(|turn| &turn.id == turn_id && turn.status == TurnStatus::Running)
+                    .ok_or_else(|| HarnessError::State(format!("turn {turn_id} is not running")))?;
+                self.close_durable_wait(
+                    turn,
+                    envelope,
+                    execution.revision(),
+                    status,
+                    reason,
+                    &options.authority,
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+        if !matches!(&entry, TurnEntry::ResumeWait { .. }) {
+            self.models.validate()?;
+        }
+        if durable_handler_required && !self.approvals.supports_durable_wait() {
+            return Err(HarnessError::InvalidConfiguration(
+                "run-until-wait requires a durable Approval handler".to_owned(),
+            ));
+        }
+        let resume_wait_entry = matches!(&entry, TurnEntry::ResumeWait { .. });
+        let execution_binding = if resume_wait_entry {
+            None
+        } else {
+            options.validated_execution_binding()?
+        };
+        let memory_scope = if resume_wait_entry {
+            None
+        } else {
+            validate_turn_context_inputs(&options.context)?;
+            Some(options.validated_memory_scope()?)
+        };
+        let mut deadline = if resume_wait_entry {
+            None
+        } else {
+            deadline(options.timeout)?
+        };
         let existing = self
             .load_thread_as(thread_id, &options.authority)
             .await?
@@ -857,6 +1391,9 @@ impl HarnessRuntime {
         ) = match entry {
             TurnEntry::Start(prompt) => {
                 validate_prompt(&prompt)?;
+                let memory_scope = memory_scope.ok_or_else(|| {
+                    HarnessError::State("new Turn has no validated memory scope".to_owned())
+                })?;
                 let capacity = self
                     .state
                     .thread_capacity_as(thread_id, &options.authority)
@@ -1034,6 +1571,42 @@ impl HarnessRuntime {
                     .await?;
                 (turn, conversation, context, step, call_ids, turn_control)
             }
+            TurnEntry::ResumeWait { turn_id, exact } => {
+                let turn = existing
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == turn_id && turn.status == TurnStatus::Running)
+                    .ok_or_else(|| {
+                        HarnessError::State(format!(
+                            "turn {turn_id} is not the running turn in thread {thread_id}"
+                        ))
+                    })?;
+                let turn_control = self.register_turn_control(turn, options.authority.clone())?;
+                match self
+                    .prepare_durable_wait_resume(thread_id, &turn_id, exact.as_ref(), &options)
+                    .await?
+                {
+                    DurableResumePreparation::Waiting(wait) => {
+                        return Ok(TurnExecutionResult::Waiting(wait));
+                    }
+                    DurableResumePreparation::Claimed {
+                        prepared,
+                        active_deadline,
+                    } => {
+                        deadline = active_deadline;
+                        let (turn, conversation, context, step, call_ids) = *prepared;
+                        (turn, conversation, context, step, call_ids, turn_control)
+                    }
+                }
+            }
+        };
+
+        let mut progress = match ProgressGovernor::from_items(self.progress_policy, &turn.items) {
+            Ok(progress) => progress,
+            Err(error) => {
+                self.settle_error(&mut turn, &error).await?;
+                return Err(error);
+            }
         };
 
         let model_stream = options
@@ -1041,9 +1614,8 @@ impl HarnessRuntime {
             .clone()
             .map_or_else(ModelStream::disabled, ModelStream::new)
             .with_cancellation(options.cancellation.clone());
-        for step in starting_step..self.max_steps {
-            let _ = self
-                .apply_pending_steering(&mut turn, false, &model_stream, None)
+        'agent: for step in starting_step..self.max_steps {
+            self.govern_progress_at_safe_boundary(&mut progress, &mut turn, false)
                 .await?;
             let mut items = conversation_items.clone();
             items.extend(model_visible_items(&turn.items));
@@ -1053,7 +1625,7 @@ impl HarnessRuntime {
                 authority: options.authority.clone(),
                 items,
                 context: context_blocks.clone(),
-                tools: self.tools.descriptors(),
+                tools: self.tool_view.descriptors.clone(),
             };
             let model_request_sha256 = match model_request_sha256(&request) {
                 Ok(value) => value,
@@ -1063,7 +1635,7 @@ impl HarnessRuntime {
                 }
             };
 
-            match self
+            let settled = match self
                 .complete_model_routed(
                     ObservationTarget::new(
                         thread_id,
@@ -1079,12 +1651,37 @@ impl HarnessRuntime {
                 )
                 .await
             {
-                Ok(SettledModelOutput {
+                Ok(settled) => settled,
+                Err(error) => {
+                    self.settle_error(&mut turn, &error).await?;
+                    return Err(error);
+                }
+            };
+            match self
+                .validate_model_output_if_current(
+                    &mut turn,
+                    &model_stream,
+                    u32::try_from(step + 1).unwrap_or(u32::MAX),
+                    &settled.output,
+                )
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    self.settle_error(&mut turn, &error).await?;
+                    return Err(error);
+                }
+            }
+
+            match settled {
+                SettledModelOutput {
                     model_id,
                     model_origin,
+                    model_request_sha256,
                     continuation,
                     output: ModelOutput::Message { content },
-                }) => {
+                } => {
                     let continuation =
                         continuation.map(|continuation| ItemKind::ProviderContinuation {
                             model_id: model_id.clone(),
@@ -1100,6 +1697,7 @@ impl HarnessRuntime {
                             ItemKind::AssistantMessage {
                                 model_id: Some(model_id),
                                 model_origin: Some(model_origin),
+                                model_request_sha256: Some(model_request_sha256.clone()),
                                 content: content.clone(),
                             },
                         )
@@ -1107,6 +1705,14 @@ impl HarnessRuntime {
                     {
                         continue;
                     }
+                    let candidate_item_id =
+                        match current_assistant_candidate(&turn, &model_request_sha256) {
+                            Ok(item_id) => item_id,
+                            Err(error) => {
+                                self.settle_error(&mut turn, &error).await?;
+                                return Err(error);
+                            }
+                        };
                     let verification_request = VerificationRequest {
                         thread_id: thread_id.clone(),
                         turn_id: turn.id.clone(),
@@ -1142,22 +1748,56 @@ impl HarnessRuntime {
                             Err(error) => {
                                 let error =
                                     HarnessError::Verification(format!("{verifier_name}: {error}"));
+                                if self
+                                    .apply_pending_steering(
+                                        &mut turn,
+                                        true,
+                                        &model_stream,
+                                        Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
+                                    )
+                                    .await?
+                                {
+                                    continue 'agent;
+                                }
                                 self.settle_error(&mut turn, &error).await?;
                                 return Err(error);
                             }
                         };
                         if let Err(error) = validate_outcome(&verifier_name, &outcome) {
+                            if self
+                                .apply_pending_steering(
+                                    &mut turn,
+                                    true,
+                                    &model_stream,
+                                    Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
+                                )
+                                .await?
+                            {
+                                continue 'agent;
+                            }
                             self.settle_error(&mut turn, &error).await?;
                             return Err(error);
                         }
-                        self.record(
-                            &mut turn,
-                            ItemKind::VerificationResult {
-                                verifier: verifier_name.clone(),
-                                outcome: outcome.clone(),
-                            },
-                        )
-                        .await?;
+                        if self
+                            .record_verification_result_if_current(
+                                &mut turn,
+                                &model_stream,
+                                u32::try_from(step + 1).unwrap_or(u32::MAX),
+                                &candidate_item_id,
+                                ItemKind::VerificationResult {
+                                    verifier: verifier_name.clone(),
+                                    candidate_item_id: Some(candidate_item_id.clone()),
+                                    verifier_origin: Some(registered.origin.clone()),
+                                    verifier_binding_sha256: Some(
+                                        registered.completion_binding.binding_sha256().to_owned(),
+                                    ),
+                                    outcome: outcome.clone(),
+                                },
+                            )
+                            .await?
+                        {
+                            continue 'agent;
+                        }
                         if let VerificationOutcome::Failed { reason, retryable } = outcome {
                             if retryable {
                                 retry_candidate = true;
@@ -1165,37 +1805,62 @@ impl HarnessRuntime {
                                 let error = HarnessError::Verification(format!(
                                     "{verifier_name}: {reason}"
                                 ));
+                                if self
+                                    .apply_pending_steering(
+                                        &mut turn,
+                                        true,
+                                        &model_stream,
+                                        Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
+                                    )
+                                    .await?
+                                {
+                                    continue 'agent;
+                                }
                                 self.settle_error(&mut turn, &error).await?;
                                 return Err(error);
                             }
                         }
                     }
-                    if self
-                        .apply_pending_steering(
-                            &mut turn,
-                            !retry_candidate,
-                            &model_stream,
-                            Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
-                        )
-                        .await?
-                    {
-                        continue;
-                    }
                     if retry_candidate {
+                        if self
+                            .apply_pending_steering(
+                                &mut turn,
+                                false,
+                                &model_stream,
+                                Some(u32::try_from(step + 1).unwrap_or(u32::MAX)),
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
                         continue;
                     }
-                    self.state
-                        .finish_turn_as(&turn, TurnStatus::Completed, &options.authority)
-                        .await?;
-                    turn.status = TurnStatus::Completed;
-                    return Ok(TurnOutcome {
-                        turn,
-                        final_text: content,
-                    });
+                    match self
+                        .complete_candidate_if_current(
+                            &mut turn,
+                            &model_stream,
+                            u32::try_from(step + 1).unwrap_or(u32::MAX),
+                            &candidate_item_id,
+                        )
+                        .await
+                    {
+                        Ok(Some(final_text)) => {
+                            return Ok(TurnExecutionResult::Completed(Box::new(TurnOutcome {
+                                turn,
+                                final_text,
+                            })));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            self.settle_error(&mut turn, &error).await?;
+                            return Err(error);
+                        }
+                    }
                 }
-                Ok(SettledModelOutput {
+                SettledModelOutput {
                     model_id,
                     model_origin,
+                    model_request_sha256: _,
                     continuation,
                     output:
                         ModelOutput::ToolCall {
@@ -1203,7 +1868,7 @@ impl HarnessRuntime {
                             name,
                             input,
                         },
-                }) => {
+                } => {
                     if tool_call_ids.contains(&call_id) {
                         let error = HarnessError::Model(format!(
                             "model reused Tool call id {call_id:?} within one Turn"
@@ -1238,34 +1903,68 @@ impl HarnessRuntime {
                     }
                     tool_call_ids.insert(call_id.clone());
 
-                    self.authorize_tool_call(
-                        &mut turn,
-                        &ModelToolCall {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
+                    let call = ModelToolCall {
+                        call_id,
+                        name,
+                        input,
+                    };
+                    match mode {
+                        TurnExecutionMode::Blocking => {
+                            self.authorize_tool_call(
+                                &mut turn,
+                                &call,
+                                &self.tool_view,
+                                &model_request_sha256,
+                                &options,
+                                deadline,
+                            )
+                            .await?;
+                        }
+                        TurnExecutionMode::Durable {
+                            wait_ttl: Some(wait_ttl),
+                        } => match self
+                            .authorize_tool_call_until_wait(
+                                &mut turn,
+                                &call,
+                                &self.tool_view,
+                                &model_request_sha256,
+                                &options,
+                                deadline,
+                                wait_ttl,
+                                &model_stream,
+                                u32::try_from(step + 1).unwrap_or(u32::MAX),
+                            )
+                            .await?
+                        {
+                            DurableAuthorization::Authorized => {}
+                            DurableAuthorization::Restart => continue,
+                            DurableAuthorization::Waiting(wait) => {
+                                return Ok(TurnExecutionResult::Waiting(wait));
+                            }
                         },
-                        &model_request_sha256,
-                        &options,
-                        deadline,
-                    )
-                    .await?;
+                        TurnExecutionMode::Durable { wait_ttl: None } => {
+                            return Err(HarnessError::State(
+                                "durable execution has no wall-clock wait lifetime".to_owned(),
+                            ));
+                        }
+                    }
 
                     if self
-                        .supersede_tool_before_effect(&mut turn, &call_id)
+                        .supersede_tool_before_effect(&mut turn, &call.call_id)
                         .await?
                     {
                         continue;
                     }
-                    self.execute_tool_call(&mut turn, &name, call_id, input, &options, deadline)
+                    self.execute_tool_call(&mut turn, call, &self.tool_view, &options, deadline)
                         .await?;
                 }
-                Ok(SettledModelOutput {
+                SettledModelOutput {
                     model_id,
                     model_origin,
+                    model_request_sha256: _,
                     continuation,
                     output: ModelOutput::ToolCalls { calls },
-                }) => {
+                } => {
                     if let Some(call) = calls
                         .iter()
                         .find(|call| tool_call_ids.contains(&call.call_id))
@@ -1318,6 +2017,7 @@ impl HarnessRuntime {
                         self.authorize_tool_call(
                             &mut turn,
                             call,
+                            &self.tool_view,
                             &model_request_sha256,
                             &options,
                             deadline,
@@ -1325,23 +2025,851 @@ impl HarnessRuntime {
                         .await?;
                     }
 
-                    if self
-                        .execute_tool_batch(&mut turn, &calls, &options, deadline)
-                        .await?
-                    {
+                    let superseded = self
+                        .execute_tool_batch(&mut turn, &calls, &self.tool_view, &options, deadline)
+                        .await?;
+                    if superseded {
                         continue;
                     }
-                }
-                Err(error) => {
-                    self.settle_error(&mut turn, &error).await?;
-                    return Err(error);
                 }
             }
         }
 
+        // The last permitted Model step may itself complete the repetition
+        // threshold. Settle that durable evidence before the coarser step
+        // budget so NoProgress retains its more actionable failure reason.
+        self.govern_progress_at_safe_boundary(&mut progress, &mut turn, true)
+            .await?;
         let error = HarnessError::MaxSteps(self.max_steps);
         self.settle_error(&mut turn, &error).await?;
         Err(error)
+    }
+
+    fn completion_generation(
+        &self,
+        turn: &Turn,
+        candidate_item_id: &ItemId,
+    ) -> Result<CompletionGeneration, HarnessError> {
+        require_current_assistant_candidate(turn, candidate_item_id)?;
+        let model_request_sha256 = candidate_model_request_sha256(turn, candidate_item_id)?;
+        self.completion_generation_for_model_request(turn, model_request_sha256)
+    }
+
+    fn completion_generation_for_model_request(
+        &self,
+        turn: &Turn,
+        model_request_sha256: String,
+    ) -> Result<CompletionGeneration, HarnessError> {
+        let mut route_entries = Vec::with_capacity(self.models.entries.len());
+        for entry in &self.models.entries {
+            route_entries.push(CompletionModelRouteEntry {
+                model_id: entry.identity.get()?,
+                origin: &entry.origin,
+            });
+        }
+        let retry = self
+            .models
+            .retry_policy
+            .map(|policy| -> Result<_, HarnessError> {
+                Ok(CompletionModelRetrySnapshot {
+                    max_retries: policy.max_retries(),
+                    initial_delay_ms: duration_millis_u64(
+                        policy.initial_delay(),
+                        "Model initial retry delay",
+                    )?,
+                    max_delay_ms: duration_millis_u64(
+                        policy.max_delay(),
+                        "Model maximum retry delay",
+                    )?,
+                })
+            })
+            .transpose()?;
+        let route = CompletionModelRouteSnapshot {
+            entries: route_entries,
+            attempt_timeout_ms: self
+                .models
+                .attempt_timeout
+                .map(|duration| duration_millis_u64(duration, "Model attempt timeout"))
+                .transpose()?,
+            timeout_cooldown_ms: self
+                .models
+                .timeout_cooldown
+                .map(|duration| duration_millis_u64(duration, "Model timeout cooldown"))
+                .transpose()?,
+            retry,
+        };
+
+        let mut tool_bindings = Vec::with_capacity(self.tool_view.descriptors.len());
+        for descriptor in &self.tool_view.descriptors {
+            let registered = self.tools.get(&descriptor.name).ok_or_else(|| {
+                HarnessError::State(format!(
+                    "frozen Tool view references missing registration {:?}",
+                    descriptor.name
+                ))
+            })?;
+            tool_bindings.push(CompletionToolBindingSnapshot {
+                descriptor,
+                origin: &registered.origin,
+                batch_execution: registered.batch_execution,
+                cancellation_settlement_timeout_ms: duration_millis_u64(
+                    registered.cancellation_settlement_timeout,
+                    "Tool cancellation settlement timeout",
+                )?,
+            });
+        }
+        let tool_view = CompletionToolViewSnapshot {
+            tools: tool_bindings,
+        };
+        let verifier_manifest = self.verification.completion_bindings();
+        let governance = CompletionRuntimeGovernanceSnapshot {
+            max_steps: self.max_steps,
+            max_model_attempts_per_step: self.max_model_attempts_per_step,
+            max_parallel_tool_calls: self.max_parallel_tool_calls,
+            max_concurrent_turns: self.max_concurrent_turns,
+            max_failure_cycle_repetitions: self.progress_policy.max_failure_cycle_repetitions(),
+        };
+
+        let mut execution_bindings = turn
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, ItemKind::ExecutionBinding { .. }));
+        let execution_binding_sha256 = execution_bindings
+            .next()
+            .map(crate::completion_execution_binding_sha256)
+            .transpose()?;
+        if execution_bindings.next().is_some() {
+            return Err(HarnessError::State(
+                "completion Turn contains multiple ExecutionBinding Items".to_owned(),
+            ));
+        }
+        let assurance = if execution_binding_sha256.is_some() {
+            CompletionAssurance::DeploymentBound
+        } else {
+            CompletionAssurance::RuntimeMeasured
+        };
+
+        CompletionGeneration::new(
+            model_request_sha256,
+            crate::completion_model_route_sha256(&route)?,
+            crate::completion_tool_view_sha256(&tool_view)?,
+            crate::completion_verifier_manifest_sha256(&verifier_manifest)?,
+            crate::completion_runtime_governance_sha256(&governance)?,
+            execution_binding_sha256,
+            assurance,
+        )
+    }
+
+    async fn complete_candidate_if_current(
+        &self,
+        turn: &mut Turn,
+        model_stream: &ModelStream,
+        model_step: u32,
+        candidate_item_id: &ItemId,
+    ) -> Result<Option<String>, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty() {
+            if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+                control.accepting_steering = false;
+                return Err(error);
+            }
+            model_stream.invalidate_step(model_step);
+            return Ok(None);
+        }
+        if let Err(error) = require_current_assistant_candidate(turn, candidate_item_id) {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+
+        // Sealing and the atomic State transition stay inside the same Turn
+        // critical section. A later steering submission must therefore observe
+        // either the applied correction or a terminally sealed Turn.
+        control.accepting_steering = false;
+        let generation = self.completion_generation(turn, candidate_item_id)?;
+        let receipt = crate::build_completion_receipt(
+            turn,
+            &control.authority,
+            candidate_item_id,
+            generation,
+            CompletionContract::v1_no_external_requirements(),
+        )?;
+        let final_text = durable_candidate_text(turn, receipt.candidate_item_id())?;
+        self.state
+            .complete_turn_as(turn, receipt.clone(), &control.authority)
+            .await?;
+        turn.status = TurnStatus::Completed;
+        turn.completion_receipt = Some(receipt);
+        Ok(Some(final_text))
+    }
+
+    async fn govern_progress_at_safe_boundary(
+        &self,
+        progress: &mut ProgressGovernor,
+        turn: &mut Turn,
+        seal_if_continue: bool,
+    ) -> Result<(), HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty()
+            && let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await
+        {
+            control.accepting_steering = false;
+            drop(control);
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
+        let verdict = match progress.advance(&turn.items) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                control.accepting_steering = false;
+                drop(control);
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
+        };
+        let ProgressVerdict::Stop {
+            cycle_period,
+            repetitions,
+        } = verdict
+        else {
+            if seal_if_continue {
+                // A terminal caller must close steering in the same critical
+                // section that consumed it. Otherwise a submission could be
+                // accepted between this boundary and terminal settlement.
+                control.accepting_steering = false;
+            }
+            return Ok(());
+        };
+        let error = HarnessError::NoProgress {
+            cycle_period,
+            repetitions,
+        };
+        control.accepting_steering = false;
+        drop(control);
+        self.settle_error(turn, &error).await?;
+        Err(error)
+    }
+
+    async fn prepare_durable_wait_resume(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        exact: Option<&DurableWaitResumeFence>,
+        options: &TurnExecutionOptions,
+    ) -> Result<DurableResumePreparation, HarnessError> {
+        let thread = self
+            .load_thread_as(thread_id, &options.authority)
+            .await?
+            .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+        let mut running = thread
+            .turns
+            .iter()
+            .filter(|turn| turn.status == TurnStatus::Running);
+        let mut turn = running
+            .next()
+            .filter(|turn| &turn.id == turn_id)
+            .cloned()
+            .ok_or_else(|| {
+                HarnessError::State(format!(
+                    "turn {turn_id} is not the running turn in thread {thread_id}"
+                ))
+            })?;
+        if running.next().is_some() {
+            return Err(HarnessError::State(
+                "thread projection contains multiple running turns".to_owned(),
+            ));
+        }
+
+        let execution = self
+            .state
+            .agent_loop_execution_as(thread_id, turn_id, &options.authority)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::State(format!("turn {turn_id} has no live durable wait"))
+            })?;
+        if let Some(exact) = exact {
+            validate_exact_wait_resume(&execution, exact)?;
+        }
+        if matches!(execution, AgentLoopExecution::Executing { .. }) {
+            return Err(HarnessError::State(
+                "durable wait was already claimed; generic replay after a possibly started effect is forbidden"
+                    .to_owned(),
+            ));
+        }
+        let envelope = execution.envelope().clone();
+        if wait_authority(&envelope)? != options.authority {
+            return Err(HarnessError::Approval(
+                "durable wait execution authority differs from the frozen original authority"
+                    .to_owned(),
+            ));
+        }
+        let accepted_denial = if let AgentLoopExecution::Ready { resume, .. } = &execution
+            && let ApprovalDecision::Deny { reason } = &resume.settlement.decision
+        {
+            Some((approval_record_from_resume(resume)?, reason.clone()))
+        } else {
+            None
+        };
+        if let Some((record, reason)) = accepted_denial {
+            let tool = record.request.authorization.descriptor.name.clone();
+            self.deny_durable_wait(&turn, &envelope, execution, &record, &options.authority)
+                .await?;
+            return Err(HarnessError::ApprovalDenied { tool, reason });
+        }
+        if options.cancellation.is_cancelled() {
+            self.close_durable_wait(
+                &turn,
+                &envelope,
+                execution.revision(),
+                TurnStatus::Cancelled,
+                TurnStopReason::Cancelled,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        if envelope
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| crate::kernel::now_ms() >= expires_at_ms)
+        {
+            self.close_durable_wait(
+                &turn,
+                &envelope,
+                execution.revision(),
+                TurnStatus::TimedOut,
+                TurnStopReason::TimedOut,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::TimedOut {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        let (request, envelope_model_request_sha256) = match &envelope.wait_kind {
+            WaitKind::Approval {
+                request,
+                model_request_sha256,
+            } => (request.clone(), model_request_sha256.clone()),
+        };
+
+        let record = if let AgentLoopExecution::Ready { resume, .. } = &execution {
+            approval_record_from_resume(resume)?
+        } else {
+            if let Err(error) = self
+                .submit_durable_approval(&request, &options.authority)
+                .await
+            {
+                return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                    turn,
+                    envelope,
+                    status: delivery_retry(ApprovalDeliveryOperation::Submit, &error),
+                })));
+            }
+            let record = match self
+                .read_durable_approval(&request, &options.authority)
+                .await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                        turn,
+                        envelope,
+                        status: ApprovalWaitStatus::DeliveryRetry {
+                            operation: ApprovalDeliveryOperation::Read,
+                            message:
+                                "Approval request is absent after idempotent repair submission"
+                                    .to_owned(),
+                        },
+                    })));
+                }
+                Err(error) => {
+                    return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                        turn,
+                        envelope,
+                        status: delivery_retry(ApprovalDeliveryOperation::Read, &error),
+                    })));
+                }
+            };
+            let inbox_status = match approval_wait_status(&record, &request, &options.authority) {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                        turn,
+                        envelope,
+                        status: delivery_retry(ApprovalDeliveryOperation::Read, &error),
+                    })));
+                }
+            };
+            match inbox_status {
+                ApprovalWaitStatus::Pending | ApprovalWaitStatus::Orphaned { .. } => {
+                    return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                        turn,
+                        envelope,
+                        status: inbox_status,
+                    })));
+                }
+                ApprovalWaitStatus::Settled => {}
+                ApprovalWaitStatus::DeliveryRetry { .. } => {
+                    return Ok(DurableResumePreparation::Waiting(Box::new(ApprovalWait {
+                        turn,
+                        envelope,
+                        status: inbox_status,
+                    })));
+                }
+            }
+            record
+        };
+
+        let settlement_decision = settled_approval_decision(&record)?;
+        if matches!(&settlement_decision, ApprovalDecision::Approve) {
+            let capacity = self
+                .state
+                .thread_capacity_as(thread_id, &options.authority)
+                .await?
+                .ok_or_else(|| HarnessError::State(format!("thread {thread_id} does not exist")))?;
+            require_runtime_capacity(&capacity)?;
+        }
+
+        if let ApprovalDecision::Deny { reason } = &settlement_decision {
+            self.deny_durable_wait(&turn, &envelope, execution, &record, &options.authority)
+                .await?;
+            return Err(HarnessError::ApprovalDenied {
+                tool: request.authorization.descriptor.name.clone(),
+                reason: reason.clone(),
+            });
+        }
+
+        let boundary_turn = turn_at_wait_boundary(&turn, &envelope)?;
+        let evidence = approval_resume_evidence(&boundary_turn, &envelope.requested_by)?;
+        if evidence.batch_calls.len() != 1 || evidence.current_batch_index != 0 {
+            return Err(HarnessError::State(
+                "durable Approval resume accepts only one non-batch Tool call".to_owned(),
+            ));
+        }
+        validate_durable_approval_evidence(&evidence, &request, &envelope_model_request_sha256)?;
+        let memory_scope = options.validated_memory_scope()?;
+        validate_turn_context_inputs(&options.context)?;
+        let _ = options.validated_execution_binding()?;
+        require_execution_binding(&boundary_turn, options.execution_binding.as_ref())?;
+        self.models.validate()?;
+        if !self
+            .models
+            .contains(&evidence.model_id, &evidence.model_origin)
+        {
+            return Err(HarnessError::State(
+                "approval continuation Model identity or origin is absent from the configured route"
+                    .to_owned(),
+            ));
+        }
+        if !self.tool_view.names.contains(&evidence.tool) {
+            return Err(HarnessError::State(
+                "approval continuation Tool is absent from the active capability view".to_owned(),
+            ));
+        }
+        let registered = self.tools.get(&evidence.tool).ok_or_else(|| {
+            HarnessError::State(format!(
+                "approval continuation Tool {} is not registered",
+                evidence.tool
+            ))
+        })?;
+        if registered.origin != evidence.tool_origin {
+            return Err(HarnessError::State(
+                "approval continuation Tool origin changed after suspension".to_owned(),
+            ));
+        }
+        let reconstructed_request = ApprovalRequest {
+            id: evidence.approval_id.clone(),
+            requested_by: evidence.requested_by.clone(),
+            authorization: ToolAuthorization {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                call_id: evidence.call_id.clone(),
+                descriptor: registered.descriptor.clone(),
+                origin: registered.origin.clone(),
+                input: evidence.input.clone(),
+            },
+            reason: evidence.reason.clone(),
+            risk: evidence.risk,
+        };
+        if reconstructed_request != request {
+            return Err(HarnessError::State(
+                "durable Approval request differs from its original Turn evidence".to_owned(),
+            ));
+        }
+
+        let mut prior_thread = thread.clone();
+        prior_thread
+            .turns
+            .retain(|candidate| &candidate.id != turn_id);
+        let conversation = self.context.compile_conversation(&prior_thread)?;
+        let prompt = turn_prompt(&boundary_turn)?;
+        let conversation_summary = if let Some(compactor) =
+            self.context.conversation_compactor_name(&conversation)
+        {
+            match self
+                .controlled_observed(
+                    ObservationTarget::new(thread_id, turn_id, compactor, ExecutionPhase::Context),
+                    &options.cancellation,
+                    None,
+                    || {
+                        self.context.compile_conversation_summary(
+                            &conversation,
+                            &prompt,
+                            options.cancellation.clone(),
+                        )
+                    },
+                )
+                .await
+            {
+                Ok(summary) => summary,
+                Err(error @ HarnessError::Cancelled { .. }) => {
+                    self.close_durable_wait(
+                        &turn,
+                        &envelope,
+                        execution.revision(),
+                        TurnStatus::Cancelled,
+                        TurnStopReason::Cancelled,
+                        &options.authority,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let compilation = match self
+            .controlled_observed(
+                ObservationTarget::new(
+                    thread_id,
+                    turn_id,
+                    "context-engine",
+                    ExecutionPhase::Context,
+                ),
+                &options.cancellation,
+                None,
+                || self.context.compile(&prompt, memory_scope),
+            )
+            .await
+        {
+            Ok(compilation) => compilation,
+            Err(error @ HarnessError::Cancelled { .. }) => {
+                self.close_durable_wait(
+                    &turn,
+                    &envelope,
+                    execution.revision(),
+                    TurnStatus::Cancelled,
+                    TurnStopReason::Cancelled,
+                    &options.authority,
+                )
+                .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let compilation = self
+            .context
+            .merge_conversation_summary(compilation, conversation_summary)?;
+        let compilation = self
+            .context
+            .merge_turn_context(compilation, &options.context)?;
+        let mut original_items = conversation.items.clone();
+        original_items.extend(model_visible_items(
+            &boundary_turn.items[..evidence.model_request_item_index],
+        ));
+        let original_request = ModelRequest {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            authority: options.authority.clone(),
+            items: original_items,
+            context: compilation.blocks.clone(),
+            tools: self.tool_view.descriptors.clone(),
+        };
+        if model_request_sha256(&original_request)? != evidence.model_request_sha256 {
+            return Err(HarnessError::State(
+                "durable approval continuation Model request changed after suspension".to_owned(),
+            ));
+        }
+        let generation = self.completion_generation_for_model_request(
+            &boundary_turn,
+            evidence.model_request_sha256.clone(),
+        )?;
+        if generation != envelope.completion_generation {
+            return Err(HarnessError::State(
+                "durable approval continuation generation changed after suspension".to_owned(),
+            ));
+        }
+        self.accept_and_claim_durable_wait(&mut turn, &envelope, execution, &record, options)
+            .await?;
+        let active_deadline = deadline_from_remaining(envelope.remaining_active_timeout_ms)?;
+        let call = evidence.batch_calls[0].clone();
+        if !self
+            .supersede_tool_before_effect(&mut turn, &call.call_id)
+            .await?
+        {
+            self.execute_tool_call(&mut turn, call, &self.tool_view, options, active_deadline)
+                .await?;
+        }
+
+        Ok(DurableResumePreparation::Claimed {
+            prepared: Box::new((
+                turn,
+                conversation.items,
+                compilation.blocks,
+                evidence.consumed_steps,
+                evidence.tool_call_ids,
+            )),
+            active_deadline,
+        })
+    }
+
+    async fn deny_durable_wait(
+        &self,
+        turn: &Turn,
+        envelope: &TurnWaitEnvelope,
+        execution: AgentLoopExecution,
+        record: &ApprovalRecord,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
+        let command_id = deterministic_denial_command_id(envelope, record)?;
+        self.state
+            .deny_wait_as(
+                turn,
+                &envelope.wait_id,
+                execution.revision(),
+                command_id,
+                record,
+                authority,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn accept_and_claim_durable_wait(
+        &self,
+        turn: &mut Turn,
+        envelope: &TurnWaitEnvelope,
+        execution: AgentLoopExecution,
+        record: &ApprovalRecord,
+        options: &TurnExecutionOptions,
+    ) -> Result<(), HarnessError> {
+        if options.cancellation.is_cancelled() {
+            self.close_durable_wait(
+                turn,
+                envelope,
+                execution.revision(),
+                TurnStatus::Cancelled,
+                TurnStopReason::Cancelled,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        if envelope
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| crate::kernel::now_ms() >= expires_at_ms)
+        {
+            self.close_durable_wait(
+                turn,
+                envelope,
+                execution.revision(),
+                TurnStatus::TimedOut,
+                TurnStopReason::TimedOut,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::TimedOut {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        let resume = match execution {
+            AgentLoopExecution::Waiting { .. } => {
+                let command_id = deterministic_resume_command_id(envelope, record)?;
+                let stored = self
+                    .state
+                    .accept_resume_as(
+                        turn,
+                        &envelope.wait_id,
+                        envelope.revision,
+                        command_id,
+                        record,
+                        &options.authority,
+                    )
+                    .await?;
+                let (approval_decision, transition, resume) = resume_accepted_event(stored, turn)?;
+                turn.items.push(approval_decision);
+                turn.items.push(transition);
+                resume
+            }
+            AgentLoopExecution::Ready { resume, .. } => {
+                validate_ready_settlement(&resume, record)?;
+                resume
+            }
+            AgentLoopExecution::Executing { .. } => {
+                return Err(HarnessError::State(
+                    "durable execution claim changed during resume".to_owned(),
+                ));
+            }
+        };
+        if options.cancellation.is_cancelled() {
+            self.close_durable_wait(
+                turn,
+                envelope,
+                resume.revision,
+                TurnStatus::Cancelled,
+                TurnStopReason::Cancelled,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::Cancelled {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        if envelope
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| crate::kernel::now_ms() >= expires_at_ms)
+        {
+            self.close_durable_wait(
+                turn,
+                envelope,
+                resume.revision,
+                TurnStatus::TimedOut,
+                TurnStopReason::TimedOut,
+                &options.authority,
+            )
+            .await?;
+            return Err(HarnessError::TimedOut {
+                phase: ExecutionPhase::Approval,
+            });
+        }
+        let stored = self
+            .state
+            .claim_ready_as(
+                turn,
+                AgentLoopReadyClaimCommand::new(
+                    envelope.wait_id.clone(),
+                    resume.revision,
+                    resume.command_id.clone(),
+                    AgentLoopClaimId::generate(),
+                    self.worker_id.clone(),
+                ),
+                &options.authority,
+            )
+            .await?;
+        turn.items.push(ready_claimed_event(stored, turn)?);
+        Ok(())
+    }
+
+    async fn close_durable_wait(
+        &self,
+        turn: &Turn,
+        envelope: &TurnWaitEnvelope,
+        expected_revision: u64,
+        status: TurnStatus,
+        reason: TurnStopReason,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
+        self.state
+            .close_wait_as(
+                turn,
+                AgentLoopWaitCloseCommand::new(
+                    envelope.wait_id.clone(),
+                    expected_revision,
+                    AgentLoopCloseCommandId::generate(),
+                    status,
+                    reason,
+                ),
+                authority,
+            )
+            .await?;
+
+        // State is authoritative. Inbox cleanup is bounded and deliberately
+        // failure-tolerant so a closed wait can never be resurrected by a
+        // delivery outage or a late settlement.
+        let _ = self
+            .abandon_durable_approval(
+                &turn.thread_id,
+                &turn.id,
+                "authoritative durable wait was closed before settlement consumption",
+                authority,
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn submit_durable_approval(
+        &self,
+        request: &ApprovalRequest,
+        authority: &AuthorityContext,
+    ) -> Result<ApprovalRecord, HarnessError> {
+        let cancellation = crate::CancellationToken::new();
+        let delivery_deadline = deadline(Some(DURABLE_APPROVAL_DELIVERY_TIMEOUT))?;
+        self.controlled_observed(
+            ObservationTarget::new(
+                &request.authorization.thread_id,
+                &request.authorization.turn_id,
+                "approval-handler-submit",
+                ExecutionPhase::Approval,
+            ),
+            &cancellation,
+            delivery_deadline,
+            || self.approvals.submit_wait_as(request, authority),
+        )
+        .await
+    }
+
+    async fn read_durable_approval(
+        &self,
+        request: &ApprovalRequest,
+        authority: &AuthorityContext,
+    ) -> Result<Option<ApprovalRecord>, HarnessError> {
+        let cancellation = crate::CancellationToken::new();
+        let delivery_deadline = deadline(Some(DURABLE_APPROVAL_DELIVERY_TIMEOUT))?;
+        self.controlled_observed(
+            ObservationTarget::new(
+                &request.authorization.thread_id,
+                &request.authorization.turn_id,
+                "approval-handler-read",
+                ExecutionPhase::Approval,
+            ),
+            &cancellation,
+            delivery_deadline,
+            || self.approvals.get_wait_as(&request.id, authority),
+        )
+        .await
+    }
+
+    async fn abandon_durable_approval(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        reason: &str,
+        authority: &AuthorityContext,
+    ) -> Result<(), HarnessError> {
+        let cancellation = crate::CancellationToken::new();
+        let delivery_deadline = deadline(Some(DURABLE_APPROVAL_DELIVERY_TIMEOUT))?;
+        self.controlled_observed(
+            ObservationTarget::new(
+                thread_id,
+                turn_id,
+                "approval-handler-abandon",
+                ExecutionPhase::Approval,
+            ),
+            &cancellation,
+            delivery_deadline,
+            || {
+                self.approvals
+                    .abandon_turn_as(thread_id, turn_id, reason, authority)
+            },
+        )
+        .await
     }
 
     async fn prepare_approval_resume(
@@ -1388,7 +2916,12 @@ impl HarnessRuntime {
         {
             return Err(HarnessError::State(
                 "approval continuation Model identity or origin is absent from the configured route"
-                    .to_owned(),
+                .to_owned(),
+            ));
+        }
+        if !self.tool_view.names.contains(&evidence.tool) {
+            return Err(HarnessError::State(
+                "approval continuation Tool is absent from the active capability view".to_owned(),
             ));
         }
         let registered = self.tools.get(&evidence.tool).ok_or_else(|| {
@@ -1456,7 +2989,7 @@ impl HarnessRuntime {
             authority: options.authority.clone(),
             items: original_items,
             context: compilation.blocks.clone(),
-            tools: self.tools.descriptors(),
+            tools: self.tool_view.descriptors.clone(),
         };
         if model_request_sha256(&original_request)? != evidence.model_request_sha256 {
             return Err(HarnessError::State(
@@ -1515,6 +3048,7 @@ impl HarnessRuntime {
             self.authorize_tool_call(
                 &mut turn,
                 call,
+                &self.tool_view,
                 &evidence.model_request_sha256,
                 options,
                 deadline,
@@ -1527,7 +3061,13 @@ impl HarnessRuntime {
             &self.tools,
         )?;
         let _ = self
-            .execute_tool_batch(&mut turn, &evidence.batch_calls, options, deadline)
+            .execute_tool_batch(
+                &mut turn,
+                &evidence.batch_calls,
+                &self.tool_view,
+                options,
+                deadline,
+            )
             .await?;
 
         Ok((
@@ -1542,21 +3082,19 @@ impl HarnessRuntime {
     async fn execute_tool_call(
         &self,
         turn: &mut Turn,
-        name: &str,
-        call_id: String,
-        input: Value,
+        call: ModelToolCall,
+        tool_view: &ToolCapabilityView,
         options: &TurnExecutionOptions,
         deadline: Option<Instant>,
     ) -> Result<(), HarnessError> {
+        if let Err(error) = tool_view.require(&call.name) {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
         let registered = self
             .tools
-            .get(name)
-            .ok_or_else(|| HarnessError::UnknownTool(name.to_owned()))?;
-        let call = ModelToolCall {
-            call_id,
-            name: name.to_owned(),
-            input,
-        };
+            .get(&call.name)
+            .ok_or_else(|| HarnessError::UnknownTool(call.name.clone()))?;
         match invoke_tool_capability(
             ToolCapabilityInvocation {
                 tool: registered.tool.clone(),
@@ -1585,9 +3123,16 @@ impl HarnessRuntime {
         &self,
         turn: &mut Turn,
         calls: &[ModelToolCall],
+        tool_view: &ToolCapabilityView,
         options: &TurnExecutionOptions,
         deadline: Option<Instant>,
     ) -> Result<bool, HarnessError> {
+        for call in calls {
+            if let Err(error) = tool_view.require(&call.name) {
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
+        }
         let mut index = 0;
         while index < calls.len() {
             let registered = self
@@ -1608,15 +3153,8 @@ impl HarnessRuntime {
                     return Ok(true);
                 }
                 let call = &calls[index];
-                self.execute_tool_call(
-                    turn,
-                    &call.name,
-                    call.call_id.clone(),
-                    call.input.clone(),
-                    options,
-                    deadline,
-                )
-                .await?;
+                self.execute_tool_call(turn, call.clone(), tool_view, options, deadline)
+                    .await?;
                 index += 1;
                 continue;
             }
@@ -1642,18 +3180,17 @@ impl HarnessRuntime {
             }
             if end == index + 1 {
                 let call = &calls[index];
-                self.execute_tool_call(
+                self.execute_tool_call(turn, call.clone(), tool_view, options, deadline)
+                    .await?;
+            } else {
+                self.execute_parallel_tool_calls(
                     turn,
-                    &call.name,
-                    call.call_id.clone(),
-                    call.input.clone(),
+                    &calls[index..end],
+                    tool_view,
                     options,
                     deadline,
                 )
                 .await?;
-            } else {
-                self.execute_parallel_tool_calls(turn, &calls[index..end], options, deadline)
-                    .await?;
             }
             index = end;
         }
@@ -1664,11 +3201,16 @@ impl HarnessRuntime {
         &self,
         turn: &mut Turn,
         calls: &[ModelToolCall],
+        tool_view: &ToolCapabilityView,
         options: &TurnExecutionOptions,
         deadline: Option<Instant>,
     ) -> Result<(), HarnessError> {
         let mut jobs = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().cloned().enumerate() {
+            if let Err(error) = tool_view.require(&call.name) {
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
             let Some(registered) = self.tools.get(&call.name) else {
                 let error = HarnessError::UnknownTool(call.name);
                 self.settle_error(turn, &error).await?;
@@ -1783,14 +3325,281 @@ impl HarnessRuntime {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize_tool_call_until_wait(
+        &self,
+        turn: &mut Turn,
+        call: &ModelToolCall,
+        tool_view: &ToolCapabilityView,
+        model_request_sha256: &str,
+        options: &TurnExecutionOptions,
+        deadline: Option<Instant>,
+        wait_ttl: Duration,
+        model_stream: &ModelStream,
+        model_step: u32,
+    ) -> Result<DurableAuthorization, HarnessError> {
+        if let Err(error) = tool_view.require(&call.name) {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
+        let Some(registered) = self.tools.get(&call.name) else {
+            let error = HarnessError::UnknownTool(call.name.clone());
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        };
+        let authorization = ToolAuthorization {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.id.clone(),
+            call_id: call.call_id.clone(),
+            descriptor: registered.descriptor.clone(),
+            origin: registered.origin.clone(),
+            input: call.input.clone(),
+        };
+        let decision = match self
+            .controlled_observed(
+                ObservationTarget::new(
+                    &turn.thread_id,
+                    &turn.id,
+                    "policy-engine",
+                    ExecutionPhase::Policy,
+                ),
+                &options.cancellation,
+                deadline,
+                || self.policy.authorize(&authorization, &options.authority),
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.settle_error(turn, &error).await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_policy_decision(&decision) {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
+        if !matches!(&decision, PolicyDecision::Ask { .. }) {
+            self.record(
+                turn,
+                ItemKind::PolicyDecision {
+                    call_id: call.call_id.clone(),
+                    tool_origin: Some(authorization.origin.clone()),
+                    decision: decision.clone(),
+                },
+            )
+            .await?;
+        }
+
+        match decision {
+            PolicyDecision::Allow => Ok(DurableAuthorization::Authorized),
+            PolicyDecision::Deny { reason } => {
+                let error = HarnessError::PolicyDenied {
+                    tool: call.name.clone(),
+                    reason,
+                };
+                self.settle_error(turn, &error).await?;
+                Err(error)
+            }
+            PolicyDecision::Ask { reason, risk } => {
+                let control = self.turn_control(&turn.thread_id)?;
+                let mut control = control.lock().await;
+                require_control_turn(&control, turn)?;
+                if !control.pending_steering.is_empty() {
+                    if let Err(error) = self
+                        .record_unlocked(
+                            turn,
+                            superseded_tool_result(&call.call_id),
+                            &control.authority,
+                        )
+                        .await
+                    {
+                        control.accepting_steering = false;
+                        return Err(error);
+                    }
+                    if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await
+                    {
+                        control.accepting_steering = false;
+                        return Err(error);
+                    }
+                    model_stream.invalidate_step(model_step);
+                    return Ok(DurableAuthorization::Restart);
+                }
+                if let Err(error) = self
+                    .record_unlocked(
+                        turn,
+                        ItemKind::PolicyDecision {
+                            call_id: call.call_id.clone(),
+                            tool_origin: Some(authorization.origin.clone()),
+                            decision: PolicyDecision::Ask {
+                                reason: reason.clone(),
+                                risk,
+                            },
+                        },
+                        &control.authority,
+                    )
+                    .await
+                {
+                    control.accepting_steering = false;
+                    return Err(error);
+                }
+                let request = ApprovalRequest {
+                    id: ApprovalId::generate(),
+                    requested_by: options.authority.actor().clone(),
+                    authorization,
+                    reason,
+                    risk,
+                };
+                let generation = match self
+                    .completion_generation_for_model_request(turn, model_request_sha256.to_owned())
+                {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        control.accepting_steering = false;
+                        drop(control);
+                        self.settle_error(turn, &error).await?;
+                        return Err(error);
+                    }
+                };
+                if options.cancellation.is_cancelled() {
+                    let error = HarnessError::Cancelled {
+                        phase: ExecutionPhase::Approval,
+                    };
+                    control.accepting_steering = false;
+                    drop(control);
+                    self.settle_error(turn, &error).await?;
+                    return Err(error);
+                }
+                let remaining_active_timeout_ms =
+                    match remaining_active_timeout_ms(deadline, ExecutionPhase::Approval) {
+                        Ok(remaining) => remaining,
+                        Err(error) => {
+                            control.accepting_steering = false;
+                            drop(control);
+                            self.settle_error(turn, &error).await?;
+                            return Err(error);
+                        }
+                    };
+
+                // Sealing and the authoritative wait transition share the same
+                // Turn-control section. Steering can observe either its own
+                // durable application or a sealed worker-release boundary.
+                control.accepting_steering = false;
+                let authority = control.authority.clone();
+                let wait_id = AgentLoopWaitId::generate();
+                let envelope = match self
+                    .state
+                    .start_approval_wait_as(
+                        turn,
+                        AgentLoopWaitStartCommand::new(
+                            wait_id.clone(),
+                            request.clone(),
+                            generation.clone(),
+                            Some(wait_ttl),
+                            remaining_active_timeout_ms,
+                        ),
+                        &authority,
+                    )
+                    .await
+                {
+                    Ok(stored) => {
+                        let (approval_requested, transition, envelope) =
+                            wait_started_event(stored, turn)?;
+                        turn.items.push(approval_requested);
+                        turn.items.push(transition);
+                        envelope
+                    }
+                    Err(start_error) => {
+                        match self
+                            .state
+                            .agent_loop_execution_as(&turn.thread_id, &turn.id, &authority)
+                            .await
+                        {
+                            Ok(Some(execution))
+                                if wait_envelope_matches_start(
+                                    execution.envelope(),
+                                    &wait_id,
+                                    &request,
+                                    &generation,
+                                    wait_ttl,
+                                    remaining_active_timeout_ms,
+                                    &authority,
+                                ) =>
+                            {
+                                let recovered = self
+                                    .load_thread_as(&turn.thread_id, &authority)
+                                    .await?
+                                    .and_then(|thread| {
+                                        thread
+                                            .turns
+                                            .into_iter()
+                                            .find(|candidate| candidate.id == turn.id)
+                                    })
+                                    .ok_or_else(|| {
+                                        HarnessError::State(
+                                            "committed durable wait disappeared during recovery"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                *turn = recovered;
+                                execution.envelope().clone()
+                            }
+                            Ok(None) => {
+                                drop(control);
+                                self.settle_error(turn, &start_error).await?;
+                                return Err(start_error);
+                            }
+                            Ok(Some(_)) => {
+                                return Err(HarnessError::State(format!(
+                                    "Approval wait start failed ({start_error}); another durable wait is current"
+                                )));
+                            }
+                            Err(reload_error) => {
+                                return Err(HarnessError::State(format!(
+                                    "Approval wait start failed ({start_error}); ambiguous wait reload also failed ({reload_error})"
+                                )));
+                            }
+                        }
+                    }
+                };
+                drop(control);
+
+                let record = match self.submit_durable_approval(&request, &authority).await {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Ok(DurableAuthorization::Waiting(Box::new(ApprovalWait {
+                            turn: turn.clone(),
+                            envelope,
+                            status: delivery_retry(ApprovalDeliveryOperation::Submit, &error),
+                        })));
+                    }
+                };
+                let status = match approval_wait_status(&record, &request, &authority) {
+                    Ok(status) => status,
+                    Err(error) => delivery_retry(ApprovalDeliveryOperation::Submit, &error),
+                };
+                Ok(DurableAuthorization::Waiting(Box::new(ApprovalWait {
+                    turn: turn.clone(),
+                    envelope,
+                    status,
+                })))
+            }
+        }
+    }
+
     async fn authorize_tool_call(
         &self,
         turn: &mut Turn,
         call: &ModelToolCall,
+        tool_view: &ToolCapabilityView,
         model_request_sha256: &str,
         options: &TurnExecutionOptions,
         deadline: Option<Instant>,
     ) -> Result<(), HarnessError> {
+        if let Err(error) = tool_view.require(&call.name) {
+            self.settle_error(turn, &error).await?;
+            return Err(error);
+        }
         let Some(registered) = self.tools.get(&call.name) else {
             let error = HarnessError::UnknownTool(call.name.clone());
             self.settle_error(turn, &error).await?;
@@ -2047,6 +3856,13 @@ impl HarnessRuntime {
                         })?
                         .clone()
                 };
+                let request_sha256 = model_request_sha256(&request)?;
+                let completion_request_sha256 = crate::completion_model_request_sha256(&request)?;
+                // Preserve the digest of the exact provider-neutral request
+                // after continuation affinity has filtered the route-specific
+                // view. The outer logical request can differ from this value
+                // during failover and must not be attributed to the candidate.
+                let settled_request_sha256 = completion_request_sha256;
                 let attempt_stream = stream
                     .for_step(model_step)
                     .with_cancellation(crate::CancellationToken::new());
@@ -2066,6 +3882,9 @@ impl HarnessRuntime {
                             request,
                             stream: attempt_stream.clone(),
                             retry_index,
+                            attempt: u32::try_from(attempts).unwrap_or(u32::MAX),
+                            model_step,
+                            request_sha256,
                         },
                     )
                     .await;
@@ -2079,6 +3898,7 @@ impl HarnessRuntime {
                     return settlement.result.map(|response| SettledModelOutput {
                         model_id: model_id.to_owned(),
                         model_origin: registered.origin.clone(),
+                        model_request_sha256: settled_request_sha256,
                         output: response.output,
                         continuation: response.continuation,
                     });
@@ -2120,6 +3940,7 @@ impl HarnessRuntime {
                         return Ok(SettledModelOutput {
                             model_id: model_id.to_owned(),
                             model_origin: registered.origin.clone(),
+                            model_request_sha256: settled_request_sha256,
                             output: response.output,
                             continuation: response.continuation,
                         });
@@ -2171,9 +3992,30 @@ impl HarnessRuntime {
             request,
             stream,
             retry_index,
+            attempt,
+            model_step,
+            request_sha256,
         } = invocation;
         let started = Instant::now();
         let dropped_before = stream.dropped_events();
+        let advertised_tool_count = u32::try_from(request.tools.len()).unwrap_or(u32::MAX);
+        let tools = request
+            .tools
+            .iter()
+            .take(MAX_TOOL_TRACE_NAMES)
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let tool_choice = registered.model.tool_choice(&request);
+        stream.emit_tool_trace(ModelStreamEvent::ToolTraceRequest {
+            model_step,
+            attempt,
+            model_id: target.capability.to_owned(),
+            request_sha256,
+            tools,
+            advertised_tool_count,
+            tools_truncated: request.tools.len() > MAX_TOOL_TRACE_NAMES,
+            tool_choice,
+        });
         let provider_stream = stream.clone();
         let controlled_result = controlled_with_settlement_cancellation(
             cancellation,
@@ -2188,7 +4030,6 @@ impl HarnessRuntime {
             },
         )
         .await;
-        stream.close();
         let stream_events_dropped = stream.dropped_events().saturating_sub(dropped_before);
         let (result, control) = match controlled_result {
             Ok(result) => (result, ModelAttemptControl::None),
@@ -2222,6 +4063,40 @@ impl HarnessRuntime {
             ),
             _ => (None, None, None),
         };
+        let (outcome, structured_tool_calls, tool_syntax_in_text) = match (&result, control) {
+            (_, ModelAttemptControl::Cancelled) => (ModelToolTraceOutcome::Cancelled, 0, false),
+            (_, ModelAttemptControl::DeadlineElapsed) => {
+                (ModelToolTraceOutcome::TimedOut, 0, false)
+            }
+            (Ok(response), _) => match &response.output {
+                ModelOutput::Message { content } => (
+                    ModelToolTraceOutcome::Message,
+                    0,
+                    resembles_tool_call_syntax(content),
+                ),
+                ModelOutput::ToolCall { .. } => (ModelToolTraceOutcome::ToolCall, 1, false),
+                ModelOutput::ToolCalls { calls } => (
+                    ModelToolTraceOutcome::ToolCall,
+                    u32::try_from(calls.len()).unwrap_or(u32::MAX),
+                    false,
+                ),
+            },
+            (Err(_), _) => (ModelToolTraceOutcome::Failure, 0, false),
+        };
+        stream.emit_tool_trace(ModelStreamEvent::ToolTraceResponse {
+            model_step,
+            attempt,
+            model_id: target.capability.to_owned(),
+            duration_micros: elapsed_micros(started),
+            outcome,
+            structured_tool_calls,
+            tool_syntax_in_text,
+            provider_model: provider_model.clone(),
+            provider_request_id: provider_request_id.clone(),
+            provider_failure_kind,
+            provider_status_code,
+        });
+        stream.close();
         self.observability.emit(&PhaseObservation {
             thread_id: target.thread_id.clone(),
             turn_id: target.turn_id.clone(),
@@ -2370,18 +4245,7 @@ impl HarnessRuntime {
         }
         for call_id in call_ids {
             if let Err(error) = self
-                .record_unlocked(
-                    turn,
-                    ItemKind::ToolResult {
-                        call_id: (*call_id).to_owned(),
-                        output: serde_json::json!({
-                            "error": "tool call superseded by user steering before execution"
-                        }),
-                        is_error: true,
-                        connector_evidence: Vec::new(),
-                    },
-                    &control.authority,
-                )
+                .record_unlocked(turn, superseded_tool_result(call_id), &control.authority)
                 .await
             {
                 control.accepting_steering = false;
@@ -2426,6 +4290,79 @@ impl HarnessRuntime {
             .record_unlocked(turn, decision, &control.authority)
             .await
         {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        Ok(false)
+    }
+
+    /// Records verifier evidence only while its assistant candidate remains
+    /// current. Steering and the result append share the Turn-control lock, so
+    /// a queued correction either supersedes the candidate first or is
+    /// rejected later by a terminal seal; stale verifier output never crosses
+    /// this boundary.
+    async fn record_verification_result_if_current(
+        &self,
+        turn: &mut Turn,
+        model_stream: &ModelStream,
+        model_step: u32,
+        candidate_item_id: &ItemId,
+        result: ItemKind,
+    ) -> Result<bool, HarnessError> {
+        if !matches!(
+            &result,
+            ItemKind::VerificationResult {
+                candidate_item_id: Some(result_candidate_id),
+                verifier_origin: Some(_),
+                verifier_binding_sha256: Some(_),
+                ..
+            } if result_candidate_id == candidate_item_id
+        ) {
+            return Err(HarnessError::State(
+                "Runtime attempted to record unbound verifier evidence".to_owned(),
+            ));
+        }
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty() {
+            if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+                control.accepting_steering = false;
+                return Err(error);
+            }
+            model_stream.invalidate_step(model_step);
+            return Ok(true);
+        }
+        if let Err(error) = require_current_assistant_candidate(turn, candidate_item_id) {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        if let Err(error) = self.record_unlocked(turn, result, &control.authority).await {
+            control.accepting_steering = false;
+            return Err(error);
+        }
+        Ok(false)
+    }
+
+    async fn validate_model_output_if_current(
+        &self,
+        turn: &mut Turn,
+        model_stream: &ModelStream,
+        model_step: u32,
+        output: &ModelOutput,
+    ) -> Result<bool, HarnessError> {
+        let control = self.turn_control(&turn.thread_id)?;
+        let mut control = control.lock().await;
+        require_control_turn(&control, turn)?;
+        if !control.pending_steering.is_empty() {
+            if let Err(error) = self.apply_pending_steering_locked(turn, &mut control).await {
+                control.accepting_steering = false;
+                return Err(error);
+            }
+            model_stream.invalidate_step(model_step);
+            return Ok(true);
+        }
+        if let Err(error) = self.tool_view.validate_output(output) {
             control.accepting_steering = false;
             return Err(error);
         }
@@ -2647,9 +4584,64 @@ impl HarnessRuntime {
 
 type PreparedExecution = (Turn, Vec<Item>, Vec<ContextBlock>, usize, BTreeSet<String>);
 
+fn superseded_tool_result(call_id: &str) -> ItemKind {
+    ItemKind::ToolResult {
+        call_id: call_id.to_owned(),
+        output: serde_json::json!({
+            "error": "tool call superseded by user steering before execution"
+        }),
+        is_error: true,
+        connector_evidence: Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TurnExecutionMode {
+    Blocking,
+    Durable { wait_ttl: Option<Duration> },
+}
+
+impl TurnExecutionMode {
+    fn is_durable(self) -> bool {
+        matches!(self, Self::Durable { .. })
+    }
+
+    fn set_wait_ttl(&mut self, wait_ttl: Duration) {
+        if let Self::Durable {
+            wait_ttl: configured,
+        } = self
+        {
+            *configured = Some(wait_ttl);
+        }
+    }
+}
+
+enum DurableAuthorization {
+    Authorized,
+    Restart,
+    Waiting(Box<ApprovalWait>),
+}
+
+enum DurableResumePreparation {
+    Waiting(Box<ApprovalWait>),
+    Claimed {
+        prepared: Box<PreparedExecution>,
+        active_deadline: Option<Instant>,
+    },
+}
+
 enum TurnEntry {
     Start(String),
     ResumeApproval(TurnId),
+    ResumeWait {
+        turn_id: TurnId,
+        exact: Option<DurableWaitResumeFence>,
+    },
+}
+
+struct DurableWaitResumeFence {
+    wait_id: AgentLoopWaitId,
+    expected_revision: u64,
 }
 
 struct ApprovalResumeEvidence {
@@ -2669,6 +4661,614 @@ struct ApprovalResumeEvidence {
     current_batch_index: usize,
     consumed_steps: usize,
     tool_call_ids: BTreeSet<String>,
+}
+
+fn validate_durable_approval_evidence(
+    evidence: &ApprovalResumeEvidence,
+    request: &ApprovalRequest,
+    envelope_model_request_sha256: &str,
+) -> Result<(), HarnessError> {
+    if evidence.approval_id != request.id
+        || evidence.requested_by != request.requested_by
+        || evidence.call_id != request.authorization.call_id
+        || evidence.tool != request.authorization.descriptor.name
+        || evidence.input != request.authorization.input
+        || evidence.tool_origin != request.authorization.origin
+        || evidence.reason != request.reason
+        || evidence.risk != request.risk
+        || evidence.model_request_sha256 != envelope_model_request_sha256
+    {
+        return Err(HarnessError::State(
+            "durable Approval envelope differs from original Turn evidence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn completed_turn(result: TurnExecutionResult) -> Result<TurnOutcome, HarnessError> {
+    match result {
+        TurnExecutionResult::Completed(outcome) => Ok(*outcome),
+        TurnExecutionResult::Waiting(wait) => Err(HarnessError::State(format!(
+            "blocking Turn unexpectedly released worker at wait {}",
+            wait.envelope.wait_id
+        ))),
+    }
+}
+
+fn validate_exact_wait_resume(
+    execution: &AgentLoopExecution,
+    exact: &DurableWaitResumeFence,
+) -> Result<(), HarnessError> {
+    if execution.wait_id() != &exact.wait_id {
+        return Err(HarnessError::State(format!(
+            "durable wait {} differs from requested wait {}",
+            execution.wait_id(),
+            exact.wait_id
+        )));
+    }
+    let revision_matches = match execution {
+        AgentLoopExecution::Waiting { envelope } => exact.expected_revision == envelope.revision,
+        AgentLoopExecution::Ready { resume, .. } => {
+            exact.expected_revision == resume.revision
+                || exact.expected_revision == resume.previous_revision
+        }
+        AgentLoopExecution::Executing { .. } => false,
+    };
+    if !revision_matches {
+        return Err(HarnessError::State(format!(
+            "durable wait {} is not resumable from requested revision {} (current {})",
+            exact.wait_id,
+            exact.expected_revision,
+            execution.revision()
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_runtime_wait_ttl(wait_ttl: Duration) -> Result<Duration, HarnessError> {
+    let milliseconds = duration_millis_ceil(wait_ttl, "Approval wait lifetime")?;
+    if !(1..=MAX_AGENT_LOOP_WAIT_MS).contains(&milliseconds) {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "Approval wait lifetime must be 1-{MAX_AGENT_LOOP_WAIT_MS} milliseconds"
+        )));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
+fn validate_durable_active_timeout(timeout: Option<Duration>) -> Result<(), HarnessError> {
+    let Some(timeout) = timeout else {
+        return Ok(());
+    };
+    let milliseconds = duration_millis_ceil(timeout, "durable Turn timeout")?;
+    if milliseconds > MAX_AGENT_LOOP_WAIT_MS {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "durable Turn timeout must not exceed {MAX_AGENT_LOOP_WAIT_MS} milliseconds"
+        )));
+    }
+    Ok(())
+}
+
+fn wait_ttl_from_envelope(envelope: &TurnWaitEnvelope) -> Result<Duration, HarnessError> {
+    let expires_at_ms = envelope.expires_at_ms.ok_or_else(|| {
+        HarnessError::State("durable Approval wait has no wall-clock expiry".to_owned())
+    })?;
+    let wait_ttl_ms = expires_at_ms
+        .checked_sub(envelope.server_started_at_ms)
+        .filter(|milliseconds| (1..=MAX_AGENT_LOOP_WAIT_MS).contains(milliseconds))
+        .ok_or_else(|| {
+            HarnessError::State("durable Approval wait lifetime is invalid".to_owned())
+        })?;
+    Ok(Duration::from_millis(wait_ttl_ms))
+}
+
+fn duration_millis_ceil(duration: Duration, label: &str) -> Result<u64, HarnessError> {
+    let milliseconds = duration.as_millis();
+    let rounded = if duration.subsec_nanos() % 1_000_000 == 0 {
+        milliseconds
+    } else {
+        milliseconds.checked_add(1).ok_or_else(|| {
+            HarnessError::InvalidConfiguration(format!("{label} exceeds u128 milliseconds"))
+        })?
+    };
+    u64::try_from(rounded).map_err(|_| {
+        HarnessError::InvalidConfiguration(format!("{label} exceeds u64 milliseconds"))
+    })
+}
+
+fn remaining_active_timeout_ms(
+    active_deadline: Option<Instant>,
+    phase: ExecutionPhase,
+) -> Result<Option<u64>, HarnessError> {
+    let Some(active_deadline) = active_deadline else {
+        return Ok(None);
+    };
+    let now = Instant::now();
+    if active_deadline <= now {
+        return Err(HarnessError::TimedOut { phase });
+    }
+    let milliseconds = duration_millis_ceil(active_deadline.duration_since(now), "Turn timeout")?;
+    if !(1..=MAX_AGENT_LOOP_WAIT_MS).contains(&milliseconds) {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "durable Turn timeout must be 1-{MAX_AGENT_LOOP_WAIT_MS} milliseconds"
+        )));
+    }
+    Ok(Some(milliseconds))
+}
+
+fn deadline_from_remaining(
+    remaining_active_timeout_ms: Option<u64>,
+) -> Result<Option<Instant>, HarnessError> {
+    remaining_active_timeout_ms
+        .map(|milliseconds| {
+            if !(1..=MAX_AGENT_LOOP_WAIT_MS).contains(&milliseconds) {
+                return Err(HarnessError::State(
+                    "stored active timeout remainder is outside the supported range".to_owned(),
+                ));
+            }
+            Instant::now()
+                .checked_add(Duration::from_millis(milliseconds))
+                .ok_or_else(|| {
+                    HarnessError::State(
+                        "stored active timeout exceeds the runtime clock range".to_owned(),
+                    )
+                })
+        })
+        .transpose()
+}
+
+fn wait_authority(envelope: &TurnWaitEnvelope) -> Result<AuthorityContext, HarnessError> {
+    AuthorityContext::new(envelope.requested_by.clone(), envelope.tenant_id.clone())
+}
+
+fn wait_started_event(
+    stored: StoredEvent,
+    expected_turn: &Turn,
+) -> Result<(Item, Item, TurnWaitEnvelope), HarnessError> {
+    if stored.thread_id != expected_turn.thread_id {
+        return Err(HarnessError::State(
+            "wait transition was recorded in another Thread".to_owned(),
+        ));
+    }
+    let StateEvent::WaitStarted {
+        turn_id,
+        approval_requested,
+        transition,
+    } = stored.event
+    else {
+        return Err(HarnessError::State(
+            "State returned a non-wait event for wait start".to_owned(),
+        ));
+    };
+    if turn_id != expected_turn.id {
+        return Err(HarnessError::State(
+            "wait transition was recorded for another Turn".to_owned(),
+        ));
+    }
+    let ItemKind::AgentLoopWaitStarted { envelope } = &transition.kind else {
+        return Err(HarnessError::State(
+            "wait transition has no durable envelope".to_owned(),
+        ));
+    };
+    let envelope = (**envelope).clone();
+    Ok((approval_requested, transition, envelope))
+}
+
+fn wait_envelope_matches_start(
+    envelope: &TurnWaitEnvelope,
+    wait_id: &AgentLoopWaitId,
+    request: &ApprovalRequest,
+    generation: &CompletionGeneration,
+    wait_ttl: Duration,
+    remaining_active_timeout_ms: Option<u64>,
+    authority: &AuthorityContext,
+) -> bool {
+    let expected_ttl_ms = u64::try_from(wait_ttl.as_millis()).ok();
+    let actual_ttl_ms = envelope
+        .expires_at_ms
+        .and_then(|expires_at_ms| expires_at_ms.checked_sub(envelope.server_started_at_ms));
+    envelope.wait_id == *wait_id
+        && envelope.thread_id == request.authorization.thread_id
+        && envelope.turn_id == request.authorization.turn_id
+        && envelope.tenant_id.as_deref() == authority.tenant_id()
+        && envelope.requested_by == *authority.actor()
+        && envelope.remaining_active_timeout_ms == remaining_active_timeout_ms
+        && envelope.completion_generation == *generation
+        && expected_ttl_ms == actual_ttl_ms
+        && matches!(
+            &envelope.wait_kind,
+            WaitKind::Approval {
+                request: envelope_request,
+                model_request_sha256,
+            } if envelope_request == request
+                && model_request_sha256 == generation.model_request_sha256()
+        )
+}
+
+fn delivery_retry(
+    operation: ApprovalDeliveryOperation,
+    error: &HarnessError,
+) -> ApprovalWaitStatus {
+    ApprovalWaitStatus::DeliveryRetry {
+        operation,
+        message: bounded_runtime_error(&error.to_string()),
+    }
+}
+
+fn approval_wait_status(
+    record: &ApprovalRecord,
+    request: &ApprovalRequest,
+    authority: &AuthorityContext,
+) -> Result<ApprovalWaitStatus, HarnessError> {
+    if &record.request != request || record.tenant_id() != authority.tenant_id() {
+        return Err(HarnessError::Approval(
+            "Approval Inbox record differs from the durable wait request or tenant".to_owned(),
+        ));
+    }
+    if record.revision == 0 {
+        return Err(HarnessError::Approval(
+            "Approval Inbox record has an invalid zero revision".to_owned(),
+        ));
+    }
+    match &record.status {
+        ApprovalRecordStatus::Pending if record.settled_at_ms.is_none() => {
+            Ok(ApprovalWaitStatus::Pending)
+        }
+        ApprovalRecordStatus::Settled { decision, .. } if record.settled_at_ms.is_some() => {
+            validate_approval_decision(decision)?;
+            Ok(ApprovalWaitStatus::Settled)
+        }
+        ApprovalRecordStatus::Orphaned { reason } if record.settled_at_ms.is_some() => {
+            Ok(ApprovalWaitStatus::Orphaned {
+                reason: reason.clone(),
+            })
+        }
+        _ => Err(HarnessError::Approval(
+            "Approval Inbox record lifecycle fields are inconsistent".to_owned(),
+        )),
+    }
+}
+
+fn turn_at_wait_boundary(
+    turn: &Turn,
+    expected_envelope: &TurnWaitEnvelope,
+) -> Result<Turn, HarnessError> {
+    let wait_index = turn
+        .items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                &item.kind,
+                ItemKind::AgentLoopWaitStarted { envelope }
+                    if envelope.as_ref() == expected_envelope
+            )
+        })
+        .ok_or_else(|| {
+            HarnessError::State(
+                "running Turn has no transition for the current durable wait".to_owned(),
+            )
+        })?;
+    if wait_index == 0
+        || !matches!(
+            turn.items[wait_index - 1].kind,
+            ItemKind::ApprovalRequested { .. }
+        )
+    {
+        return Err(HarnessError::State(
+            "durable wait transition is not adjacent to its Approval request".to_owned(),
+        ));
+    }
+    let mut boundary = turn.clone();
+    boundary.items.truncate(wait_index);
+    Ok(boundary)
+}
+
+fn turn_wait_envelope<'a>(
+    turn: &'a Turn,
+    wait_id: &AgentLoopWaitId,
+) -> Result<&'a TurnWaitEnvelope, HarnessError> {
+    let envelope = turn
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match &item.kind {
+            ItemKind::AgentLoopWaitStarted { envelope } if &envelope.wait_id == wait_id => {
+                Some(envelope.as_ref())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| HarnessError::State(format!("turn {} has no wait {wait_id}", turn.id)))?;
+    if envelope.thread_id != turn.thread_id || envelope.turn_id != turn.id {
+        return Err(HarnessError::State(
+            "durable wait envelope differs from its owning Turn".to_owned(),
+        ));
+    }
+    Ok(envelope)
+}
+
+fn deterministic_resume_command_id(
+    envelope: &TurnWaitEnvelope,
+    record: &ApprovalRecord,
+) -> Result<AgentLoopResumeCommandId, HarnessError> {
+    let digest = crate::json::bounded_serialized_sha256(
+        &(
+            "runtime-agent-loop-resume-v1",
+            envelope.wait_id.as_str(),
+            record,
+        ),
+        MAX_MODEL_REQUEST_BYTES,
+    )
+    .map_err(|error| {
+        HarnessError::State(format!(
+            "cannot digest deterministic Approval resume command: {error:?}"
+        ))
+    })?;
+    Ok(AgentLoopResumeCommandId::from_string(format!(
+        "agent-loop-resume-{digest}"
+    )))
+}
+
+fn deterministic_denial_command_id(
+    envelope: &TurnWaitEnvelope,
+    record: &ApprovalRecord,
+) -> Result<AgentLoopDenyCommandId, HarnessError> {
+    let digest = crate::json::bounded_serialized_sha256(
+        &(
+            "runtime-agent-loop-denial-v1",
+            envelope.wait_id.as_str(),
+            record,
+        ),
+        MAX_MODEL_REQUEST_BYTES,
+    )
+    .map_err(|error| {
+        HarnessError::State(format!(
+            "cannot digest deterministic Approval denial command: {error:?}"
+        ))
+    })?;
+    Ok(AgentLoopDenyCommandId::from_string(format!(
+        "agent-loop-deny-{digest}"
+    )))
+}
+
+fn resume_accepted_event(
+    stored: StoredEvent,
+    expected_turn: &Turn,
+) -> Result<(Item, Item, ResumeEvidence), HarnessError> {
+    if stored.thread_id != expected_turn.thread_id {
+        return Err(HarnessError::State(
+            "resume transition was recorded in another Thread".to_owned(),
+        ));
+    }
+    let StateEvent::AcceptResume {
+        turn_id,
+        approval_decision,
+        transition,
+    } = stored.event
+    else {
+        return Err(HarnessError::State(
+            "State returned a non-resume event for resume acceptance".to_owned(),
+        ));
+    };
+    if turn_id != expected_turn.id {
+        return Err(HarnessError::State(
+            "resume transition was recorded for another Turn".to_owned(),
+        ));
+    }
+    let ItemKind::AgentLoopResumeAccepted { evidence } = &transition.kind else {
+        return Err(HarnessError::State(
+            "resume transition has no accepted evidence".to_owned(),
+        ));
+    };
+    let evidence = (**evidence).clone();
+    Ok((approval_decision, transition, evidence))
+}
+
+fn ready_claimed_event(stored: StoredEvent, expected_turn: &Turn) -> Result<Item, HarnessError> {
+    if stored.thread_id != expected_turn.thread_id {
+        return Err(HarnessError::State(
+            "claim transition was recorded in another Thread".to_owned(),
+        ));
+    }
+    let StateEvent::ClaimReady {
+        turn_id,
+        transition,
+    } = stored.event
+    else {
+        return Err(HarnessError::State(
+            "State returned a non-claim event for execution claim".to_owned(),
+        ));
+    };
+    if turn_id != expected_turn.id {
+        return Err(HarnessError::State(
+            "claim transition was recorded for another Turn".to_owned(),
+        ));
+    }
+    if !matches!(transition.kind, ItemKind::AgentLoopReadyClaimed { .. }) {
+        return Err(HarnessError::State(
+            "claim transition has no execution-claim evidence".to_owned(),
+        ));
+    }
+    Ok(transition)
+}
+
+fn validate_ready_settlement(
+    resume: &ResumeEvidence,
+    record: &ApprovalRecord,
+) -> Result<(), HarnessError> {
+    let ApprovalRecordStatus::Settled {
+        decision,
+        decided_by,
+    } = &record.status
+    else {
+        return Err(HarnessError::State(
+            "Ready execution has no settled Approval Inbox record".to_owned(),
+        ));
+    };
+    if resume.settlement.inbox_schema_version != record.schema_version
+        || resume.settlement.request != record.request
+        || resume.settlement.tenant_id.as_deref() != record.tenant_id()
+        || &resume.settlement.decision != decision
+        || &resume.settlement.decided_by != decided_by
+        || resume.settlement.inbox_revision != record.revision
+        || resume.settlement.requested_at_ms != record.requested_at_ms
+        || Some(resume.settlement.settled_at_ms) != record.settled_at_ms
+    {
+        return Err(HarnessError::State(
+            "Ready execution settlement differs from the authoritative Approval Inbox".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn approval_record_from_resume(resume: &ResumeEvidence) -> Result<ApprovalRecord, HarnessError> {
+    let settlement = &resume.settlement;
+    let record = ApprovalRecord {
+        schema_version: settlement.inbox_schema_version,
+        request: settlement.request.clone(),
+        tenant_id: settlement.tenant_id.clone(),
+        status: ApprovalRecordStatus::Settled {
+            decision: settlement.decision.clone(),
+            decided_by: settlement.decided_by.clone(),
+        },
+        revision: settlement.inbox_revision,
+        requested_at_ms: settlement.requested_at_ms,
+        settled_at_ms: Some(settlement.settled_at_ms),
+    };
+    let authority = wait_authority_from_request(&record.request, record.tenant_id())?;
+    let _ = approval_wait_status(&record, &record.request, &authority)?;
+    Ok(record)
+}
+
+fn wait_authority_from_request(
+    request: &ApprovalRequest,
+    tenant_id: Option<&str>,
+) -> Result<AuthorityContext, HarnessError> {
+    AuthorityContext::new(request.requested_by.clone(), tenant_id.map(str::to_owned))
+}
+
+fn settled_approval_decision(record: &ApprovalRecord) -> Result<ApprovalDecision, HarnessError> {
+    let ApprovalRecordStatus::Settled { decision, .. } = &record.status else {
+        return Err(HarnessError::Approval(
+            "Approval record is not settled".to_owned(),
+        ));
+    };
+    validate_approval_decision(decision)?;
+    Ok(decision.clone())
+}
+
+fn current_assistant_candidate(
+    turn: &Turn,
+    expected_model_request_sha256: &str,
+) -> Result<ItemId, HarnessError> {
+    let Some(candidate) = turn.items.last() else {
+        return Err(HarnessError::State(
+            "recorded assistant candidate disappeared from the Turn".to_owned(),
+        ));
+    };
+    match &candidate.kind {
+        ItemKind::AssistantMessage {
+            model_id: Some(_),
+            model_origin: Some(_),
+            model_request_sha256: Some(actual),
+            ..
+        } if actual == expected_model_request_sha256 => Ok(candidate.id.clone()),
+        _ => Err(HarnessError::State(
+            "recorded assistant candidate is missing its exact Model request binding".to_owned(),
+        )),
+    }
+}
+
+fn require_current_assistant_candidate(
+    turn: &Turn,
+    candidate_item_id: &ItemId,
+) -> Result<(), HarnessError> {
+    if turn.status != TurnStatus::Running || turn.completion_receipt.is_some() {
+        return Err(HarnessError::State(
+            "verification requires an unsettled running Turn".to_owned(),
+        ));
+    }
+    let candidate_index = turn
+        .items
+        .iter()
+        .position(|item| &item.id == candidate_item_id)
+        .ok_or_else(|| {
+            HarnessError::State("verification candidate disappeared from the Turn".to_owned())
+        })?;
+    if !matches!(
+        turn.items[candidate_index].kind,
+        ItemKind::AssistantMessage {
+            model_id: Some(_),
+            model_origin: Some(_),
+            model_request_sha256: Some(_),
+            ..
+        }
+    ) {
+        return Err(HarnessError::State(
+            "verification candidate is not an attributed assistant message".to_owned(),
+        ));
+    }
+    if turn.items.iter().skip(candidate_index + 1).any(|item| {
+        !matches!(
+            &item.kind,
+            ItemKind::VerificationResult {
+                candidate_item_id: Some(result_candidate_id),
+                ..
+            } if result_candidate_id == candidate_item_id
+        )
+    }) {
+        return Err(HarnessError::State(
+            "verification candidate is no longer the current Turn candidate".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_model_request_sha256(
+    turn: &Turn,
+    candidate_item_id: &ItemId,
+) -> Result<String, HarnessError> {
+    let candidate = turn
+        .items
+        .iter()
+        .find(|item| &item.id == candidate_item_id)
+        .ok_or_else(|| {
+            HarnessError::State("completion candidate disappeared from the Turn".to_owned())
+        })?;
+    let ItemKind::AssistantMessage {
+        model_request_sha256: Some(model_request_sha256),
+        ..
+    } = &candidate.kind
+    else {
+        return Err(HarnessError::State(
+            "completion candidate has no exact Model request digest".to_owned(),
+        ));
+    };
+    Ok(model_request_sha256.clone())
+}
+
+fn durable_candidate_text(turn: &Turn, candidate_item_id: &ItemId) -> Result<String, HarnessError> {
+    let candidate = turn
+        .items
+        .iter()
+        .find(|item| &item.id == candidate_item_id)
+        .ok_or_else(|| {
+            HarnessError::State(
+                "completion receipt references a missing assistant candidate".to_owned(),
+            )
+        })?;
+    let ItemKind::AssistantMessage { content, .. } = &candidate.kind else {
+        return Err(HarnessError::State(
+            "completion receipt candidate is not an assistant message".to_owned(),
+        ));
+    };
+    Ok(content.clone())
+}
+
+fn duration_millis_u64(duration: Duration, label: &str) -> Result<u64, HarnessError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        HarnessError::InvalidConfiguration(format!(
+            "{label} exceeds the completion-generation millisecond range"
+        ))
+    })
 }
 
 fn require_execution_binding(
@@ -3151,6 +5751,7 @@ fn retain_model_continuations(
 struct SettledModelOutput {
     model_id: String,
     model_origin: crate::CapabilityOrigin,
+    model_request_sha256: String,
     output: ModelOutput,
     continuation: Option<ModelContinuation>,
 }
@@ -3164,6 +5765,9 @@ struct ModelAttemptInvocation {
     request: ModelRequest,
     stream: ModelStream,
     retry_index: u8,
+    attempt: u32,
+    model_step: u32,
+    request_sha256: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3484,6 +6088,22 @@ fn model_request_sha256(request: &ModelRequest) -> Result<String, HarnessError> 
             crate::json::BoundedJsonError::CannotEncode => "cannot encode model request".to_owned(),
         })
     })
+}
+
+fn resembles_tool_call_syntax(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    [
+        "tool_calls",
+        "tool_call",
+        "<tool_use",
+        "<function_calls",
+        "<|tool",
+        "recipient=functions.",
+        "recipient=mcp__",
+        "dsml",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn validate_policy_decision(decision: &PolicyDecision) -> Result<(), HarnessError> {
@@ -4039,18 +6659,20 @@ mod tests {
     };
 
     use super::{
-        AllowListPolicy, ApprovalHandler, HarnessRuntime, LanguageModel, MAX_PENDING_STEERING,
-        MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES, ModelRetryPolicy, ModelRoute,
-        PolicyEngine, Tool, TurnExecutionOptions, require_runtime_capacity,
+        AllowListPolicy, ApprovalHandler, ApprovalWaitStatus, HarnessRuntime, LanguageModel,
+        MAX_PENDING_STEERING, MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES,
+        ModelRetryPolicy, ModelRoute, PolicyEngine, ProgressGovernor, ProgressPolicy, Tool,
+        TurnExecutionOptions, TurnExecutionResult, require_runtime_capacity,
         validate_approval_decision, validate_model_request, validate_model_response,
         validate_model_tool_call, validate_model_tool_calls, validate_policy_decision,
         validate_tool_output,
     };
     use crate::{
-        ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalInbox, ApprovalRecordStatus,
-        ApprovalRequest, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-        CapabilityOrigin, ConnectorEvidenceClaim, ContextEngine, ContextSource,
-        ConversationCompactionConfig, ConversationCompactionRequest,
+        ActorIdentity, AgentLoopExecution, ApprovalActor, ApprovalDecision, ApprovalInbox,
+        ApprovalRecordStatus, ApprovalRequest, AuthorityContext,
+        CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
+        CompletionAssurance, CompletionRequirementStatus, ConnectorEvidenceClaim, ContextEngine,
+        ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
         ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
         ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
         ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler,
@@ -4082,12 +6704,38 @@ mod tests {
 
     struct EvidenceConnectorTool;
 
+    struct InvalidOutputTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct SteerableInvalidOutputTool {
+        calls: Arc<AtomicUsize>,
+        fifth_entered: Arc<Notify>,
+        release_fifth: Arc<Notify>,
+    }
+
     struct AuthorityRecordingPolicy {
         observed: Arc<Mutex<Option<AuthorityContext>>>,
     }
 
     struct AuthorityRecordingModel {
         observed: Arc<Mutex<Option<AuthorityContext>>>,
+    }
+
+    struct RepeatedFailureModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct RepeatedFailureThenSteeringModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn invalid_tool_output() -> Value {
+        let mut output = Value::Null;
+        for _ in 0..=crate::json::MAX_JSON_DEPTH {
+            output = Value::Array(vec![output]);
+        }
+        output
     }
 
     fn sqlite_test_path(label: &str) -> std::path::PathBuf {
@@ -4285,6 +6933,325 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_rejects_invalid_model_visible_tool_selection() {
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .expect("register echo");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let error = runtime
+            .with_model_visible_tools(["missing"])
+            .err()
+            .expect("unregistered Tool cannot enter a capability view");
+        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
+
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .expect("register echo");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let error = runtime
+            .with_model_visible_tools(["echo", "echo"])
+            .err()
+            .expect("duplicate Tool selection is ambiguous");
+        assert!(matches!(error, HarnessError::InvalidConfiguration(_)));
+    }
+
+    #[tokio::test]
+    async fn registered_but_hidden_tool_never_reaches_policy_or_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: calls.clone(),
+                }),
+            )
+            .expect("register echo");
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_visible_tools(Vec::<String>::new())
+        .expect("empty text-only capability view");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "must remain hidden")
+            .await
+            .expect_err("hidden Tool call must fail closed");
+        assert!(
+            matches!(&error, HarnessError::Model(message) if message.contains("not disclosed"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread");
+        let turn = projected.turns.last().expect("failed turn");
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert!(!turn.items.iter().any(|item| {
+            matches!(
+                item.kind,
+                ItemKind::ToolCall { .. }
+                    | ItemKind::PolicyDecision { .. }
+                    | ItemKind::ApprovalRequested { .. }
+                    | ItemKind::ToolResult { .. }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn hidden_tool_batch_is_rejected_atomically_before_any_effect() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: calls.clone(),
+                }),
+            )
+            .expect("register echo");
+        let runtime = HarnessRuntime::new(
+            Arc::new(BatchToolModel),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("echo")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_model_visible_tools(Vec::<String>::new())
+        .expect("empty text-only capability view");
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "batch must remain hidden")
+            .await
+            .expect_err("hidden Tool batch must fail closed");
+        assert!(matches!(error, HarnessError::Model(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread");
+        let turn = projected.turns.last().expect("failed turn");
+        assert!(!turn.items.iter().any(|item| {
+            matches!(
+                item.kind,
+                ItemKind::ToolCall { .. }
+                    | ItemKind::PolicyDecision { .. }
+                    | ItemKind::ToolResult { .. }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_cycle_stops_before_another_model_or_tool_call() {
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(InvalidOutputTool {
+                    calls: tool_calls.clone(),
+                }),
+            )
+            .expect("register unstable Tool");
+        let runtime = HarnessRuntime::new(
+            Arc::new(RepeatedFailureModel {
+                calls: model_calls.clone(),
+            }),
+            tools,
+            Arc::new(AllowListPolicy::deny_by_default().allow("unstable")),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        )
+        .with_max_steps(5);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let error = runtime
+            .run_turn(&thread.id, "do not spin")
+            .await
+            .expect_err("equivalent failure cycle must stop");
+        assert!(matches!(
+            error,
+            HarnessError::NoProgress {
+                cycle_period: 1,
+                repetitions: 5
+            }
+        ));
+        assert_eq!(model_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 5);
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load thread")
+            .expect("thread");
+        let turn = projected.turns.last().expect("failed turn");
+        assert_eq!(turn.status, TurnStatus::Failed);
+        let last_result = turn
+            .items
+            .iter()
+            .rposition(|item| matches!(item.kind, ItemKind::ToolResult { .. }))
+            .expect("last Tool result");
+        let runtime_error = turn
+            .items
+            .iter()
+            .rposition(|item| matches!(item.kind, ItemKind::RuntimeError { .. }))
+            .expect("no-progress evidence");
+        assert!(last_result < runtime_error);
+        assert!(
+            !turn
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::AssistantMessage { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_progress_boundary_seals_steering_before_settlement() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let mut turn = runtime
+            .state
+            .start_turn(&thread.id)
+            .await
+            .expect("start turn");
+        let _turn_control = runtime
+            .register_turn_control(&turn, AuthorityContext::local_process())
+            .expect("register Turn control");
+        let mut progress = ProgressGovernor::from_items(ProgressPolicy::default(), &turn.items)
+            .expect("create progress governor");
+
+        runtime
+            .govern_progress_at_safe_boundary(&mut progress, &mut turn, true)
+            .await
+            .expect("terminal safe boundary");
+        assert_eq!(turn.status, TurnStatus::Running);
+        let error = runtime
+            .steer_turn(
+                &thread.id,
+                &turn.id,
+                "too late",
+                ActorIdentity::LocalProcess,
+            )
+            .await
+            .expect_err("terminal boundary must reject later steering before settlement");
+        assert!(error.to_string().contains("no longer accepts steering"));
+    }
+
+    #[tokio::test]
+    async fn durable_steering_precedes_a_no_progress_stop_at_the_safe_boundary() {
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let fifth_entered = Arc::new(Notify::new());
+        let release_fifth = Arc::new(Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(SteerableInvalidOutputTool {
+                    calls: tool_calls.clone(),
+                    fifth_entered: fifth_entered.clone(),
+                    release_fifth: release_fifth.clone(),
+                }),
+            )
+            .expect("register steerable Tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(RepeatedFailureThenSteeringModel {
+                    calls: model_calls.clone(),
+                }),
+                tools,
+                Arc::new(AllowListPolicy::deny_by_default().allow("unstable")),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_max_steps(8),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let thread_id = thread.id.clone();
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread_id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "start").await })
+        };
+
+        fifth_entered.notified().await;
+        let active = runtime
+            .load_thread(&thread_id)
+            .await
+            .expect("load active Thread")
+            .expect("Thread");
+        let turn_id = active.turns.last().expect("active Turn").id.clone();
+        runtime
+            .steer_turn(
+                &thread_id,
+                &turn_id,
+                "change course",
+                ActorIdentity::LocalProcess,
+            )
+            .await
+            .expect("durably queue steering");
+        release_fifth.notify_one();
+
+        let outcome = worker
+            .await
+            .expect("worker")
+            .expect("steering must reset the failure cycle before settlement");
+        assert_eq!(
+            outcome.final_text,
+            "steering applied before progress settlement"
+        );
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 5);
+        let result_index = outcome
+            .turn
+            .items
+            .iter()
+            .rposition(|item| matches!(item.kind, ItemKind::ToolResult { .. }))
+            .expect("fifth result");
+        let steering_index = outcome
+            .turn
+            .items
+            .iter()
+            .rposition(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+            .expect("applied steering");
+        assert!(result_index < steering_index);
+    }
+
     #[tokio::test]
     async fn state_item_failure_still_durably_settles_the_turn() {
         let runtime = HarnessRuntime::new(
@@ -4416,6 +7383,44 @@ mod tests {
                     ],
                 )
                 .map_err(|error| HarnessError::Tool(error.to_string()))
+            })
+        }
+    }
+
+    impl Tool for InvalidOutputTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "unstable".to_owned(),
+                description: "Returns one deterministically invalid result".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn execute<'a>(&'a self, _input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(invalid_tool_output())
+            })
+        }
+    }
+
+    impl Tool for SteerableInvalidOutputTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "unstable".to_owned(),
+                description: "Waits on its fifth invalid result".to_owned(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+
+        fn execute<'a>(&'a self, _input: Value, _context: ToolContext) -> HarnessFuture<'a, Value> {
+            Box::pin(async move {
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 5 {
+                    self.fifth_entered.notify_one();
+                    self.release_fifth.notified().await;
+                }
+                Ok(invalid_tool_output())
             })
         }
     }
@@ -4662,6 +7667,50 @@ mod tests {
                     HarnessError::Model("model authority recorder poisoned".to_owned())
                 })? = Some(request.authority.clone());
                 EchoModel.complete(request).await
+            })
+        }
+    }
+
+    impl LanguageModel for RepeatedFailureModel {
+        fn id(&self) -> &str {
+            "test/repeated-failure-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(ModelOutput::ToolCall {
+                    call_id: format!("repeated-failure-{attempt}"),
+                    name: "unstable".to_owned(),
+                    input: json!({"probe": "same"}),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for RepeatedFailureThenSteeringModel {
+        fn id(&self) -> &str {
+            "test/repeated-failure-then-steering-model"
+        }
+
+        fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if request.items.iter().any(|item| {
+                    matches!(
+                        &item.kind,
+                        ItemKind::UserMessage { content } if content == "change course"
+                    )
+                }) {
+                    return Ok(ModelOutput::Message {
+                        content: "steering applied before progress settlement".to_owned(),
+                    });
+                }
+                Ok(ModelOutput::ToolCall {
+                    call_id: format!("steerable-failure-{attempt}"),
+                    name: "unstable".to_owned(),
+                    input: json!({"probe": "same"}),
+                })
             })
         }
     }
@@ -4927,6 +7976,11 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct BlockingAskPolicy {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
     impl PolicyEngine for BlockingAllowPolicy {
         fn authorize<'a>(
             &'a self,
@@ -4937,6 +7991,23 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(PolicyDecision::Allow)
+            })
+        }
+    }
+
+    impl PolicyEngine for BlockingAskPolicy {
+        fn authorize<'a>(
+            &'a self,
+            _request: &'a ToolAuthorization,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, PolicyDecision> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(PolicyDecision::Ask {
+                    reason: "operator confirmation required".to_owned(),
+                    risk: RiskLevel::High,
+                })
             })
         }
     }
@@ -5356,6 +8427,10 @@ mod tests {
 
     struct RevisionModel;
 
+    struct SteeringRevisionModel {
+        calls: AtomicUsize,
+    }
+
     impl LanguageModel for RevisionModel {
         fn id(&self) -> &str {
             "test/revision-model"
@@ -5369,11 +8444,30 @@ mod tests {
                         ItemKind::VerificationResult {
                             outcome: VerificationOutcome::Failed { .. },
                             ..
-                        }
+                        } | ItemKind::SteeringApplied { .. }
                     )
                 });
                 Ok(ModelOutput::Message {
                     content: if revising { "good" } else { "bad" }.to_owned(),
+                })
+            })
+        }
+    }
+
+    impl LanguageModel for SteeringRevisionModel {
+        fn id(&self) -> &str {
+            "test/steering-revision-model"
+        }
+
+        fn complete<'a>(&'a self, _request: ModelRequest) -> HarnessFuture<'a, ModelOutput> {
+            Box::pin(async move {
+                Ok(ModelOutput::Message {
+                    content: if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "bad"
+                    } else {
+                        "good"
+                    }
+                    .to_owned(),
                 })
             })
         }
@@ -5384,6 +8478,12 @@ mod tests {
     }
 
     struct BlockingRetryVerifier {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    struct BlockingHardVerifier {
         calls: AtomicUsize,
         entered: Arc<Notify>,
         release: Arc<Notify>,
@@ -5441,6 +8541,38 @@ mod tests {
                     Ok(VerificationOutcome::Failed {
                         reason: "candidate must equal good".to_owned(),
                         retryable: true,
+                    })
+                }
+            })
+        }
+    }
+
+    impl Verifier for BlockingHardVerifier {
+        fn descriptor(&self) -> VerifierDescriptor {
+            VerifierDescriptor {
+                name: "blocking-hard-candidate-quality".to_owned(),
+                description: "Exercises Steering precedence over a hard completion rejection"
+                    .to_owned(),
+            }
+        }
+
+        fn verify<'a>(
+            &'a self,
+            request: VerificationRequest,
+        ) -> HarnessFuture<'a, VerificationOutcome> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                if request.candidate == "good" {
+                    Ok(VerificationOutcome::Passed {
+                        summary: Some("candidate accepted".to_owned()),
+                    })
+                } else {
+                    Ok(VerificationOutcome::Failed {
+                        reason: "candidate is terminally invalid".to_owned(),
+                        retryable: false,
                     })
                 }
             })
@@ -5636,6 +8768,76 @@ mod tests {
         }
     }
 
+    struct UnavailableDurableApproval;
+
+    impl ApprovalHandler for UnavailableDurableApproval {
+        fn decide<'a>(
+            &'a self,
+            _request: &'a ApprovalRequest,
+        ) -> HarnessFuture<'a, ApprovalDecision> {
+            Box::pin(pending())
+        }
+
+        fn supports_durable_wait(&self) -> bool {
+            true
+        }
+
+        fn submit_wait_as<'a>(
+            &'a self,
+            _request: &'a ApprovalRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, crate::ApprovalRecord> {
+            Box::pin(async {
+                Err(HarnessError::Approval(
+                    "simulated durable Approval delivery failure".to_owned(),
+                ))
+            })
+        }
+
+        fn get_wait_as<'a>(
+            &'a self,
+            _approval_id: &'a crate::ApprovalId,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, Option<crate::ApprovalRecord>> {
+            Box::pin(async {
+                Err(HarnessError::Approval(
+                    "simulated durable Approval read failure".to_owned(),
+                ))
+            })
+        }
+    }
+
+    struct NeverDeliverDurableApproval;
+
+    impl ApprovalHandler for NeverDeliverDurableApproval {
+        fn decide<'a>(
+            &'a self,
+            _request: &'a ApprovalRequest,
+        ) -> HarnessFuture<'a, ApprovalDecision> {
+            Box::pin(pending())
+        }
+
+        fn supports_durable_wait(&self) -> bool {
+            true
+        }
+
+        fn submit_wait_as<'a>(
+            &'a self,
+            _request: &'a ApprovalRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, crate::ApprovalRecord> {
+            Box::pin(pending())
+        }
+
+        fn get_wait_as<'a>(
+            &'a self,
+            _approval_id: &'a crate::ApprovalId,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, Option<crate::ApprovalRecord>> {
+            Box::pin(pending())
+        }
+    }
+
     struct TestMemoryProvider;
 
     impl MemoryProvider for TestMemoryProvider {
@@ -5714,7 +8916,7 @@ mod tests {
             .expect("load")
             .expect("thread");
         assert_eq!(projected.turns.len(), 1);
-        assert_eq!(projected.turns[0], outcome.turn);
+        assert_eq!(&projected.turns[0], &outcome.turn);
         assert_eq!(state.events(&thread.id).await.expect("events").len(), 9);
         assert!(matches!(
             outcome.turn.items.as_slice(),
@@ -6651,6 +9853,7 @@ mod tests {
             crate::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("test/continuation-model".to_owned()),
                 model_origin: Some(CapabilityOrigin::BuiltIn),
+                model_request_sha256: None,
                 content: "first turn complete".to_owned(),
             }),
             crate::Item::new(ItemKind::UserMessage {
@@ -6918,6 +10121,259 @@ mod tests {
             .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
             .expect("application evidence");
         assert!(queued < applied);
+    }
+
+    #[tokio::test]
+    async fn steering_supersedes_a_hard_verifier_result_before_it_is_recorded() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut verification = VerificationRegistry::new();
+        verification
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(BlockingHardVerifier {
+                    calls: AtomicUsize::new(0),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .expect("register verifier");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(SteeringRevisionModel {
+                    calls: AtomicUsize::new(0),
+                }),
+                ToolRegistry::new(),
+                Arc::new(AllowListPolicy::deny_by_default()),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_verification(verification),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move { runtime.run_turn(&thread_id, "produce a candidate").await })
+        };
+        entered.notified().await;
+        let turn_id = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread")
+            .turns[0]
+            .id
+            .clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "replace the rejected candidate",
+                ActorIdentity::LocalProcess,
+            )
+            .await
+            .expect("queue Steering during verification");
+        release.notify_one();
+
+        let outcome = worker
+            .await
+            .expect("worker")
+            .expect("Steering must supersede the stale hard rejection");
+        assert_eq!(outcome.final_text, "good");
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        let assistant_ids = outcome
+            .turn
+            .items
+            .iter()
+            .filter_map(|item| {
+                matches!(item.kind, ItemKind::AssistantMessage { .. }).then_some(item.id.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_ids.len(), 2);
+        let results = outcome
+            .turn
+            .items
+            .iter()
+            .filter_map(|item| {
+                let ItemKind::VerificationResult {
+                    candidate_item_id,
+                    outcome,
+                    ..
+                } = &item.kind
+                else {
+                    return None;
+                };
+                Some((candidate_item_id.clone(), outcome.clone()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![(
+                Some(assistant_ids[1].clone()),
+                VerificationOutcome::Passed {
+                    summary: Some("candidate accepted".to_owned())
+                }
+            )]
+        );
+        assert_eq!(
+            outcome
+                .turn
+                .completion_receipt
+                .as_ref()
+                .expect("completion receipt")
+                .candidate_item_id(),
+            &assistant_ids[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_steering_wins_the_atomic_completion_fence() {
+        let runtime = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            StateEngine::new(Arc::new(MemoryEventStore::new())),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let mut turn = runtime
+            .state
+            .start_turn(&thread.id)
+            .await
+            .expect("start turn");
+        let _turn_control = runtime
+            .register_turn_control(&turn, AuthorityContext::local_process())
+            .expect("register Turn control");
+        let request_sha256 = crate::completion_model_request_sha256(&json!({
+            "candidate": "stale"
+        }))
+        .expect("request digest");
+        runtime
+            .record(
+                &mut turn,
+                ItemKind::AssistantMessage {
+                    model_id: Some("test/revision-model".to_owned()),
+                    model_origin: Some(CapabilityOrigin::BuiltIn),
+                    model_request_sha256: Some(request_sha256),
+                    content: "stale".to_owned(),
+                },
+            )
+            .await
+            .expect("record candidate");
+        let candidate_item_id = turn.items.last().expect("candidate").id.clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn.id,
+                "do not complete this candidate",
+                ActorIdentity::LocalProcess,
+            )
+            .await
+            .expect("queue Steering before completion");
+
+        let final_text = runtime
+            .complete_candidate_if_current(
+                &mut turn,
+                &ModelStream::disabled(),
+                1,
+                &candidate_item_id,
+            )
+            .await
+            .expect("completion fence");
+        assert_eq!(final_text, None);
+        assert_eq!(turn.status, TurnStatus::Running);
+        assert!(turn.completion_receipt.is_none());
+        assert!(
+            turn.items
+                .iter()
+                .any(|item| { matches!(item.kind, ItemKind::SteeringApplied { .. }) })
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Running);
+        assert!(projected.turns[0].completion_receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_carries_the_authoritative_candidate_receipt() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(RevisionModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state.clone(),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let outcome = runtime
+            .run_turn(&thread.id, "complete exactly this candidate")
+            .await
+            .expect("complete Turn");
+        let receipt = outcome
+            .turn
+            .completion_receipt
+            .as_ref()
+            .expect("new completion must carry a receipt");
+        let candidate = outcome
+            .turn
+            .items
+            .iter()
+            .find(|item| &item.id == receipt.candidate_item_id())
+            .expect("receipt candidate");
+        let ItemKind::AssistantMessage {
+            content,
+            model_request_sha256: Some(model_request_sha256),
+            ..
+        } = &candidate.kind
+        else {
+            panic!("receipt must reference an attributed assistant candidate");
+        };
+        assert_eq!(&outcome.final_text, content);
+        assert_eq!(
+            receipt.generation().model_request_sha256(),
+            model_request_sha256
+        );
+        assert_eq!(
+            receipt.generation().assurance(),
+            CompletionAssurance::RuntimeMeasured
+        );
+        assert_eq!(
+            receipt.contract().artifact(),
+            CompletionRequirementStatus::NotRequired
+        );
+        assert_eq!(
+            receipt.contract().effect(),
+            CompletionRequirementStatus::NotRequired
+        );
+        assert_eq!(
+            receipt.contract().business_delivery(),
+            CompletionRequirementStatus::NotRequired
+        );
+        assert_eq!(receipt.source_thread_id(), &thread.id);
+        assert_eq!(receipt.turn_id(), &outcome.turn.id);
+
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(&projected.turns[0], &outcome.turn);
+        assert!(
+            state
+                .events(&thread.id)
+                .await
+                .expect("events")
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    StateEvent::TurnCompleted {
+                        turn_id,
+                        receipt: durable_receipt,
+                    } if turn_id == &outcome.turn.id && durable_receipt == receipt
+                ))
+        );
     }
 
     #[tokio::test]
@@ -7377,6 +10833,1172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_until_wait_releases_guards_and_resumes_exact_settlement() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+        let thread = runtime.create_thread().await.expect("create thread");
+
+        let wait = match runtime
+            .run_turn_until_wait(&thread.id, "release worker", Duration::from_secs(60))
+            .await
+            .expect("start durable wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must release a durable wait"),
+        };
+        assert_eq!(wait.status, ApprovalWaitStatus::Pending);
+        assert_eq!(wait.turn.status, TurnStatus::Running);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("load wait"),
+            Some(AgentLoopExecution::Waiting { .. })
+        ));
+        assert!(
+            runtime
+                .steer_turn(
+                    &thread.id,
+                    &wait.turn.id,
+                    "too late",
+                    ActorIdentity::LocalProcess,
+                )
+                .await
+                .is_err(),
+            "worker release must remove the same-process steering control"
+        );
+
+        let pending = inbox
+            .get(&match &wait.envelope.wait_kind {
+                crate::WaitKind::Approval { request, .. } => request.id.clone(),
+            })
+            .await
+            .expect("read pending approval")
+            .expect("pending approval");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+        let substituted_authority = AuthorityContext::new(
+            ActorIdentity::Authenticated {
+                authority: "test-identity".to_owned(),
+                subject: "other-requester".to_owned(),
+            },
+            None,
+        )
+        .expect("substituted authority");
+        let authority_error = runtime
+            .resume_wait_with_options(
+                &thread.id,
+                &wait.turn.id,
+                TurnExecutionOptions {
+                    authority: substituted_authority,
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("resume cannot substitute the original authority");
+        assert!(
+            authority_error
+                .to_string()
+                .contains("frozen original authority")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let wrong_wait = runtime
+            .resume_wait_exact_with_options(
+                &thread.id,
+                &wait.turn.id,
+                &crate::AgentLoopWaitId::from_static("wrong-wait"),
+                wait.envelope.revision,
+                TurnExecutionOptions::default(),
+            )
+            .await
+            .expect_err("exact resume rejects another wait identity");
+        assert!(
+            wrong_wait
+                .to_string()
+                .contains("differs from requested wait")
+        );
+        let stale_revision = runtime
+            .resume_wait_exact_with_options(
+                &thread.id,
+                &wait.turn.id,
+                &wait.envelope.wait_id,
+                wait.envelope.revision + 10,
+                TurnExecutionOptions::default(),
+            )
+            .await
+            .expect_err("exact resume rejects an unobserved revision");
+        assert!(stale_revision.to_string().contains("not resumable"));
+        let resumed = runtime
+            .resume_wait_exact_with_options(
+                &thread.id,
+                &wait.turn.id,
+                &wait.envelope.wait_id,
+                wait.envelope.revision,
+                TurnExecutionOptions::default(),
+            )
+            .await
+            .expect("resume exact wait");
+        let TurnExecutionResult::Completed(outcome) = resumed else {
+            panic!("settled Approval must complete the Turn")
+        };
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("load closed execution")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_wait_cancellation_is_terminal_idempotent_and_state_first() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(Arc::new(AtomicUsize::new(0))),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+        let thread = runtime.create_thread().await.expect("create thread");
+        let wait = match runtime
+            .run_turn_until_wait(&thread.id, "cancel exact wait", Duration::from_secs(60))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let command_id = crate::AgentLoopCloseCommandId::from_static("protocol-cancel-retry");
+        let first = runtime
+            .cancel_wait_exact_as(
+                &thread.id,
+                &wait.turn.id,
+                &wait.envelope.wait_id,
+                wait.envelope.revision,
+                command_id.clone(),
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect("cancel wait");
+        let retry = runtime
+            .cancel_wait_exact_as(
+                &thread.id,
+                &wait.turn.id,
+                &wait.envelope.wait_id,
+                wait.envelope.revision,
+                command_id,
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect("exact terminal retry");
+        assert_eq!(retry.sequence, first.sequence);
+        assert!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("query terminal wait")
+                .is_none()
+        );
+        let projected = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Cancelled);
+        let approval_id = match &wait.envelope.wait_kind {
+            crate::WaitKind::Approval { request, .. } => &request.id,
+        };
+        let approval = inbox
+            .get(approval_id)
+            .await
+            .expect("read approval")
+            .expect("approval");
+        assert!(matches!(
+            approval.status,
+            ApprovalRecordStatus::Orphaned { .. }
+        ));
+        let changed_command = runtime
+            .cancel_wait_exact_as(
+                &thread.id,
+                &wait.turn.id,
+                &wait.envelope.wait_id,
+                wait.envelope.revision,
+                crate::AgentLoopCloseCommandId::from_static("different-command"),
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect_err("different command cannot rewrite a terminal Turn");
+        assert!(changed_command.to_string().contains("not running"));
+    }
+
+    #[tokio::test]
+    async fn durable_delivery_failure_is_typed_wait_and_pending_handler_is_bounded() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(Arc::new(AtomicUsize::new(0))),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(Arc::new(UnavailableDurableApproval));
+        let thread = runtime.create_thread().await.expect("create thread");
+        let wait = match runtime
+            .run_turn_until_wait(&thread.id, "delivery fails", Duration::from_secs(60))
+            .await
+            .expect("delivery failure remains resumable")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("delivery failure cannot complete"),
+        };
+        assert!(matches!(
+            wait.status,
+            ApprovalWaitStatus::DeliveryRetry {
+                operation: super::ApprovalDeliveryOperation::Submit,
+                ..
+            }
+        ));
+        assert_eq!(wait.turn.status, TurnStatus::Running);
+        assert!(matches!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("load wait"),
+            Some(AgentLoopExecution::Waiting { .. })
+        ));
+
+        let bounded_state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let bounded_runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(Arc::new(AtomicUsize::new(0))),
+            Arc::new(AskPolicy),
+            bounded_state,
+        )
+        .with_approval_handler(Arc::new(NeverDeliverDurableApproval));
+        let bounded_thread = bounded_runtime
+            .create_thread()
+            .await
+            .expect("create bounded thread");
+        let bounded = tokio::time::timeout(
+            Duration::from_secs(1),
+            bounded_runtime.run_turn_until_wait(
+                &bounded_thread.id,
+                "pending delivery",
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("independent delivery deadline must release worker")
+        .expect("pending handler maps to typed wait");
+        assert!(matches!(
+            bounded,
+            TurnExecutionResult::Waiting(wait)
+                if matches!(wait.status, ApprovalWaitStatus::DeliveryRetry { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_resume_freezes_timeout_and_rejects_replacement_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(handler);
+        let thread = runtime.create_thread().await.expect("create thread");
+        let wait = match runtime
+            .run_turn_until_wait_with_options(
+                &thread.id,
+                "freeze timeout",
+                Duration::from_secs(2),
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_millis(200)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect("start timed wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        assert!(wait.envelope.remaining_active_timeout_ms.is_some());
+        let pending = inbox
+            .pending(1)
+            .await
+            .expect("list approval")
+            .into_iter()
+            .next()
+            .expect("pending approval");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let replacement = runtime
+            .resume_wait_with_options(
+                &thread.id,
+                &wait.turn.id,
+                TurnExecutionOptions {
+                    timeout: Some(Duration::from_secs(1)),
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("caller cannot replace stored budget");
+        assert!(replacement.to_string().contains("stored active timeout"));
+        let resumed = runtime
+            .resume_wait_with_options(&thread.id, &wait.turn.id, TurnExecutionOptions::default())
+            .await
+            .expect("wait time does not consume active timeout");
+        assert!(matches!(resumed, TurnExecutionResult::Completed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_resume_rejects_generation_drift_before_accept_or_effect() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone());
+        let thread = first.create_thread().await.expect("create thread");
+        let wait = match first
+            .run_turn_until_wait(&thread.id, "generation", Duration::from_secs(60))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let pending = inbox
+            .pending(1)
+            .await
+            .expect("pending")
+            .into_iter()
+            .next()
+            .expect("approval");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle");
+        let drifted = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_max_steps(31)
+        .with_approval_handler(handler.clone());
+        let error = drifted
+            .resume_wait_with_options(&thread.id, &wait.turn.id, TurnExecutionOptions::default())
+            .await
+            .expect_err("generation drift must fail closed");
+        assert!(error.to_string().contains("generation changed"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("wait remains live"),
+            Some(AgentLoopExecution::Waiting { .. })
+        ));
+        let exact = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(handler);
+        assert!(matches!(
+            exact
+                .resume_wait_with_options(
+                    &thread.id,
+                    &wait.turn.id,
+                    TurnExecutionOptions::default(),
+                )
+                .await
+                .expect("exact generation resumes"),
+            TurnExecutionResult::Completed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_resume_uses_state_settlement_when_inbox_is_unavailable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+        let thread = first.create_thread().await.expect("create thread");
+        let wait = match first
+            .run_turn_until_wait(&thread.id, "ready recovery", Duration::from_secs(60))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let settled = {
+            let pending = inbox
+                .pending(1)
+                .await
+                .expect("pending")
+                .into_iter()
+                .next()
+                .expect("approval");
+            inbox
+                .settle(
+                    &pending.request.id,
+                    pending.revision,
+                    ApprovalDecision::Approve,
+                    ApprovalActor::Authenticated {
+                        authority: "test-operator".to_owned(),
+                        subject: "approver".to_owned(),
+                    },
+                )
+                .await
+                .expect("settle")
+        };
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        let turn = projected
+            .turns
+            .iter()
+            .find(|turn| turn.id == wait.turn.id)
+            .expect("turn");
+        state
+            .accept_resume_as(
+                turn,
+                &wait.envelope.wait_id,
+                wait.envelope.revision,
+                super::deterministic_resume_command_id(&wait.envelope, &settled)
+                    .expect("command id"),
+                &settled,
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect("accept without claim");
+        let ready = state
+            .agent_loop_execution(&thread.id, &wait.turn.id)
+            .await
+            .expect("load Ready")
+            .expect("Ready execution");
+        let ready_revision = ready.revision();
+        assert!(matches!(&ready, AgentLoopExecution::Ready { .. }));
+        super::validate_exact_wait_resume(
+            &ready,
+            &super::DurableWaitResumeFence {
+                wait_id: wait.envelope.wait_id.clone(),
+                expected_revision: wait.envelope.revision,
+            },
+        )
+        .expect("Ready accepts the source Waiting revision on retry");
+
+        let restarted = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(Arc::new(UnavailableDurableApproval));
+        assert!(matches!(
+            restarted
+                .resume_wait_exact_with_options(
+                    &thread.id,
+                    &wait.turn.id,
+                    &wait.envelope.wait_id,
+                    ready_revision,
+                    TurnExecutionOptions::default(),
+                )
+                .await
+                .expect("Ready State evidence must not depend on Inbox availability"),
+            TurnExecutionResult::Completed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_denial_settles_atomically_without_claim_tool_or_generation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone());
+        let thread = first.create_thread().await.expect("create thread");
+        let wait = match first
+            .run_turn_until_wait(&thread.id, "deny", Duration::from_secs(60))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let pending = inbox
+            .pending(1)
+            .await
+            .expect("pending")
+            .into_iter()
+            .next()
+            .expect("approval");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Deny {
+                    reason: "operator denied".to_owned(),
+                },
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("deny");
+        let drifted = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_max_steps(1)
+        .with_approval_handler(handler);
+        let error = drifted
+            .resume_wait_with_options(&thread.id, &wait.turn.id, TurnExecutionOptions::default())
+            .await
+            .expect_err("denial is terminal");
+        assert!(matches!(error, HarnessError::ApprovalDenied { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+        assert!(
+            projected.turns[0]
+                .items
+                .iter()
+                .all(|item| !matches!(item.kind, ItemKind::AgentLoopReadyClaimed { .. }))
+        );
+        assert!(
+            projected.turns[0]
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::AgentLoopWaitDenied { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn state_accepted_denial_precedes_cancellation_and_expiry() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(Arc::new(AtomicUsize::new(0))),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+
+        let cancelled_thread = runtime
+            .create_thread()
+            .await
+            .expect("create cancelled Thread");
+        let cancelled_wait = match runtime
+            .run_turn_until_wait(
+                &cancelled_thread.id,
+                "accepted denial before cancellation",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("start cancelled-priority wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let cancelled_pending = inbox
+            .pending(1)
+            .await
+            .expect("pending cancellation approval")
+            .into_iter()
+            .next()
+            .expect("cancellation approval");
+        let cancelled_settlement = inbox
+            .settle(
+                &cancelled_pending.request.id,
+                cancelled_pending.revision,
+                ApprovalDecision::Deny {
+                    reason: "accepted before cancellation".to_owned(),
+                },
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle cancellation denial");
+        let projected = state
+            .load_thread(&cancelled_thread.id)
+            .await
+            .expect("load cancellation Thread")
+            .expect("cancellation Thread");
+        let turn = projected
+            .turns
+            .iter()
+            .find(|turn| turn.id == cancelled_wait.turn.id)
+            .expect("cancellation Turn");
+        state
+            .accept_resume_as(
+                turn,
+                &cancelled_wait.envelope.wait_id,
+                1,
+                super::deterministic_resume_command_id(
+                    &cancelled_wait.envelope,
+                    &cancelled_settlement,
+                )
+                .expect("cancellation resume id"),
+                &cancelled_settlement,
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect("accept cancellation denial");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = runtime
+            .resume_wait_with_options(
+                &cancelled_thread.id,
+                &cancelled_wait.turn.id,
+                TurnExecutionOptions {
+                    cancellation,
+                    ..TurnExecutionOptions::default()
+                },
+            )
+            .await
+            .expect_err("accepted denial outranks later cancellation");
+        assert!(matches!(error, HarnessError::ApprovalDenied { .. }));
+
+        let expired_thread = runtime
+            .create_thread()
+            .await
+            .expect("create expired Thread");
+        let expired_wait = match runtime
+            .run_turn_until_wait(
+                &expired_thread.id,
+                "accepted denial before expiry",
+                Duration::from_millis(50),
+            )
+            .await
+            .expect("start expiry-priority wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let expired_pending = inbox
+            .pending(1)
+            .await
+            .expect("pending expiry approval")
+            .into_iter()
+            .next()
+            .expect("expiry approval");
+        let expired_settlement = inbox
+            .settle(
+                &expired_pending.request.id,
+                expired_pending.revision,
+                ApprovalDecision::Deny {
+                    reason: "accepted before expiry".to_owned(),
+                },
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle expiry denial");
+        let projected = state
+            .load_thread(&expired_thread.id)
+            .await
+            .expect("load expiry Thread")
+            .expect("expiry Thread");
+        let turn = projected
+            .turns
+            .iter()
+            .find(|turn| turn.id == expired_wait.turn.id)
+            .expect("expiry Turn");
+        state
+            .accept_resume_as(
+                turn,
+                &expired_wait.envelope.wait_id,
+                1,
+                super::deterministic_resume_command_id(&expired_wait.envelope, &expired_settlement)
+                    .expect("expiry resume id"),
+                &expired_settlement,
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect("accept expiry denial");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let error = runtime
+            .resume_wait_with_options(
+                &expired_thread.id,
+                &expired_wait.turn.id,
+                TurnExecutionOptions::default(),
+            )
+            .await
+            .expect_err("accepted denial outranks later expiry");
+        assert!(matches!(error, HarnessError::ApprovalDenied { .. }));
+        for thread_id in [&cancelled_thread.id, &expired_thread.id] {
+            let projected = state
+                .load_thread(thread_id)
+                .await
+                .expect("load denial-priority result")
+                .expect("denial-priority Thread");
+            assert_eq!(projected.turns[0].status, TurnStatus::Failed);
+            assert!(
+                projected.turns[0]
+                    .items
+                    .iter()
+                    .all(|item| !matches!(item.kind, ItemKind::AgentLoopWaitClosed { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_durable_wait_closes_atomically_without_inbox_resume() {
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(Arc::new(AtomicUsize::new(0))),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+        let thread = runtime.create_thread().await.expect("create thread");
+        let wait = match runtime
+            .run_turn_until_wait(&thread.id, "expire", Duration::from_millis(50))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let approval_id = match &wait.envelope.wait_kind {
+            crate::WaitKind::Approval { request, .. } => request.id.clone(),
+        };
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let error = runtime
+            .resume_wait_with_options(&thread.id, &wait.turn.id, TurnExecutionOptions::default())
+            .await
+            .expect_err("expired wait must close");
+        assert_eq!(
+            error,
+            HarnessError::TimedOut {
+                phase: ExecutionPhase::Approval
+            }
+        );
+        let projected = state
+            .load_thread(&thread.id)
+            .await
+            .expect("load")
+            .expect("thread");
+        assert_eq!(projected.turns[0].status, TurnStatus::TimedOut);
+        assert!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("closed wait")
+                .is_none()
+        );
+        let abandoned = inbox
+            .get(&approval_id)
+            .await
+            .expect("read abandoned approval")
+            .expect("approval record remains auditable");
+        assert!(matches!(
+            abandoned.status,
+            ApprovalRecordStatus::Orphaned { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_durable_resume_claims_execute_tool_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let first = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone());
+        let thread = first.create_thread().await.expect("create thread");
+        let wait = match first
+            .run_turn_until_wait(&thread.id, "race", Duration::from_secs(60))
+            .await
+            .expect("start wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let pending = inbox
+            .pending(1)
+            .await
+            .expect("pending")
+            .into_iter()
+            .next()
+            .expect("approval");
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle");
+        let one = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_approval_handler(handler.clone());
+        let two = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state,
+        )
+        .with_approval_handler(handler);
+        let (left, right) = tokio::join!(
+            one.resume_wait_with_options(
+                &thread.id,
+                &wait.turn.id,
+                TurnExecutionOptions::default()
+            ),
+            two.resume_wait_with_options(
+                &thread.id,
+                &wait.turn.id,
+                TurnExecutionOptions::default()
+            )
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn public_recovery_refuses_executing_durable_wait_without_orphaning_inbox() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool_entered = Arc::new(Notify::new());
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(PendingCountingTool {
+                    calls: calls.clone(),
+                    entered: tool_entered.clone(),
+                }),
+            )
+            .expect("register pending Tool");
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(EchoModel),
+                tools,
+                Arc::new(AskPolicy),
+                state.clone(),
+            )
+            .with_approval_handler(handler.clone()),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let wait = match runtime
+            .run_turn_until_wait(&thread.id, "claim then pause", Duration::from_secs(60))
+            .await
+            .expect("start durable wait")
+        {
+            TurnExecutionResult::Waiting(wait) => wait,
+            TurnExecutionResult::Completed(_) => panic!("Ask must wait"),
+        };
+        let approval_id = match &wait.envelope.wait_kind {
+            crate::WaitKind::Approval { request, .. } => request.id.clone(),
+        };
+        let pending = inbox
+            .get(&approval_id)
+            .await
+            .expect("read pending approval")
+            .expect("pending approval");
+        inbox
+            .settle(
+                &approval_id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle approval");
+
+        let worker = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            let turn_id = wait.turn.id.clone();
+            let wait_id = wait.envelope.wait_id.clone();
+            let revision = wait.envelope.revision;
+            async move {
+                runtime
+                    .resume_wait_exact_with_options(
+                        &thread_id,
+                        &turn_id,
+                        &wait_id,
+                        revision,
+                        TurnExecutionOptions::default(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), tool_entered.notified())
+            .await
+            .expect("resumed worker must claim before entering the Tool");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("load claimed execution"),
+            Some(AgentLoopExecution::Executing { .. })
+        ));
+
+        let takeover = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            ToolRegistry::new(),
+            Arc::new(AllowListPolicy::deny_by_default()),
+            state.clone(),
+        )
+        .with_approval_handler(handler);
+        let error = takeover
+            .recover_thread_as(
+                &thread.id,
+                &wait.turn.id,
+                &AuthorityContext::local_process(),
+            )
+            .await
+            .expect_err("public Runtime recovery must not overwrite an Executing claim");
+        assert!(
+            error
+                .to_string()
+                .contains("exclusive recovery cannot interrupt")
+        );
+        assert!(matches!(
+            state
+                .agent_loop_execution(&thread.id, &wait.turn.id)
+                .await
+                .expect("load recovery-fenced execution"),
+            Some(AgentLoopExecution::Executing { .. })
+        ));
+        let approval = inbox
+            .get(&approval_id)
+            .await
+            .expect("read approval after refused recovery")
+            .expect("approval remains auditable");
+        assert!(matches!(
+            approval.status,
+            ApprovalRecordStatus::Settled {
+                decision: ApprovalDecision::Approve,
+                ..
+            }
+        ));
+
+        worker.abort();
+        assert!(
+            worker
+                .await
+                .expect_err("stop pending worker")
+                .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_wait_keeps_tool_call_batches_on_blocking_approval_path() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler = Arc::new(
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10))
+                .expect("approval handler"),
+        );
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(BatchToolModel),
+                registry(calls.clone()),
+                Arc::new(BatchAskFirstPolicy),
+                state,
+            )
+            .with_approval_handler(handler),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let mut worker = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            async move {
+                runtime
+                    .run_turn_until_wait(&thread_id, "batch", Duration::from_secs(60))
+                    .await
+            }
+        });
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(record) = inbox
+                    .pending(1)
+                    .await
+                    .expect("pending approvals")
+                    .into_iter()
+                    .next()
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("batch approval submission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut worker)
+                .await
+                .is_err(),
+            "batch Ask must retain the legacy blocking worker"
+        );
+        inbox
+            .settle(
+                &pending.request.id,
+                pending.revision,
+                ApprovalDecision::Approve,
+                ApprovalActor::Authenticated {
+                    authority: "test-operator".to_owned(),
+                    subject: "approver".to_owned(),
+                },
+            )
+            .await
+            .expect("settle batch approval");
+        assert!(matches!(
+            worker
+                .await
+                .expect("join batch worker")
+                .expect("complete batch"),
+            TurnExecutionResult::Completed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn durable_approval_wait_resumes_after_worker_loss() {
         let calls = Arc::new(AtomicUsize::new(0));
         let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
@@ -7539,6 +12161,29 @@ mod tests {
         .await
         .expect_err("requester drift must fail closed");
         assert!(actor_error.to_string().contains("requester differs"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let view_error = HarnessRuntime::new(
+            Arc::new(EchoModel),
+            registry(calls.clone()),
+            Arc::new(AskPolicy),
+            state.clone(),
+        )
+        .with_model_visible_tools(Vec::<String>::new())
+        .expect("empty capability view")
+        .with_approval_handler(handler.clone())
+        .resume_approval_turn_with_options(
+            &thread.id,
+            &turn_id,
+            TurnExecutionOptions {
+                context: vec![turn_context.clone()],
+                execution_binding: Some(execution_binding.clone()),
+                ..TurnExecutionOptions::default()
+            },
+        )
+        .await
+        .expect_err("capability view drift must fail closed");
+        assert!(view_error.to_string().contains("capability view"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let context_error = HarnessRuntime::new(
@@ -8522,6 +13167,7 @@ mod tests {
                 model_id,
                 model_origin,
                 content,
+                ..
             } if model_id.as_deref() == Some("test/usage-model")
                 && model_origin.as_ref() == Some(&origin)
                 && content == "observed"
@@ -8730,6 +13376,7 @@ mod tests {
                     model_id,
                     model_origin,
                     content,
+                    ..
                 } if model_id.as_deref() == Some("test/route-secondary")
                     && model_origin.as_ref() == Some(&secondary_origin)
                     && content == "secondary result"
@@ -8804,8 +13451,21 @@ mod tests {
         assert!(error.to_string().contains("failover was suppressed"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+        let user_visible_events = sink
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ModelStreamEvent::TextDelta { .. } | ModelStreamEvent::StepInvalidated { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            sink.events.lock().expect("events").as_slice(),
+            user_visible_events,
             [ModelStreamEvent::TextDelta {
                 model_step: 1,
                 delta: "primary fragment".to_owned(),
@@ -10438,8 +15098,21 @@ mod tests {
             .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
             .expect("durable application record");
         assert!(queued < applied);
+        let user_visible_events = sink
+            .events
+            .lock()
+            .expect("stream events")
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ModelStreamEvent::TextDelta { .. } | ModelStreamEvent::StepInvalidated { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert!(matches!(
-            sink.events.lock().expect("stream events").as_slice(),
+            user_visible_events.as_slice(),
             [
                 ModelStreamEvent::TextDelta { delta, .. },
                 ModelStreamEvent::StepInvalidated { model_step: 1 }
@@ -10676,6 +15349,118 @@ mod tests {
             .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
             .expect("steering application");
         assert!(tool_call < tool_result && tool_result < applied);
+    }
+
+    #[tokio::test]
+    async fn steering_before_durable_ask_balances_the_superseded_tool_call() {
+        let policy_entered = Arc::new(Notify::new());
+        let policy_release = Arc::new(Notify::new());
+        let model_release = Arc::new(Notify::new());
+        model_release.notify_one();
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(
+                CapabilityOrigin::BuiltIn,
+                Arc::new(EchoTool {
+                    calls: tool_calls.clone(),
+                }),
+            )
+            .expect("register echo");
+        let handler = Arc::new(
+            InboxApprovalHandler::new(
+                Arc::new(MemoryApprovalInbox::new()),
+                Duration::from_millis(10),
+            )
+            .expect("approval handler"),
+        );
+        let runtime = Arc::new(
+            HarnessRuntime::new(
+                Arc::new(SteeringToolModel {
+                    calls: AtomicUsize::new(0),
+                    entered: Arc::new(Notify::new()),
+                    release: model_release,
+                }),
+                tools,
+                Arc::new(BlockingAskPolicy {
+                    entered: policy_entered.clone(),
+                    release: policy_release.clone(),
+                }),
+                StateEngine::new(Arc::new(MemoryEventStore::new())),
+            )
+            .with_approval_handler(handler),
+        );
+        let thread = runtime.create_thread().await.expect("create thread");
+        let worker = {
+            let runtime = runtime.clone();
+            let thread_id = thread.id.clone();
+            tokio::spawn(async move {
+                runtime
+                    .run_turn_until_wait(&thread_id, "original", Duration::from_secs(60))
+                    .await
+            })
+        };
+        policy_entered.notified().await;
+        let turn_id = runtime
+            .load_thread(&thread.id)
+            .await
+            .expect("load active")
+            .expect("thread")
+            .turns[0]
+            .id
+            .clone();
+        runtime
+            .steer_turn(
+                &thread.id,
+                &turn_id,
+                "skip the pending approval",
+                ApprovalActor::LocalProcess,
+            )
+            .await
+            .expect("queue steering");
+        policy_release.notify_one();
+
+        let result = worker.await.expect("worker").expect("steered turn");
+        let TurnExecutionResult::Completed(outcome) = result else {
+            panic!("steering must supersede the Approval wait boundary")
+        };
+        assert_eq!(outcome.final_text, "accepted: skip the pending approval");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        let tool_call = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::ToolCall { .. }))
+            .expect("recorded Tool call");
+        let tool_result = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::ToolResult {
+                        call_id,
+                        is_error: true,
+                        ..
+                    } if call_id == "stale-tool-call"
+                )
+            })
+            .expect("synthetic Tool result");
+        let applied = outcome
+            .turn
+            .items
+            .iter()
+            .position(|item| matches!(item.kind, ItemKind::SteeringApplied { .. }))
+            .expect("steering application");
+        assert!(tool_call < tool_result && tool_result < applied);
+        assert!(
+            !outcome
+                .turn
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, ItemKind::AgentLoopWaitStarted { .. }))
+        );
     }
 
     #[tokio::test]

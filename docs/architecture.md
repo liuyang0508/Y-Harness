@@ -86,6 +86,11 @@ direction:
   bounded frames/deltas/total bytes, exactly one mandatory final typed response,
   and no behavior change for requests without a provisional-event sink;
 - one registry path for built-in and extension tools;
+- a frozen Runtime-generation Tool Capability View that defaults to all
+  registered descriptors, permits an explicit embedded-host subset, rejects
+  unknown/duplicate selection at configuration time, and fences every single,
+  batch, parallel, and approval-resumed Tool call against the exact disclosed
+  set before Policy or execution;
 - a frozen fail-safe Tool batch declaration, whole-batch authorization,
   maximal explicitly safe concurrent runs with a 1–64 Runtime ceiling,
   sequential fences, and source-ordered durable result settlement;
@@ -119,6 +124,12 @@ direction:
   retaining each subsystem's post-decode invariant validation;
 - deterministic completion verifiers whose retryable failures re-enter the
   Agent Loop and whose hard failures prevent false completion;
+- deterministic format-1 Completion Receipts that bind one exact Assistant
+  candidate, Model request, Turn evidence prefix, frozen Model route, Tool
+  Capability View, Verifier manifest/outcomes, Runtime governance, trusted
+  authority, and optional execution binding; State validates the receipt
+  against the exact running projection and atomically commits successful
+  terminal status with it;
 - an append-only SQLite event journal with in-memory parity for tests;
 - deterministic projection, idempotent event append, checkpoint persistence,
   and interrupted-turn recovery;
@@ -139,6 +150,9 @@ direction:
   dedicated byte budget are reserved for durable Turn settlement and a
   separately authorized protocol capability exposes the worst pressure without
   pretending to report host storage;
+- an optional bounded HTTP deployment adapter whose liveness/readiness routes
+  translate the authoritative Protocol-v37 admission projection without
+  opening stores or probing downstream dependencies;
 - JSONL trace export as a derived view of the authoritative event journal;
 - a versioned Memory Provider registry with declared operations and collision
   rejection;
@@ -155,7 +169,7 @@ direction:
   ceilings, exact coverage plus source/content fingerprints, an engine-owned
   non-authoritative marker, Context-phase cancellation/deadline/panic isolation,
   content-free audit evidence introduced by schema 2 and retained by the
-  current schema-14 writer, and no mutation of authoritative history or
+  current schema-16 writer, and no mutation of authoritative history or
   persistence of generated summary bodies;
 - optional 1–64-block per-Turn reference Context with pre-State count/byte/
   identity validation, fixed non-authoritative labeling, provider-specific
@@ -240,6 +254,20 @@ direction:
   with Runtime-bound registered Tool/origin, trusted actor/tenant, exact output
   SHA-256, recovery-time execution-chain validation, Model invisibility, and
   archive-format-4 preservation without cross-tenant authority rewriting;
+- schema-15 atomic `TurnCompleted` settlement with a deterministic bounded
+  CompletionReceipt; new writers reject receipt-free success, while migrated
+  receipt-free schema-1 through schema-14 completion remains explicitly
+  legacy/unverified; archive format 5 preserves receipt bytes, so fork/import
+  provenance establishes inherited source proof without claiming that the
+  target Thread reran completion gates;
+- schema-16 same-journal `AgentLoopExecution` coordination for one durable
+  Approval wait, with immutable authority/generation/active-budget envelope,
+  revision-fenced `Waiting`/`Ready`/`Executing`, atomic cancellation and
+  timeout closure, atomic denial without a worker claim, and archive-format-6
+  preservation; independently versioned live-wait projection schema 1 is
+  updated in the journal transaction, indexes `Waiting`/`ReadyAllow` expiry and
+  immediately due `ReadyDeny`, and supports tenant-local keyset discovery plus
+  exact 1–2-event maintenance without complete Thread recovery;
 - Approval Inbox schema 3 immutable optional tenant ownership with exact
   Memory/SQLite list/get/settle/orphan fencing, validated lookup projection,
   attributed same-tenant separation of duty, restart continuation, and
@@ -355,18 +383,18 @@ direction:
   cursors, content-free health transitions, and
   Effect-before-Temporal-before-Protocol/MCP shutdown while leaving Core
   task-free and the Ledger authoritative;
-- embedded Temporal Driver API 2 with host-supplied time, optional
-  Workflow/Handoff/Effect composition, 1–256-record tenant-local identity scans per
-  source, disposable cursors, fail-closed extension-page revalidation,
-  deterministic actor-and-fence command identity, exact-boundary advancement
-  through existing CAS commands, and independent
+- embedded Temporal Driver API 3 with host-supplied time, optional
+  Workflow/Handoff/Effect/State composition, 1–256-record tenant-local keyset
+  scans per source, disposable cursors, fail-closed extension-page
+  revalidation, deterministic fence-bound command identity, exact-boundary
+  advancement through existing CAS commands, and independent
   applied/duplicate/fenced/failed settlement; it starts no background task and
   introduces no scheduler database or second time authority;
 - an opt-in reference-service Temporal lifecycle that supplies the fixed
   service Authority and Unix time, bounds cadence and scan size, skips missed
   ticks, retains only a disposable process cursor, emits bounded health
-  transitions, and stops before Protocol/MCP shutdown while leaving Core
-  task-free;
+  transitions, advances the same bounded Agent Loop wait projection, and stops
+  before Protocol/MCP shutdown while leaving Core task-free;
 - a public bounded Task Orchestrator that executes host-provided sub-Agent
   capabilities, advances dependencies, isolates timeout/panic failure, cancels
   fenced workers, and settles only an exact current lease;
@@ -387,10 +415,25 @@ direction:
   deadline on Runtime-owned automatic snapshot work, and reports Operation and
   background completion independently without forced-success relabeling; stdio
   and mTLS hosts invoke it during shutdown;
-- protocol-v31 negotiation with the asymmetric 2 MiB request/16 MiB
+- cancellation-aware JSONL framing that observes Host shutdown only between
+  request frames, preserving every accepted response; the reference service
+  maps SIGTERM/SIGINT or Ctrl-C into that boundary and uses a bounded detached
+  stdin bridge so an open supervisor pipe cannot pin Tokio Runtime shutdown;
+- protocol-v37 negotiation with the asymmetric 2 MiB request/16 MiB
   response ceilings, allocation-time bounded JSON serialization, count-plus-
   byte State event cursor pages, byte-authoritative Thread capacity, and an
-  explicit Token Counter and Conversation Compactor API coordinate; protocol 31
+  explicit Token Counter and Conversation Compactor API coordinate; protocol
+  37 advertises State/snapshot schema 16 and Thread archive format 6, adds
+  opt-in durable Approval release, exact wait discovery/resume/cancellation,
+  and a bounded Waiting Operation projection; protocol 36 historically added
+  schema-15 CompletionReceipt projection and terminal receipt digests;
+  protocol 35 added bounded Tool Trace
+  events and credential-free MCP registration projections; protocol 34 added
+  independently authorized, content-free `ready`, `at_capacity`, and
+  `draining` admission derived from the same finite Operation registry and
+  one-way lifecycle that gate Turns; protocol 33 added credential-free private
+  Skill Registry projections to the protocol-32 Runtime Catalog; protocol 32
+  introduced that immutable active-generation catalog; protocol 31
   advertises Task Graph schema 4 and its exact Worker capability-matching
   boundary without accepting remote self-assertion; protocol 30 historically
   advertised Secret Provider API 3 and its typed use contexts without adding a
@@ -423,7 +466,7 @@ direction:
   schema-7 atomic ordered Tool-call batches, schema-8 Engine-owned Thread
   names, and schema-9 atomic Thread forks;
 - initialization-time compatibility coordinates for engine, State event,
-  snapshot, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
+  snapshot, Thread archive, Approval Inbox, Task Coordinator, Memory API, Token Counter API,
   Conversation Compactor API, Secret API, Skill API, model-gateway API,
   Workflow Coordinator, Human Handoff Coordinator, and Workspace Provider API
   versions;
@@ -461,7 +504,7 @@ direction:
   the later mutation-capable open;
 - an independently installable full-screen Rust TUI under `clients/tui` that
   supervises the engine process and controls it exclusively through Protocol
-  v31, with bounded tenant-fenced recent-Thread navigation, authoritative
+  v36, with bounded tenant-fenced recent-Thread navigation, authoritative
   Thread projection,
   bounded provisional streaming, cancellation, event paging, and read-only
   Approval/Task inspection;
@@ -494,9 +537,8 @@ direction:
 Snapshot archival, distributed orchestration coordination, lease/fenced remote
 approval continuation, unknown Tool-effect reconciliation, Model load
 balancing/circuit breaking, additional direct vendor model adapters,
-Linux/Windows
-sandbox brokers, Skill catalogs/private registry authentication and append-only
-transparency-log consistency,
+Linux/Windows sandbox brokers, Skill Registry mirror federation/OAuth and
+append-only transparency-log consistency,
 streaming large-dataset Evaluation reports, certificate subject/SAN identity,
 multi-principal reference-service tenant routing, general Secret-manager
 integration, tenant-partitioned MCP sessions, external Artifact storage and
@@ -634,11 +676,66 @@ approvals, and results retain the existing State schema and ordering.
 Every side effect follows:
 
 ```text
-validate → resolve capability → authorize → record decision → execute
-         → record result → verify/continue
+freeze/compile capability view → advertise exact Model request
+         → validate proposed call belongs to that view
+         → resolve registered capability → authorize → record decision
+         → execute → record result → verify/continue
 ```
 
 No client, plugin, or model provider may bypass this ordering.
+Registry membership alone is never evidence that a Tool was disclosed to the
+Model. Capability View membership gates entry into Policy and execution; Policy
+and Approval remain independent authorities after that gate.
+
+The Loop is governed as a hierarchical controller inside the Runtime rather
+than as a flat `while` loop or a container for every subsystem. Admission,
+transient execution phases, durable Waiting, terminal settlement, progress
+governance, completion receipts, and typed extension boundaries are specified
+in [ADR 0155](adr/0155-hierarchical-agent-loop-governance.md). That ADR is also
+the honest current-state matrix for the eleven reviewed Loop principles.
+Format-1 completion settlement is implemented by
+[ADR 0157](adr/0157-generation-bound-completion-receipt.md). The durable
+Waiting and exact-resume contract is specified in
+[ADR 0158](adr/0158-durable-agent-loop-waiting-and-resume.md): `TurnStatus`
+remains `Running` or terminal, while a same-State-journal, same-CAS
+`AgentLoopExecution` now distinguishes `Waiting`, `Ready`, and `Executing` for
+the implemented single non-batch pre-Tool Approval slice. State 16 and Protocol
+37 release the worker, preserve the original authority/generation/remaining
+active timeout, expose exact discovery/resume/cancellation, and settle denial
+atomically without a claim. ADR 0159 adds the same-transaction live-wait due
+index and bounded Temporal timeout/denial convergence without complete Thread
+recovery. Generalized batch waiting, explicit non-mixed `HumanInput`, Inbox
+repair outbox/tombstone, finite worker leases, `NeedsReconciliation`, a frozen
+Context capsule independent of caller replay, and cross-process resume
+receipts remain future work. Dynamic capability projection and typed
+interceptors are likewise planned rather than represented as implemented
+features.
+
+ADR 0156 implements the first liveness guard beneath that hierarchy: a bounded,
+replayable Progress Governor over exact failure-bearing Tool cycles. Its stop is
+evaluated only after pending durable Steering is applied at a pre-Model or
+terminal-step-budget safe boundary. Terminal continuation seals Steering under
+the same lock before `MaxSteps` settlement. It adds no State or Protocol shape
+and is not represented as semantic failure classification or external-effect
+deduplication.
+
+Successful completion follows a separate evidence boundary after the last
+Model proposal:
+
+```text
+persist candidate + Model-request digest
+  → run frozen candidate-bound Verifiers
+  → apply accepted Steering before every terminal decision
+  → build and revalidate deterministic CompletionReceipt
+  → atomically commit TurnCompleted(receipt)
+  → expose receipt digest to the Operation/client
+  → run channel delivery and derived post-terminal jobs separately
+```
+
+Format 1 proves only evidence inside the owning Turn. Artifact, Effect, and
+business-delivery obligations must be explicitly `not_required`; the receipt
+does not certify cross-aggregate Artifact content, external Effect truth,
+channel acknowledgement, or Memory/title/suggestion/Evaluation jobs.
 
 For a Policy `ask`, authorization expands without changing the invariant:
 

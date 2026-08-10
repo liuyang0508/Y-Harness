@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ApprovalDecision, ApprovalRequest, AuthorityContext, HarnessFuture, PolicyDecision, ThreadId,
-    ToolAuthorization, TurnId,
+    ApprovalDecision, ApprovalId, ApprovalRecord, ApprovalRequest, AuthorityContext, HarnessFuture,
+    PolicyDecision, ThreadId, ToolAuthorization, TurnId,
 };
 
 /// Authorization boundary evaluated before tool execution.
@@ -38,6 +38,46 @@ pub trait ApprovalHandler: Send + Sync {
                 ));
             }
             self.decide(request).await
+        })
+    }
+
+    /// Returns whether this handler can submit and reload a durable wait
+    /// without retaining a polling worker.
+    #[must_use]
+    fn supports_durable_wait(&self) -> bool {
+        false
+    }
+
+    /// Idempotently submits one durable wait under trusted tenant authority.
+    ///
+    /// Handlers must override this together with [`Self::supports_durable_wait`]
+    /// and [`Self::get_wait_as`]. The default fails closed and never fabricates
+    /// an [`ApprovalRecord`].
+    fn submit_wait_as<'a>(
+        &'a self,
+        _request: &'a ApprovalRequest,
+        _authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalRecord> {
+        Box::pin(async {
+            Err(crate::HarnessError::InvalidConfiguration(
+                "approval handler does not support durable waits".to_owned(),
+            ))
+        })
+    }
+
+    /// Reloads one durable wait inside the exact trusted tenant boundary.
+    ///
+    /// The default fails closed rather than treating an unsupported handler as
+    /// an empty Inbox.
+    fn get_wait_as<'a>(
+        &'a self,
+        _approval_id: &'a ApprovalId,
+        _authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Option<ApprovalRecord>> {
+        Box::pin(async {
+            Err(crate::HarnessError::InvalidConfiguration(
+                "approval handler does not support durable waits".to_owned(),
+            ))
         })
     }
 
@@ -127,5 +167,61 @@ impl ApprovalHandler for DenyAllApprovals {
         _authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, ApprovalDecision> {
         self.decide(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ApprovalHandler, DenyAllApprovals};
+    use crate::{
+        ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, AuthorityContext,
+        CapabilityOrigin, HarnessError, RiskLevel, ThreadId, ToolAuthorization, ToolDescriptor,
+        TurnId,
+    };
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest {
+            id: ApprovalId::from_static("approval"),
+            requested_by: ApprovalActor::LocalProcess,
+            authorization: ToolAuthorization {
+                thread_id: ThreadId::from_static("thread"),
+                turn_id: TurnId::from_static("turn"),
+                call_id: "call".to_owned(),
+                descriptor: ToolDescriptor {
+                    name: "fixture.tool".to_owned(),
+                    description: "fixture tool".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                },
+                origin: CapabilityOrigin::BuiltIn,
+                input: json!({}),
+            },
+            reason: "fixture approval".to_owned(),
+            risk: RiskLevel::Low,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_durable_wait_port_fails_closed_without_changing_blocking_decisions() {
+        let handler = DenyAllApprovals;
+        let request = request();
+        let authority = AuthorityContext::local_process();
+
+        assert!(!handler.supports_durable_wait());
+        assert!(matches!(
+            handler.submit_wait_as(&request, &authority).await,
+            Err(HarnessError::InvalidConfiguration(message))
+                if message.contains("does not support durable waits")
+        ));
+        assert!(matches!(
+            handler.get_wait_as(&request.id, &authority).await,
+            Err(HarnessError::InvalidConfiguration(message))
+                if message.contains("does not support durable waits")
+        ));
+        assert!(matches!(
+            handler.decide_as(&request, &authority).await,
+            Ok(ApprovalDecision::Deny { .. })
+        ));
     }
 }

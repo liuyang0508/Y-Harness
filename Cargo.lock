@@ -2714,6 +2714,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "y-harness-aquaculture"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "y-harness",
+ "y-harness-domain-pack",
+]
+
+[[package]]
 name = "y-harness-benchmark-runner"
 version = "0.1.0"
 dependencies = [
@@ -2755,6 +2768,7 @@ version = "0.1.0"
 dependencies = [
  "ratatui",
  "serde_json",
+ "sha2",
  "tokio",
  "unicode-width",
  "y-harness",

@@ -1,10 +1,10 @@
-# Client protocol v31
+# Client protocol v37
 
 This document is the language-neutral wire specification for the current
 Y-Harness client protocol. The protocol controls one headless Runtime; it does
 not duplicate Agent Loop, State, Policy, or approval semantics in a client.
 
-Protocol version `"31"` is exact. Every request carries that value, and a peer
+Protocol version `"37"` is exact. Every request carries that value, and a peer
 using another value receives `unsupported_version`. Version evolution and
 durable schema support are defined in
 [`compatibility.md`](compatibility.md).
@@ -39,7 +39,7 @@ A request has exactly three top-level fields:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "31",
+  "protocol_version": "37",
   "command": {
     "method": "initialize"
   }
@@ -56,7 +56,7 @@ A successful response nests a typed result:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "31",
+  "protocol_version": "37",
   "body": {
     "status": "success",
     "result": {
@@ -73,7 +73,7 @@ An error response has the same correlation envelope:
 ```json
 {
   "id": "request-1",
-  "protocol_version": "31",
+  "protocol_version": "37",
   "body": {
     "status": "error",
     "error": {
@@ -98,7 +98,7 @@ not create hidden session state.
 ```json
 {
   "id": "init-1",
-  "protocol_version": "31",
+  "protocol_version": "37",
   "command": {
     "method": "initialize"
   }
@@ -110,7 +110,7 @@ The result type is `initialized`:
 ```json
 {
   "id": "init-1",
-  "protocol_version": "31",
+  "protocol_version": "37",
   "body": {
     "status": "success",
     "result": {
@@ -121,6 +121,8 @@ The result type is `initialized`:
         "operation.events",
         "operation.forget",
         "operation.get",
+        "runtime.catalog",
+        "service.status",
         "thread.capacity",
         "thread.create",
         "thread.events",
@@ -130,12 +132,16 @@ The result type is `initialized`:
         "thread.name",
         "thread.recover",
         "turn.start",
-        "turn.steer"
+        "turn.steer",
+        "turn.wait.cancel",
+        "turn.wait.get",
+        "turn.wait.resume"
       ],
       "compatibility": {
         "engine_version": "0.1.0",
-        "state_event_schema": 14,
-        "state_snapshot_schema": 14,
+        "state_event_schema": 16,
+        "state_snapshot_schema": 16,
+        "thread_archive_format": 6,
         "approval_inbox_schema": 3,
         "task_graph_schema": 4,
         "workflow_run_schema": 1,
@@ -159,10 +165,103 @@ principal. Approval permissions appear only when a durable Approval Inbox is
 configured; Task permissions appear only when a durable Task Coordinator is
 configured; Workflow permissions appear only when a Workflow Engine is
 configured over that Task Coordinator and a durable Workflow Coordinator;
+durable Turn-wait permissions require Runtime durable-wait support and remain
+independently authorizable from Approval settlement;
 Human Handoff permissions appear only when a Human Handoff Engine is
 configured with durable coordination and authoritative subject resolution. A
 client sees Effect permissions only when a durable Effect Engine is installed. A
 client must not infer a permission from a compatibility coordinate.
+
+## Runtime catalog
+
+When `initialize` advertises `runtime.catalog`, an authorized client may read
+the immutable, credential-free projection for the active Engine generation:
+
+```json
+{
+  "id": "catalog-1",
+  "protocol_version": "37",
+  "command": { "method": "get_runtime_catalog" }
+}
+```
+
+The `runtime_catalog` result contains the exact configuration SHA-256, ordered
+Model route, Model identities and adapter families, optional credential-free
+HTTPS endpoints, registered Tool names, exact active Skill locks, configured
+Skill Registry identities/endpoints/package-origin allowlists/authentication
+classes/private-CA presence, configured MCP transport identities, and the host
+reload strategy. It never exposes API keys, Secret references, environment
+variable names, resolved Secret values, CA bytes, process commands, arguments,
+or child environments. This is read-only observation, not capability
+registration.
+
+## Service admission status
+
+When `initialize` advertises `service.status`, an authorized supervisor or
+client may read the content-free state that gates process-local Turn admission:
+
+```json
+{
+  "id": "status-1",
+  "protocol_version": "37",
+  "command": { "method": "get_service_status" }
+}
+```
+
+A newly opened reference host with no retained Operations responds:
+
+```json
+{
+  "id": "status-1",
+  "protocol_version": "37",
+  "body": {
+    "status": "success",
+    "result": {
+      "type": "service_status",
+      "status": {
+        "admission": "ready",
+        "running_operations": 0,
+        "retained_operations": 0,
+        "operation_retention_limit": 64
+      }
+    }
+  }
+}
+```
+
+`ready` means the host still accepts Turns and at least one retained Operation
+slot is free. `at_capacity` means the process is live but terminal or running
+Operations occupy every slot; clients must settle and forget terminal
+Operations before new admission can succeed. `draining` means the one-way
+shutdown transition has begun and new Turns will remain rejected. The command
+continues to work during drain.
+
+A successful response establishes Protocol-process liveness. It does not
+establish the health of any external Model, MCP server, Memory provider, Skill
+Registry, Effect target, network path, or multi-node peer. Counts are host-wide
+operational metadata and remote access requires the explicit `service.status`
+permission.
+
+An optional HTTP deployment adapter maps this same projection to `GET /livez`
+and `GET /readyz`; it does not open State or maintain an independent boolean.
+The former succeeds for every responsive admission state, while the latter
+succeeds only for `ready`. See
+[ADR 0151](adr/0151-bounded-http-deployment-probes.md). This translation is not
+a new Client Protocol command or compatibility coordinate.
+
+The transport helpers `serve_jsonl_until_cancelled` and
+`serve_jsonl_as_until_cancelled` let a Host stop waiting for the next frame
+without truncating a frame already accepted. The reference `yh serve` Host maps
+SIGTERM/SIGINT on Unix and Ctrl-C on Windows to this boundary, then begins the
+same irreversible Handler drain and bounded resource settlement. Signal
+handling is not a Protocol command or Core policy. See
+[ADR 0152](adr/0152-signal-driven-reference-service-drain.md).
+
+The reference service reports `restart_boundary`: configuration changes become
+active only after a supervisor or the optional TUI has preflighted the new
+configuration, drained the old process generation, and started a new one. A
+running Turn therefore retains its frozen Model, Tool, Skill, Policy, and
+Context generation.
 
 For a tenant-scoped authority, Approval and Task permissions are available
 when their durable stores are configured. Approval list/get/settlement and
@@ -192,6 +291,8 @@ than `before_sequence`.
 | `method` | Command fields | Required permission | Success result `type` |
 |---|---|---|---|
 | `initialize` | none | `initialize` | `initialized` |
+| `get_runtime_catalog` | none | `runtime.catalog` | `runtime_catalog` |
+| `get_service_status` | none | `service.status` | `service_status` |
 | `create_thread` | none | `thread.create` | `thread_created` |
 | `fork_thread` | `parent_thread_id`, `child_thread_id`, optional `through_turn_id` | `thread.fork` | `thread_forked` |
 | `list_threads` | optional `before_sequence`, optional `limit` | `thread.list` | `threads` |
@@ -199,7 +300,10 @@ than `before_sequence`.
 | `get_thread` | `thread_id` | `thread.get` | `thread` |
 | `recover_thread` | `thread_id`, `expected_turn_id` | `thread.recover` | `thread_recovered` |
 | `get_thread_capacity` | `thread_id` | `thread.capacity` | `thread_capacity` |
-| `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `context`, optional `timeout_ms` | `turn.start` | `turn_started` |
+| `start_turn` | `thread_id`, `prompt`, optional `memory_scope`, optional `context`, optional `timeout_ms`, optional `approval_wait_ttl_ms` | `turn.start` | `turn_started` |
+| `get_turn_execution` | `thread_id`, `turn_id` | `turn.wait.get` | `turn_execution` |
+| `resume_turn_wait` | `thread_id`, `turn_id`, `wait_id`, `expected_revision`, optional `memory_scope`, optional `context` | `turn.wait.resume` | `turn_started` |
+| `cancel_turn_wait` | `thread_id`, `turn_id`, `wait_id`, `expected_revision`, `command_id` | `turn.wait.cancel` | `turn_wait_cancelled` |
 | `steer_turn` | `thread_id`, `expected_turn_id`, `content` | `turn.steer` | `turn_steered` |
 | `get_operation` | `operation_id` | `operation.get` | `operation` |
 | `get_operation_events` | `operation_id`, optional `after_sequence`, optional `limit` | `operation.events` | `operation_events` |
@@ -256,6 +360,18 @@ fenced by the authority resolved from the transport.
 input. `timeout_ms`, when present, must be greater than zero and fit the host
 Runtime clock. A timeout is a total external-work deadline, not a guarantee
 that non-cooperative persistence can be forcibly aborted.
+
+`approval_wait_ttl_ms` is omitted by default. When present it must be
+1–86,400,000 and the Runtime must have a durable Approval handler. It opts this
+Turn into worker release at a supported pre-effect Approval boundary;
+`timeout_ms`, if also present, must not exceed 86,400,000. Runtime freezes the
+remaining active timeout while `Waiting` or `Ready` and restores only that
+remainder after an exact worker claim. The wait lifetime is a separate
+server-clock liveness bound. Protocol 37 does not put a scheduler inside the
+request handler: expiry is revalidated and atomically settled when resume
+observes it, or is discovered through the bounded State wait projection and
+settled by an embedding host's Temporal Driver tick. The reference service
+opts into that host lifecycle only when `temporal` is configured.
 
 `context` defaults to an empty list. Each entry is non-authoritative reference
 data supplied by the authenticated Turn caller:
@@ -359,6 +475,13 @@ than `interrupted`, or a live operation in the same Protocol host fails without
 mutation. Retrying the same request after that Turn is already `interrupted`
 is idempotent while no newer Turn is running.
 
+State also refuses recovery while that exact Turn has a durable Agent Loop
+execution in `Waiting`, `Ready`, or `Executing`. `Waiting` and `Ready` must use
+the typed `turn.wait.*` lifecycle. `Executing` requires explicit effect
+reconciliation and cannot be relabelled `interrupted` merely because the
+calling process cannot observe its worker. This fence is enforced below the
+Protocol host, so an embedded caller cannot bypass it.
+
 Recovery appends an `interrupted` terminal event and abandons approvals the old
 Turn can no longer consume. It does not resume the interrupted stack,
 synthesize a Tool result, or replay Model/Tool work. Starting a replacement
@@ -433,10 +556,20 @@ not return the terminal Turn:
 `get_operation` returns one of these tagged states:
 
 - `{"status":"running","thread_id":"thread-..."}`;
-- `{"status":"completed","thread_id":"thread-...","turn_id":"turn-...","final_text":"..."}`;
+- `{"status":"waiting","execution":{"thread_id":"thread-...","turn_id":"turn-...","wait_id":"wait-...","revision":1,"state":"waiting","expires_at_ms":1785751200000,"remaining_active_timeout_ms":120000,"approval_id":"approval-..."},"approval_delivery":{"status":"pending"}}`;
+- `{"status":"completed","thread_id":"thread-...","turn_id":"turn-...","final_text":"...","completion_receipt_sha256":"lowercase-64-character-sha256"}`;
 - `{"status":"failed","error":"..."}`;
 - `{"status":"cancelled","error":"..."}`;
 - `{"status":"timed_out","error":"..."}`.
+
+`waiting` is terminal for that process-local Operation, but the owning Turn
+remains durably `Running`. Its `execution` is the authoritative bounded State
+coordinate. `approval_delivery` is the latest process observation and is one
+of `pending`, `settled`, `orphaned { reason }`, or
+`retry { action: "submit" | "read", message }`; it never overrides State.
+Clients may forget the settled process Operation, then use
+`get_turn_execution` to rediscover the live coordinate after reconnect or
+restart.
 
 `cancel_operation` requests cooperative cancellation. Its `accepted` field is
 `true` only when the operation was running when checked. Clients must continue
@@ -457,6 +590,120 @@ If `get_operation_events` returns
 `{"type":"step_invalidated","model_step":N}`, clients must discard provisional
 text previously emitted for model step `N`. Authoritative State and the
 terminal operation result remain the reconciliation source.
+
+### Durable Approval wait control plane
+
+Protocol 37 adds a non-blocking control plane for the implemented Approval
+wait slice. A client opts in per Turn:
+
+```json
+{
+  "id": "turn-1",
+  "protocol_version": "37",
+  "command": {
+    "method": "start_turn",
+    "thread_id": "thread-...",
+    "prompt": "perform the governed action",
+    "timeout_ms": 120000,
+    "approval_wait_ttl_ms": 86400000
+  }
+}
+```
+
+At one non-batch Tool call whose Policy decision is `ask`, Runtime journals the
+Tool call, Policy decision, Approval request, and `WaitStarted` evidence before
+releasing its worker. The Operation then reports `waiting`. The immutable
+envelope freezes original execution authority, tenant, completion generation,
+Model-request digest, remaining active timeout, and server expiry. It is not a
+client-authored execution token.
+
+After reconnect or Engine restart, read the current coordinate from State:
+
+```json
+{
+  "id": "wait-get-1",
+  "protocol_version": "37",
+  "command": {
+    "method": "get_turn_execution",
+    "thread_id": "thread-...",
+    "turn_id": "turn-..."
+  }
+}
+```
+
+The `turn_execution` result contains `execution: null` or the same bounded
+coordinate used by `OperationStatus::waiting`. Its `state` is:
+
+- `waiting`: no Approval settlement has been accepted into State;
+- `ready`: exact settlement evidence is durable and no worker has claimed it;
+- `executing`: one process-local worker won the State CAS claim; generic replay
+  is forbidden because the Tool effect may have started.
+
+Approval lookup and settlement remain separate commands requiring their own
+permissions and an independently authenticated approver. The approver does
+not become the Turn requester. After the Inbox record is terminal, resume the
+exact observed coordinate:
+
+```json
+{
+  "id": "wait-resume-1",
+  "protocol_version": "37",
+  "command": {
+    "method": "resume_turn_wait",
+    "thread_id": "thread-...",
+    "turn_id": "turn-...",
+    "wait_id": "wait-...",
+    "expected_revision": 1
+  }
+}
+```
+
+The result is a new process-local `turn_started` Operation. Runtime reloads the
+complete State and Inbox evidence, preserves the original authority, verifies
+the reconstructed Model request and frozen generation, atomically accepts an
+approval into `ready`, then claims it before Tool execution. A `ready` retry
+may name either the current revision returned by `get_turn_execution` or its
+source Waiting revision; every wait identity must match. `memory_scope` and
+`context` repeat the original non-authoritative inputs and cannot replace the
+stored active timeout or grant authority. If the Inbox is still pending or
+temporarily unreadable, the new Operation may settle as `waiting` again with a
+bounded delivery status.
+
+An Approval denial is consumed and the Turn is failed in one State CAS without
+creating an execution claim. To abandon an unclaimed `waiting` or non-denial
+`ready` execution, use a caller-stable command identity:
+
+```json
+{
+  "id": "wait-cancel-1",
+  "protocol_version": "37",
+  "command": {
+    "method": "cancel_turn_wait",
+    "thread_id": "thread-...",
+    "turn_id": "turn-...",
+    "wait_id": "wait-...",
+    "expected_revision": 1,
+    "command_id": "wait-cancel-command-1"
+  }
+}
+```
+
+The synchronous `turn_wait_cancelled` result echoes `thread_id`, `turn_id`,
+`wait_id`, `command_id`, and the new `revision`. Reuse the exact `command_id`
+and command fields after a lost response; changed reuse fails closed. State is
+settled before bounded best-effort Inbox cleanup. An `executing` wait cannot be
+cancelled through this command.
+
+This Protocol surface does not claim a general suspension scheduler. Worker
+release is not implemented for same-response multi-Tool batches or
+`HumanInput`; the Core and Protocol request handler start no scheduler thread.
+An embedding host may use the schema-1 State due projection through Temporal
+Driver API 3, and the reference service does so only when `temporal` is
+configured. There is still no durable Inbox repair outbox/tombstone, finite
+cross-process claim lease, `NeedsReconciliation` state, frozen Context capsule
+independent of caller replay, or durable cross-process resume-result receipt.
+Clients must therefore treat State as authoritative, never replay `executing`,
+and not infer safe external-effect repetition from a missing process Operation.
 
 ## Task Graph and worker lifecycle
 
@@ -774,10 +1021,13 @@ A new command against a stale revision returns retryable `effect_conflict`.
 The ledger does not itself authorize, execute, retry, compensate, or verify a
 business action.
 
-Temporal Driver API 2 is an embedded host API, not a Protocol v31 command or
-capability. A host may invoke one bounded tick with trusted authority and time
-to discover due Workflow waits, expired Handoff claims, and expired Effect
-leases, then reuse the existing fenced domain commands. The reference
+Temporal Driver API 3 is an embedded host API, not a Protocol v37 lifecycle
+command or capability. A host may invoke one bounded tick with trusted
+authority and time to discover due Workflow waits, expired Handoff claims,
+expired Effect leases, and due Agent Loop wait fences, then reuse the existing
+fenced State/domain commands. Agent Loop maintenance reads its materialized
+index and exactly one or two lifecycle events; it never recovers a complete
+Thread merely to discover or settle time-owned work. The reference
 `yh serve` process does not start that polling lifecycle by default. An
 operator may explicitly enable its host-owned loop through service config
 without adding a Protocol capability; protocol clients still cannot submit
@@ -807,9 +1057,20 @@ temporal application time, cadence, or cursors.
 ```
 
 Operation event sequence numbers are local to one retained operation. The
-buffer retains at most 4,096 events and 1,048,576 delta bytes. When older
+buffer retains at most 4,096 events and 1,048,576 event-payload bytes. When older
 events were evicted, `dropped_through_sequence` is the highest lost sequence;
 the terminal operation result and authoritative State remain valid.
+
+Protocol v37 also returns bounded `tool_trace_request` and
+`tool_trace_response` events around each Runtime-owned Model attempt. The
+request event identifies the Model step/attempt, registered route identity,
+exact provider-neutral request SHA-256, effective Tool choice, total advertised
+Tool count, and at most 64 Tool names with an explicit truncation flag. The
+response event reports duration, settlement class, structured Tool-call count,
+Tool-syntax-in-text detection, and bounded credential-free Provider metadata.
+These events never contain prompts, Tool arguments/results, Tool schemas,
+headers, credentials, or arbitrary Provider failure text. They are provisional
+operation diagnostics; durable State remains authoritative.
 
 The default/max operation-event page is 16/32. The default/max State-event page
 is 16/32. `get_events` uses durable global event sequences and also stops
@@ -1125,6 +1386,53 @@ Tool results cannot retain evidence. Protocol clients may observe these
 records through ordinary State projections but cannot author or elevate them,
 and Model requests receive the Tool output with `connector_evidence` removed.
 
+State event and snapshot schema 15 make successful completion an atomic,
+generation-bound transition. The completing event has the shape
+`{"type":"turn_completed","turn_id":"turn-...","receipt":{...}}`; the
+receipt explicitly binds the source Thread, Turn, current Assistant candidate,
+candidate Model-request digest, ordered evidence, candidate-bound passing
+Verifier results, trusted authority, and frozen Runtime generation. Schema-15
+`assistant_message` Items therefore carry `model_request_sha256`, while
+`verification_result` Items carry `candidate_item_id`, `verifier_origin`, and
+`verifier_binding_sha256`. A schema-15 writer cannot emit receipt-free
+`TurnFinished(Completed)`.
+
+Fork and archive import preserve the source receipt unchanged. If the target
+stream rebinds `Turn.thread_id`, clients must interpret a differing
+`receipt.source_thread_id` as inherited source-stream proof backed by the
+Thread lineage/import digest, not as a completion executed again in the target
+stream. Thread archive format 5 preserves schema-15 receipts. Supported older
+receipt-free completed history remains readable but is legacy/unverified and
+never receives a synthetic receipt. See [ADR 0157](adr/0157-generation-bound-completion-receipt.md).
+
+State event and snapshot schema 16 add model-hidden Agent Loop coordination
+Items and atomic events for one durable Approval wait:
+
+- `wait_started` carries the complete self-digested `TurnWaitEnvelope`;
+- `accept_resume` appends the ordinary Approval decision plus exact
+  `ResumeEvidence` and moves `Waiting` to `Ready`;
+- `claim_ready` appends unique worker/claim evidence and moves `Ready` to
+  `Executing`;
+- `wait_closed` atomically records an exact cancellation or observed-expiry
+  closure and terminal Turn status; and
+- `deny_wait` atomically copies the exact Inbox denial into State and fails the
+  Turn without a worker claim.
+
+These coordination Items are observable through State projections but are
+excluded from Model conversation replay. `TurnStatus` remains `running` while
+the separate live projection is `waiting`, `ready`, or `executing`; terminal
+settlement removes the live projection. The append-only State and snapshot
+schema remains 16; the disposable, transactionally maintained live-wait index
+has its own projection schema 1 coordinate. It indexes expiring `Waiting` and
+approved `Ready` states, while an accepted denial becomes immediately due for
+atomic `deny_wait` convergence and is never rewritten as a timeout. The
+current schema has no serialized
+`NeedsReconciliation` or finite claim-lease state. Thread archive format 6
+preserves schema-16 evidence; format 5 remains the historical format that
+first preserved schema-15 CompletionReceipts. See
+[ADR 0158](adr/0158-durable-agent-loop-waiting-and-resume.md) and
+[ADR 0159](adr/0159-bounded-indexed-durable-agent-loop-wait-expiry.md).
+
 `tool_origin` is also present for `deny` and `ask`, so authorization provenance
 does not depend on Tool execution succeeding. It may be absent only in
 immutable schema-1, schema-2, or schema-3 history.
@@ -1142,11 +1450,12 @@ observable through this protocol requires the compatibility action defined in
 
 ## Bounds and retention
 
-| Boundary | Protocol v31 value |
+| Boundary | Protocol v37 value |
 |---|---:|
 | Request frame | 2,097,152 bytes |
 | Response frame | 16,777,216 bytes |
 | Request `id` | 1–128 restricted ASCII bytes |
+| Durable Approval wait lifetime | 1–86,400,000 milliseconds when opted in |
 | Opaque command identity | 1–256 bytes |
 | Thread name | 1–256 trimmed non-control bytes, or null |
 | Prompt | 1–1,048,576 bytes |
@@ -1182,7 +1491,7 @@ then drains Runtime snapshot maintenance with the time that remains.
 | `invalid_json` | Frame is not a decodable request object |
 | `frame_too_large` | Request exceeds the input frame limit |
 | `response_too_large` | Result could not fit the output frame limit |
-| `unsupported_version` | Request protocol is not exactly `"31"` |
+| `unsupported_version` | Request protocol is not exactly `"37"` |
 | `invalid_request_id` | Correlation ID violates its syntax or bound |
 | `forbidden` | Principal lacks the exact command permission |
 | `invalid_request` | Command fields, lifecycle, identity, or target are invalid |
@@ -1203,6 +1512,10 @@ Tool-effect status is uncertain.
 ## Conformance evidence
 
 The protocol module contains wire-shape regression tests for both envelopes,
+Protocol-37 durable-wait commands, permissions, bounded projections, Waiting
+Operation settlement, exact resume/cancel coordinates, and TUI recovery,
+schema-16 wait/resume/claim/closure/denial evidence, schema-15 atomic
+completion receipts and candidate/verifier binding,
 schema-14 Connector evidence, schema-13 execution-binding evidence,
 schema-1 Workflow lifecycle and command-digest evidence,
 schema-1 Human Handoff ownership, claim fencing, actor-bound command evidence,

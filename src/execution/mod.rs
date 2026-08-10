@@ -1895,19 +1895,21 @@ mod tests {
                 metadata,
             },
             execution: EvaluationExecution::Completed {
-                outcome: TurnOutcome {
+                outcome: Box::new(TurnOutcome {
                     turn: crate::Turn {
                         id: TurnId::from_static("turn-test"),
                         thread_id: ThreadId::from_static("thread-test"),
                         status: TurnStatus::Completed,
+                        completion_receipt: None,
                         items: vec![Item::new(ItemKind::AssistantMessage {
                             model_id: Some("fixture/model".to_owned()),
                             model_origin: Some(CapabilityOrigin::BuiltIn),
+                            model_request_sha256: None,
                             content: "candidate".to_owned(),
                         })],
                     },
                     final_text: "candidate".to_owned(),
-                },
+                }),
             },
         })
     }
@@ -2092,6 +2094,7 @@ mod tests {
                 items: vec![Item::new(ItemKind::AssistantMessage {
                     model_id: Some("fixture/model".to_owned()),
                     model_origin: Some(CapabilityOrigin::BuiltIn),
+                    model_request_sha256: None,
                     content: "candidate".to_owned(),
                 })],
                 candidate: "candidate".to_owned(),

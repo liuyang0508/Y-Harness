@@ -29,7 +29,7 @@ pub const APPROVAL_INBOX_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_APPROVAL_INBOX_SCHEMA_VERSION: u32 = 2;
 // One record must fit comfortably inside the 1 MiB reference-protocol frame
 // together with its response envelope.
-const MAX_APPROVAL_RECORD_BYTES: usize = 525_312;
+pub(crate) const MAX_APPROVAL_RECORD_BYTES: usize = 525_312;
 const MAX_APPROVAL_REASON_BYTES: usize = 4_096;
 // Covers one maximum denial/orphan reason plus status, revision, and timestamp
 // growth. Tests pin the worst supported terminal forms at the pending ceiling.
@@ -844,6 +844,27 @@ impl ApprovalHandler for InboxApprovalHandler {
         })
     }
 
+    fn supports_durable_wait(&self) -> bool {
+        true
+    }
+
+    fn submit_wait_as<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, ApprovalRecord> {
+        let request = request.clone();
+        Box::pin(async move { self.inbox.submit_as(request, authority).await })
+    }
+
+    fn get_wait_as<'a>(
+        &'a self,
+        approval_id: &'a ApprovalId,
+        authority: &'a AuthorityContext,
+    ) -> HarnessFuture<'a, Option<ApprovalRecord>> {
+        Box::pin(async move { self.inbox.get_as(approval_id, authority).await })
+    }
+
     fn abandon_turn<'a>(
         &'a self,
         thread_id: &'a ThreadId,
@@ -1430,6 +1451,46 @@ mod tests {
             .await
             .expect_err("stale revision");
         assert!(matches!(conflict, HarnessError::ApprovalConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn inbox_handler_exposes_exact_tenant_durable_wait_records() {
+        let inbox = Arc::new(MemoryApprovalInbox::new());
+        let handler =
+            InboxApprovalHandler::new(inbox.clone(), Duration::from_millis(10)).expect("handler");
+        let authority = tenant_authority("tenant-a", "requester");
+        let other_tenant = tenant_authority("tenant-b", "requester");
+        let mut request = request();
+        request.requested_by = authority.actor().clone();
+
+        assert!(handler.supports_durable_wait());
+        let submitted = handler
+            .submit_wait_as(&request, &authority)
+            .await
+            .expect("durable submission");
+        assert_eq!(submitted.tenant_id(), Some("tenant-a"));
+        assert!(matches!(submitted.status, ApprovalRecordStatus::Pending));
+        assert_eq!(
+            handler
+                .submit_wait_as(&request, &authority)
+                .await
+                .expect("idempotent durable submission"),
+            submitted
+        );
+        assert_eq!(
+            handler
+                .get_wait_as(&request.id, &authority)
+                .await
+                .expect("durable load"),
+            Some(submitted)
+        );
+        assert_eq!(
+            handler
+                .get_wait_as(&request.id, &other_tenant)
+                .await
+                .expect("cross-tenant load is hidden"),
+            None
+        );
     }
 
     #[tokio::test]

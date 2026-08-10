@@ -1,5 +1,7 @@
 //! Minimal project configuration and persistent stdio service host.
 
+#[cfg(feature = "http-probe")]
+use std::net::SocketAddr;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -16,54 +18,71 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{self as tokio_io, BufReader as TokioBufReader, BufWriter as TokioBufWriter};
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity, AgentMemoryHubProvider, AllowListPolicy,
-    ApprovalInbox, AuthorityContext, CONVERSATION_COMPACTOR_API_VERSION, CancellationToken,
-    CapabilityOrigin, ContextEngine, ConversationCompactionConfig, ConversationCompactorDescriptor,
-    ConversationCompactorRegistry, ConversationContextConfig, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
-    DEFAULT_MAX_PARALLEL_TOOL_CALLS, DigestLockedProcessBroker,
-    EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION,
-    EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine, EffectSecretEnvironment,
-    EvaluationBaseline, EvaluationCase, EvaluationEngine, EvaluationReport, EvaluationSuite,
-    EvaluationTarget, GraderDescriptor, GraderRegistry, HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError,
-    HarnessFuture, HarnessRuntime, HumanHandoffCoordinator, HumanHandoffEngine,
-    HumanHandoffSubject, HumanHandoffSubjectResolver, InboxApprovalHandler,
-    JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor, JsonCommandGrader,
-    JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool, JsonCommandVerifier,
-    JsonProcessConfig, LanguageModel, LocalProcessBroker, MAX_MODEL_ATTEMPTS_PER_STEP,
-    MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES, MacOsSeatbeltBroker, McpClient,
-    MemoryContextConfig, MemoryEventStore, MemoryFailureMode, MemoryHealthStatus, MemoryProvider,
-    MemoryRegistry, ModelRegistry, ModelRetryPolicy, NetworkAccess, PROTOCOL_VERSION,
-    ProcessBroker, ProtocolAuthorizer, ProtocolHandler, ProtocolPrincipal, SECRET_API_VERSION,
-    STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillEngine,
-    SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry, SkillTransparencyRequirement,
-    SkillTrustStore, SqliteApprovalInbox, SqliteEffectCoordinator, SqliteEffectDispatchGovernor,
-    SqliteEventStore, SqliteHumanHandoffCoordinator, SqliteTaskCoordinator,
-    SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
+    AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION, APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity,
+    AgentMemoryHubProvider, AllowListPolicy, ApprovalInbox, AuthorityContext,
+    CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin, ContextEngine,
+    ConversationCompactionConfig, ConversationCompactorDescriptor, ConversationCompactorRegistry,
+    ConversationContextConfig, DEFAULT_MAX_FAILURE_CYCLE_REPETITIONS,
+    DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+    DigestLockedProcessBroker, EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION,
+    EFFECT_LEDGER_SCHEMA_VERSION, EVALUATION_FORMAT_VERSION, EffectCoordinator, EffectEngine,
+    EffectSecretEnvironment, EvaluationBaseline, EvaluationCase, EvaluationEngine,
+    EvaluationReport, EvaluationSuite, EvaluationTarget, GraderDescriptor, GraderRegistry,
+    HUMAN_HANDOFF_SCHEMA_VERSION, HarnessError, HarnessFuture, HarnessRuntime,
+    HumanHandoffCoordinator, HumanHandoffEngine, HumanHandoffSubject, HumanHandoffSubjectResolver,
+    InboxApprovalHandler, JSON_COMMAND_MAX_INPUT_BYTES, JsonCommandConversationCompactor,
+    JsonCommandGrader, JsonCommandModel, JsonCommandModelProtocol, JsonCommandTool,
+    JsonCommandVerifier, JsonProcessConfig, LanguageModel, LocalProcessBroker,
+    MAX_MODEL_ATTEMPTS_PER_STEP, MAX_PARALLEL_TOOL_CALLS, MAX_THREAD_ARCHIVE_BYTES,
+    MacOsSeatbeltBroker, McpClient, MemoryContextConfig, MemoryEventStore, MemoryFailureMode,
+    MemoryHealthStatus, MemoryProvider, MemoryRegistry, ModelRegistry, ModelRetryPolicy,
+    ModelToolChoice, NetworkAccess, PROTOCOL_VERSION, ProcessBroker, ProtocolAuthorizer,
+    ProtocolHandler, ProtocolPrincipal, RuntimeCatalog, RuntimeMcpCatalogEntry,
+    RuntimeModelCatalogEntry, RuntimeSkillCatalogEntry, RuntimeSkillRegistryCatalogEntry,
+    SECRET_API_VERSION, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
+    SignedSkillPackage, SkillEngine, SkillId, SkillPackage, SkillPublisherPolicy, SkillRegistry,
+    SkillTransparencyRequirement, SkillTrustStore, SqliteApprovalInbox, SqliteEffectCoordinator,
+    SqliteEffectDispatchGovernor, SqliteEventStore, SqliteHumanHandoffCoordinator,
+    SqliteTaskCoordinator, SqliteWorkflowCoordinator, StateEngine, StdioMcpClient, StdioMcpConfig,
     StdioMcpLaunchAuthority, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator, TemporalDriver, ThreadId,
     ToolBatchExecution, ToolDescriptor, ToolRegistry, TurnExecutionOptions, TurnOutcome,
     VerificationRegistry, VerifierDescriptor, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCoordinator,
     WorkflowEngine, decode_thread_archive, encode_thread_archive, register_selected_mcp_tools,
-    serve_jsonl,
+    serve_jsonl_until_cancelled,
 };
+
+#[cfg(feature = "http-probe")]
+use y_harness::{HttpProbeServer, HttpProbeServerConfig, HttpProbeServerReport};
 
 use y_harness::{
     EnvironmentSecretProvider, SecretProvider, SecretReference, TenantEnvironmentSecretProvider,
 };
-#[cfg(any(feature = "https-mcp", feature = "https-model"))]
+#[cfg(any(
+    feature = "https-mcp",
+    feature = "https-model",
+    feature = "https-skill"
+))]
 use y_harness::{SecretRequest, SecretServiceUse, SecretUseContext};
 
-#[cfg(feature = "https-mcp")]
-use y_harness::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
 #[cfg(feature = "https-model")]
 use y_harness::{
-    HttpsJsonModel, HttpsJsonModelConfig, OpenAiResponsesModel, OpenAiResponsesModelConfig,
+    AnthropicMessagesModel, AnthropicMessagesModelConfig, ChatCompletionTokenLimitField,
+    GeminiGenerateContentModel, GeminiGenerateContentModelConfig, HttpsJsonModel,
+    HttpsJsonModelConfig, OpenAiChatCompletionsModel, OpenAiChatCompletionsModelConfig,
+    OpenAiResponsesModel, OpenAiResponsesModelConfig,
 };
 #[cfg(feature = "https-skill")]
-use y_harness::{HttpsSkillSource, HttpsSkillSourceConfig};
+use y_harness::{
+    HttpSkillAuthorization, HttpSkillRequest, HttpSkillResponse, HttpSkillTransport,
+    HttpsSkillSource, HttpsSkillSourceConfig, ReqwestHttpSkillTransport,
+};
+#[cfg(feature = "https-mcp")]
+use y_harness::{HttpsJsonMcpClient, HttpsJsonMcpConfig};
 
 use super::{
     CliResult, DemoModel, EchoTool,
     effect_service::{self, ServiceEffectConsumerConfig, build as build_effect_consumer},
+    service_stdio::ServiceStdin,
     temporal_service::{self, ServiceTemporalConfig},
 };
 
@@ -72,10 +91,29 @@ const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 65_536;
 const MAX_SKILL_PACKAGE_FILE_BYTES: u64 = 16_777_216;
 const MAX_PROJECT_SKILL_FILES: usize = 4_096;
+#[cfg(feature = "https-skill")]
+const MAX_SKILL_CATALOG_BYTES: usize = 4_194_304;
+#[cfg(feature = "https-skill")]
+const MAX_SKILL_CATALOG_ENTRIES: usize = 4_096;
+#[cfg(feature = "https-skill")]
+const MAX_SKILL_CATALOG_QUERY_BYTES: usize = 256;
+#[cfg(feature = "https-skill")]
+const MAX_CATALOG_INSTALL_PACKAGES: usize = 256;
+#[cfg(feature = "https-skill")]
+const MAX_CATALOG_INSTALL_BYTES: usize = 67_108_864;
+#[cfg(feature = "https-skill")]
+const MAX_SKILL_REGISTRIES: usize = 64;
+#[cfg(feature = "https-skill")]
+const MAX_SKILL_REGISTRY_PACKAGE_ORIGINS: usize = 16;
+const MAX_CONFIG_HISTORY_FILES: usize = 4_096;
 const MAX_PINNED_COMMAND_BYTES: u64 = 268_435_456;
 const MAX_EVALUATION_ARTIFACT_BYTES: u64 = 16_777_216;
 const OPERATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(any(feature = "https-mcp", feature = "https-model"))]
+#[cfg(any(
+    feature = "https-mcp",
+    feature = "https-model",
+    feature = "https-skill"
+))]
 const MAX_CA_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -85,6 +123,8 @@ struct ServiceConfig {
     data_directory: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authority: Option<ServiceAuthorityConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_profiles: Vec<ServiceProviderProfileConfig>,
     #[serde(default = "default_max_parallel_tool_calls")]
     max_parallel_tool_calls: usize,
     #[serde(default = "default_max_model_attempts_per_step")]
@@ -109,12 +149,16 @@ struct ServiceConfig {
     conversation: Option<ServiceConversationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skills: Option<ServiceSkillsConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skill_registries: Vec<ServiceSkillRegistryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evaluation: Option<ServiceEvaluationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temporal: Option<ServiceTemporalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effect_consumer: Option<ServiceEffectConsumerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_probe: Option<ServiceHttpProbeConfig>,
 }
 
 impl Default for ServiceConfig {
@@ -123,6 +167,7 @@ impl Default for ServiceConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             data_directory: ".y-harness".to_owned(),
             authority: None,
+            provider_profiles: Vec::new(),
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
             model: Some(ServiceModelConfig::Demo {
@@ -137,10 +182,41 @@ impl Default for ServiceConfig {
             memory: None,
             conversation: None,
             skills: None,
+            skill_registries: Vec::new(),
             evaluation: None,
             temporal: None,
             effect_consumer: None,
+            http_probe: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceHttpProbeConfig {
+    bind_address: String,
+    #[serde(default = "default_http_probe_max_connections")]
+    max_connections: usize,
+    #[serde(default = "default_http_probe_request_timeout_ms")]
+    request_timeout_ms: u64,
+    #[serde(default = "default_http_probe_status_timeout_ms")]
+    status_timeout_ms: u64,
+    #[serde(default = "default_http_probe_shutdown_timeout_ms")]
+    shutdown_timeout_ms: u64,
+}
+
+#[cfg(feature = "http-probe")]
+impl ServiceHttpProbeConfig {
+    fn runtime_config(&self) -> CliResult<HttpProbeServerConfig> {
+        let bind_address = self.bind_address.parse::<SocketAddr>().map_err(|_| {
+            "http_probe.bind_address must be a literal IP socket address such as 127.0.0.1:8081"
+        })?;
+        Ok(HttpProbeServerConfig::new(bind_address)?.with_limits(
+            self.max_connections,
+            Duration::from_millis(self.request_timeout_ms),
+            Duration::from_millis(self.status_timeout_ms),
+            Duration::from_millis(self.shutdown_timeout_ms),
+        )?)
     }
 }
 
@@ -165,9 +241,16 @@ enum ServiceModelConfig {
         protocol: JsonCommandModelProtocol,
         process: ServiceJsonProcessConfig,
     },
+    ProviderModel {
+        id: String,
+        provider_profile: String,
+        model: String,
+    },
     OpenAiResponses {
         id: String,
         model: String,
+        #[serde(default = "default_openai_responses_endpoint")]
+        endpoint: String,
         api_key_secret_reference: String,
         api_key_environment: String,
         #[serde(default = "default_openai_request_timeout_ms")]
@@ -202,8 +285,187 @@ impl ServiceModelConfig {
         match self {
             Self::Demo { id }
             | Self::JsonCommand { id, .. }
+            | Self::ProviderModel { id, .. }
             | Self::OpenAiResponses { id, .. }
             | Self::HttpsJsonGateway { id, .. } => id,
+        }
+    }
+
+    fn adapter(&self) -> &'static str {
+        match self {
+            Self::Demo { .. } => "deterministic_demo",
+            Self::JsonCommand { .. } => "brokered_json_command",
+            Self::ProviderModel { .. } => "provider_profile",
+            Self::OpenAiResponses { .. } => "openai_responses_compatible",
+            Self::HttpsJsonGateway { .. } => "y_harness_https_gateway",
+        }
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::OpenAiResponses { endpoint, .. } | Self::HttpsJsonGateway { endpoint, .. } => {
+                Some(endpoint)
+            }
+            Self::Demo { .. } | Self::JsonCommand { .. } | Self::ProviderModel { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ServiceProviderProfileConfig {
+    OpenAiResponses {
+        id: String,
+        #[serde(default = "default_openai_responses_endpoint")]
+        endpoint: String,
+        api_key_secret_reference: String,
+        api_key_environment: String,
+        #[serde(default = "default_openai_request_timeout_ms")]
+        request_timeout_ms: u64,
+        #[serde(default = "default_connect_timeout_ms")]
+        connect_timeout_ms: u64,
+        #[serde(default = "default_openai_max_response_bytes")]
+        max_response_bytes: usize,
+        #[serde(default = "default_max_concurrency")]
+        max_concurrency: usize,
+    },
+    OpenAiChatCompletions {
+        id: String,
+        #[serde(default = "default_openai_chat_completions_endpoint")]
+        endpoint: String,
+        api_key_secret_reference: String,
+        api_key_environment: String,
+        #[serde(default = "default_native_max_output_tokens")]
+        max_output_tokens: u32,
+        #[serde(default)]
+        token_limit_field: ServiceChatCompletionTokenLimitField,
+        #[serde(default = "default_enabled")]
+        streaming: bool,
+        #[serde(default = "default_enabled")]
+        stream_usage: bool,
+        #[serde(default)]
+        allow_loopback_http: bool,
+        #[serde(default)]
+        initial_tool_choice: ModelToolChoice,
+        #[serde(default = "default_openai_request_timeout_ms")]
+        request_timeout_ms: u64,
+        #[serde(default = "default_connect_timeout_ms")]
+        connect_timeout_ms: u64,
+        #[serde(default = "default_openai_max_response_bytes")]
+        max_response_bytes: usize,
+        #[serde(default = "default_max_concurrency")]
+        max_concurrency: usize,
+    },
+    AnthropicMessages {
+        id: String,
+        #[serde(default = "default_anthropic_messages_endpoint")]
+        endpoint: String,
+        #[serde(default = "default_anthropic_api_version")]
+        api_version: String,
+        api_key_secret_reference: String,
+        api_key_environment: String,
+        #[serde(default = "default_native_max_output_tokens")]
+        max_output_tokens: u32,
+        #[serde(default)]
+        initial_tool_choice: ModelToolChoice,
+        #[serde(default = "default_openai_request_timeout_ms")]
+        request_timeout_ms: u64,
+        #[serde(default = "default_connect_timeout_ms")]
+        connect_timeout_ms: u64,
+        #[serde(default = "default_openai_max_response_bytes")]
+        max_response_bytes: usize,
+        #[serde(default = "default_max_concurrency")]
+        max_concurrency: usize,
+    },
+    GeminiGenerateContent {
+        id: String,
+        #[serde(default = "default_gemini_api_base")]
+        base_url: String,
+        #[serde(default = "default_gemini_api_version")]
+        api_version: String,
+        api_key_secret_reference: String,
+        api_key_environment: String,
+        #[serde(default = "default_native_max_output_tokens")]
+        max_output_tokens: u32,
+        #[serde(default = "default_openai_request_timeout_ms")]
+        request_timeout_ms: u64,
+        #[serde(default = "default_connect_timeout_ms")]
+        connect_timeout_ms: u64,
+        #[serde(default = "default_openai_max_response_bytes")]
+        max_response_bytes: usize,
+        #[serde(default = "default_max_concurrency")]
+        max_concurrency: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceChatCompletionTokenLimitField {
+    #[default]
+    MaxCompletionTokens,
+    MaxTokens,
+}
+
+#[cfg(feature = "https-model")]
+impl ServiceChatCompletionTokenLimitField {
+    fn runtime(self) -> ChatCompletionTokenLimitField {
+        match self {
+            Self::MaxCompletionTokens => ChatCompletionTokenLimitField::MaxCompletionTokens,
+            Self::MaxTokens => ChatCompletionTokenLimitField::MaxTokens,
+        }
+    }
+}
+
+impl ServiceProviderProfileConfig {
+    fn id(&self) -> &str {
+        match self {
+            Self::OpenAiResponses { id, .. }
+            | Self::OpenAiChatCompletions { id, .. }
+            | Self::AnthropicMessages { id, .. }
+            | Self::GeminiGenerateContent { id, .. } => id,
+        }
+    }
+
+    fn adapter(&self) -> &'static str {
+        match self {
+            Self::OpenAiResponses { .. } => "openai_responses",
+            Self::OpenAiChatCompletions { .. } => "openai_chat_completions",
+            Self::AnthropicMessages { .. } => "anthropic_messages",
+            Self::GeminiGenerateContent { .. } => "gemini_generate_content",
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        match self {
+            Self::OpenAiResponses { endpoint, .. }
+            | Self::OpenAiChatCompletions { endpoint, .. }
+            | Self::AnthropicMessages { endpoint, .. } => endpoint,
+            Self::GeminiGenerateContent { base_url, .. } => base_url,
+        }
+    }
+
+    fn secret_mapping(&self) -> (&str, &str) {
+        match self {
+            Self::OpenAiResponses {
+                api_key_secret_reference,
+                api_key_environment,
+                ..
+            }
+            | Self::OpenAiChatCompletions {
+                api_key_secret_reference,
+                api_key_environment,
+                ..
+            }
+            | Self::AnthropicMessages {
+                api_key_secret_reference,
+                api_key_environment,
+                ..
+            }
+            | Self::GeminiGenerateContent {
+                api_key_secret_reference,
+                api_key_environment,
+                ..
+            } => (api_key_secret_reference, api_key_environment),
         }
     }
 }
@@ -367,6 +629,18 @@ struct ServiceSkillsConfig {
     trust: Option<ServiceSkillTrustConfig>,
 }
 
+impl Default for ServiceSkillsConfig {
+    fn default() -> Self {
+        Self {
+            package_files: Vec::new(),
+            external_package_files: Vec::new(),
+            activate: Vec::new(),
+            budget_tokens: default_skill_budget_tokens(),
+            trust: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceSkillTrustConfig {
@@ -405,6 +679,172 @@ struct ServiceSkillTransparencyLogConfig {
 struct ServiceSkillRevocationConfig {
     revoked_at_ms: u64,
     reason_code: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSkillRegistryConfig {
+    id: String,
+    catalog_endpoint: String,
+    package_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authentication: Option<ServiceSkillRegistryAuthenticationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusive_root_ca_pem_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ServiceSkillRegistryAuthenticationConfig {
+    Bearer {
+        secret_reference: String,
+        environment: String,
+    },
+}
+
+#[cfg(feature = "https-skill")]
+struct ConfiguredSkillRegistry {
+    id: String,
+    catalog_endpoint: String,
+    package_origins: BTreeSet<String>,
+    exclusive_root_ca_pem: Option<Vec<u8>>,
+    authorization: Option<ConfiguredSkillRegistryAuthorization>,
+}
+
+#[cfg(feature = "https-skill")]
+struct ConfiguredSkillRegistryAuthorization {
+    reference: SecretReference,
+    provider: Arc<dyn SecretProvider>,
+    authority: AuthorityContext,
+}
+
+#[cfg(feature = "https-skill")]
+impl ConfiguredSkillRegistry {
+    fn source_config(&self, endpoint: &str, maximum: usize) -> CliResult<HttpsSkillSourceConfig> {
+        let mut config = HttpsSkillSourceConfig::new(endpoint)?.with_limits(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            maximum,
+            8,
+        )?;
+        if let Some(pem) = &self.exclusive_root_ca_pem {
+            config = config.with_exclusive_root_certificates_pem(pem.clone())?;
+        }
+        Ok(config)
+    }
+
+    fn permits_package_endpoint(&self, endpoint: &str) -> CliResult<()> {
+        let origin = canonical_https_origin(endpoint, "Skill Registry package endpoint")?;
+        if !self.package_origins.contains(&origin) {
+            return Err(format!(
+                "Skill Registry {} catalog selected package origin {origin} outside its configured allowlist",
+                self.id
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn resolve_credential(
+        &self,
+        use_case: SecretServiceUse,
+    ) -> CliResult<Option<y_harness::SecretValue>> {
+        let Some(authorization) = &self.authorization else {
+            return Ok(None);
+        };
+        let credential = authorization
+            .provider
+            .resolve_as(
+                SecretRequest {
+                    reference: authorization.reference.clone(),
+                    consumer: format!("skill-registry/{}", self.id),
+                    use_context: SecretUseContext::Service { use_case },
+                },
+                &authorization.authority,
+            )
+            .await
+            .map_err(|_| format!("Skill Registry {} credential resolution failed", self.id))?;
+        Ok(Some(credential))
+    }
+
+    async fn probe_credential(&self) -> CliResult<()> {
+        let _credential = self
+            .resolve_credential(SecretServiceUse::StartupProbe)
+            .await?;
+        Ok(())
+    }
+
+    async fn request_authorization(&self) -> CliResult<Option<HttpSkillAuthorization>> {
+        Ok(self
+            .resolve_credential(SecretServiceUse::TransportRequest)
+            .await?
+            .map(HttpSkillAuthorization::Bearer))
+    }
+}
+
+#[cfg(feature = "https-skill")]
+enum SkillCatalogAcquisition {
+    Public { catalog_endpoint: String },
+    Registry(ConfiguredSkillRegistry),
+}
+
+#[cfg(feature = "https-skill")]
+impl SkillCatalogAcquisition {
+    fn catalog_endpoint(&self) -> &str {
+        match self {
+            Self::Public { catalog_endpoint } => catalog_endpoint,
+            Self::Registry(registry) => &registry.catalog_endpoint,
+        }
+    }
+
+    fn registry_id(&self) -> Option<&str> {
+        match self {
+            Self::Public { .. } => None,
+            Self::Registry(registry) => Some(&registry.id),
+        }
+    }
+
+    async fn fetch_catalog(
+        &self,
+        loaded: &LoadedConfig,
+        expected_sha256: &str,
+    ) -> CliResult<SkillCatalog> {
+        match self {
+            Self::Public { catalog_endpoint } => {
+                fetch_skill_catalog(loaded, catalog_endpoint, expected_sha256).await
+            }
+            Self::Registry(registry) => {
+                fetch_skill_registry_catalog(loaded, registry, expected_sha256).await
+            }
+        }
+    }
+
+    async fn fetch_package(
+        &self,
+        expected: &SkillId,
+        entry: &SkillCatalogEntry,
+    ) -> CliResult<SignedSkillPackage> {
+        match self {
+            Self::Public { .. } => {
+                let source = HttpsSkillSource::new(HttpsSkillSourceConfig::new(&entry.endpoint)?)?;
+                Ok(source.fetch(expected, &entry.content_sha256).await?)
+            }
+            Self::Registry(registry) => {
+                registry.permits_package_endpoint(&entry.endpoint)?;
+                let max_response_bytes = usize::try_from(MAX_SKILL_PACKAGE_FILE_BYTES)
+                    .map_err(|_| "Skill package byte limit is unsupported on this platform")?;
+                let source = HttpsSkillSource::new(
+                    registry.source_config(&entry.endpoint, max_response_bytes)?,
+                )?;
+                match registry.request_authorization().await? {
+                    Some(HttpSkillAuthorization::Bearer(credential)) => Ok(source
+                        .fetch_with_bearer(expected, &entry.content_sha256, credential)
+                        .await?),
+                    None => Ok(source.fetch(expected, &entry.content_sha256).await?),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -672,6 +1112,62 @@ struct InstalledProjectSkill {
     path: PathBuf,
 }
 
+#[cfg(feature = "https-skill")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillCatalog {
+    format_version: u32,
+    entries: Vec<SkillCatalogEntry>,
+}
+
+#[cfg(feature = "https-skill")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillCatalogEntry {
+    name: String,
+    version: Version,
+    description: String,
+    endpoint: String,
+    content_sha256: String,
+    #[serde(default)]
+    yanked: bool,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[cfg(feature = "https-skill")]
+impl SkillCatalogEntry {
+    fn id(&self) -> SkillId {
+        SkillId {
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "https-skill")]
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillCatalogInstallReceipt<'a> {
+    format_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_id: Option<&'a str>,
+    catalog_endpoint: &'a str,
+    catalog_sha256: &'a str,
+    root: &'a SkillId,
+    packages: Vec<SkillCatalogInstallReceiptEntry<'a>>,
+}
+
+#[cfg(feature = "https-skill")]
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillCatalogInstallReceiptEntry<'a> {
+    name: &'a str,
+    version: &'a Version,
+    content_sha256: &'a str,
+    endpoint: &'a str,
+}
+
 #[derive(Eq, PartialEq)]
 enum InstalledProjectSkillSource {
     Trusted(SkillPackage),
@@ -812,6 +1308,165 @@ pub async fn run_skill_install_https(
     Err("HTTPS Skill installation requires the `https-skill` Cargo feature".into())
 }
 
+/// Searches one exact digest-pinned public catalog without granting install authority.
+#[cfg(feature = "https-skill")]
+pub async fn run_skill_search_catalog(
+    endpoint: String,
+    expected_sha256: String,
+    query: String,
+    config_path: String,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let catalog = fetch_skill_catalog(&loaded, &endpoint, &expected_sha256).await?;
+    print_skill_catalog_search(&catalog, &expected_sha256, None, &query)
+}
+
+#[cfg(feature = "https-skill")]
+fn print_skill_catalog_search(
+    catalog: &SkillCatalog,
+    expected_sha256: &str,
+    registry: Option<&str>,
+    query: &str,
+) -> CliResult<()> {
+    let query = query.trim();
+    if query.is_empty()
+        || query.len() > MAX_SKILL_CATALOG_QUERY_BYTES
+        || query.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "Skill catalog query must contain 1-{MAX_SKILL_CATALOG_QUERY_BYTES} trimmed non-control bytes; use * to list every entry"
+        )
+        .into());
+    }
+    let query = query.to_ascii_lowercase();
+    let mut matched = 0_usize;
+    for entry in &catalog.entries {
+        let searchable = format!(
+            "{} {} {}",
+            entry.name,
+            entry.description,
+            entry.tags.join(" ")
+        )
+        .to_ascii_lowercase();
+        if query == "*" || searchable.contains(&query) {
+            matched = matched
+                .checked_add(1)
+                .ok_or("Skill catalog result count overflow")?;
+            println!(
+                "package: {}@{} {} {} {}",
+                entry.name,
+                entry.version,
+                entry.content_sha256,
+                if entry.yanked { "yanked" } else { "available" },
+                entry.description
+            );
+        }
+    }
+    println!("catalog matches: {matched}");
+    println!("catalog lock: {expected_sha256}");
+    if let Some(registry) = registry {
+        println!("registry: {registry}");
+    }
+    Ok(())
+}
+
+/// Searches one configured Registry without granting install authority.
+#[cfg(feature = "https-skill")]
+pub async fn run_skill_search_registry(
+    registry: String,
+    expected_sha256: String,
+    query: String,
+    config_path: String,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let registry = configured_skill_registry(&loaded, &registry)?;
+    let catalog = fetch_skill_registry_catalog(&loaded, &registry, &expected_sha256).await?;
+    print_skill_catalog_search(&catalog, &expected_sha256, Some(&registry.id), &query)
+}
+
+/// Reports that the optional catalog discovery surface is not compiled.
+#[cfg(not(feature = "https-skill"))]
+pub async fn run_skill_search_catalog(
+    _endpoint: String,
+    _expected_sha256: String,
+    _query: String,
+    _config_path: String,
+) -> CliResult<()> {
+    Err("HTTPS Skill catalog search requires the `https-skill` Cargo feature".into())
+}
+
+#[cfg(not(feature = "https-skill"))]
+pub async fn run_skill_search_registry(
+    _registry: String,
+    _expected_sha256: String,
+    _query: String,
+    _config_path: String,
+) -> CliResult<()> {
+    Err("Skill Registry search requires the `https-skill` Cargo feature".into())
+}
+
+/// Fetches an exact signed dependency closure from one digest-pinned catalog.
+pub async fn run_skill_install_catalog(
+    endpoint: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+) -> CliResult<()> {
+    install_skill_catalog_closure(endpoint, expected_sha256, identity, config_path, false).await
+}
+
+/// Fetches an exact signed closure and atomically activates its selected root.
+pub async fn run_skill_upgrade_catalog(
+    endpoint: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+) -> CliResult<()> {
+    install_skill_catalog_closure(endpoint, expected_sha256, identity, config_path, true).await
+}
+
+/// Installs one exact signed closure from a configured Registry without activation.
+pub async fn run_skill_install_registry(
+    registry: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+) -> CliResult<()> {
+    install_skill_registry_closure(registry, expected_sha256, identity, config_path, false).await
+}
+
+/// Installs one Registry closure and activates its selected root after preflight.
+pub async fn run_skill_upgrade_registry(
+    registry: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+) -> CliResult<()> {
+    install_skill_registry_closure(registry, expected_sha256, identity, config_path, true).await
+}
+
+#[cfg(not(feature = "https-skill"))]
+async fn install_skill_registry_closure(
+    _registry: String,
+    _expected_sha256: String,
+    _identity: String,
+    _config_path: String,
+    _activate: bool,
+) -> CliResult<()> {
+    Err("Skill Registry installation requires the `https-skill` Cargo feature".into())
+}
+
+#[cfg(not(feature = "https-skill"))]
+async fn install_skill_catalog_closure(
+    _endpoint: String,
+    _expected_sha256: String,
+    _identity: String,
+    _config_path: String,
+    _activate: bool,
+) -> CliResult<()> {
+    Err("HTTPS Skill catalog installation requires the `https-skill` Cargo feature".into())
+}
+
 /// Lists installed packages after revalidating every digest and identity.
 pub fn run_skill_list(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
@@ -819,15 +1474,151 @@ pub fn run_skill_list(config_path: String) -> CliResult<()> {
     verify_installed_external_skills(&loaded, &installed)?;
     println!("installed skills: {}", installed.len());
     for (id, skill) in installed {
+        let active = loaded
+            .config
+            .skills
+            .as_ref()
+            .is_some_and(|skills| skills.activate.contains(&id));
         println!(
-            "skill: {}@{} {} {} {}",
+            "skill: {}@{} {} {} {} {}",
             id.name,
             id.version,
             skill.package().content_sha256,
             skill.trust_label(),
+            if active { "active" } else { "inactive" },
             skill.path.display()
         );
     }
+    Ok(())
+}
+
+/// Activates one exact installed Skill and its exact dependency closure.
+///
+/// The candidate configuration is fully assembled before an atomic replace;
+/// the previous configuration is retained in the project data directory.
+pub async fn run_skill_activate(identity: String, config_path: String) -> CliResult<()> {
+    let requested = parse_skill_identity(&identity)?;
+    let mut loaded = load_config(&config_path)?;
+    let installed = installed_project_skills(&loaded)?;
+    let closure = installed_skill_closure(&requested, &installed)?;
+    let skills = loaded.config.skills.get_or_insert_with(Default::default);
+    for dependency in closure {
+        let selected = installed.get(&dependency).ok_or_else(|| {
+            format!(
+                "Skill {}@{} is not installed",
+                dependency.name, dependency.version
+            )
+        })?;
+        let relative = portable_project_relative_path(
+            selected
+                .path
+                .strip_prefix(&loaded.root)
+                .map_err(|_| "installed Skill escaped the project root")?,
+        )?;
+        let configured = match selected.source {
+            InstalledProjectSkillSource::Trusted(_) => &mut skills.package_files,
+            InstalledProjectSkillSource::External(_) => &mut skills.external_package_files,
+        };
+        if !configured.contains(&relative) {
+            configured.push(relative);
+            configured.sort();
+        }
+    }
+    skills
+        .activate
+        .retain(|active| active.name != requested.name || active == &requested);
+    if !skills.activate.contains(&requested) {
+        skills.activate.push(requested.clone());
+        skills.activate.sort();
+    }
+    commit_service_config(&loaded, &loaded.config, &format!("activate-{identity}")).await?;
+    println!("activated: {}@{}", requested.name, requested.version);
+    Ok(())
+}
+
+/// Deactivates one exact root Skill while retaining its pinned package files.
+pub async fn run_skill_deactivate(identity: String, config_path: String) -> CliResult<()> {
+    let requested = parse_skill_identity(&identity)?;
+    let mut loaded = load_config(&config_path)?;
+    let skills = loaded
+        .config
+        .skills
+        .as_mut()
+        .ok_or("no Skills are configured")?;
+    let previous = skills.activate.len();
+    skills.activate.retain(|active| active != &requested);
+    if skills.activate.len() == previous {
+        return Err(format!(
+            "Skill {}@{} is not active",
+            requested.name, requested.version
+        )
+        .into());
+    }
+    commit_service_config(&loaded, &loaded.config, &format!("deactivate-{identity}")).await?;
+    println!("deactivated: {}@{}", requested.name, requested.version);
+    Ok(())
+}
+
+/// Lists immutable configuration revisions available for explicit rollback.
+pub fn run_skill_history(config_path: String) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let directory = config_history_directory(&loaded, false)?;
+    if !directory.exists() {
+        println!("configuration revisions: 0");
+        return Ok(());
+    }
+    let mut revisions = Vec::new();
+    let mut entries = fs::read_dir(directory)?;
+    for index in 0..=MAX_CONFIG_HISTORY_FILES {
+        let Some(entry) = entries.next().transpose()? else {
+            break;
+        };
+        if index == MAX_CONFIG_HISTORY_FILES {
+            return Err(format!(
+                "configuration history exceeds {MAX_CONFIG_HISTORY_FILES} entries"
+            )
+            .into());
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err("configuration history contains a non-regular entry".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "configuration history contains a non-UTF-8 entry")?;
+        let revision = name
+            .strip_suffix(".json")
+            .ok_or("configuration history contains an unknown file")?;
+        validate_lower_sha256(revision, "configuration revision")?;
+        revisions.push(revision.to_owned());
+    }
+    revisions.sort();
+    println!("configuration revisions: {}", revisions.len());
+    for revision in revisions {
+        println!("revision: {revision}");
+    }
+    Ok(())
+}
+
+/// Restores one exact immutable configuration revision after full preflight.
+pub async fn run_skill_rollback(revision: String, config_path: String) -> CliResult<()> {
+    validate_lower_sha256(&revision, "configuration revision")?;
+    let loaded = load_config(&config_path)?;
+    let directory = config_history_directory(&loaded, false)?;
+    let source = directory.join(format!("{revision}.json"));
+    let source = fs::canonicalize(&source)
+        .map_err(|_| format!("configuration revision {revision} does not exist"))?;
+    if !source.starts_with(&directory) || !source.is_file() {
+        return Err("configuration revision escaped its history directory".into());
+    }
+    let encoded = read_bounded(&source, MAX_CONFIG_BYTES, "configuration revision")?;
+    if lower_sha256(&encoded) != revision {
+        return Err("configuration revision content digest does not match its identity".into());
+    }
+    let candidate: ServiceConfig = serde_json::from_slice(&encoded)?;
+    commit_service_config(&loaded, &candidate, &format!("rollback-{revision}")).await?;
+    println!("rolled back configuration: {revision}");
     Ok(())
 }
 
@@ -851,9 +1642,9 @@ pub fn run_skill_verify(config_path: String) -> CliResult<()> {
 }
 
 /// Removes one exact unreferenced package by moving it into project-local trash.
-pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> {
+pub async fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> {
     let requested = parse_skill_identity(&identity)?;
-    let loaded = load_config(&config_path)?;
+    let mut loaded = load_config(&config_path)?;
     let installed = installed_project_skills(&loaded)?;
     let selected = installed.get(&requested).ok_or_else(|| {
         format!(
@@ -869,22 +1660,35 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
             )
             .into());
         }
-        for configured in &skills.package_files {
-            if resolve_project_file(&loaded.root, configured)? == selected.path {
-                return Err(format!(
-                    "refusing to remove configured Skill {identity}; remove {configured:?} from skills.package_files first"
-                )
-                .into());
+    }
+
+    let selected_path = selected.path.clone();
+    let selected_digest = selected.package().content_sha256.clone();
+    let selected_suffix = selected.source.file_suffix();
+    let root = loaded.root.clone();
+    let mut config_changed = false;
+    if let Some(skills) = loaded.config.skills.as_mut() {
+        let mut retained = Vec::with_capacity(skills.package_files.len());
+        for configured in std::mem::take(&mut skills.package_files) {
+            if resolve_project_file(&root, &configured)? == selected_path {
+                config_changed = true;
+            } else {
+                retained.push(configured);
             }
         }
-        for configured in &skills.external_package_files {
-            if resolve_project_file(&loaded.root, configured)? == selected.path {
-                return Err(format!(
-                    "refusing to remove configured external Skill {identity}; remove {configured:?} from skills.external_package_files first"
-                )
-                .into());
+        skills.package_files = retained;
+        let mut retained = Vec::with_capacity(skills.external_package_files.len());
+        for configured in std::mem::take(&mut skills.external_package_files) {
+            if resolve_project_file(&root, &configured)? == selected_path {
+                config_changed = true;
+            } else {
+                retained.push(configured);
             }
         }
+        skills.external_package_files = retained;
+    }
+    if config_changed {
+        commit_service_config(&loaded, &loaded.config, &format!("remove-{identity}")).await?;
     }
 
     fs::create_dir_all(&loaded.data_directory)?;
@@ -895,15 +1699,15 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
     let removed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let destination = trash.join(format!(
         "{}.removed-{removed_at}-{}.{}",
-        selected.package().content_sha256,
+        selected_digest,
         std::process::id(),
-        selected.source.file_suffix()
+        selected_suffix
     ));
     if destination.exists() {
         return Err(format!("Skill trash destination exists: {}", destination.display()).into());
     }
-    fs::rename(&selected.path, &destination)?;
-    println!("removed: {}", selected.path.display());
+    fs::rename(&selected_path, &destination)?;
+    println!("removed: {}", selected_path.display());
     println!("recoverable: {}", destination.display());
     Ok(())
 }
@@ -912,6 +1716,7 @@ pub fn run_skill_remove(identity: String, config_path: String) -> CliResult<()> 
 pub async fn run_doctor(config_path: String) -> CliResult<()> {
     let loaded = load_config(&config_path)?;
     let authority = loaded.authority()?;
+    probe_skill_registry_credentials(&loaded).await?;
     let data_state = if loaded.data_directory.exists() {
         require_contained_directory(&loaded.root, &loaded.data_directory)?;
         if !loaded.data_directory.is_dir() {
@@ -943,6 +1748,18 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     println!("model: {}", models.route[0]);
     println!("models: {}", models.registry.ids().len());
     println!("model route: {}", models.route.join(" -> "));
+    println!(
+        "provider profiles: {}",
+        loaded.config.provider_profiles.len()
+    );
+    for profile in &loaded.config.provider_profiles {
+        println!(
+            "provider profile: {} / {} / {}",
+            profile.id(),
+            profile.adapter(),
+            profile.endpoint()
+        );
+    }
     println!(
         "model timeout cooldown: {}",
         models.timeout_cooldown.map_or_else(
@@ -983,6 +1800,9 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         loaded.config.max_model_attempts_per_step
     );
     println!(
+        "progress governor: failure cycle period 1-4 / {DEFAULT_MAX_FAILURE_CYCLE_REPETITIONS} repetitions"
+    );
+    println!(
         "verifiers: {}",
         capabilities.verification.descriptors().len()
     );
@@ -1004,6 +1824,28 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     println!("skills: {}", capabilities.skill_locks.len());
     for skill in &capabilities.skill_locks {
         println!("skill lock: {skill}");
+    }
+    println!(
+        "skill registries: {} configured / {} authenticated",
+        loaded.config.skill_registries.len(),
+        loaded
+            .config
+            .skill_registries
+            .iter()
+            .filter(|registry| registry.authentication.is_some())
+            .count()
+    );
+    for registry in &loaded.config.skill_registries {
+        println!(
+            "skill registry: {} / {} / {} package origin(s) / {}",
+            registry.id,
+            registry.catalog_endpoint,
+            registry.package_origins.len(),
+            match &registry.authentication {
+                Some(ServiceSkillRegistryAuthenticationConfig::Bearer { .. }) => "bearer",
+                None => "public",
+            }
+        );
     }
     if let Some(status) = &capabilities.memory_health {
         println!("memory: agent-memory-hub ({status:?})");
@@ -1046,6 +1888,18 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
     } else {
         println!("effect consumer: disabled");
     }
+    if let Some(probe) = &loaded.config.http_probe {
+        println!(
+            "http probe: enabled ({} / {} connections / {} ms request / {} ms status / {} ms shutdown)",
+            probe.bind_address,
+            probe.max_connections,
+            probe.request_timeout_ms,
+            probe.status_timeout_ms,
+            probe.shutdown_timeout_ms
+        );
+    } else {
+        println!("http probe: disabled");
+    }
     println!("data: {} ({data_state})", loaded.data_directory.display());
     println!(
         "stores: state={} approval={} task={} workflow={} handoff={} effect={} effect-governance={}",
@@ -1058,10 +1912,24 @@ pub async fn run_doctor(config_path: String) -> CliResult<()> {
         readiness_label(stores.effect_governance)
     );
     println!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} wait-projection={AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     );
     shutdown_mcp_clients(&capabilities.mcp_clients).await?;
     println!("status: ok");
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+async fn probe_skill_registry_credentials(loaded: &LoadedConfig) -> CliResult<()> {
+    for configured in &loaded.config.skill_registries {
+        let registry = configured_skill_registry(loaded, &configured.id)?;
+        registry.probe_credential().await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "https-skill"))]
+async fn probe_skill_registry_credentials(_loaded: &LoadedConfig) -> CliResult<()> {
     Ok(())
 }
 
@@ -1218,13 +2086,14 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     let configured_effect_consumer = build_effect_consumer(&loaded).await?;
     let configured_models = build_models(&loaded).await?;
     let capabilities = build_capabilities(&loaded, configured_models.demo_tools).await?;
+    let runtime_catalog = configured_runtime_catalog(&loaded, &configured_models, &capabilities)?;
     let state = StateEngine::new(Arc::new(
         SqliteEventStore::open(loaded.data_directory.join("state.db")).await?,
     ));
     let ConfiguredRuntime {
         runtime,
         mcp_clients,
-    } = assemble_configured_runtime(&loaded, configured_models, capabilities, state)?;
+    } = assemble_configured_runtime(&loaded, configured_models, capabilities, state.clone())?;
     let approvals =
         Arc::new(SqliteApprovalInbox::open(loaded.data_directory.join("approvals.db")).await?);
     let tasks =
@@ -1258,6 +2127,21 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
     );
     let effect_port: Arc<dyn EffectCoordinator> = effects;
     let effect_engine = EffectEngine::new(effect_port);
+    let handler = Arc::new(
+        ProtocolHandler::new(runtime)
+            .with_approval_inbox(approval_port)
+            .with_task_coordinator(task_port)
+            .with_workflow_engine(workflow_engine.clone())
+            .with_human_handoff_engine(handoff_engine.clone())
+            .with_effect_engine(effect_engine.clone())
+            .with_runtime_catalog(runtime_catalog)
+            .with_authorizer(Arc::new(FixedLocalProcessAuthorizer {
+                authority: authority.clone(),
+            })),
+    );
+    let mut shutdown_signals = ServiceShutdownSignals::new()?;
+    let service_input = ServiceStdin::spawn()?;
+    let http_probe = start_http_probe(&loaded, handler.clone()).await?;
     let effect_service = match configured_effect_consumer {
         Some(configured) => {
             let configured = configured
@@ -1275,6 +2159,7 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         .map(|config| {
             temporal_service::start(
                 TemporalDriver::new()
+                    .with_state_engine(state.clone())
                     .with_workflow_engine(workflow_engine.clone())
                     .with_human_handoff_engine(handoff_engine.clone())
                     .with_effect_engine(effect_engine.clone()),
@@ -1283,19 +2168,28 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
             )
         })
         .transpose()?;
-    let handler = ProtocolHandler::new(runtime)
-        .with_approval_inbox(approval_port)
-        .with_task_coordinator(task_port)
-        .with_workflow_engine(workflow_engine)
-        .with_human_handoff_engine(handoff_engine)
-        .with_effect_engine(effect_engine)
-        .with_authorizer(Arc::new(FixedLocalProcessAuthorizer { authority }));
-    let served = serve_jsonl(
-        &handler,
-        TokioBufReader::new(tokio_io::stdin()),
+    let transport_shutdown = CancellationToken::new();
+    let serving = serve_jsonl_until_cancelled(
+        handler.as_ref(),
+        TokioBufReader::new(service_input),
         TokioBufWriter::new(tokio_io::stdout()),
-    )
-    .await;
+        transport_shutdown.clone(),
+    );
+    tokio::pin!(serving);
+    let served = tokio::select! {
+        result = &mut serving => result,
+        signal = shutdown_signals.recv() => {
+            transport_shutdown.cancel();
+            let settlement = serving.await;
+            match signal {
+                Ok(()) => settlement,
+                Err(error) => settlement.and(Err(HarnessError::Protocol(format!(
+                    "failed to receive service shutdown signal: {error}"
+                )))),
+            }
+        }
+    };
+    handler.begin_draining();
     let effect_shutdown = match effect_service {
         Some(effect_service) => effect_service.shutdown().await,
         None => Ok(()),
@@ -1305,12 +2199,125 @@ pub async fn run_service(config_path: String) -> CliResult<()> {
         None => Ok(()),
     };
     let protocol_shutdown = shutdown_protocol_handler(&handler).await;
+    let http_probe_shutdown = match http_probe {
+        Some(http_probe) => http_probe.shutdown().await,
+        None => Ok(()),
+    };
     let mcp_shutdown = shutdown_mcp_clients(&mcp_clients).await;
     served?;
     effect_shutdown?;
     temporal_shutdown?;
     protocol_shutdown?;
+    http_probe_shutdown?;
     mcp_shutdown
+}
+
+#[cfg(unix)]
+struct ServiceShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ServiceShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        let received = tokio::select! {
+            signal = self.interrupt.recv() => signal,
+            signal = self.terminate.recv() => signal,
+        };
+        received.ok_or_else(|| std::io::Error::other("service signal stream closed"))
+    }
+}
+
+#[cfg(not(unix))]
+struct ServiceShutdownSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(not(unix))]
+impl ServiceShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        self.ctrl_c
+            .recv()
+            .await
+            .ok_or_else(|| std::io::Error::other("service signal stream closed"))
+    }
+}
+
+#[cfg(feature = "http-probe")]
+struct RunningHttpProbe {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<Result<HttpProbeServerReport, HarnessError>>,
+}
+
+#[cfg(feature = "http-probe")]
+impl RunningHttpProbe {
+    async fn shutdown(self) -> CliResult<()> {
+        self.cancellation.cancel();
+        let report = self
+            .task
+            .await
+            .map_err(|_| "HTTP probe supervisor stopped unexpectedly")??;
+        if report.task_panics > 0 {
+            return Err(format!(
+                "HTTP probe isolated {} connection task panic(s)",
+                report.task_panics
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "http-probe")]
+async fn start_http_probe(
+    loaded: &LoadedConfig,
+    handler: Arc<ProtocolHandler>,
+) -> CliResult<Option<RunningHttpProbe>> {
+    let Some(configured) = &loaded.config.http_probe else {
+        return Ok(None);
+    };
+    let server = HttpProbeServer::bind(configured.runtime_config()?, handler).await?;
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(server.serve(cancellation.clone()));
+    Ok(Some(RunningHttpProbe { cancellation, task }))
+}
+
+#[cfg(not(feature = "http-probe"))]
+struct RunningHttpProbe;
+
+#[cfg(not(feature = "http-probe"))]
+impl RunningHttpProbe {
+    async fn shutdown(self) -> CliResult<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "http-probe"))]
+async fn start_http_probe(
+    loaded: &LoadedConfig,
+    _handler: Arc<ProtocolHandler>,
+) -> CliResult<Option<RunningHttpProbe>> {
+    if loaded.config.http_probe.is_some() {
+        Err("HTTP probe configuration requires the `http-probe` Cargo feature".into())
+    } else {
+        Ok(None)
+    }
 }
 
 async fn shutdown_protocol_handler(handler: &ProtocolHandler) -> Result<(), HarnessError> {
@@ -1385,6 +2392,148 @@ pub async fn run_evaluation(
     } else {
         Err("configured Evaluation baseline regressed".into())
     }
+}
+
+fn configured_runtime_catalog(
+    loaded: &LoadedConfig,
+    models: &ConfiguredModels,
+    capabilities: &ConfiguredCapabilities,
+) -> CliResult<RuntimeCatalog> {
+    let configured_models = match (
+        loaded.config.model.as_ref(),
+        loaded.config.models.as_slice(),
+    ) {
+        (Some(model), []) => vec![model],
+        (None, configured) => configured.iter().collect(),
+        _ => return Err("configured Model catalog is internally inconsistent".into()),
+    };
+    let mut catalog_models = configured_models
+        .into_iter()
+        .map(|model| {
+            let (adapter, endpoint) = match model {
+                ServiceModelConfig::ProviderModel {
+                    provider_profile, ..
+                } => {
+                    let profile = find_provider_profile(&loaded.config, provider_profile)?;
+                    (
+                        profile.adapter().to_owned(),
+                        Some(profile.endpoint().to_owned()),
+                    )
+                }
+                _ => (
+                    model.adapter().to_owned(),
+                    model.endpoint().map(str::to_owned),
+                ),
+            };
+            Ok(RuntimeModelCatalogEntry {
+                id: model.id().to_owned(),
+                adapter,
+                endpoint,
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+    catalog_models.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let installed = installed_project_skills(loaded)?;
+    verify_installed_external_skills(loaded, &installed)?;
+    let mut active = BTreeSet::new();
+    if let Some(skills) = &loaded.config.skills {
+        for requested in &skills.activate {
+            active.extend(installed_skill_closure(requested, &installed)?);
+        }
+    }
+    let skills = active
+        .into_iter()
+        .map(|id| {
+            let installed = installed
+                .get(&id)
+                .ok_or_else(|| format!("active Skill {}@{} disappeared", id.name, id.version))?;
+            Ok(RuntimeSkillCatalogEntry {
+                name: id.name,
+                version: id.version.to_string(),
+                content_sha256: installed.package().content_sha256.clone(),
+                trust: installed.trust_label().to_owned(),
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    let mut skill_registries = loaded
+        .config
+        .skill_registries
+        .iter()
+        .map(|registry| RuntimeSkillRegistryCatalogEntry {
+            id: registry.id.clone(),
+            catalog_endpoint: registry.catalog_endpoint.clone(),
+            package_origins: registry.package_origins.clone(),
+            authentication: match &registry.authentication {
+                Some(ServiceSkillRegistryAuthenticationConfig::Bearer { .. }) => {
+                    "bearer".to_owned()
+                }
+                None => "public".to_owned(),
+            },
+            exclusive_root_ca: registry.exclusive_root_ca_pem_path.is_some(),
+        })
+        .collect::<Vec<_>>();
+    skill_registries.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut mcp_servers = loaded
+        .config
+        .mcp_servers
+        .iter()
+        .map(|server| RuntimeMcpCatalogEntry {
+            id: server.id.clone(),
+            transport: "stdio".to_owned(),
+            endpoint: None,
+            enabled: server.enabled,
+            registered_tools: registered_mcp_tools(&capabilities.tools, &server.id),
+        })
+        .chain(
+            loaded
+                .config
+                .https_mcp_servers
+                .iter()
+                .map(|server| RuntimeMcpCatalogEntry {
+                    id: server.id.clone(),
+                    transport: "https".to_owned(),
+                    endpoint: Some(server.endpoint.clone()),
+                    enabled: server.enabled,
+                    registered_tools: registered_mcp_tools(&capabilities.tools, &server.id),
+                }),
+        )
+        .collect::<Vec<_>>();
+    mcp_servers.sort_by(|left, right| left.id.cmp(&right.id));
+
+    Ok(RuntimeCatalog {
+        configuration_sha256: lower_sha256(&read_bounded(
+            &loaded.path,
+            MAX_CONFIG_BYTES,
+            "service config",
+        )?),
+        model_route: models.route.clone(),
+        models: catalog_models,
+        tools: capabilities
+            .tools
+            .descriptors()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
+        skills,
+        skill_registries,
+        mcp_servers,
+        reload_strategy: "restart_boundary".to_owned(),
+    })
+}
+
+fn registered_mcp_tools(tools: &ToolRegistry, server_id: &str) -> Vec<String> {
+    let expected_origin = format!("mcp/{server_id}");
+    tools
+        .registrations()
+        .into_iter()
+        .filter_map(|(name, origin)| match origin {
+            CapabilityOrigin::External { id } if id == expected_origin => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
 fn assemble_configured_runtime(
@@ -1827,10 +2976,8 @@ fn load_project_skills(
     if packages_empty && config.activate.is_empty() {
         return Ok(None);
     }
-    if packages_empty || config.activate.is_empty() {
-        return Err(
-            "skills requires at least one package file and a non-empty activate list".into(),
-        );
+    if packages_empty {
+        return Err("skills.activate requires at least one configured package file".into());
     }
 
     let mut registry = SkillRegistry::new();
@@ -1858,6 +3005,10 @@ fn load_project_skills(
             ),
         };
         registry.register_signed(origin, signed, &trust)?;
+    }
+
+    if config.activate.is_empty() {
+        return Ok(None);
     }
 
     Ok(Some(SkillEngine::new(registry).resolve(
@@ -2170,16 +3321,653 @@ fn install_project_skill(
         package.content_sha256,
         source.trust_label()
     );
-    let relative = destination
-        .strip_prefix(&loaded.root)
-        .map_err(|_| "installed Skill escaped the project root")?;
+    let relative = portable_project_relative_path(
+        destination
+            .strip_prefix(&loaded.root)
+            .map_err(|_| "installed Skill escaped the project root")?,
+    )?;
     println!(
         "activation required: add {:?} to {} and {}@{} to skills.activate",
-        relative.to_string_lossy(),
+        relative,
         source.activation_field(),
         id.name,
         id.version
     );
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+async fn fetch_skill_catalog(
+    loaded: &LoadedConfig,
+    endpoint: &str,
+    expected_sha256: &str,
+) -> CliResult<SkillCatalog> {
+    validate_lower_sha256(expected_sha256, "Skill catalog SHA-256")?;
+    let source_config = HttpsSkillSourceConfig::new(endpoint)?.with_limits(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        MAX_SKILL_CATALOG_BYTES,
+        8,
+    )?;
+    let transport = ReqwestHttpSkillTransport::new(&source_config)?;
+    let response = transport
+        .fetch(HttpSkillRequest {
+            endpoint: source_config.endpoint().to_owned(),
+            timeout: Duration::from_secs(30),
+            max_response_bytes: MAX_SKILL_CATALOG_BYTES,
+            authorization: None,
+        })
+        .await?;
+    decode_and_cache_skill_catalog(loaded, expected_sha256, response)
+}
+
+#[cfg(feature = "https-skill")]
+async fn fetch_skill_registry_catalog(
+    loaded: &LoadedConfig,
+    registry: &ConfiguredSkillRegistry,
+    expected_sha256: &str,
+) -> CliResult<SkillCatalog> {
+    validate_lower_sha256(expected_sha256, "Skill catalog SHA-256")?;
+    let source_config =
+        registry.source_config(&registry.catalog_endpoint, MAX_SKILL_CATALOG_BYTES)?;
+    let transport = ReqwestHttpSkillTransport::new(&source_config)?;
+    let response = transport
+        .fetch(HttpSkillRequest {
+            endpoint: source_config.endpoint().to_owned(),
+            timeout: Duration::from_secs(30),
+            max_response_bytes: MAX_SKILL_CATALOG_BYTES,
+            authorization: registry.request_authorization().await?,
+        })
+        .await
+        .map_err(|_| format!("Skill Registry {} catalog transport failed", registry.id))?;
+    decode_and_cache_skill_catalog(loaded, expected_sha256, response)
+}
+
+#[cfg(feature = "https-skill")]
+fn decode_and_cache_skill_catalog(
+    loaded: &LoadedConfig,
+    expected_sha256: &str,
+    response: HttpSkillResponse,
+) -> CliResult<SkillCatalog> {
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "remote Skill catalog returned HTTP status {}",
+            response.status
+        )
+        .into());
+    }
+    if response.body.len() > MAX_SKILL_CATALOG_BYTES {
+        return Err("remote Skill catalog exceeded its configured limit".into());
+    }
+    if !response
+        .content_type
+        .as_deref()
+        .is_some_and(is_json_content_type)
+    {
+        return Err("remote Skill catalog must be application/json".into());
+    }
+    let actual_sha256 = lower_sha256(&response.body);
+    if actual_sha256 != expected_sha256 {
+        return Err("remote Skill catalog does not match its expected SHA-256".into());
+    }
+    let catalog: SkillCatalog =
+        serde_json::from_slice(&response.body).map_err(|_| "remote Skill catalog is malformed")?;
+    validate_skill_catalog(&catalog)?;
+    cache_package_bytes(
+        loaded,
+        "catalogs",
+        &format!("{expected_sha256}.json"),
+        &response.body,
+        MAX_SKILL_CATALOG_BYTES,
+    )?;
+    Ok(catalog)
+}
+
+#[cfg(feature = "https-skill")]
+fn validate_skill_catalog(catalog: &SkillCatalog) -> CliResult<()> {
+    if catalog.format_version != 1 {
+        return Err(format!(
+            "unsupported Skill catalog format {}; expected 1",
+            catalog.format_version
+        )
+        .into());
+    }
+    if catalog.entries.len() > MAX_SKILL_CATALOG_ENTRIES {
+        return Err(format!("Skill catalog exceeds {MAX_SKILL_CATALOG_ENTRIES} entries").into());
+    }
+    let mut previous: Option<SkillId> = None;
+    for entry in &catalog.entries {
+        let id = entry.id();
+        let parsed = parse_skill_identity(&format!("{}@{}", id.name, id.version))?;
+        if parsed != id {
+            return Err("Skill catalog identity is not canonical".into());
+        }
+        if previous.as_ref().is_some_and(|value| value >= &id) {
+            return Err("Skill catalog entries must be unique and sorted by identity".into());
+        }
+        previous = Some(id);
+        if entry.description.trim().is_empty()
+            || entry.description.len() > 4_096
+            || entry.description.chars().any(char::is_control)
+        {
+            return Err("Skill catalog descriptions must contain 1-4096 non-control bytes".into());
+        }
+        validate_lower_sha256(&entry.content_sha256, "Skill catalog package SHA-256")?;
+        HttpsSkillSourceConfig::new(&entry.endpoint)?;
+        if entry.tags.len() > 32 {
+            return Err("Skill catalog entry cannot contain more than 32 tags".into());
+        }
+        let mut previous_tag: Option<&str> = None;
+        for tag in &entry.tags {
+            if tag.is_empty()
+                || tag.len() > 64
+                || tag.bytes().any(|byte| {
+                    !(byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-'))
+                })
+                || previous_tag.is_some_and(|value| value >= tag.as_str())
+            {
+                return Err(
+                    "Skill catalog tags must be unique sorted lowercase portable identities".into(),
+                );
+            }
+            previous_tag = Some(tag);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+async fn install_skill_catalog_closure(
+    endpoint: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+    activate: bool,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    install_skill_catalog_acquisition(
+        &loaded,
+        SkillCatalogAcquisition::Public {
+            catalog_endpoint: endpoint,
+        },
+        expected_sha256,
+        identity,
+        config_path,
+        activate,
+    )
+    .await
+}
+
+#[cfg(feature = "https-skill")]
+async fn install_skill_registry_closure(
+    registry: String,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+    activate: bool,
+) -> CliResult<()> {
+    let loaded = load_config(&config_path)?;
+    let registry = configured_skill_registry(&loaded, &registry)?;
+    install_skill_catalog_acquisition(
+        &loaded,
+        SkillCatalogAcquisition::Registry(registry),
+        expected_sha256,
+        identity,
+        config_path,
+        activate,
+    )
+    .await
+}
+
+#[cfg(feature = "https-skill")]
+async fn install_skill_catalog_acquisition(
+    loaded: &LoadedConfig,
+    acquisition: SkillCatalogAcquisition,
+    expected_sha256: String,
+    identity: String,
+    config_path: String,
+    activate: bool,
+) -> CliResult<()> {
+    let root = parse_skill_identity(&identity)?;
+    let catalog = acquisition.fetch_catalog(loaded, &expected_sha256).await?;
+    let index = catalog
+        .entries
+        .iter()
+        .map(|entry| (entry.id(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let root_entry = index.get(&root).ok_or_else(|| {
+        format!(
+            "Skill catalog does not contain requested {}@{}",
+            root.name, root.version
+        )
+    })?;
+    if root_entry.yanked {
+        return Err(format!(
+            "Skill catalog marks requested {}@{} as yanked",
+            root.name, root.version
+        )
+        .into());
+    }
+    let installed = installed_project_skills(loaded)?;
+    verify_installed_external_skills(loaded, &installed)?;
+    let trust = configured_skill_trust(loaded)?;
+    let mut pending = vec![root.clone()];
+    let mut graph = BTreeMap::<SkillId, SkillPackage>::new();
+    let mut fetched = BTreeMap::<SkillId, SignedSkillPackage>::new();
+    let mut fetched_bytes = 0_usize;
+    while let Some(current) = pending.pop() {
+        if graph.contains_key(&current) {
+            continue;
+        }
+        if graph.len() >= MAX_CATALOG_INSTALL_PACKAGES {
+            return Err(format!(
+                "Skill catalog dependency closure exceeds {MAX_CATALOG_INSTALL_PACKAGES} packages"
+            )
+            .into());
+        }
+        let entry = index.get(&current).ok_or_else(|| {
+            format!(
+                "Skill catalog omits dependency {}@{}",
+                current.name, current.version
+            )
+        })?;
+        let package = if let Some(existing) = installed.get(&current) {
+            if !matches!(existing.source, InstalledProjectSkillSource::External(_)) {
+                return Err(format!(
+                    "catalog dependency {}@{} is installed with local trust, not its signed External envelope",
+                    current.name, current.version
+                )
+                .into());
+            }
+            if existing.package().content_sha256 != entry.content_sha256 {
+                return Err(format!(
+                    "installed Skill {}@{} conflicts with the catalog content pin",
+                    current.name, current.version
+                )
+                .into());
+            }
+            existing.package().clone()
+        } else {
+            if entry.yanked {
+                return Err(format!(
+                    "Skill catalog dependency {}@{} is yanked and not already installed",
+                    current.name, current.version
+                )
+                .into());
+            }
+            let signed = acquisition.fetch_package(&current, entry).await?;
+            validate_external_skill(&signed, &trust)?;
+            let encoded_bytes = serde_json::to_vec(&signed)?.len();
+            fetched_bytes = fetched_bytes
+                .checked_add(encoded_bytes)
+                .ok_or("catalog package-byte total overflow")?;
+            if fetched_bytes > MAX_CATALOG_INSTALL_BYTES {
+                return Err(format!(
+                    "catalog package closure exceeds {MAX_CATALOG_INSTALL_BYTES} bytes"
+                )
+                .into());
+            }
+            let package = signed.package.clone();
+            fetched.insert(current.clone(), signed);
+            package
+        };
+        pending.extend(package.manifest.dependencies.iter().map(SkillId::from));
+        graph.insert(current, package);
+    }
+    validate_catalog_dependency_graph(&root, &graph)?;
+    println!(
+        "catalog plan: {} package(s) / {} download(s) / {} bytes",
+        graph.len(),
+        fetched.len(),
+        fetched_bytes
+    );
+    for signed in fetched.into_values() {
+        install_project_skill(loaded, InstalledProjectSkillSource::External(signed))?;
+    }
+    write_catalog_install_receipt(
+        loaded,
+        acquisition.registry_id(),
+        acquisition.catalog_endpoint(),
+        &expected_sha256,
+        &root,
+        &graph,
+        &index,
+    )?;
+    if activate {
+        run_skill_activate(identity, config_path).await?;
+    } else {
+        println!(
+            "activation required: yh package activate {}@{}",
+            root.name, root.version
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+fn validate_catalog_dependency_graph(
+    root: &SkillId,
+    graph: &BTreeMap<SkillId, SkillPackage>,
+) -> CliResult<()> {
+    if !graph.contains_key(root) {
+        return Err("Skill catalog dependency graph omits its root".into());
+    }
+    let mut remaining = BTreeMap::<SkillId, usize>::new();
+    let mut dependants = BTreeMap::<SkillId, Vec<SkillId>>::new();
+    for (id, package) in graph {
+        remaining.insert(id.clone(), package.manifest.dependencies.len());
+        for dependency in &package.manifest.dependencies {
+            let dependency = SkillId::from(dependency);
+            if !graph.contains_key(&dependency) {
+                return Err(format!(
+                    "Skill catalog graph omits dependency {}@{}",
+                    dependency.name, dependency.version
+                )
+                .into());
+            }
+            dependants.entry(dependency).or_default().push(id.clone());
+        }
+    }
+    let mut ready = remaining
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    let mut settled = 0_usize;
+    while let Some(id) = ready.pop() {
+        settled = settled
+            .checked_add(1)
+            .ok_or("Skill catalog graph count overflow")?;
+        if let Some(nodes) = dependants.get(&id) {
+            for dependant in nodes {
+                let count = remaining
+                    .get_mut(dependant)
+                    .ok_or("Skill catalog graph changed during validation")?;
+                *count = count
+                    .checked_sub(1)
+                    .ok_or("Skill catalog graph dependency count underflow")?;
+                if *count == 0 {
+                    ready.push(dependant.clone());
+                }
+            }
+        }
+    }
+    if settled != graph.len() {
+        return Err("Skill catalog dependency graph contains a cycle".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+fn write_catalog_install_receipt(
+    loaded: &LoadedConfig,
+    registry_id: Option<&str>,
+    catalog_endpoint: &str,
+    catalog_sha256: &str,
+    root: &SkillId,
+    graph: &BTreeMap<SkillId, SkillPackage>,
+    index: &BTreeMap<SkillId, &SkillCatalogEntry>,
+) -> CliResult<()> {
+    let packages = graph
+        .keys()
+        .map(|id| {
+            let entry = index.get(id).ok_or("catalog receipt package disappeared")?;
+            Ok(SkillCatalogInstallReceiptEntry {
+                name: &entry.name,
+                version: &entry.version,
+                content_sha256: &entry.content_sha256,
+                endpoint: &entry.endpoint,
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+    let receipt = SkillCatalogInstallReceipt {
+        format_version: 1,
+        registry_id,
+        catalog_endpoint,
+        catalog_sha256,
+        root,
+        packages,
+    };
+    let mut encoded = serde_json::to_vec_pretty(&receipt)?;
+    encoded.push(b'\n');
+    let root_digest = graph
+        .get(root)
+        .ok_or("catalog receipt root disappeared")?
+        .content_sha256
+        .as_str();
+    cache_package_bytes(
+        loaded,
+        "receipts",
+        &format!("{catalog_sha256}-{root_digest}.json"),
+        &encoded,
+        MAX_SKILL_CATALOG_BYTES,
+    )?;
+    println!("catalog receipt: {catalog_sha256}-{root_digest}");
+    Ok(())
+}
+
+#[cfg(feature = "https-skill")]
+fn cache_package_bytes(
+    loaded: &LoadedConfig,
+    namespace: &str,
+    file_name: &str,
+    bytes: &[u8],
+    maximum: usize,
+) -> CliResult<()> {
+    if bytes.len() > maximum {
+        return Err("package cache object exceeds its configured limit".into());
+    }
+    fs::create_dir_all(&loaded.data_directory)?;
+    require_contained_directory(&loaded.root, &loaded.data_directory)?;
+    let cache = loaded.data_directory.join("package-cache").join(namespace);
+    fs::create_dir_all(&cache)?;
+    require_contained_directory(&loaded.root, &cache)?;
+    let destination = cache.join(file_name);
+    if destination.exists() {
+        let existing = read_bounded(
+            &destination,
+            u64::try_from(maximum)?,
+            "package cache object",
+        )?;
+        if existing != bytes {
+            return Err("package cache object conflicts with its immutable identity".into());
+        }
+        return Ok(());
+    }
+    write_new_file(&destination, bytes, "package cache object")
+}
+
+#[cfg(feature = "https-skill")]
+fn is_json_content_type(value: &str) -> bool {
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+}
+
+fn installed_skill_closure(
+    requested: &SkillId,
+    installed: &BTreeMap<SkillId, InstalledProjectSkill>,
+) -> CliResult<BTreeSet<SkillId>> {
+    let mut pending = vec![requested.clone()];
+    let mut closure = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if closure.contains(&current) {
+            continue;
+        }
+        let skill = installed.get(&current).ok_or_else(|| {
+            format!(
+                "Skill {}@{} is not installed",
+                current.name, current.version
+            )
+        })?;
+        if closure.len() >= MAX_PROJECT_SKILL_FILES {
+            return Err(format!(
+                "Skill dependency closure exceeds {MAX_PROJECT_SKILL_FILES} packages"
+            )
+            .into());
+        }
+        closure.insert(current);
+        pending.extend(
+            skill
+                .package()
+                .manifest
+                .dependencies
+                .iter()
+                .map(SkillId::from),
+        );
+    }
+    Ok(closure)
+}
+
+async fn commit_service_config(
+    loaded: &LoadedConfig,
+    candidate: &ServiceConfig,
+    reason: &str,
+) -> CliResult<()> {
+    let mut encoded = serde_json::to_vec_pretty(candidate)?;
+    encoded.push(b'\n');
+    if u64::try_from(encoded.len())? > MAX_CONFIG_BYTES {
+        return Err(format!("service config exceeds {MAX_CONFIG_BYTES} bytes").into());
+    }
+    let current = read_bounded(&loaded.path, MAX_CONFIG_BYTES, "service config")?;
+    if encoded == current {
+        println!("configuration unchanged: {}", loaded.path.display());
+        return Ok(());
+    }
+
+    let candidate_sha256 = lower_sha256(&encoded);
+    let stage = loaded.root.join(format!(
+        ".y-harness-config-stage-{}-{candidate_sha256}.json",
+        std::process::id()
+    ));
+    write_new_file(&stage, &encoded, "staged service config")?;
+    let preflight = async {
+        let staged = load_config(stage.to_str().ok_or("staged config path is not UTF-8")?)?;
+        let models = build_models(&staged).await?;
+        let capabilities = build_capabilities(&staged, models.demo_tools).await?;
+        shutdown_mcp_clients(&capabilities.mcp_clients).await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if let Err(error) = preflight {
+        let cleanup = fs::remove_file(&stage);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "configuration preflight failed: {error}; staged-file cleanup also failed: {cleanup_error}"
+            )
+            .into()),
+        };
+    }
+
+    let history = config_history_directory(loaded, true)?;
+    let current_sha256 = lower_sha256(&current);
+    let backup = history.join(format!("{current_sha256}.json"));
+    validate_config_history_capacity(&history, &backup)?;
+    if backup.exists() {
+        let retained = read_bounded(&backup, MAX_CONFIG_BYTES, "configuration revision")?;
+        if retained != current {
+            let _ = fs::remove_file(&stage);
+            return Err("configuration history digest collision".into());
+        }
+    } else {
+        write_new_file(&backup, &current, "configuration revision")?;
+    }
+
+    if let Err(error) = fs::rename(&stage, &loaded.path) {
+        let cleanup = fs::remove_file(&stage);
+        return match cleanup {
+            Ok(()) => Err(format!(
+                "cannot atomically replace service config {}: {error}",
+                loaded.path.display()
+            )
+            .into()),
+            Err(cleanup_error) => Err(format!(
+                "cannot atomically replace service config {}: {error}; staged-file cleanup also failed: {cleanup_error}",
+                loaded.path.display()
+            )
+            .into()),
+        };
+    }
+    // Windows cannot open a directory handle with std File; the rename is
+    // already atomic and directory durability is a Unix-only refinement.
+    #[cfg(unix)]
+    File::open(&loaded.root)?.sync_all()?;
+    println!("configuration revision: {candidate_sha256}");
+    println!("previous revision: {current_sha256}");
+    println!("configuration reason: {reason}");
+    Ok(())
+}
+
+fn config_history_directory(loaded: &LoadedConfig, create: bool) -> CliResult<PathBuf> {
+    let requested = loaded.data_directory.join("config-history");
+    if create {
+        fs::create_dir_all(&requested)?;
+    } else if !requested.exists() {
+        return Ok(requested);
+    }
+    let directory = fs::canonicalize(&requested)?;
+    if directory == loaded.root || !directory.starts_with(&loaded.root) || !directory.is_dir() {
+        return Err("configuration history must remain a project subdirectory".into());
+    }
+    Ok(directory)
+}
+
+fn validate_config_history_capacity(directory: &Path, prospective: &Path) -> CliResult<()> {
+    let mut count = 0_usize;
+    let mut entries = fs::read_dir(directory)?;
+    for index in 0..=MAX_CONFIG_HISTORY_FILES {
+        let Some(entry) = entries.next().transpose()? else {
+            break;
+        };
+        if index == MAX_CONFIG_HISTORY_FILES {
+            return Err(format!(
+                "configuration history exceeds {MAX_CONFIG_HISTORY_FILES} entries"
+            )
+            .into());
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err("configuration history contains a non-regular entry".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "configuration history contains a non-UTF-8 entry")?;
+        let revision = name
+            .strip_suffix(".json")
+            .ok_or("configuration history contains an unknown file")?;
+        validate_lower_sha256(revision, "configuration revision")?;
+        count = count.saturating_add(1);
+    }
+    if !prospective.exists() && count >= MAX_CONFIG_HISTORY_FILES {
+        return Err(format!(
+            "configuration history reached its {MAX_CONFIG_HISTORY_FILES}-entry limit"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn lower_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+            encoded
+        })
+}
+
+fn validate_lower_sha256(value: &str, kind: &str) -> CliResult<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{kind} must be 64 lowercase hexadecimal characters").into());
+    }
     Ok(())
 }
 
@@ -2457,6 +4245,7 @@ async fn build_https_mcp_client(
 }
 
 async fn build_models(loaded: &LoadedConfig) -> CliResult<ConfiguredModels> {
+    validate_provider_profiles(&loaded.config.provider_profiles)?;
     let (configured, route, attempt_timeout, retry_config, timeout_cooldown) = match (
         loaded.config.model.as_ref(),
         loaded.config.models.as_slice(),
@@ -2569,9 +4358,25 @@ async fn build_model(
                 false,
             ))
         }
+        ServiceModelConfig::ProviderModel {
+            id,
+            provider_profile,
+            model,
+        } => {
+            let profile = find_provider_profile(&loaded.config, provider_profile)?;
+            let model = build_provider_profile_model(loaded, id, model, profile).await?;
+            Ok((
+                CapabilityOrigin::TrustedExtension {
+                    id: format!("first-party-provider/{}", profile.adapter()),
+                },
+                model,
+                false,
+            ))
+        }
         ServiceModelConfig::OpenAiResponses {
             id,
             model,
+            endpoint,
             api_key_secret_reference,
             api_key_environment,
             request_timeout_ms,
@@ -2583,6 +4388,7 @@ async fn build_model(
                 loaded,
                 id,
                 model,
+                endpoint,
                 api_key_secret_reference,
                 api_key_environment,
                 *request_timeout_ms,
@@ -2634,6 +4440,150 @@ async fn build_model(
     }
 }
 
+fn validate_provider_profiles(profiles: &[ServiceProviderProfileConfig]) -> CliResult<()> {
+    if profiles.len() > 64 {
+        return Err("provider_profiles cannot contain more than 64 entries".into());
+    }
+    let mut ids = BTreeSet::new();
+    for profile in profiles {
+        let id = profile.id();
+        if id.is_empty()
+            || id.len() > 128
+            || id.bytes().any(|byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+            })
+        {
+            return Err("Provider Profile id must be 1-128 portable ASCII identity bytes".into());
+        }
+        if !ids.insert(id) {
+            return Err(format!("duplicate Provider Profile identity {id}").into());
+        }
+        let (secret_reference, environment) = profile.secret_mapping();
+        let reference = SecretReference::new(secret_reference.to_owned())?;
+        let _mapping_validator = EnvironmentSecretProvider::new(
+            "provider-profile-validation",
+            BTreeMap::from([(reference, environment.to_owned())]),
+        )?;
+        validate_provider_profile_shape(profile)?;
+    }
+    Ok(())
+}
+
+fn find_provider_profile<'a>(
+    config: &'a ServiceConfig,
+    id: &str,
+) -> CliResult<&'a ServiceProviderProfileConfig> {
+    config
+        .provider_profiles
+        .iter()
+        .find(|profile| profile.id() == id)
+        .ok_or_else(|| format!("model references unknown Provider Profile {id}").into())
+}
+
+#[cfg(feature = "https-model")]
+fn validate_provider_profile_shape(profile: &ServiceProviderProfileConfig) -> CliResult<()> {
+    let (secret_reference, _) = profile.secret_mapping();
+    let reference = SecretReference::new(secret_reference.to_owned())?;
+    match profile {
+        ServiceProviderProfileConfig::OpenAiResponses {
+            endpoint,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let _config = OpenAiResponsesModelConfig::new("validation-model", reference)?
+                .with_endpoint(endpoint)?
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+        }
+        ServiceProviderProfileConfig::OpenAiChatCompletions {
+            endpoint,
+            max_output_tokens,
+            token_limit_field,
+            streaming,
+            stream_usage,
+            allow_loopback_http,
+            initial_tool_choice,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let _config = OpenAiChatCompletionsModelConfig::new("validation-model", reference)?
+                .with_loopback_http(*allow_loopback_http)?
+                .with_endpoint(endpoint)?
+                .with_token_limit_field(token_limit_field.runtime())
+                .with_streaming(*streaming)
+                .with_stream_usage(*stream_usage)
+                .with_initial_tool_choice(initial_tool_choice.clone())
+                .with_limits(
+                    *max_output_tokens,
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+        }
+        ServiceProviderProfileConfig::AnthropicMessages {
+            endpoint,
+            api_version,
+            max_output_tokens,
+            initial_tool_choice,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let _config = AnthropicMessagesModelConfig::new("validation-model", reference)?
+                .with_endpoint(endpoint)?
+                .with_api_version(api_version)?
+                .with_max_output_tokens(*max_output_tokens)?
+                .with_initial_tool_choice(initial_tool_choice.clone())
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+        }
+        ServiceProviderProfileConfig::GeminiGenerateContent {
+            base_url,
+            api_version,
+            max_output_tokens,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let _config = GeminiGenerateContentModelConfig::new("validation-model", reference)?
+                .with_base_url(base_url)?
+                .with_api_version(api_version)?
+                .with_max_output_tokens(*max_output_tokens)?
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "https-model"))]
+fn validate_provider_profile_shape(_profile: &ServiceProviderProfileConfig) -> CliResult<()> {
+    Ok(())
+}
+
 #[cfg(feature = "https-model")]
 /// Selects the unscoped or exact-tenant environment adapter for one Model Secret.
 fn configured_environment_secrets(
@@ -2665,12 +4615,150 @@ fn configured_environment_secret_provider(
     }
 }
 
+#[cfg(feature = "https-model")]
+async fn build_provider_profile_model(
+    loaded: &LoadedConfig,
+    id: &str,
+    model: &str,
+    profile: &ServiceProviderProfileConfig,
+) -> CliResult<Arc<dyn LanguageModel>> {
+    let (secret_reference, environment) = profile.secret_mapping();
+    let reference = SecretReference::new(secret_reference.to_owned())?;
+    let secrets = configured_environment_secrets(loaded, &reference, environment.to_owned())?;
+    let _credential = secrets
+        .resolve_as(
+            SecretRequest {
+                reference: reference.clone(),
+                consumer: id.to_owned(),
+                use_context: SecretUseContext::Service {
+                    use_case: SecretServiceUse::StartupProbe,
+                },
+            },
+            &loaded.authority()?,
+        )
+        .await?;
+    match profile {
+        ServiceProviderProfileConfig::OpenAiResponses {
+            endpoint,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let config = OpenAiResponsesModelConfig::new(model, reference)?
+                .with_endpoint(endpoint)?
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+            Ok(Arc::new(OpenAiResponsesModel::new(id, config, secrets)?))
+        }
+        ServiceProviderProfileConfig::OpenAiChatCompletions {
+            endpoint,
+            max_output_tokens,
+            token_limit_field,
+            streaming,
+            stream_usage,
+            allow_loopback_http,
+            initial_tool_choice,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let config = OpenAiChatCompletionsModelConfig::new(model, reference)?
+                .with_loopback_http(*allow_loopback_http)?
+                .with_endpoint(endpoint)?
+                .with_token_limit_field(token_limit_field.runtime())
+                .with_streaming(*streaming)
+                .with_stream_usage(*stream_usage)
+                .with_initial_tool_choice(initial_tool_choice.clone())
+                .with_limits(
+                    *max_output_tokens,
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+            Ok(Arc::new(OpenAiChatCompletionsModel::new(
+                id, config, secrets,
+            )?))
+        }
+        ServiceProviderProfileConfig::AnthropicMessages {
+            endpoint,
+            api_version,
+            max_output_tokens,
+            initial_tool_choice,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let config = AnthropicMessagesModelConfig::new(model, reference)?
+                .with_endpoint(endpoint)?
+                .with_api_version(api_version)?
+                .with_max_output_tokens(*max_output_tokens)?
+                .with_initial_tool_choice(initial_tool_choice.clone())
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+            Ok(Arc::new(AnthropicMessagesModel::new(id, config, secrets)?))
+        }
+        ServiceProviderProfileConfig::GeminiGenerateContent {
+            base_url,
+            api_version,
+            max_output_tokens,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_response_bytes,
+            max_concurrency,
+            ..
+        } => {
+            let config = GeminiGenerateContentModelConfig::new(model, reference)?
+                .with_base_url(base_url)?
+                .with_api_version(api_version)?
+                .with_max_output_tokens(*max_output_tokens)?
+                .with_limits(
+                    Duration::from_millis(*request_timeout_ms),
+                    Duration::from_millis(*connect_timeout_ms),
+                    *max_response_bytes,
+                    *max_concurrency,
+                )?;
+            Ok(Arc::new(GeminiGenerateContentModel::new(
+                id, config, secrets,
+            )?))
+        }
+    }
+}
+
+#[cfg(not(feature = "https-model"))]
+async fn build_provider_profile_model(
+    _loaded: &LoadedConfig,
+    _id: &str,
+    _model: &str,
+    _profile: &ServiceProviderProfileConfig,
+) -> CliResult<Arc<dyn LanguageModel>> {
+    Err(
+        "Provider Profile configuration requires a binary built with `--features https-model`"
+            .into(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "https-model")]
 async fn build_openai_model(
     loaded: &LoadedConfig,
     id: &str,
     model: &str,
+    endpoint: &str,
     api_key_secret_reference: &str,
     api_key_environment: &str,
     request_timeout_ms: u64,
@@ -2693,12 +4781,14 @@ async fn build_openai_model(
             &loaded.authority()?,
         )
         .await?;
-    let config = OpenAiResponsesModelConfig::new(model, reference)?.with_limits(
-        Duration::from_millis(request_timeout_ms),
-        Duration::from_millis(connect_timeout_ms),
-        max_response_bytes,
-        max_concurrency,
-    )?;
+    let config = OpenAiResponsesModelConfig::new(model, reference)?
+        .with_endpoint(endpoint)?
+        .with_limits(
+            Duration::from_millis(request_timeout_ms),
+            Duration::from_millis(connect_timeout_ms),
+            max_response_bytes,
+            max_concurrency,
+        )?;
     let model = OpenAiResponsesModel::new(id, config, secrets)?;
     Ok(Arc::new(model))
 }
@@ -2709,6 +4799,7 @@ async fn build_openai_model(
     _loaded: &LoadedConfig,
     _id: &str,
     _model: &str,
+    _endpoint: &str,
     _api_key_secret_reference: &str,
     _api_key_environment: &str,
     _request_timeout_ms: u64,
@@ -2817,17 +4908,202 @@ fn load_config(path: &str) -> CliResult<LoadedConfig> {
     if let Some(effect_consumer) = &config.effect_consumer {
         effect_consumer.validate()?;
     }
+    validate_http_probe_config(config.http_probe.as_ref())?;
     configured_authority(&config)?;
     let root = path
         .parent()
         .ok_or_else(|| format!("config has no parent directory: {}", path.display()))?
         .to_owned();
     let data_directory = resolve_data_directory(&root, &config.data_directory)?;
-    Ok(LoadedConfig {
+    let loaded = LoadedConfig {
         config,
         path,
         root,
         data_directory,
+    };
+    validate_skill_registry_configs(&loaded)?;
+    Ok(loaded)
+}
+
+#[cfg(feature = "http-probe")]
+fn validate_http_probe_config(config: Option<&ServiceHttpProbeConfig>) -> CliResult<()> {
+    if let Some(config) = config {
+        let _validated = config.runtime_config()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "http-probe"))]
+fn validate_http_probe_config(config: Option<&ServiceHttpProbeConfig>) -> CliResult<()> {
+    if config.is_some() {
+        Err("HTTP probe configuration requires the `http-probe` Cargo feature".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "https-skill")]
+fn validate_skill_registry_configs(loaded: &LoadedConfig) -> CliResult<()> {
+    if loaded.config.skill_registries.len() > MAX_SKILL_REGISTRIES {
+        return Err(format!(
+            "skill_registries cannot contain more than {MAX_SKILL_REGISTRIES} entries"
+        )
+        .into());
+    }
+    let mut ids = BTreeSet::new();
+    for registry in &loaded.config.skill_registries {
+        if registry.id.is_empty()
+            || registry.id.len() > 128
+            || registry.id.bytes().any(|byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+            })
+        {
+            return Err("Skill Registry id must be 1-128 portable ASCII identity bytes".into());
+        }
+        if !ids.insert(registry.id.as_str()) {
+            return Err(format!("duplicate Skill Registry identity {}", registry.id).into());
+        }
+        if !(1..=MAX_SKILL_REGISTRY_PACKAGE_ORIGINS).contains(&registry.package_origins.len()) {
+            return Err(format!(
+                "Skill Registry {} package_origins must contain 1-{MAX_SKILL_REGISTRY_PACKAGE_ORIGINS} origins",
+                registry.id
+            )
+            .into());
+        }
+        let mut previous: Option<&str> = None;
+        for origin in &registry.package_origins {
+            let canonical = canonical_registry_origin(origin)?;
+            if canonical != *origin {
+                return Err(format!(
+                    "Skill Registry {} package origin must use canonical form {canonical}",
+                    registry.id
+                )
+                .into());
+            }
+            if previous.is_some_and(|value| value >= origin.as_str()) {
+                return Err(format!(
+                    "Skill Registry {} package_origins must be unique and sorted",
+                    registry.id
+                )
+                .into());
+            }
+            previous = Some(origin);
+        }
+        let mut source = HttpsSkillSourceConfig::new(&registry.catalog_endpoint)?.with_limits(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            MAX_SKILL_CATALOG_BYTES,
+            8,
+        )?;
+        if let Some(path) = &registry.exclusive_root_ca_pem_path {
+            let path = resolve_project_file(&loaded.root, path)?;
+            source = source.with_exclusive_root_certificates_pem(read_bounded(
+                &path,
+                MAX_CA_BYTES,
+                "exclusive Skill Registry root CA",
+            )?)?;
+        }
+        let _validated_source = source;
+        if let Some(ServiceSkillRegistryAuthenticationConfig::Bearer {
+            secret_reference,
+            environment,
+        }) = &registry.authentication
+        {
+            let reference = SecretReference::new(secret_reference.clone())?;
+            let _mapping = EnvironmentSecretProvider::new(
+                "skill-registry-validation",
+                BTreeMap::from([(reference, environment.clone())]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "https-skill"))]
+fn validate_skill_registry_configs(loaded: &LoadedConfig) -> CliResult<()> {
+    if loaded.config.skill_registries.is_empty() {
+        Ok(())
+    } else {
+        Err("Skill Registry configuration requires the `https-skill` Cargo feature".into())
+    }
+}
+
+#[cfg(feature = "https-skill")]
+fn canonical_registry_origin(value: &str) -> CliResult<String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "Skill Registry package origin must be an absolute HTTPS origin")?;
+    let canonical = url.origin().ascii_serialization();
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || canonical == "null"
+    {
+        return Err(
+            "Skill Registry package origin must be a canonical HTTPS origin without path, userinfo, query, or fragment"
+                .into(),
+        );
+    }
+    Ok(canonical)
+}
+
+#[cfg(feature = "https-skill")]
+fn canonical_https_origin(endpoint: &str, kind: &str) -> CliResult<String> {
+    HttpsSkillSourceConfig::new(endpoint)?;
+    let url = reqwest::Url::parse(endpoint).map_err(|_| format!("{kind} is not a URL"))?;
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(format!("{kind} has no network origin").into());
+    }
+    Ok(origin)
+}
+
+#[cfg(feature = "https-skill")]
+fn configured_skill_registry(
+    loaded: &LoadedConfig,
+    identity: &str,
+) -> CliResult<ConfiguredSkillRegistry> {
+    let configured = loaded
+        .config
+        .skill_registries
+        .iter()
+        .find(|registry| registry.id == identity)
+        .ok_or_else(|| format!("unknown Skill Registry {identity}"))?;
+    let exclusive_root_ca_pem = configured
+        .exclusive_root_ca_pem_path
+        .as_ref()
+        .map(|path| {
+            let path = resolve_project_file(&loaded.root, path)?;
+            read_bounded(&path, MAX_CA_BYTES, "exclusive Skill Registry root CA")
+        })
+        .transpose()?;
+    let authorization = match &configured.authentication {
+        None => None,
+        Some(ServiceSkillRegistryAuthenticationConfig::Bearer {
+            secret_reference,
+            environment,
+        }) => {
+            let reference = SecretReference::new(secret_reference.clone())?;
+            let provider = configured_environment_secret_provider(
+                loaded,
+                BTreeMap::from([(reference.clone(), environment.clone())]),
+            )?;
+            Some(ConfiguredSkillRegistryAuthorization {
+                reference,
+                provider,
+                authority: loaded.authority()?,
+            })
+        }
+    };
+    Ok(ConfiguredSkillRegistry {
+        id: configured.id.clone(),
+        catalog_endpoint: configured.catalog_endpoint.clone(),
+        package_origins: configured.package_origins.iter().cloned().collect(),
+        exclusive_root_ca_pem,
+        authorization,
     })
 }
 
@@ -2850,6 +5126,28 @@ fn resolve_data_directory(root: &Path, configured: &str) -> CliResult<PathBuf> {
         return Err("data_directory must name a project subdirectory".into());
     }
     Ok(root.join(path))
+}
+
+fn portable_project_relative_path(relative: &Path) -> CliResult<String> {
+    let mut portable = String::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                if !portable.is_empty() {
+                    portable.push('/');
+                }
+                portable.push_str(
+                    name.to_str()
+                        .ok_or("installed Skill path is not valid UTF-8")?,
+                );
+            }
+            _ => return Err("installed Skill path must stay below the project root".into()),
+        }
+    }
+    if portable.is_empty() {
+        return Err("installed Skill path is empty".into());
+    }
+    Ok(portable)
 }
 
 fn resolve_project_file(root: &Path, configured: &str) -> CliResult<PathBuf> {
@@ -2962,6 +5260,34 @@ const fn default_enabled() -> bool {
 
 fn default_demo_model_id() -> String {
     "local/demo".to_owned()
+}
+
+fn default_openai_responses_endpoint() -> String {
+    "https://api.openai.com/v1/responses".to_owned()
+}
+
+fn default_openai_chat_completions_endpoint() -> String {
+    "https://api.openai.com/v1/chat/completions".to_owned()
+}
+
+fn default_anthropic_messages_endpoint() -> String {
+    "https://api.anthropic.com/v1/messages".to_owned()
+}
+
+fn default_anthropic_api_version() -> String {
+    "2023-06-01".to_owned()
+}
+
+fn default_gemini_api_base() -> String {
+    "https://generativelanguage.googleapis.com".to_owned()
+}
+
+fn default_gemini_api_version() -> String {
+    "v1beta".to_owned()
+}
+
+const fn default_native_max_output_tokens() -> u32 {
+    8_192
 }
 
 const fn default_model_attempt_timeout_ms() -> u64 {
@@ -3080,23 +5406,220 @@ const fn default_tool_max_output_bytes() -> usize {
     1_048_576
 }
 
+const fn default_http_probe_max_connections() -> usize {
+    64
+}
+
+const fn default_http_probe_request_timeout_ms() -> u64 {
+    2_000
+}
+
+const fn default_http_probe_status_timeout_ms() -> u64 {
+    1_000
+}
+
+const fn default_http_probe_shutdown_timeout_ms() -> u64 {
+    5_000
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
         CapabilityOrigin, EvaluationBaseline, EvaluationSuite, LoadedConfig, ServiceConfig,
-        ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig,
+        ServiceEvaluationConfig, ServiceGraderConfig, ServiceJsonProcessConfig, ServiceModelConfig,
         ServiceProcessLaunchConfig, ServiceToolConfig, ServiceVerifierConfig, ToolBatchExecution,
         build_capabilities, build_effect_consumer, build_evaluation, build_models,
         configured_authority, configured_skill_trust, load_config, resolve_data_directory,
         verify_file_sha256,
     };
+    use super::{ServiceHttpProbeConfig, validate_http_probe_config};
     use std::{
         fs,
         path::{Path, PathBuf},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(feature = "https-skill")]
+    use super::{
+        ConfiguredSkillRegistry, ConfiguredSkillRegistryAuthorization, EnvironmentSecretProvider,
+        SecretProvider, SecretReference, SecretServiceUse, SecretUseContext,
+        SkillCatalogAcquisition, SkillCatalogEntry, SkillId,
+    };
+    #[cfg(feature = "https-skill")]
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex},
+    };
+    #[cfg(feature = "https-skill")]
+    use y_harness::{
+        AuthorityContext, HarnessError, HarnessFuture, SECRET_API_VERSION,
+        SecretProviderDescriptor, SecretRequest, SecretValue,
+    };
+
+    #[cfg(feature = "https-skill")]
+    struct RecordingRegistrySecretProvider {
+        use_contexts: Mutex<Vec<SecretUseContext>>,
+    }
+
+    #[cfg(feature = "https-skill")]
+    impl SecretProvider for RecordingRegistrySecretProvider {
+        fn descriptor(&self) -> SecretProviderDescriptor {
+            SecretProviderDescriptor {
+                name: "registry-secret-context-test".to_owned(),
+                description: "Records private Registry Secret use contexts".to_owned(),
+                api_version: SECRET_API_VERSION,
+            }
+        }
+
+        fn resolve<'a>(&'a self, _request: SecretRequest) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async {
+                Err(HarnessError::Secret(
+                    "unscoped Registry fixture resolution is forbidden".to_owned(),
+                ))
+            })
+        }
+
+        fn resolve_as<'a>(
+            &'a self,
+            request: SecretRequest,
+            _authority: &'a AuthorityContext,
+        ) -> HarnessFuture<'a, SecretValue> {
+            Box::pin(async move {
+                self.use_contexts
+                    .lock()
+                    .expect("Registry Secret contexts")
+                    .push(request.use_context);
+                SecretValue::new(b"fixture-credential".to_vec())
+            })
+        }
+    }
+
+    #[cfg(feature = "https-skill")]
+    #[test]
+    fn private_registry_fences_every_catalog_package_to_configured_origins() {
+        let registry = ConfiguredSkillRegistry {
+            id: "private/default".to_owned(),
+            catalog_endpoint: "https://registry.example.test/catalog.json".to_owned(),
+            package_origins: BTreeSet::from([
+                "https://cdn-a.example.test".to_owned(),
+                "https://cdn-b.example.test:8443".to_owned(),
+            ]),
+            exclusive_root_ca_pem: None,
+            authorization: None,
+        };
+        registry
+            .permits_package_endpoint("https://cdn-a.example.test/packages/a.json")
+            .expect("configured origin");
+        registry
+            .permits_package_endpoint("https://cdn-b.example.test:8443/packages/b.json")
+            .expect("configured origin and port");
+        let error = registry
+            .permits_package_endpoint("https://attacker.example.test/packages/a.json")
+            .expect_err("reject unconfigured origin");
+        assert!(
+            error
+                .to_string()
+                .contains("outside its configured allowlist")
+        );
+        assert!(
+            registry
+                .permits_package_endpoint("https://cdn-a.example.test/packages/a.json?token=x")
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "https-skill")]
+    #[tokio::test]
+    async fn private_registry_rejects_package_origin_before_resolving_credential() {
+        let reference =
+            SecretReference::new("registry/private".to_owned()).expect("Registry Secret reference");
+        let provider = Arc::new(
+            EnvironmentSecretProvider::new(
+                "registry-origin-order-test",
+                std::collections::BTreeMap::from([(
+                    reference.clone(),
+                    "YH_REGISTRY_ORIGIN_ORDER_SECRET_DO_NOT_SET".to_owned(),
+                )]),
+            )
+            .expect("Registry Secret provider"),
+        );
+        let acquisition = SkillCatalogAcquisition::Registry(ConfiguredSkillRegistry {
+            id: "private/default".to_owned(),
+            catalog_endpoint: "https://registry.example.test/catalog.json".to_owned(),
+            package_origins: BTreeSet::from(["https://packages.example.test".to_owned()]),
+            exclusive_root_ca_pem: None,
+            authorization: Some(ConfiguredSkillRegistryAuthorization {
+                reference,
+                provider,
+                authority: y_harness::AuthorityContext::local_process(),
+            }),
+        });
+        let expected = SkillId {
+            name: "fixture".to_owned(),
+            version: semver::Version::parse("1.0.0").expect("version"),
+        };
+        let entry = SkillCatalogEntry {
+            name: expected.name.clone(),
+            version: expected.version.clone(),
+            description: "fixture".to_owned(),
+            endpoint: "https://attacker.example.test/fixture.json".to_owned(),
+            content_sha256: "a".repeat(64),
+            yanked: false,
+            tags: Vec::new(),
+        };
+        let result = acquisition.fetch_package(&expected, &entry).await;
+        let error = match result {
+            Ok(_) => panic!("unconfigured package origin must fail before transport"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("outside its configured allowlist")
+        );
+    }
+
+    #[cfg(feature = "https-skill")]
+    #[tokio::test]
+    async fn private_registry_distinguishes_probe_from_transport_secret_use() {
+        let provider = Arc::new(RecordingRegistrySecretProvider {
+            use_contexts: Mutex::new(Vec::new()),
+        });
+        let registry = ConfiguredSkillRegistry {
+            id: "private/default".to_owned(),
+            catalog_endpoint: "https://registry.example.test/catalog.json".to_owned(),
+            package_origins: BTreeSet::from(["https://packages.example.test".to_owned()]),
+            exclusive_root_ca_pem: None,
+            authorization: Some(ConfiguredSkillRegistryAuthorization {
+                reference: SecretReference::new("registry/private".to_owned())
+                    .expect("Registry Secret reference"),
+                provider: provider.clone(),
+                authority: AuthorityContext::local_process(),
+            }),
+        };
+
+        registry.probe_credential().await.expect("Registry probe");
+        let _authorization = registry
+            .request_authorization()
+            .await
+            .expect("Registry request authorization");
+        assert_eq!(
+            *provider
+                .use_contexts
+                .lock()
+                .expect("Registry Secret contexts"),
+            vec![
+                SecretUseContext::Service {
+                    use_case: SecretServiceUse::StartupProbe,
+                },
+                SecretUseContext::Service {
+                    use_case: SecretServiceUse::TransportRequest,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn config_is_strict_and_data_directory_cannot_escape() {
@@ -3135,12 +5658,69 @@ mod tests {
             batch_execution, ..
         } = &explicitly_safe.tools[0];
         assert_eq!(*batch_execution, ToolBatchExecution::ParallelSafe);
-        assert!(
-            serde_json::from_str::<ServiceConfig>(
-                r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"open_ai_responses","id":"openai/default","model":"model-explicit","api_key_secret_reference":"openai/default","api_key_environment":"OPENAI_API_KEY"}}"#
-            )
-            .is_ok()
-        );
+        let responses = serde_json::from_str::<ServiceConfig>(
+            r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"open_ai_responses","id":"openai/default","model":"model-explicit","api_key_secret_reference":"openai/default","api_key_environment":"OPENAI_API_KEY"}}"#,
+        )
+        .expect("default Responses endpoint");
+        assert!(matches!(
+            responses.model,
+            Some(ServiceModelConfig::OpenAiResponses { endpoint, .. })
+                if endpoint == "https://api.openai.com/v1/responses"
+        ));
+        let compatible = serde_json::from_str::<ServiceConfig>(
+            r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"open_ai_responses","id":"vendor/model","model":"model-explicit","endpoint":"https://models.example.test/v1/responses","api_key_secret_reference":"vendor/default","api_key_environment":"VENDOR_API_KEY"}}"#,
+        )
+        .expect("compatible Responses endpoint");
+        assert!(matches!(
+            compatible.model,
+            Some(ServiceModelConfig::OpenAiResponses { endpoint, .. })
+                if endpoint == "https://models.example.test/v1/responses"
+        ));
+        let profiled = serde_json::from_str::<ServiceConfig>(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "provider_profiles": [
+                {
+                  "type": "anthropic_messages",
+                  "id": "anthropic/production",
+                  "api_key_secret_reference": "provider/anthropic",
+                  "api_key_environment": "ANTHROPIC_API_KEY"
+                },
+                {
+                  "type": "gemini_generate_content",
+                  "id": "google/production",
+                  "api_key_secret_reference": "provider/gemini",
+                  "api_key_environment": "GEMINI_API_KEY"
+                }
+              ],
+              "models": [
+                {
+                  "type": "provider_model",
+                  "id": "anthropic/primary",
+                  "provider_profile": "anthropic/production",
+                  "model": "claude-sonnet-4-5"
+                },
+                {
+                  "type": "provider_model",
+                  "id": "google/fallback",
+                  "provider_profile": "google/production",
+                  "model": "gemini-2.5-pro"
+                }
+              ],
+              "model_route": {"models": ["anthropic/primary", "google/fallback"]}
+            }"#,
+        )
+        .expect("native Provider Profiles");
+        assert_eq!(profiled.provider_profiles.len(), 2);
+        assert!(matches!(
+            &profiled.models[1],
+            ServiceModelConfig::ProviderModel {
+                provider_profile,
+                model,
+                ..
+            } if provider_profile == "google/production" && model == "gemini-2.5-pro"
+        ));
         assert!(
             serde_json::from_str::<ServiceConfig>(
                 r#"{"schema_version":1,"data_directory":".y-harness","model":{"type":"demo"},"extra":true}"#
@@ -3150,6 +5730,114 @@ mod tests {
         assert!(resolve_data_directory(Path::new("/project"), "../outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), "/outside").is_err());
         assert!(resolve_data_directory(Path::new("/project"), ".").is_err());
+    }
+
+    #[cfg(feature = "https-model")]
+    #[test]
+    fn native_provider_profiles_validate_protocol_specific_bounds() {
+        let valid = serde_json::from_str::<ServiceConfig>(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "provider_profiles": [{
+                "type": "gemini_generate_content",
+                "id": "google/production",
+                "api_key_secret_reference": "provider/gemini",
+                "api_key_environment": "GEMINI_API_KEY"
+              }],
+              "model": {"type": "demo"}
+            }"#,
+        )
+        .expect("Provider Profile config");
+        super::validate_provider_profiles(&valid.provider_profiles).expect("valid native profile");
+
+        let invalid = serde_json::from_str::<ServiceConfig>(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "provider_profiles": [{
+                "type": "anthropic_messages",
+                "id": "anthropic/production",
+                "endpoint": "http://api.anthropic.test/v1/messages",
+                "api_key_secret_reference": "provider/anthropic",
+                "api_key_environment": "ANTHROPIC_API_KEY"
+              }],
+              "model": {"type": "demo"}
+            }"#,
+        )
+        .expect("syntactically valid profile");
+        let error = super::validate_provider_profiles(&invalid.provider_profiles)
+            .expect_err("reject non-HTTPS endpoint");
+        assert!(error.to_string().contains("must use HTTPS"));
+    }
+
+    #[cfg(feature = "https-skill")]
+    #[test]
+    fn pinned_skill_catalog_is_sorted_bounded_and_acyclic() {
+        let shipped: super::SkillCatalog = serde_json::from_str(include_str!(
+            "../../config/y-harness.skill-catalog.example.json"
+        ))
+        .expect("shipped Skill catalog shape");
+        super::validate_skill_catalog(&shipped).expect("shipped Skill catalog bounds");
+
+        let entry = |name: &str| super::SkillCatalogEntry {
+            name: name.to_owned(),
+            version: super::Version::parse("1.0.0").expect("version"),
+            description: format!("{name} package"),
+            endpoint: format!("https://packages.example.test/{name}.json"),
+            content_sha256: "0".repeat(64),
+            yanked: false,
+            tags: vec!["agent".to_owned(), "skill".to_owned()],
+        };
+        let mut catalog = super::SkillCatalog {
+            format_version: 1,
+            entries: vec![entry("alpha"), entry("beta")],
+        };
+        super::validate_skill_catalog(&catalog).expect("valid sorted catalog");
+        catalog.entries.swap(0, 1);
+        let error = super::validate_skill_catalog(&catalog).expect_err("reject unsorted catalog");
+        assert!(error.to_string().contains("unique and sorted"));
+
+        let package = |name: &str, dependency: Option<&str>| {
+            serde_json::from_value::<super::SkillPackage>(serde_json::json!({
+                "manifest": {
+                    "api_version": "1",
+                    "name": name,
+                    "version": "1.0.0",
+                    "description": format!("{name} package"),
+                    "estimated_tokens": 1,
+                    "dependencies": dependency.into_iter().map(|dependency| serde_json::json!({
+                        "name": dependency,
+                        "version": "1.0.0"
+                    })).collect::<Vec<_>>(),
+                    "required_tools": []
+                },
+                "instructions": "test",
+                "resources": {},
+                "content_sha256": "0".repeat(64)
+            }))
+            .expect("Skill package shape")
+        };
+        let alpha = super::SkillId {
+            name: "alpha".to_owned(),
+            version: super::Version::parse("1.0.0").expect("version"),
+        };
+        let beta = super::SkillId {
+            name: "beta".to_owned(),
+            version: super::Version::parse("1.0.0").expect("version"),
+        };
+        let graph = std::collections::BTreeMap::from([
+            (alpha.clone(), package("alpha", Some("beta"))),
+            (beta.clone(), package("beta", None)),
+        ]);
+        super::validate_catalog_dependency_graph(&alpha, &graph).expect("acyclic graph");
+        let cyclic = std::collections::BTreeMap::from([
+            (alpha.clone(), package("alpha", Some("beta"))),
+            (beta, package("beta", Some("alpha"))),
+        ]);
+        let error = super::validate_catalog_dependency_graph(&alpha, &cyclic)
+            .expect_err("reject dependency cycle");
+        assert!(error.to_string().contains("cycle"));
     }
 
     #[tokio::test]
@@ -3371,6 +6059,57 @@ mod tests {
                 .contains("temporal.poll_interval_ms must be 100-86400000")
         );
         fs::remove_dir_all(root).expect("remove Temporal config fixture");
+    }
+
+    #[cfg(feature = "http-probe")]
+    #[test]
+    fn http_probe_config_requires_literal_address_and_bounded_limits() {
+        let valid = ServiceHttpProbeConfig {
+            bind_address: "127.0.0.1:8081".to_owned(),
+            max_connections: 8,
+            request_timeout_ms: 2_000,
+            status_timeout_ms: 1_000,
+            shutdown_timeout_ms: 5_000,
+        };
+        let runtime = valid.runtime_config().expect("valid HTTP probe config");
+        assert_eq!(runtime.bind_address.to_string(), "127.0.0.1:8081");
+        assert_eq!(runtime.max_connections, 8);
+
+        let mut invalid = valid.clone();
+        invalid.bind_address = "localhost:8081".to_owned();
+        assert!(
+            invalid
+                .runtime_config()
+                .expect_err("DNS name must not enter probe bind authority")
+                .to_string()
+                .contains("literal IP socket address")
+        );
+        invalid = valid;
+        invalid.status_timeout_ms = 0;
+        assert!(
+            validate_http_probe_config(Some(&invalid))
+                .expect_err("zero status timeout must fail")
+                .to_string()
+                .contains("status timeout")
+        );
+    }
+
+    #[cfg(not(feature = "http-probe"))]
+    #[test]
+    fn http_probe_config_is_rejected_without_the_feature() {
+        let configured = ServiceHttpProbeConfig {
+            bind_address: "127.0.0.1:8081".to_owned(),
+            max_connections: 8,
+            request_timeout_ms: 2_000,
+            status_timeout_ms: 1_000,
+            shutdown_timeout_ms: 5_000,
+        };
+        assert!(
+            validate_http_probe_config(Some(&configured))
+                .expect_err("feature-disabled probe config must fail closed")
+                .to_string()
+                .contains("requires the `http-probe` Cargo feature")
+        );
     }
 
     #[tokio::test]
@@ -3687,6 +6426,22 @@ mod tests {
         ))
         .expect("OpenAI example config");
         serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.responses-compatible.example.json"
+        ))
+        .expect("Responses-compatible Provider example config");
+        let provider_profiles = serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.provider-profiles.example.json"
+        ))
+        .expect("native Provider Profile example config");
+        super::validate_provider_profiles(&provider_profiles.provider_profiles)
+            .expect("valid native Provider Profile bounds");
+        let local_chat = serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.openai-chat-local.example.json"
+        ))
+        .expect("local Chat-compatible Provider example config");
+        super::validate_provider_profiles(&local_chat.provider_profiles)
+            .expect("valid loopback Chat-compatible Provider bounds");
+        serde_json::from_str::<ServiceConfig>(include_str!(
             "../../config/y-harness.openai-amh.macos.example.json"
         ))
         .expect("OpenAI plus Agent Memory Hub example config");
@@ -3698,6 +6453,11 @@ mod tests {
             "../../config/y-harness.skill.example.json"
         ))
         .expect("project Skill example config");
+        let skill_registry = serde_json::from_str::<ServiceConfig>(include_str!(
+            "../../config/y-harness.skill-registry.example.json"
+        ))
+        .expect("private Skill Registry example config");
+        assert_eq!(skill_registry.skill_registries.len(), 1);
         serde_json::from_str::<ServiceConfig>(include_str!(
             "../../config/y-harness.route.example.json"
         ))
@@ -3783,6 +6543,52 @@ mod tests {
             .err()
             .expect("reject unknown route entry");
         assert!(error.to_string().contains("unknown model"));
+
+        let unknown_profile = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "models": [{
+                "type": "provider_model",
+                "id": "vendor/model",
+                "provider_profile": "missing/profile",
+                "model": "model-name"
+              }],
+              "model_route": {"models": ["vendor/model"]}
+            }"#,
+        );
+        let error = build_models(&unknown_profile)
+            .await
+            .err()
+            .expect("reject unknown Provider Profile");
+        assert!(error.to_string().contains("unknown Provider Profile"));
+
+        let duplicate_profiles = loaded(
+            r#"{
+              "schema_version": 1,
+              "data_directory": ".y-harness",
+              "provider_profiles": [
+                {
+                  "type": "open_ai_responses",
+                  "id": "vendor/default",
+                  "api_key_secret_reference": "vendor/key-a",
+                  "api_key_environment": "VENDOR_KEY_A"
+                },
+                {
+                  "type": "open_ai_responses",
+                  "id": "vendor/default",
+                  "api_key_secret_reference": "vendor/key-b",
+                  "api_key_environment": "VENDOR_KEY_B"
+                }
+              ],
+              "model": {"type": "demo"}
+            }"#,
+        );
+        let error = build_models(&duplicate_profiles)
+            .await
+            .err()
+            .expect("reject duplicate Provider Profiles");
+        assert!(error.to_string().contains("duplicate Provider Profile"));
 
         let invalid_timeout = loaded(
             r#"{

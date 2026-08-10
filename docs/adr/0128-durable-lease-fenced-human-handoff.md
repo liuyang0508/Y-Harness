@@ -41,6 +41,17 @@ one-shot decision.
 - Retain immutable, contiguous, actor-attributed transitions. Deserialization
   reconstructs the complete current projection, claim expirations, and every
   actor-bound command digest instead of trusting cached fields.
+- Treat 4,096 transitions and 16 MiB of encoded state as work-admission
+  ceilings. Claim and renewal consume work capacity. Reserve two additional
+  transitions and 278,528 additional encoded bytes exclusively for release or
+  expiration recovery and terminal resolution or cancellation. A case may
+  therefore use its final work slot to become `claimed`, then expire back to
+  the queue and still cancel, or resolve the active claim directly.
+- Keep the reserve finite: the absolute hard boundaries are 4,098 transitions
+  and 17,055,744 encoded bytes. Exact actor/content duplicate recognition still
+  precedes admission at either boundary. Deserialization rejects work
+  transitions placed in the reserved transition window. These rules do not
+  change the serialized aggregate or command representation.
 - Persist cases through a tenant-partitioned, revision-CAS Coordinator.
   Memory and SQLite implementations share create, load, queued-list, and apply
   semantics. SQLite schema 1 uses WAL, `synchronous=FULL`, immediate
@@ -60,7 +71,9 @@ one-shot decision.
 
 ## Bounds and recovery
 
-- One case retains at most 4,096 transitions and 16 MiB of encoded state.
+- One case admits claim work through 4,096 transitions and 16 MiB of encoded
+  state. Its recovery/settlement-only hard limits are 4,098 transitions and
+  17,055,744 encoded bytes.
 - One actor-bound command is limited to 128 KiB. Resolution summaries are
   limited to 64 KiB.
 - Claim leases are 1 second through 7 days.

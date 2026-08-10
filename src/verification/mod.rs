@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CancellationToken, CapabilityOrigin, HarnessError, HarnessFuture, Item, ThreadId, TurnId,
-    VerificationOutcome,
+    CancellationToken, CapabilityOrigin, CompletionVerifierBinding, HarnessError, HarnessFuture,
+    Item, ThreadId, TurnId, VerificationOutcome,
     kernel::{
         capture_capability_metadata, validate_capability_name, validate_capability_origin,
         validate_registry_growth,
@@ -62,6 +62,8 @@ pub struct RegisteredVerifier {
     pub descriptor: VerifierDescriptor,
     /// Registration trust origin.
     pub origin: CapabilityOrigin,
+    /// Frozen descriptor-and-origin coordinate used by completion receipts.
+    pub completion_binding: CompletionVerifierBinding,
     /// Executable verifier.
     pub verifier: Arc<dyn Verifier>,
 }
@@ -93,11 +95,13 @@ impl VerificationRegistry {
         if self.verifiers.contains_key(&descriptor.name) {
             return Err(HarnessError::DuplicateCapability(descriptor.name));
         }
+        let completion_binding = CompletionVerifierBinding::new(&descriptor, origin.clone())?;
         self.verifiers.insert(
             descriptor.name.clone(),
             RegisteredVerifier {
                 descriptor,
                 origin,
+                completion_binding,
                 verifier,
             },
         );
@@ -116,6 +120,15 @@ impl VerificationRegistry {
         self.verifiers
             .values()
             .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
+    /// Returns the frozen completion manifest in strict verifier-name order.
+    #[must_use]
+    pub fn completion_bindings(&self) -> Vec<CompletionVerifierBinding> {
+        self.verifiers
+            .values()
+            .map(|registered| registered.completion_binding.clone())
             .collect()
     }
 
@@ -201,6 +214,29 @@ mod tests {
             .register(CapabilityOrigin::BuiltIn, Arc::new(PassingVerifier))
             .expect_err("duplicate must fail");
         assert!(error.to_string().contains("duplicate capability"));
+    }
+
+    #[test]
+    fn registration_freezes_completion_binding_and_origin() {
+        let origin = CapabilityOrigin::TrustedExtension {
+            id: "verified-package".to_owned(),
+        };
+        let mut registry = VerificationRegistry::new();
+        registry
+            .register(origin.clone(), Arc::new(PassingVerifier))
+            .expect("register verifier");
+
+        let bindings = registry.completion_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name(), "required-output");
+        assert_eq!(bindings[0].origin(), &origin);
+        assert_eq!(bindings[0].binding_sha256().len(), 64);
+        assert!(
+            bindings[0]
+                .binding_sha256()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 
     #[test]

@@ -16,33 +16,37 @@ turning it into a comparative score. They are produced by the independent
   identity;
 - format 6 adds Hermes Agent's one-shot response plus strict bounded usage
   sidecar, observed Provider/Model identity, and explicit estimated-cost
-  semantics; and
+  semantics;
 - format 7 is a separate Codex CF-003 fault-conformance envelope. It correlates
   a deterministic local Responses Provider, released-product JSONL, and the
-  independent MCP effect oracle without turning them into a score; and
+  independent MCP effect oracle without turning them into a score;
 - format 8 adds a controller-cancelled Codex process, exact persisted rollout
   identity, same-Thread `exec resume`, source-defined synthetic `aborted`
-  output, and before/after no-replay observations; and
+  output, and before/after no-replay observations;
 - format 9 drives Y-Harness itself through real typed stdio service processes,
   SQLite restart, permissioned exact-Turn recovery, and the same independent
-  one-effect oracle.
+  one-effect oracle; and
+- format 10 adds SWE-agent's bounded single-instance `.traj`, exact
+  SWE-agent/SWE-ReX/source/config coordinates, and its configured ACI Tool
+  loop without relabeling the product's blocklist as Harness approval.
 
 ## Top-level contract
 
 | Field | Meaning |
 |---|---|
-| `format_version` | Exact integer `1` through `9`; readers must select one exact schema and reject unsupported values. |
+| `format_version` | Exact integer `1` through `10`; readers must select one exact schema and reject unsupported values. |
 | `adapter` | Adapter name/version, product name, observed CLI version, and SHA-256 of both adapter and product executables. |
 | `coordinate` | Caller-assigned run, benchmark and case identities; caller-asserted workspace snapshot; start time and host platform. |
 | `controls` | Requested profile/provider/model/timeout and budget when exposed, observed model identities, prompt fingerprints, authority, inherited environment names, unsupported controls, and claim eligibility. |
 | `execution` | Exactly one `completed`, `product_error`, or `adapter_error` settlement. |
 
-The table's execution variants describe formats 1–6. Formats 7–9 keep the same
-adapter, coordinate, and non-claim control principles but have fault-specific
-execution objects. Formats 7/8 retain strict Codex JSONL and deterministic
-Provider summaries; format 9 retains typed Y-Harness Protocol/State recovery
-evidence. All validate the fixture independently. Their `passed` field means
-only that the pre-registered fault experiment satisfied its closed contracts.
+The table's execution variants describe formats 1–6 and 10. Formats 7–9 keep
+the same adapter, coordinate, and non-claim control principles but have
+fault-specific execution objects. Formats 7/8 retain strict Codex JSONL and
+deterministic Provider summaries; format 9 retains typed Y-Harness
+Protocol/State recovery evidence. All validate the fixture independently.
+Their `passed` field means only that the pre-registered fault experiment
+satisfied its closed contracts.
 
 `completed` and `product_error` contain the same `settlement` shape:
 
@@ -52,8 +56,8 @@ only that the pre-registered fault experiment satisfied its closed contracts.
   format 3 preserves Grok Build cost only when the product marks it complete,
   while format 4 sums cost from validated completed Pi assistant messages and
   format 5 sums only successful validated OpenCode `step-finish` records;
-  format 6 keeps Hermes's estimate in raw evidence and reports actual cost as
-  unavailable;
+  formats 6 and 10 keep product-reported cost evidence only in the raw object
+  and report actual Provider spend as unavailable;
   complete format-3 settlements add `actual_cost_usd_ticks`, where
   `10_000_000_000` ticks equal one USD, and reject disagreement with the
   product's float projection; an adapter must never infer these fields;
@@ -280,6 +284,35 @@ status, and source only under `raw_result.usage`; `actual_cost_usd` remains
 launcher need not identify its dependency graph. These are explicit
 unsupported controls.
 
+The SWE-agent adapter emits format 10 and fixes `claim_eligible: false`. It
+supports only `bare`: the caller supplies an exact SWE-agent executable hash,
+expected SWE-agent version and source commit, expected SWE-ReX version, and an
+exact selected-config digest. `PYTHONPATH` and SWE-agent's config/tool roots
+are pointed at that source root. The workspace, source root, initially empty
+home, output, and temp directories must be pairwise disjoint. The problem
+statement and empty `.env` are create-exclusive private files removed after
+execution; the selected config and referenced Tool bundles remain available
+to the product.
+
+The adapter invokes public `sweagent run` controls for one local repository,
+one safe problem identity, an explicit loopback API base, exact Model, system
+template, model-call/cost limits, output directory, and disabled PR/local-patch
+actions. A successful process must create exactly the expected bounded
+`<output>/<case>/<case>.traj`. Format 10 validates its trajectory/history/info
+shape, every retained step, model statistics, submitted patch, SWE-agent
+version/source commit, and SWE-ReX version. `num_turns` is the number of
+retained SWE-agent trajectory steps; `requested_max_turns` carries the
+configured model-call limit and is not a claim that re-query calls equal
+steps.
+
+The `.traj` is rewritten after steps rather than committed as a durable effect
+journal. SWE-agent checks call and cost limits after a Model call, its command
+blocklist requests a retry rather than authorization, and `.traj` does not
+independently settle Provider/Model or SWE-ReX container identity. A source
+commit does not prove that the supplied checkout is clean, and one config hash
+does not transitively hash every referenced Tool bundle. These limitations are
+machine-readable; no live or comparative SWE-agent record is checked in.
+
 ## Evidence
 
 The first real format-1 record and its exact input are preserved under
@@ -390,3 +423,8 @@ It used a locked source install, isolated platform/Hermes home, and
 deterministic loopback Provider. It remains non-comparative,
 `claim_eligible: false` adapter-conformance evidence; estimated cost is not
 promoted to actual cost.
+
+The SWE-agent format-10 contract is source-tested against official snapshot
+[`abd7d69`](https://github.com/SWE-agent/SWE-agent/tree/abd7d69724d1413b30fea43d4724bb5b463906b4),
+which reports SWE-agent `1.1.0`. No live Provider/container execution or
+comparative result is checked in; the adapter remains `claim_eligible: false`.

@@ -1,30 +1,36 @@
 //! Pinned, bounded HTTPS acquisition for signed declarative Skill packages.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
 use super::{SignedSkillPackage, SkillId, SkillRegistry, SkillTrustStore, validate_package};
-use crate::{CapabilityOrigin, HarnessError, HarnessFuture, kernel::validate_capability_name};
+use crate::{
+    CapabilityOrigin, HarnessError, HarnessFuture, SecretValue, kernel::validate_capability_name,
+};
 
 const MAX_HTTPS_SKILL_URL_BYTES: usize = 8_192;
 const MAX_HTTPS_SKILL_RESPONSE_BYTES: usize = 16_777_216;
 const MAX_HTTPS_SKILL_CONCURRENCY: usize = 64;
 const MAX_HTTPS_SKILL_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_ROOT_CA_PEM_BYTES: usize = 1_048_576;
+const MAX_ROOT_CA_CERTIFICATES: usize = 64;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16_777_216;
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
 /// Validated policy for one exact remote signed-package URL.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpsSkillSourceConfig {
     endpoint: String,
     request_timeout: Duration,
     connect_timeout: Duration,
     max_response_bytes: usize,
     max_concurrency: usize,
+    exclusive_root_ca_pem: Option<Arc<[u8]>>,
 }
 
 impl HttpsSkillSourceConfig {
@@ -36,6 +42,7 @@ impl HttpsSkillSourceConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            exclusive_root_ca_pem: None,
         };
         config.validate()?;
         Ok(config)
@@ -53,6 +60,19 @@ impl HttpsSkillSourceConfig {
         self.connect_timeout = connect_timeout;
         self.max_response_bytes = max_response_bytes;
         self.max_concurrency = max_concurrency;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Trusts only the supplied bounded PEM CA bundle for this source.
+    ///
+    /// This is intended for an operator-configured private Registry. Ambient
+    /// native and WebPKI roots are disabled when this option is present.
+    pub fn with_exclusive_root_certificates_pem(
+        mut self,
+        pem: impl Into<Vec<u8>>,
+    ) -> Result<Self, HarnessError> {
+        self.exclusive_root_ca_pem = Some(Arc::from(pem.into()));
         self.validate()?;
         Ok(self)
     }
@@ -106,8 +126,38 @@ impl HttpsSkillSourceConfig {
                 "Skill source concurrency must be 1-{MAX_HTTPS_SKILL_CONCURRENCY}"
             )));
         }
+        if let Some(pem) = &self.exclusive_root_ca_pem {
+            let _certificates = parse_exclusive_root_certificates(pem)?;
+        }
         Ok(())
     }
+}
+
+impl fmt::Debug for HttpsSkillSourceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpsSkillSourceConfig")
+            .field("endpoint", &self.endpoint)
+            .field("request_timeout", &self.request_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("max_concurrency", &self.max_concurrency)
+            .field(
+                "exclusive_root_ca_pem",
+                &self.exclusive_root_ca_pem.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// One request-scoped credential for a pinned Skill source.
+///
+/// The value is intentionally neither cloneable nor serializable. Callers
+/// should resolve it immediately before one request so rotation and tenant
+/// authority are re-evaluated for every network operation.
+pub enum HttpSkillAuthorization {
+    /// RFC 6750-style Bearer authorization.
+    Bearer(SecretValue),
 }
 
 /// One bounded GET issued to a trusted HTTPS transport implementation.
@@ -118,6 +168,8 @@ pub struct HttpSkillRequest {
     pub timeout: Duration,
     /// Maximum retained response bytes.
     pub max_response_bytes: usize,
+    /// Optional request-scoped authorization selected by the trusted host.
+    pub authorization: Option<HttpSkillAuthorization>,
 }
 
 /// Content-free metadata plus retained successful response bytes.
@@ -150,7 +202,7 @@ impl ReqwestHttpSkillTransport {
     /// Builds a reusable client from one validated source configuration.
     pub fn new(config: &HttpsSkillSourceConfig) -> Result<Self, HarnessError> {
         config.validate()?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .https_only(true)
             .tls_version_min(reqwest::tls::Version::TLS_1_2)
             .redirect(reqwest::redirect::Policy::none())
@@ -159,13 +211,13 @@ impl ReqwestHttpSkillTransport {
             .no_proxy()
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
-            .user_agent(concat!("y-harness/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| {
-                HarnessError::InvalidConfiguration(
-                    "failed to build HTTPS Skill transport".to_owned(),
-                )
-            })?;
+            .user_agent(concat!("y-harness/", env!("CARGO_PKG_VERSION")));
+        if let Some(pem) = &config.exclusive_root_ca_pem {
+            builder = builder.tls_certs_only(parse_exclusive_root_certificates(pem)?);
+        }
+        let client = builder.build().map_err(|_| {
+            HarnessError::InvalidConfiguration("failed to build HTTPS Skill transport".to_owned())
+        })?;
         Ok(Self {
             client,
             concurrency: Arc::new(Semaphore::new(config.max_concurrency)),
@@ -219,10 +271,35 @@ impl HttpsSkillSource {
         expected: &SkillId,
         expected_sha256: &str,
     ) -> Result<SignedSkillPackage, HarnessError> {
+        self.fetch_with_authorization(expected, expected_sha256, None)
+            .await
+    }
+
+    /// Fetches one exact package with a request-scoped Bearer credential.
+    pub async fn fetch_with_bearer(
+        &self,
+        expected: &SkillId,
+        expected_sha256: &str,
+        credential: SecretValue,
+    ) -> Result<SignedSkillPackage, HarnessError> {
+        self.fetch_with_authorization(
+            expected,
+            expected_sha256,
+            Some(HttpSkillAuthorization::Bearer(credential)),
+        )
+        .await
+    }
+
+    async fn fetch_with_authorization(
+        &self,
+        expected: &SkillId,
+        expected_sha256: &str,
+        authorization: Option<HttpSkillAuthorization>,
+    ) -> Result<SignedSkillPackage, HarnessError> {
         validate_expected_pin(expected, expected_sha256)?;
         tokio::time::timeout(
             self.config.request_timeout,
-            self.fetch_inner(expected, expected_sha256),
+            self.fetch_inner(expected, expected_sha256, authorization),
         )
         .await
         .map_err(|_| HarnessError::Skill("HTTPS Skill operation timed out".to_owned()))?
@@ -245,6 +322,7 @@ impl HttpsSkillSource {
         &self,
         expected: &SkillId,
         expected_sha256: &str,
+        authorization: Option<HttpSkillAuthorization>,
     ) -> Result<SignedSkillPackage, HarnessError> {
         let response = self
             .transport
@@ -252,6 +330,7 @@ impl HttpsSkillSource {
                 endpoint: self.config.endpoint.clone(),
                 timeout: self.config.request_timeout,
                 max_response_bytes: self.config.max_response_bytes,
+                authorization,
             })
             .await
             .map_err(|_| HarnessError::Skill("remote Skill transport failed".to_owned()))?;
@@ -302,9 +381,17 @@ async fn execute_http_fetch(
     client: &reqwest::Client,
     request: HttpSkillRequest,
 ) -> Result<HttpSkillResponse, HarnessError> {
-    let mut response = client
-        .get(&request.endpoint)
-        .header(ACCEPT, "application/json")
+    let HttpSkillRequest {
+        endpoint,
+        timeout: _,
+        max_response_bytes,
+        authorization,
+    } = request;
+    let mut builder = client.get(&endpoint).header(ACCEPT, "application/json");
+    if let Some(HttpSkillAuthorization::Bearer(secret)) = authorization {
+        builder = builder.header(AUTHORIZATION, bearer_header(secret)?);
+    }
+    let mut response = builder
         .send()
         .await
         .map_err(|_| HarnessError::Skill("HTTPS Skill request failed".to_owned()))?;
@@ -313,7 +400,7 @@ async fn execute_http_fetch(
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        && length > request.max_response_bytes as u64
+        && length > max_response_bytes as u64
     {
         return Err(HarnessError::Skill(
             "HTTPS Skill response declared an oversized body".to_owned(),
@@ -333,7 +420,7 @@ async fn execute_http_fetch(
         });
     }
 
-    let mut body = Vec::with_capacity(request.max_response_bytes.min(8_192));
+    let mut body = Vec::with_capacity(max_response_bytes.min(8_192));
     while let Some(chunk) = response
         .chunk()
         .await
@@ -343,7 +430,7 @@ async fn execute_http_fetch(
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| HarnessError::Skill("HTTPS Skill response size overflow".to_owned()))?;
-        if next > request.max_response_bytes {
+        if next > max_response_bytes {
             return Err(HarnessError::Skill(
                 "HTTPS Skill response exceeded its configured limit".to_owned(),
             ));
@@ -355,6 +442,40 @@ async fn execute_http_fetch(
         content_type,
         body,
     })
+}
+
+fn bearer_header(secret: SecretValue) -> Result<HeaderValue, HarnessError> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(
+        "Bearer ".len().saturating_add(secret.expose_bytes().len()),
+    ));
+    encoded.extend_from_slice(b"Bearer ");
+    encoded.extend_from_slice(secret.expose_bytes());
+    let mut value = HeaderValue::from_bytes(encoded.as_slice()).map_err(|_| {
+        HarnessError::Skill("private Skill Registry credential is not a valid HTTP header".into())
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+fn parse_exclusive_root_certificates(
+    pem: &[u8],
+) -> Result<Vec<reqwest::Certificate>, HarnessError> {
+    if pem.is_empty() || pem.len() > MAX_ROOT_CA_PEM_BYTES {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "exclusive Skill source root CA bundle must be 1-{MAX_ROOT_CA_PEM_BYTES} bytes"
+        )));
+    }
+    let certificates = reqwest::Certificate::from_pem_bundle(pem).map_err(|_| {
+        HarnessError::InvalidConfiguration(
+            "exclusive Skill source root CA bundle is not valid PEM".to_owned(),
+        )
+    })?;
+    if certificates.is_empty() || certificates.len() > MAX_ROOT_CA_CERTIFICATES {
+        return Err(HarnessError::InvalidConfiguration(format!(
+            "exclusive Skill source root CA bundle must contain 1-{MAX_ROOT_CA_CERTIFICATES} certificates"
+        )));
+    }
+    Ok(certificates)
 }
 
 fn validate_expected_pin(expected: &SkillId, digest: &str) -> Result<(), HarnessError> {
@@ -390,12 +511,13 @@ mod tests {
     use semver::Version;
 
     use super::{
-        HttpSkillRequest, HttpSkillResponse, HttpSkillTransport, HttpsSkillSource,
-        HttpsSkillSourceConfig,
+        HttpSkillAuthorization, HttpSkillRequest, HttpSkillResponse, HttpSkillTransport,
+        HttpsSkillSource, HttpsSkillSourceConfig,
     };
     use crate::{
-        CapabilityOrigin, HarnessError, HarnessFuture, SKILL_API_VERSION, SignedSkillPackage,
-        SkillId, SkillManifest, SkillPackage, SkillRegistry, SkillSignature, SkillTrustStore,
+        CapabilityOrigin, HarnessError, HarnessFuture, SKILL_API_VERSION, SecretValue,
+        SignedSkillPackage, SkillId, SkillManifest, SkillPackage, SkillRegistry, SkillSignature,
+        SkillTrustStore,
     };
 
     struct StubTransport {
@@ -475,6 +597,18 @@ mod tests {
                 .with_limits(Duration::from_secs(1), Duration::from_secs(1), 1, 65)
                 .is_err()
         );
+        assert!(
+            HttpsSkillSourceConfig::new("https://example.test/skill.json")
+                .expect("base source")
+                .with_exclusive_root_certificates_pem(Vec::new())
+                .is_err()
+        );
+        assert!(
+            HttpsSkillSourceConfig::new("https://example.test/skill.json")
+                .expect("base source")
+                .with_exclusive_root_certificates_pem(b"not a PEM certificate".to_vec())
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -519,6 +653,46 @@ mod tests {
         let requests = transport.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].endpoint, "https://example.test/skill.json");
+        assert!(requests[0].authorization.is_none());
+    }
+
+    #[tokio::test]
+    async fn bearer_authorization_is_request_scoped_and_not_part_of_source_config() {
+        let (signed, _) = signed_fixture();
+        let expected = SkillId {
+            name: signed.package.manifest.name.clone(),
+            version: signed.package.manifest.version.clone(),
+        };
+        let digest = signed.package.content_sha256.clone();
+        let transport = Arc::new(StubTransport {
+            status: 200,
+            content_type: Some("application/json".to_owned()),
+            body: serde_json::to_vec(&signed).expect("encode package"),
+            requests: Mutex::new(Vec::new()),
+            fail_with: None,
+        });
+        let source = HttpsSkillSource::with_transport(
+            HttpsSkillSourceConfig::new("https://registry.example.test/skill.json")
+                .expect("source config"),
+            transport.clone(),
+        )
+        .expect("source");
+        source
+            .fetch_with_bearer(
+                &expected,
+                &digest,
+                SecretValue::new(b"short-lived-token".to_vec()).expect("credential"),
+            )
+            .await
+            .expect("authenticated fetch");
+
+        let requests = transport.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            requests[0].authorization,
+            Some(HttpSkillAuthorization::Bearer(_))
+        ));
+        assert!(!format!("{:?}", source.config).contains("short-lived-token"));
     }
 
     #[tokio::test]

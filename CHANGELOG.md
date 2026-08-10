@@ -2,6 +2,18 @@
 
 All notable changes to Y-Harness are documented in this file.
 
+## Unreleased
+
+- advanced client Protocol to v37, State event/snapshot schemas to 16/16,
+  Thread archive format to 6, and embedded Temporal Driver API to 3; added an
+  independently versioned schema-1 Agent Loop wait projection, bounded
+  tenant-keyset timeout and accepted-denial convergence, exact event-evidence
+  settlement, backup-first projection migration, deterministic duplicate/CAS
+  handling across SQLite processes, and opt-in reference-service lifecycle;
+  Core still starts no scheduler, and Inbox repair, general HumanInput/batch
+  waiting, finite worker leases, frozen Context capsules, and cross-process
+  resume receipts remain open.
+
 ## 0.1.0 - 2026-08-09
 
 First tagged release. Everything below, including the initial baseline,

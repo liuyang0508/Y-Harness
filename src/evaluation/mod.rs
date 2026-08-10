@@ -180,7 +180,7 @@ pub enum EvaluationExecution {
     /// Target completed a Turn.
     Completed {
         /// Full terminal outcome and ordered Items.
-        outcome: TurnOutcome,
+        outcome: Box<TurnOutcome>,
     },
     /// Target returned a runtime error.
     Failed {
@@ -644,7 +644,9 @@ fn normalize_execution(result: Result<TurnOutcome, HarnessError>) -> EvaluationE
                 };
             }
             match bounded_serialized_size(&outcome, MAX_EVALUATION_EXECUTION_BYTES) {
-                Ok(_) => EvaluationExecution::Completed { outcome },
+                Ok(_) => EvaluationExecution::Completed {
+                    outcome: Box::new(outcome),
+                },
                 Err(BoundedJsonError::LimitExceeded) => EvaluationExecution::Failed {
                     error: format!(
                         "evaluation execution exceeds {MAX_EVALUATION_EXECUTION_BYTES} encoded bytes"
@@ -1094,6 +1096,7 @@ mod tests {
                         id: TurnId::generate(),
                         thread_id,
                         status: TurnStatus::Completed,
+                        completion_receipt: None,
                         items: Vec::<Item>::new(),
                     },
                     final_text: case.prompt,
@@ -1184,6 +1187,7 @@ mod tests {
                         id: TurnId::generate(),
                         thread_id,
                         status: TurnStatus::Completed,
+                        completion_receipt: None,
                         items: Vec::new(),
                     },
                     final_text: case.prompt,
@@ -1469,6 +1473,7 @@ mod tests {
                 id: TurnId::generate(),
                 thread_id: ThreadId::generate(),
                 status: TurnStatus::Completed,
+                completion_receipt: None,
                 items: vec![Item::new(ItemKind::ToolResult {
                     call_id: "call-deep".to_owned(),
                     output: deeply_nested,
@@ -1493,6 +1498,7 @@ mod tests {
                 id: TurnId::generate(),
                 thread_id: ThreadId::generate(),
                 status: TurnStatus::Running,
+                completion_receipt: None,
                 items: Vec::new(),
             },
             final_text: "not terminal".to_owned(),

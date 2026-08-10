@@ -49,6 +49,19 @@ provider-side storage, accepts ordered multi-call proposals, and keeps Tool
 execution, Policy, and State inside Y-Harness. Configured shell-free JSON
 Models/Tools, selected MCP Tools, Agent Memory Hub, and Evaluation Graders
 remain optional; see the [Chinese quick start](docs/quickstart.zh-CN.md).
+Native OpenAI Chat Completions, Anthropic Messages, and Gemini
+`generateContent` profiles are also available. The multi-Provider example
+binds each credential and transport policy once, then lets several configured
+Model identities reference those profiles:
+
+```bash
+cp config/y-harness.provider-profiles.example.json y-harness.local.json
+# Replace the four model placeholders, then export only the keys in use.
+export OPENAI_API_KEY='...'
+export ANTHROPIC_API_KEY='...'
+export GEMINI_API_KEY='...'
+yh doctor y-harness.local.json
+```
 
 Create and validate a persistent Harness service:
 
@@ -65,7 +78,7 @@ as `ready` or `will be created`; it never creates, bootstraps, or migrates a
 database. A legacy store fails with the exact backup-first migration command
 that must be run after all writers are stopped.
 
-`yh serve` is a headless Protocol v31 JSONL service over stdin/stdout. It
+`yh serve` is a headless Protocol v37 JSONL service over stdin/stdout. It
 persists State, approvals, Task coordination, Workflow Runs, and Human
 Handoffs, and durable external Effects under `.y-harness/`. A
 language-neutral Task Worker example is included:
@@ -102,7 +115,7 @@ one optional control-plane library, and two non-runtime evidence tools:
 | Package | Binary | Role |
 |---|---|---|
 | `y-harness` | `yh` | headless engine, service, diagnostics, migrations |
-| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v31 |
+| `y-harness-tui` | `yh-tui` | full-screen terminal client over Protocol v37 |
 | `y-harness-domain-pack` | — | optional tenant-fenced Domain Pack promotion and execution-binding control plane |
 | `y-harness-benchmark-runner` | `yh-bench` | released-product evidence adapters outside the semantic Core |
 | `y-harness-fault-fixture` | `yh-fault-fixture` | deterministic Tool fault process and oracle outside the semantic Core |
@@ -173,11 +186,37 @@ See [ADR 0018](docs/adr/0018-model-registry-and-provenance.md) and
 [ADR 0101](docs/adr/0101-bounded-typed-model-retry-policy.md), and
 [ADR 0114](docs/adr/0114-bounded-runtime-model-attempts-per-step.md).
 The reference service exposes the same contract through a mutually exclusive
-`models` catalog plus `model_route`; configured IDs are stable operator aliases,
-each Model keeps its own environment-backed Secret reference, and `yh doctor`
-rejects duplicates, unknown route entries, invalid timeouts, and invalid retry
-bounds before Provider construction. See
+`models` catalog plus `model_route`; configured IDs are stable operator aliases.
+A `provider_profiles` entry can bind one native protocol, environment-backed
+Secret reference, endpoint, timeout, byte, concurrency, and output-token policy
+once; any number of `provider_model` entries can then select concrete model IDs
+without Rust changes. Legacy per-Model configuration remains accepted.
+`yh doctor` rejects duplicate profiles, missing references, insecure public
+endpoints, unknown route entries, invalid timeouts, and invalid retry bounds
+before the service accepts requests. Chat-compatible Profiles may explicitly
+permit HTTP only on a literal loopback IP for local Ollama/vLLM-style hosts;
+redirects and ambient proxies remain disabled. See the
+[`local Chat-compatible example`](config/y-harness.openai-chat-local.example.json) and
 [ADR 0087](docs/adr/0087-explicit-configured-model-catalog-and-route.md).
+
+The direct Responses adapter defaults to OpenAI's official endpoint but also
+accepts one explicit HTTPS `endpoint` implementing the same Responses wire
+contract. This adds compatible vendors and private gateways through config and
+environment-backed API keys without Rust changes; it does not reinterpret a
+vendor's incompatible native API as OpenAI. The separate Chat Completions
+adapter covers the widely implemented `openai-completions` protocol family,
+including streamed interleaved text/Tool deltas, usage-only terminal chunks,
+legacy `max_tokens`, and exact assistant Tool-message replay. Anthropic Messages
+and Gemini `generateContent` use their own native adapters. All map native
+function calls into the same governed Tool path; Anthropic content blocks,
+Chat assistant Tool messages, and Gemini parts (including `thoughtSignature`)
+are retained as origin-bound continuations when exact replay is required.
+Other unsupported protocols remain
+behind the provider-neutral HTTPS gateway, a brokered JSON-command Model, or an
+embedded host adapter. See
+[`y-harness.responses-compatible.example.json`](config/y-harness.responses-compatible.example.json),
+[ADR 0144](docs/adr/0144-native-provider-profiles-and-origin-bound-replay.md),
+and [ADR 0146](docs/adr/0146-chat-completions-compatible-and-loopback-provider-boundary.md).
 
 One reference-service process may also be bound to one exact tenant without
 changing Rust code:
@@ -227,7 +266,7 @@ See [Architecture](docs/architecture.md) and the
 [Engineering standards](docs/engineering-standards.md); measured runtime
 evidence lives in the [performance baseline](docs/performance-baseline.md).
 The language-neutral wire contract lives in the
-[client protocol v31 specification](docs/protocol.md).
+[client protocol v37 specification](docs/protocol.md).
 The observed lessons, rejected assumptions, immutable source snapshots, and
 code/ADR traceability for Pi Agent Harness, Claude Code, Codex, Hermes Agent,
 OpenCode, and Grok Build live in the
@@ -243,7 +282,8 @@ probe, Codex `0.145.0` single-process and same-Thread restart CF-003 probes,
 and one Y-Harness service-process explicit-recovery CF-003 probe. All are
 explicitly claim-ineligible; none is presented as a cross-product comparison.
 Current proof and open blockers are tracked in
-[Release readiness](docs/release-readiness.md). Exact pre-1.0 wire, persistence,
+[Release readiness](docs/release-readiness.md) and the
+[immutable release runbook](docs/release-process.md). Exact pre-1.0 wire, persistence,
 API, and migration rules live in the
 [compatibility policy](docs/compatibility.md).
 
@@ -279,9 +319,9 @@ cargo run --locked --example embedded
 ```
 
 The [embedded example](examples/embedded.rs) registers a host-defined Model and
-Tool with explicit extension provenance, uses in-memory State, and executes the
-same Policy-controlled Agent Loop without a protocol transport, network, or
-ambient files.
+Tool with explicit extension provenance, freezes the exact model-visible Tool
+Capability View, uses in-memory State, and executes the same Policy-controlled
+Agent Loop without a protocol transport, network, or ambient files.
 
 Run the public Task orchestration surface:
 
@@ -360,6 +400,15 @@ Turn IDs, omitted count, and conservative budget are journaled. Prompt, Context
 blocks, aggregate Context, Tool output, complete Model request, errors, and
 Agent Loop steps all have transport-independent hard bounds.
 
+The Runtime also rebuilds a bounded Progress Governor from durable Tool-call
+and Tool-result evidence. At each pre-Model boundary, and once before terminal
+step-budget settlement, it first applies pending durable Steering and then
+stops an exact short failure-bearing cycle after the configured repetition
+limit. Fresh call IDs do not hide the cycle; fully successful polling is never
+stopped by this governor and remains subject to the ordinary step/deadline
+budgets. See
+[ADR 0156](docs/adr/0156-bounded-durable-progress-governor.md).
+
 JSON bounds are enforced while work is performed, not after an unbounded
 temporary encoding exists. Caller/provider `Value` trees are iteratively
 limited to 64 nested container levels and 65,536 nodes before serialization;
@@ -385,17 +434,17 @@ and an engine-owned non-authoritative warning. Compactor failure fails the Turn
 instead of silently presenting a partial summary as complete. Original Items
 remain untouched in authoritative State; summary text is ephemeral derived
 Context rather than a replacement conversation record. State schema 2
-introduced bounded content-free evidence, and the current schema-14 writer
+introduced bounded content-free evidence, and the current schema-16 writer
 preserves it: compactor identity, exact coverage, source/content fingerprints,
 and token/byte charges.
 
-Populated schema-1 through schema-13 SQLite
+Populated schema-1 through schema-15 SQLite
 databases require an offline, backup-first migration before the current
 Runtime opens them. `yh doctor` detects this incompatibility without modifying
 the database:
 
 ```bash
-yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v14.rollback.db
+yh state-migrate /absolute/path/state.db /absolute/path/state-pre-v16.rollback.db
 ```
 
 Stop all writers first. The command never overwrites the backup path and never
@@ -474,8 +523,10 @@ yh thread import <archive> <target-thread-id> [config]
 
 Export never overwrites its destination, import rejects altered or oversized
 archives before mutation, and a running Turn is not exportable. The current
-archive root is format 4 so older readers cannot silently discard schema-14
-Connector evidence. Tenant-bound execution or Connector evidence can be
+archive root is format 6 so older readers cannot silently discard schema-16
+Agent Loop wait evidence, schema-15 completion receipts, or schema-14
+Connector evidence. Tenant-bound execution
+or Connector evidence can be
 imported only into the same tenant; unbound histories retain the existing
 explicit target-tenant rebind behavior. See
 [ADR 0095](docs/adr/0095-portable-integrity-bound-thread-archives.md).
@@ -518,6 +569,35 @@ append, recovery, snapshot, and archive import. Failed results retain no
 evidence, and model-visible replay strips it to prevent privileged metadata
 from becoming instructions. See
 [ADR 0126](docs/adr/0126-runtime-bound-connector-evidence.md).
+
+State and snapshot schema 15 make successful Turn settlement one atomic
+`TurnCompleted` event carrying a deterministic `CompletionReceipt`. The
+receipt binds its source Thread and Turn, current Assistant candidate and exact
+Model request, ordered Turn evidence, candidate-bound passing Verifiers,
+trusted authority, and frozen Runtime generation. New writers cannot create a
+receipt-free completed Turn; supported older completion remains explicitly
+legacy/unverified. Fork and archive import retain the source receipt unchanged,
+so inherited proof is distinguishable from completion performed directly in a
+target stream. Thread archive format 5 preserves this evidence, and Protocol
+36 returns its SHA-256 with every completed Operation. See
+[ADR 0157](docs/adr/0157-generation-bound-completion-receipt.md).
+
+State and snapshot schema 16 add a separate durable `AgentLoopExecution`
+projection for one live Turn. A single non-batch Tool call whose Policy result
+is `ask` can atomically enter `Waiting`, release its Runtime worker, preserve
+the original authority, generation, and remaining active timeout, then move
+through revision-fenced `Ready` and `Executing` transitions after an exact
+Approval Inbox settlement. Cancellation, deterministic timeout, and Approval
+denial share the same State stream CAS; denial settles the Turn atomically
+without claiming a worker or crossing the Tool boundary. Independent
+wait-projection schema 1 maintains a tenant-keyed due index in the journal
+transaction, so host maintenance reads only fixed metadata and one or two
+exact lifecycle events. Thread archive format 6 preserves the evidence. This
+slice does not yet release workers for multi-Tool batches or `HumanInput`,
+provide an Inbox repair outbox/tombstone, issue finite execution leases, or
+model unknown effects as `NeedsReconciliation`. See
+[ADR 0158](docs/adr/0158-durable-agent-loop-waiting-and-resume.md) and
+[ADR 0159](docs/adr/0159-bounded-indexed-durable-agent-loop-wait-expiry.md).
 
 For optional cross-Thread handoff, `ThreadHandoffRequest::prepare` computes the
 longest identical Turn prefix and selects a bounded newest source-only delta.
@@ -673,15 +753,25 @@ Signed receipts are attestations, not yet Merkle inclusion or cross-log
 consistency proofs.
 
 The optional `https-skill` feature acquires one signed package from one exact
-operator-configured public HTTPS URL. Every call supplies an exact Skill
+operator-configured HTTPS URL. Every call supplies an exact Skill
 identity and digest pin; redirects, retries, ambient proxies, Referer, URL
 credentials/query/fragment, non-JSON responses, and oversized bodies are
 rejected. Package content is capped at 2 MiB raw and 16 MiB encoded, and the
 registry is capped at 64 MiB of aggregate package content. The safe
 fetch-and-register path performs all live trust checks before mutation.
 The reference operator binary includes this feature; headless library users
-may still exclude it. Catalog discovery, authenticated private registries,
-caching, and recursive dependency fetching are not implied.
+may still exclude it. The reference CLI additionally accepts a raw-SHA-256-
+pinned format-1 public HTTPS catalog. `search-https` performs bounded discovery;
+`install-catalog` resolves the exact manifest-declared signed dependency graph,
+rejects yanked downloads and cycles, and leaves it inactive; `upgrade-catalog`
+then reuses the ordinary full preflight and atomic activation path. Exact
+catalog bytes and deterministic source receipts are cached under the project
+data directory. Named private Registries may add request-scoped Bearer
+authentication, an exact Catalog URL, a canonical package-origin allowlist,
+and an exclusive project-pinned CA bundle. The credential is resolved for
+each Catalog or Package request and is never placed in configuration, cache,
+receipt, Runtime Catalog, or TUI state. npm/git packages, mirror federation,
+implicit `latest`, OAuth, and executable extensions are not implied.
 
 The reference service also accepts explicitly listed project-local Skill
 package files, signed External package files, and exact activation identities.
@@ -699,18 +789,29 @@ declarative package under the configuration project without activating it.
 `install-external <signed-package> [config]` verifies configured publisher
 trust before storing the complete signed envelope, while
 `install-https <url> <name@version> <sha256> [config]` adds ADR 0033's exact
-network pins. `list` and `verify` revalidate the bounded store and all External
-trust; `remove <name@version>` refuses configured or active packages and moves
-an unreferenced package into project-local recoverable trash even when its key
-has since been revoked. Installation never edits activation authority: the
-operator must still add the printed path to `skills.package_files` or
-`skills.external_package_files`, add the exact identity to `skills.activate`,
-and restart the service. See
+network pins. `search-https`, `install-catalog`, and `upgrade-catalog` add an
+exact catalog digest, signed recursive acquisition, immutable cache, and source
+receipt without weakening activation authority. Configured
+`registry-search`, `registry-install`, and `registry-upgrade` retain those
+pins while adding the Registry's request-scoped transport policy. `skill` and
+`package` are aliases over the same declarative
+lifecycle. `activate <name@version>` adds the exact installed dependency
+closure and preflights the complete service before atomically replacing config;
+activating a second version of the same name performs a governed update.
+`deactivate` removes activation authority while retaining content pins.
+`history` lists immutable digest-addressed config revisions and `rollback`
+preflights one exact revision before atomic restoration. `remove` still refuses
+active packages, automatically removes inactive config references, and moves
+content into project-local recoverable trash. Runtime application is a separate
+settled-Turn generation boundary: the optional TUI exposes `/doctor` and
+`/reload`. See
 [`y-harness.skill.example.json`](config/y-harness.skill.example.json) and
 [ADRs 0085](docs/adr/0085-project-configured-declarative-skills.md) and
 [0088](docs/adr/0088-explicit-mcp-activation-and-extension-locks.md), and
 [0091](docs/adr/0091-governed-project-skill-lifecycle.md), plus
-[0102](docs/adr/0102-governed-signed-external-skill-lifecycle.md).
+[0102](docs/adr/0102-governed-signed-external-skill-lifecycle.md) and
+[0145](docs/adr/0145-digest-pinned-skill-catalog-resolution.md) and
+[0148](docs/adr/0148-request-scoped-private-skill-registry.md).
 
 Evaluation is a separate comparison layer: validated cases run through an
 `EvaluationTarget` with engine-owned cancellation and deadlines. Cases and
@@ -822,17 +923,16 @@ business action, or prove that `LocalProcess` is a person. An expired claim can
 be returned to the queue by the same optional Temporal host lifecycle. See
 [ADR 0128](docs/adr/0128-durable-lease-fenced-human-handoff.md).
 
-Temporal Driver API 2 optionally composes Workflow, Handoff, and expired
-Effect-lease advancement.
-One host-driven `tick` scans at most 256 authoritative Workflow Runs and 256
-Human Handoffs, then advances exact due wait/claim fences through the existing
-CAS commands. Coordinator pages are revalidated before mutation. Its identity
-cursor is disposable: losing it repeats a bounded part of the sweep but cannot
-lose a durable timer or expiration. Core starts no interval task and owns no
-second scheduler database. The embedding product still owns wall-clock source,
-polling interval, shutdown, and failure observation. The reference `yh serve`
-host takes that responsibility only when the strict `temporal` object is
-present:
+Temporal Driver API 3 optionally composes Workflow, Handoff, expired Effect
+leases, and Agent Loop wait advancement. One host-driven `tick` scans at most
+256 authoritative rows per source, then advances exact due fences through the
+existing CAS commands. Source pages are revalidated before mutation. Its
+keyset cursor is disposable: losing it repeats a bounded part of the sweep but
+cannot lose a durable timer or expiration. Core starts no interval task and
+owns no second scheduler database. The embedding product still owns wall-clock
+source, polling interval, shutdown, and failure observation. The reference
+`yh serve` host takes that responsibility only when the strict `temporal`
+object is present:
 
 ```json
 {
@@ -1003,7 +1103,7 @@ Dispatch-governor semantics and their cross-store non-claims are fixed by
 [ADR 0141](docs/adr/0141-durable-effect-dispatch-governance.md).
 
 The same Runtime is available through an exactly versioned, typed command
-protocol. Protocol v31 preserves Protocol v30's 2 MiB request and 16 MiB
+protocol. Protocol v37 preserves Protocol v36's 2 MiB request and 16 MiB
 response ceilings, byte-authoritative Thread capacity, Token Counter and
 Conversation Compactor
 coordinates, attributed approvals, schema-3 approval continuation evidence,
@@ -1047,8 +1147,63 @@ service use contexts; it adds no Secret-bearing client command or durable
 schema. Protocol 31 advertises Task Graph schema 4 and its bounded immutable
 execution-capability requirements. Remote protocol workers cannot self-assert
 capabilities and therefore claim only universal Tasks; trusted embedded
-Orchestrators may install exact capability sets.
-Temporal Driver API 2 may convert expired exact leases to `unknown`; it never
+Orchestrators may install exact capability sets. Protocol 32 adds the optional,
+permissioned, credential-free Runtime Catalog so independent clients can
+inspect the active Model route, adapter families, Tools, exact active Skills,
+MCP registrations, configuration digest, and reload strategy without gaining
+mutation authority. Protocol 33 adds credential-free configured Skill Registry
+metadata; request credentials and CA bytes remain host-private.
+Protocol 35 adds the independently authorized, content-free `service.status`
+projection. `ready`, `at_capacity`, and `draining` are derived from the same
+finite Operation registry and one-way shutdown lifecycle that gate new Turns;
+they do not pretend to prove external Provider, MCP, Memory, Registry, or
+Effect-target health.
+Protocol 36 advertises State/snapshot schema 15 and Thread archive format 5,
+adds the archive coordinate to initialization, and binds completed Operation
+responses to the authoritative CompletionReceipt digest. It adds no client
+command capable of authoring completion evidence.
+Protocol 37 advertises State/snapshot schema 16 and Thread archive format 6.
+It adds optional `start_turn.approval_wait_ttl_ms`, exact
+`get_turn_execution`, `resume_turn_wait`, and `cancel_turn_wait` commands, and
+the `waiting` Operation status. The bounded wait projection exposes only
+coordination identities, revision, lifecycle state, server expiry, remaining
+active timeout, and Approval identity; it does not expose Tool input, Model
+context, credentials, or grant the responder execution authority.
+
+The optional `http-probe` feature translates that exact in-process projection
+for deployment supervisors; it does not create another health authority. A
+configured reference host serves only `GET /livez` and `GET /readyz`. Liveness
+is `200` whenever the Handler answers, while readiness is `200` only for
+`ready`; both `at_capacity` and `draining` return readiness `503`. Requests,
+headers, connections, status lookup, and shutdown drain are bounded, responses
+are content-free and non-cacheable, and the listener is disabled by omission.
+For example:
+
+```bash
+# Terminal A
+cp config/y-harness.http-probe.example.json y-harness.probe.json
+cargo run --locked --all-features -- serve y-harness.probe.json
+
+# Terminal B
+curl --fail http://127.0.0.1:8081/livez
+curl --fail http://127.0.0.1:8081/readyz
+```
+
+The example binds loopback. A non-loopback bind is an explicit deployment
+choice and must sit behind the pod or service network boundary because the
+probe carries no TLS or client authentication. It never probes or vouches for
+Models, MCP servers, Memory, Registries, Effect targets, or multi-node quorum.
+See [ADR 0151](docs/adr/0151-bounded-http-deployment-probes.md).
+The reference `yh serve` host also converts SIGTERM/SIGINT on Unix and Ctrl-C
+on Windows into that same one-way lifecycle. Its cancellation-aware JSONL
+transport stops only between frames: an accepted command always receives a
+complete response before drain begins. A bounded detached stdin bridge avoids
+Tokio's otherwise non-cancellable blocking stdin read, so a supervisor does not
+need to close the pipe before the process can settle. This is Host policy, not
+an Engine signal handler; embedders can use `serve_jsonl_until_cancelled` or
+`serve_jsonl_as_until_cancelled` with their own lifecycle trigger. See
+[ADR 0152](docs/adr/0152-signal-driven-reference-service-drain.md).
+Temporal Driver API 3 may convert expired exact leases to `unknown`; it never
 requeues or executes the effect. Steering requires the exact active Turn,
 invalidates crossed provisional Model output, and never executes
 a Tool call sampled from older context. When a host installs a Task
@@ -1148,12 +1303,23 @@ yh-tui --demo
 The TUI supervises `yh serve` or `yh serve-demo`, then creates/loads Threads,
 lists and resumes the latest authoritative Threads, streams Turns, polls and
 forgets Operations, and projects paginated State, Approval, and Task views only
-through Protocol v31. The Sessions panel shows direct fork ancestry from
+through Protocol v37. The Sessions panel shows direct fork ancestry from
 content-free Engine summaries. `/name [title]` changes or clears Engine-owned
 Thread metadata; `/fork [terminal-turn-id]` creates and switches to an
 independent child through the same typed protocol. Input submitted during an active Turn uses the engine's
 exact-ID steering command rather than a TUI-owned execution queue. It is implemented in
 [`clients/tui`](clients/tui) and can be omitted without changing the engine.
+The Runtime Inspector reads the credential-free active catalog through the
+same protocol. `/doctor` performs a non-mutating Engine preflight, while
+`/reload` drains and replaces the supervised Engine process only when no Turn
+is active, then reattaches the same durable Thread.
+The TUI starts Turns with a finite durable Approval lifetime. At a supported
+single-call Approval boundary it displays `WAITING`, releases the process
+Operation, and discovers the authoritative wait again after an Engine restart.
+After a separately authenticated approver settles the Inbox record, `/resume`
+attempts the exact revision-fenced resume; `/cancelwait` closes an unclaimed
+`Waiting` or `Ready` execution with a caller-stable command identity. Ordinary
+text is not accepted as a new Turn while that wait is live.
 
 Agent Memory Hub is the first-party reference integration for governed
 long-term memory. Y-Harness owns when and under which policy a memory provider

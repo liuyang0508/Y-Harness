@@ -72,7 +72,7 @@ async fn run(options: Options) -> MainResult<()> {
     }
     let mode = match &options.mode {
         Mode::Demo => EngineMode::Demo,
-        Mode::Config(config) => EngineMode::Config(config),
+        Mode::Config(config) => EngineMode::Config(config.clone()),
     };
     let mut client = ProtocolClient::spawn(&options.engine, mode)?;
     let mut app = App::bootstrap(&mut client, options.thread).await?;
@@ -169,7 +169,7 @@ fn print_help() {
            --engine <path>  Engine executable; defaults to $YH_BIN or `yh`\n  \
            --thread <id>    attach to an existing authoritative Thread\n\n\
          With no mode, y-harness.json is used when present; otherwise demo mode.\n\
-         The TUI is an optional Protocol v31 client and owns no Engine state."
+         The TUI is an optional Protocol v37 client and owns no Engine state."
     );
 }
 

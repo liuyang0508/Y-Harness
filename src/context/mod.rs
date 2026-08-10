@@ -864,16 +864,47 @@ fn model_visible_item(item: &Item) -> Option<Item> {
                 connector_evidence: Vec::new(),
             },
         }),
+        ItemKind::AssistantMessage {
+            model_id,
+            model_origin,
+            content,
+            ..
+        } => Some(Item {
+            id: item.id.clone(),
+            created_at_ms: item.created_at_ms,
+            kind: ItemKind::AssistantMessage {
+                model_id: model_id.clone(),
+                model_origin: model_origin.clone(),
+                model_request_sha256: None,
+                content: content.clone(),
+            },
+        }),
+        ItemKind::VerificationResult {
+            verifier, outcome, ..
+        } => Some(Item {
+            id: item.id.clone(),
+            created_at_ms: item.created_at_ms,
+            kind: ItemKind::VerificationResult {
+                verifier: verifier.clone(),
+                candidate_item_id: None,
+                verifier_origin: None,
+                verifier_binding_sha256: None,
+                outcome: outcome.clone(),
+            },
+        }),
         ItemKind::UserMessage { .. }
-        | ItemKind::AssistantMessage { .. }
         | ItemKind::ProviderContinuation { .. }
-        | ItemKind::ToolCall { .. }
-        | ItemKind::VerificationResult { .. } => Some(item.clone()),
+        | ItemKind::ToolCall { .. } => Some(item.clone()),
         ItemKind::ExecutionBinding { .. }
         | ItemKind::SteeringQueued { .. }
         | ItemKind::PolicyDecision { .. }
         | ItemKind::ApprovalRequested { .. }
         | ItemKind::ApprovalDecision { .. }
+        | ItemKind::AgentLoopWaitStarted { .. }
+        | ItemKind::AgentLoopResumeAccepted { .. }
+        | ItemKind::AgentLoopReadyClaimed { .. }
+        | ItemKind::AgentLoopWaitClosed { .. }
+        | ItemKind::AgentLoopWaitDenied { .. }
         | ItemKind::MemoryContext { .. }
         | ItemKind::ConversationContext { .. }
         | ItemKind::ConversationSummary { .. }

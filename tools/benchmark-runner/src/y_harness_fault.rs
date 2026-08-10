@@ -929,6 +929,7 @@ async fn start_turn(
                         memory_scope: Default::default(),
                         context: Vec::new(),
                         timeout_ms: Some(timeout_ms),
+                        approval_wait_ttl_ms: None,
                     },
                 ),
                 maximum_wait,

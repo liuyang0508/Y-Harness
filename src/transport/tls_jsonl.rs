@@ -324,6 +324,7 @@ async fn serve_connection(
         writer,
         Some(idle_timeout),
         Some(max_session_frames),
+        None,
     )
     .await
     {

@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 mod approval;
+mod completion;
 mod context;
 mod effect;
 mod evaluation;
@@ -35,6 +36,16 @@ pub use approval::{
     APPROVAL_INBOX_SCHEMA_VERSION, ApprovalInbox, ApprovalMigrationReport, ApprovalMigrationStatus,
     ApprovalRecord, ApprovalRecordStatus, InboxApprovalHandler, MemoryApprovalInbox,
     SqliteApprovalInbox,
+};
+pub use completion::{
+    COMPLETION_FORMAT_VERSION, CompletionAssurance, CompletionContract, CompletionGeneration,
+    CompletionReceipt, CompletionRequirementStatus, CompletionVerifierBinding,
+    MAX_COMPLETION_HASH_INPUT_BYTES, MAX_COMPLETION_RECEIPT_BYTES, build_completion_receipt,
+    completion_execution_binding_sha256, completion_model_request_sha256,
+    completion_model_route_sha256, completion_receipt_sha256, completion_runtime_governance_sha256,
+    completion_tool_view_sha256, completion_verifier_binding_sha256,
+    completion_verifier_manifest_sha256, validate_inherited_projected_turn_completion_receipt,
+    validate_projected_turn_completion_receipt, validate_turn_completion_receipt,
 };
 pub use context::{
     CONVERSATION_COMPACTOR_API_VERSION, ContextBlock, ContextCompilation, ContextEngine,
@@ -101,22 +112,26 @@ pub use human_handoff::{
     HumanHandoffTransitionKind, MemoryHumanHandoffCoordinator, SqliteHumanHandoffCoordinator,
 };
 pub use kernel::{
-    ActorIdentity, ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ArtifactId,
-    AuthorityContext, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId,
+    ActorIdentity, AgentLoopClaimId, AgentLoopCloseCommandId, AgentLoopDenyCommandId,
+    AgentLoopExecution, AgentLoopResumeCommandId, AgentLoopWaitId, AgentLoopWorkerId,
+    ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalSettlementEvidence,
+    ArtifactId, AuthorityContext, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId,
     ConnectorEvidence, ConnectorEvidenceClaim, EffectCommandId, EffectId, EffectLeaseId, EventId,
-    ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, HumanHandoffClaimId,
-    HumanHandoffCommandId, HumanHandoffId, InvocationContextEvidence, Item, ItemId, ItemKind,
-    MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
+    ExecutionBinding, ExecutionClaimEvidence, ExecutionPhase, HarnessError, HarnessFuture,
+    HumanHandoffClaimId, HumanHandoffCommandId, HumanHandoffId, InvocationContextEvidence, Item,
+    ItemId, ItemKind, MAX_CONNECTOR_EVIDENCE_PER_RESULT, MAX_MODEL_PROVIDER_FAILURE_MESSAGE_BYTES,
     MAX_MODEL_PROVIDER_RETRY_AFTER_MS, MAX_TOOL_CALLS_PER_BATCH,
     MAX_TOOL_CANCELLATION_SETTLEMENT_TIMEOUT, MemoryContextRecordStatus, ModelContinuation,
     ModelEventSink, ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry,
-    ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage,
-    NewStreamEvent, OperationId, PendingEvent, PolicyDecision, RegisteredModel, RegisteredTool,
-    RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId,
-    TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage, ToolAuthorization,
-    ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
-    ToolExecutionResult, ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationOutcome, WorkflowCommandId, WorkflowRunId, WorkflowSignalId, WorkflowWaitId,
+    ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelToolChoice,
+    ModelToolTraceOutcome, ModelUsage, NewStreamEvent, OperationId, PendingEvent, PolicyDecision,
+    RegisteredModel, RegisteredTool, ResumeEvidence, RiskLevel, StateEvent, SteeringId,
+    StoredEvent, TaskGraphId, TaskId, TaskLeaseId, TaskMessageId, Thread, ThreadId,
+    ThreadImportOrigin, ThreadLineage, ToolAuthorization, ToolBatchExecution, ToolCallBatch,
+    ToolCallBatchId, ToolContext, ToolDescriptor, ToolExecutionResult, ToolRegistry, Turn, TurnId,
+    TurnOutcome, TurnStatus, TurnStopReason, TurnWaitEnvelope, VerificationOutcome,
+    WaitClosureEvidence, WaitDenialEvidence, WaitKind, WorkflowCommandId, WorkflowRunId,
+    WorkflowSignalId, WorkflowWaitId,
 };
 pub use memory::{
     AgentMemoryHubProvider, MEMORY_API_VERSION, MemoryBriefRequest, MemoryBriefResponse,
@@ -128,8 +143,11 @@ pub use memory::{
 };
 #[cfg(feature = "https-model")]
 pub use model::{
-    HttpModelRequest, HttpModelResponse, HttpModelTransport, HttpsJsonModel, HttpsJsonModelConfig,
-    OpenAiResponsesModel, OpenAiResponsesModelConfig, ReqwestHttpModelTransport,
+    AnthropicMessagesModel, AnthropicMessagesModelConfig, ChatCompletionTokenLimitField,
+    GeminiGenerateContentModel, GeminiGenerateContentModelConfig, HttpModelRequest,
+    HttpModelResponse, HttpModelTransport, HttpsJsonModel, HttpsJsonModelConfig,
+    OpenAiChatCompletionsModel, OpenAiChatCompletionsModelConfig, OpenAiResponsesModel,
+    OpenAiResponsesModelConfig, ReqwestHttpModelTransport,
 };
 pub use observability::{
     Observability, ObservationOutcome, Observer, PhaseObservation, RegisteredObserver,
@@ -146,20 +164,26 @@ pub use orchestration::{
     WorkspaceProviderDescriptor, WorkspaceProvisioning, WorkspaceRequest,
 };
 pub use protocol::{
-    CompatibilityManifest, EffectListEntry, EffectListPage, EffectSummary, EffectTransitionPage,
-    FingerprintProtocolAuthorizer, HumanHandoffQueuePage, HumanHandoffSummary,
-    HumanHandoffTransitionPage, OperationStatus, OperationStreamEvent, PROTOCOL_VERSION,
-    ProtocolAuthorizer, ProtocolCommand, ProtocolError, ProtocolHandler, ProtocolPrincipal,
-    ProtocolRequest, ProtocolResponse, ProtocolResponseBody, ProtocolResult,
-    ProtocolShutdownReport, TaskGraphSummary, TaskRecordPage, WorkflowRunSummary,
-    WorkflowTransitionPage, serve_jsonl, serve_jsonl_as, serve_stdio,
+    ApprovalDeliveryAction, ApprovalDeliveryStatus, CompatibilityManifest, EffectListEntry,
+    EffectListPage, EffectSummary, EffectTransitionPage, FingerprintProtocolAuthorizer,
+    HumanHandoffQueuePage, HumanHandoffSummary, HumanHandoffTransitionPage, OperationStatus,
+    OperationStreamEvent, PROTOCOL_VERSION, ProtocolAdmissionState, ProtocolAuthorizer,
+    ProtocolCommand, ProtocolError, ProtocolHandler, ProtocolPrincipal, ProtocolRequest,
+    ProtocolResponse, ProtocolResponseBody, ProtocolResult, ProtocolServiceStatus,
+    ProtocolShutdownReport, RuntimeCatalog, RuntimeMcpCatalogEntry, RuntimeModelCatalogEntry,
+    RuntimeSkillCatalogEntry, RuntimeSkillRegistryCatalogEntry, TaskGraphSummary, TaskRecordPage,
+    TurnExecutionProjection, TurnExecutionState, WorkflowRunSummary, WorkflowTransitionPage,
+    serve_jsonl, serve_jsonl_as, serve_jsonl_as_until_cancelled, serve_jsonl_until_cancelled,
+    serve_stdio,
 };
 pub use runtime::{
-    AllowListPolicy, ApprovalHandler, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
+    AllowListPolicy, ApprovalDeliveryOperation, ApprovalHandler, ApprovalWait, ApprovalWaitStatus,
+    DEFAULT_MAX_FAILURE_CYCLE_REPETITIONS, DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
     DEFAULT_MAX_PARALLEL_TOOL_CALLS, DenyAllApprovals, HarnessRuntime, LanguageModel,
-    MAX_MODEL_ATTEMPTS_PER_STEP, MAX_MODEL_RETRIES, MAX_MODEL_RETRY_DELAY_MS,
-    MAX_PARALLEL_TOOL_CALLS, ModelRetryPolicy, PolicyEngine, SteeringReceipt, Tool,
-    TurnExecutionOptions,
+    MAX_FAILURE_CYCLE_REPETITIONS, MAX_MODEL_ATTEMPTS_PER_STEP, MAX_MODEL_RETRIES,
+    MAX_MODEL_RETRY_DELAY_MS, MAX_PARALLEL_TOOL_CALLS, ModelRetryPolicy, PolicyEngine,
+    ProgressPolicy, SteeringReceipt, Tool, TurnExecutionOptions, TurnExecutionResult,
+    TurnRunProgress,
 };
 pub use secret::{
     EnvironmentSecretProvider, RegisteredSecretProvider, SECRET_API_VERSION, SecretEffectPhase,
@@ -168,8 +192,8 @@ pub use secret::{
 };
 #[cfg(feature = "https-skill")]
 pub use skill::{
-    HttpSkillRequest, HttpSkillResponse, HttpSkillTransport, HttpsSkillSource,
-    HttpsSkillSourceConfig, ReqwestHttpSkillTransport,
+    HttpSkillAuthorization, HttpSkillRequest, HttpSkillResponse, HttpSkillTransport,
+    HttpsSkillSource, HttpsSkillSourceConfig, ReqwestHttpSkillTransport,
 };
 pub use skill::{
     RegisteredSkill, ResolvedSkill, ResolvedSkillSet, SKILL_API_VERSION, SignedSkillPackage,
@@ -178,9 +202,12 @@ pub use skill::{
     SkillTransparencyRequirement, SkillTrustStore, VerifiedSkillTransparency,
 };
 pub use state::{
-    EventStore, MAX_THREAD_ARCHIVE_BYTES, MemoryEventStore, STATE_EVENT_SCHEMA_VERSION,
-    STATE_SNAPSHOT_SCHEMA_VERSION, STATE_TERMINAL_EVENT_RESERVE,
-    STATE_TERMINAL_RECOVERY_BYTE_RESERVE, STATE_THREAD_EVENT_LIMIT,
+    AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION, AgentLoopDueCursor, AgentLoopDuePhase,
+    AgentLoopDueScanPage, AgentLoopDueWait, AgentLoopReadyClaimCommand, AgentLoopWaitCloseCommand,
+    AgentLoopWaitStartCommand, EventAppendDisposition, EventAppendResult, EventStore,
+    MAX_AGENT_LOOP_DUE_SCAN_LIMIT, MAX_AGENT_LOOP_WAIT_MS, MAX_THREAD_ARCHIVE_BYTES,
+    MemoryEventStore, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
+    STATE_TERMINAL_EVENT_RESERVE, STATE_TERMINAL_RECOVERY_BYTE_RESERVE, STATE_THREAD_EVENT_LIMIT,
     STATE_THREAD_RECOVERY_BYTE_LIMIT, SnapshotMaintenanceConfig, SnapshotMaintenanceFailure,
     SnapshotMaintenanceStats, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
     StateMigrationReport, StateMigrationStatus, StateSnapshot, THREAD_ARCHIVE_FORMAT_VERSION,
@@ -190,6 +217,10 @@ pub use temporal::{
     MAX_TEMPORAL_SCAN_LIMIT, TEMPORAL_DRIVER_API_VERSION, TemporalAttempt, TemporalAttemptOutcome,
     TemporalDriver, TemporalScanProgress, TemporalTarget, TemporalTickCursor, TemporalTickReport,
     TemporalTickRequest,
+};
+#[cfg(feature = "http-probe")]
+pub use transport::{
+    HttpProbeServer, HttpProbeServerConfig, HttpProbeServerReport, ServiceStatusSource,
 };
 #[cfg(feature = "https-mcp")]
 pub use transport::{HttpsJsonMcpClient, HttpsJsonMcpConfig};

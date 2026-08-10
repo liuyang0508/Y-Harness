@@ -18,8 +18,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 use y_harness::{
-    ApprovalDecision, ItemKind, MemoryContextRecordStatus, PROTOCOL_VERSION, PolicyDecision,
-    RiskLevel, StateCapacity, StateCapacityLevel, TaskStatus, TurnStatus, VerificationOutcome,
+    ApprovalDecision, ItemKind, MemoryContextRecordStatus, ModelStreamEvent, ModelToolChoice,
+    ModelToolTraceOutcome, PROTOCOL_VERSION, PolicyDecision, ProtocolAdmissionState, RiskLevel,
+    StateCapacity, StateCapacityLevel, TaskStatus, TurnExecutionState, TurnStatus,
+    VerificationOutcome,
 };
 
 use crate::app::{App, Focus, SidebarTab};
@@ -116,14 +118,71 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let running = app.active.as_ref().map_or_else(
-        || Span::styled("● READY", Style::default().fg(ASSISTANT)),
-        |active| {
-            let elapsed = active.started_at.elapsed().as_secs_f32();
-            Span::styled(
-                format!("◐ RUNNING {elapsed:.1}s"),
-                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
-            )
+    let admission = match app.service_status.map(|status| status.admission) {
+        Some(ProtocolAdmissionState::Ready) => {
+            Span::styled("● ENGINE READY", Style::default().fg(ASSISTANT))
+        }
+        Some(ProtocolAdmissionState::AtCapacity) => Span::styled(
+            "● ENGINE AT CAPACITY",
+            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+        ),
+        Some(ProtocolAdmissionState::Draining) => Span::styled(
+            "● ENGINE DRAINING",
+            Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled("● ENGINE STATUS UNKNOWN", Style::default().fg(MUTED)),
+    };
+    let turn_phase = app.execution.as_ref().map_or_else(
+        || {
+            if let Some(active) = &app.active {
+                let elapsed = active.started_at.elapsed().as_secs_f32();
+                Some(Span::styled(
+                    format!("◐ TURN RUNNING {elapsed:.1}s"),
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                app.latest_wait_terminal_status().map(|status| {
+                    Span::styled(
+                        format!("■ WAIT CLOSED · {}", turn_status(status).to_uppercase()),
+                        Style::default().fg(turn_status_color(status)),
+                    )
+                })
+            }
+        },
+        |execution| {
+            let wait = short_id(execution.wait_id.as_str());
+            Some(match execution.state {
+                TurnExecutionState::Waiting if app.active.is_some() => Span::styled(
+                    format!(
+                        "⏸ WAITING {wait} · rev {} · OPERATION ATTACHED",
+                        execution.revision
+                    ),
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ),
+                TurnExecutionState::Waiting => Span::styled(
+                    format!("⏸ WAITING {wait} · rev {}", execution.revision),
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ),
+                TurnExecutionState::Ready if app.active.is_some() => Span::styled(
+                    format!(
+                        "◆ READY {wait} · rev {} · OPERATION ATTACHED",
+                        execution.revision
+                    ),
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ),
+                TurnExecutionState::Ready => Span::styled(
+                    format!("◆ READY TO RESUME {wait} · rev {}", execution.revision),
+                    Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
+                ),
+                TurnExecutionState::Executing if app.active.is_some() => Span::styled(
+                    format!("▶ EXECUTING {wait} · rev {}", execution.revision),
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                ),
+                TurnExecutionState::Executing => Span::styled(
+                    format!("▶ EXECUTING DETACHED {wait} · rev {}", execution.revision),
+                    Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+                ),
+            })
         },
     );
     let capacity = app.capacity.map_or_else(
@@ -144,12 +203,15 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        running,
-        Span::styled(
-            format!("  {} · protocol v{PROTOCOL_VERSION}", app.server),
-            Style::default().fg(MUTED),
-        ),
+        admission,
     ];
+    if let Some(turn_phase) = turn_phase {
+        identity_line.extend([Span::raw(" · "), turn_phase]);
+    }
+    identity_line.push(Span::styled(
+        format!("  {} · protocol v{PROTOCOL_VERSION}", app.server),
+        Style::default().fg(MUTED),
+    ));
     if let Some(model_id) = latest_observed_model_id(app) {
         if model_id == DEMO_MODEL_ID {
             identity_line.push(Span::styled(
@@ -265,7 +327,7 @@ fn render_transcript_empty_state(frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::default(),
         Line::styled(
-            "The TUI is connected to the headless Engine through Protocol v31.",
+            "The TUI is connected to the headless Engine through Protocol v37.",
             Style::default().fg(Color::White),
         ),
         Line::styled(
@@ -320,7 +382,7 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         if visible == 0 {
             continue;
         }
-        lines.push(Line::from(vec![
+        let mut header = vec![
             Span::styled(
                 format!("TURN {} · ", short_id(turn.id.as_str())),
                 Style::default().fg(MUTED),
@@ -329,11 +391,22 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
                 turn_status(&turn.status),
                 Style::default().fg(turn_status_color(&turn.status)),
             ),
-            Span::styled(
-                format!(" · {} records", turn.items.len()),
-                Style::default().fg(MUTED),
-            ),
-        ]));
+        ];
+        if turn.status == TurnStatus::Completed {
+            let evidence = match &turn.completion_receipt {
+                Some(receipt) if receipt.source_thread_id() == &turn.thread_id => {
+                    " · receipt-bound"
+                }
+                Some(_) => " · inherited receipt",
+                None => " · legacy/unverified",
+            };
+            header.push(Span::styled(evidence, Style::default().fg(MUTED)));
+        }
+        header.push(Span::styled(
+            format!(" · {} records", turn.items.len()),
+            Style::default().fg(MUTED),
+        ));
+        lines.push(Line::from(header));
         for item in turn.items.iter().skip(turn.items.len() - visible) {
             render_item(&mut lines, &item.kind);
         }
@@ -492,6 +565,46 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
                 Style::default().fg(color),
             ));
         }
+        ItemKind::AgentLoopWaitStarted { envelope } => lines.push(Line::styled(
+            format!(
+                "⏸ WAITING · {} · revision {}",
+                short_id(envelope.wait_id.as_str()),
+                envelope.revision
+            ),
+            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+        )),
+        ItemKind::AgentLoopResumeAccepted { evidence } => lines.push(Line::styled(
+            format!(
+                "◇ READY TO RESUME · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            Style::default().fg(ASSISTANT),
+        )),
+        ItemKind::AgentLoopReadyClaimed { evidence } => lines.push(Line::styled(
+            format!(
+                "▶ EXECUTION CLAIMED · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            Style::default().fg(MUTED),
+        )),
+        ItemKind::AgentLoopWaitClosed { evidence } => lines.push(Line::styled(
+            format!(
+                "■ WAIT CLOSED · {} · {:?}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.status
+            ),
+            Style::default().fg(ERROR),
+        )),
+        ItemKind::AgentLoopWaitDenied { evidence } => lines.push(Line::styled(
+            format!(
+                "■ WAIT DENIED · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+        )),
         ItemKind::ToolResult {
             output, is_error, ..
         } => {
@@ -518,7 +631,9 @@ fn render_item(lines: &mut Vec<Line<'static>>, item: &ItemKind) {
             format!("■ STOPPED · {reason:?} during {phase:?}"),
             Style::default().fg(ERROR),
         )),
-        ItemKind::VerificationResult { verifier, outcome } => {
+        ItemKind::VerificationResult {
+            verifier, outcome, ..
+        } => {
             let (text, color) = match outcome {
                 VerificationOutcome::Passed { summary } => (
                     format!(
@@ -598,15 +713,22 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .position(|tab| *tab == app.sidebar_tab)
         .unwrap_or_default();
     frame.render_widget(
-        Tabs::new(["Activity", "Sessions", "Approvals", "Tasks"])
-            .select(selected)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-            .divider("│"),
+        Tabs::new([
+            "Activity",
+            "Sessions",
+            "Approvals",
+            "Tasks",
+            "Runtime",
+            "Tool Trace",
+        ])
+        .select(selected)
+        .style(Style::default().fg(MUTED))
+        .highlight_style(
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider("│"),
         rows[0],
     );
     match app.sidebar_tab {
@@ -614,7 +736,481 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         SidebarTab::Sessions => render_sessions(frame, app, rows[1]),
         SidebarTab::Approvals => render_approvals(frame, app, rows[1]),
         SidebarTab::Tasks => render_tasks(frame, app, rows[1]),
+        SidebarTab::Runtime => render_runtime(frame, app, rows[1]),
+        SidebarTab::ToolTrace => render_tool_trace(frame, app, rows[1]),
     }
+}
+
+fn render_tool_trace(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut lines = vec![Line::styled(
+        "TOOL TRACE · credential-free evidence",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "1  MCP DISCOVERY + REGISTRATION",
+        Style::default().fg(ACCENT),
+    ));
+    match &app.runtime_catalog {
+        Some(catalog) if !catalog.mcp_servers.is_empty() => {
+            for server in &catalog.mcp_servers {
+                let ready = server.enabled && !server.registered_tools.is_empty();
+                lines.push(Line::styled(
+                    format!(
+                        "   {} · {} · {} · {} registered",
+                        server.id,
+                        server.transport,
+                        if ready {
+                            "PASS"
+                        } else if server.enabled {
+                            "NO TOOLS"
+                        } else {
+                            "DISABLED"
+                        },
+                        server.registered_tools.len()
+                    ),
+                    Style::default().fg(if ready { ASSISTANT } else { WARNING }),
+                ));
+                if let Some(endpoint) = &server.endpoint {
+                    lines.push(Line::styled(
+                        format!("   endpoint  {}", clipped(endpoint, 160)),
+                        Style::default().fg(MUTED),
+                    ));
+                } else {
+                    lines.push(Line::styled(
+                        "   endpoint  supervised stdio process (command hidden)",
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                if !server.registered_tools.is_empty() {
+                    lines.push(Line::raw(format!(
+                        "   tools     {}",
+                        server.registered_tools.join(", ")
+                    )));
+                }
+            }
+        }
+        _ => lines.push(Line::styled(
+            "   NO MCP SERVER CONFIGURED",
+            Style::default().fg(WARNING),
+        )),
+    }
+
+    let request = app.tool_trace.iter().rev().find_map(|event| match event {
+        ModelStreamEvent::ToolTraceRequest {
+            model_step,
+            attempt,
+            model_id,
+            request_sha256,
+            tools,
+            advertised_tool_count,
+            tools_truncated,
+            tool_choice,
+        } => Some((
+            *model_step,
+            *attempt,
+            model_id,
+            request_sha256,
+            tools,
+            *advertised_tool_count,
+            *tools_truncated,
+            tool_choice,
+        )),
+        _ => None,
+    });
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "2  MODEL REQUEST CONTRACT",
+        Style::default().fg(ACCENT),
+    ));
+    if let Some((step, attempt, model, sha, tools, count, truncated, choice)) = request {
+        lines.push(Line::styled(
+            format!("   PASS · step {step} attempt {attempt} · {model}"),
+            Style::default().fg(ASSISTANT),
+        ));
+        lines.push(Line::raw(format!(
+            "   tool_choice  {}",
+            tool_choice_label(choice)
+        )));
+        lines.push(Line::raw(format!(
+            "   advertised   {count} · {}{}",
+            tools.join(", "),
+            if truncated { " …" } else { "" }
+        )));
+        lines.push(Line::styled(
+            format!("   request sha  {sha}"),
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "   NOT RUN · send the diagnostic prompt, then open /trace",
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    let response = request.and_then(|(request_step, request_attempt, request_model, ..)| {
+        app.tool_trace.iter().rev().find_map(|event| match event {
+            ModelStreamEvent::ToolTraceResponse {
+                model_step,
+                attempt,
+                model_id,
+                duration_micros,
+                outcome,
+                structured_tool_calls,
+                tool_syntax_in_text,
+                provider_model,
+                provider_request_id,
+                provider_failure_kind,
+                provider_status_code,
+            } if *model_step == request_step
+                && *attempt == request_attempt
+                && model_id == request_model =>
+            {
+                Some((
+                    *model_step,
+                    *attempt,
+                    model_id,
+                    *duration_micros,
+                    *outcome,
+                    *structured_tool_calls,
+                    *tool_syntax_in_text,
+                    provider_model,
+                    provider_request_id,
+                    provider_failure_kind,
+                    provider_status_code,
+                ))
+            }
+            _ => None,
+        })
+    });
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "3  PROVIDER SETTLEMENT",
+        Style::default().fg(ACCENT),
+    ));
+    if let Some((
+        step,
+        attempt,
+        model,
+        micros,
+        outcome,
+        calls,
+        syntax,
+        provider_model,
+        request_id,
+        failure,
+        status,
+    )) = response
+    {
+        lines.push(Line::raw(format!(
+            "   {:?} · step {step} attempt {attempt} · {model} · {:.1}s",
+            outcome,
+            micros as f64 / 1_000_000.0
+        )));
+        lines.push(Line::raw(format!(
+            "   structured Tool calls  {calls} · tool-like text  {}",
+            if syntax { "YES" } else { "no" }
+        )));
+        if let Some(provider_model) = provider_model {
+            lines.push(Line::styled(
+                format!("   provider model  {provider_model}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if let Some(request_id) = request_id {
+            lines.push(Line::styled(
+                format!("   provider request id  {request_id}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if failure.is_some() || status.is_some() {
+            lines.push(Line::styled(
+                format!("   failure {failure:?} · HTTP {status:?}"),
+                Style::default().fg(ERROR),
+            ));
+        }
+    } else {
+        lines.push(Line::styled(
+            "   WAITING FOR RESPONSE",
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    let (verdict, verdict_color) = tool_trace_verdict(app, request, response);
+    lines.push(Line::default());
+    lines.push(Line::styled("VERDICT", Style::default().fg(ACCENT)));
+    lines.push(Line::styled(
+        format!("   {verdict}"),
+        Style::default()
+            .fg(verdict_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+type TraceRequest<'a> = (
+    u32,
+    u32,
+    &'a String,
+    &'a String,
+    &'a Vec<String>,
+    u32,
+    bool,
+    &'a ModelToolChoice,
+);
+type TraceResponse<'a> = (
+    u32,
+    u32,
+    &'a String,
+    u64,
+    ModelToolTraceOutcome,
+    u32,
+    bool,
+    &'a Option<String>,
+    &'a Option<String>,
+    &'a Option<y_harness::ModelProviderFailureKind>,
+    &'a Option<u16>,
+);
+
+fn tool_trace_verdict(
+    app: &App,
+    request: Option<TraceRequest<'_>>,
+    response: Option<TraceResponse<'_>>,
+) -> (&'static str, Color) {
+    let Some(catalog) = &app.runtime_catalog else {
+        return ("RUNTIME_CATALOG_UNAVAILABLE", WARNING);
+    };
+    let registered_mcp_tools = catalog
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled)
+        .flat_map(|server| server.registered_tools.iter())
+        .collect::<Vec<_>>();
+    let mcp_enabled = catalog.mcp_servers.iter().any(|server| server.enabled);
+    let Some((_, _, _, _, sent_tools, sent_count, tools_truncated, choice)) = request else {
+        if !mcp_enabled {
+            return ("MCP_NOT_ENABLED", WARNING);
+        }
+        if registered_mcp_tools.is_empty() {
+            return ("MCP_TOOL_NOT_REGISTERED", ERROR);
+        }
+        return ("TRACE_NOT_RUN", MUTED);
+    };
+    if sent_count == 0 {
+        return ("TOOL_NOT_SENT_TO_MODEL", ERROR);
+    }
+    if mcp_enabled {
+        if registered_mcp_tools.is_empty() {
+            return ("MCP_TOOL_NOT_REGISTERED", ERROR);
+        }
+        if !registered_mcp_tools
+            .iter()
+            .any(|tool| sent_tools.iter().any(|sent| sent == *tool))
+        {
+            if tools_truncated {
+                return ("TOOL_TRACE_NAME_LIST_TRUNCATED", WARNING);
+            }
+            return ("REGISTERED_MCP_TOOL_NOT_SENT", ERROR);
+        }
+    }
+    let Some((_, _, _, _, outcome, calls, syntax, ..)) = response else {
+        return ("PROVIDER_RESPONSE_PENDING", WARNING);
+    };
+    if calls > 0 {
+        return ("STRUCTURED_TOOL_CALL_OK", ASSISTANT);
+    }
+    if syntax {
+        return ("TOOL_CALL_FLATTENED_TO_TEXT", ERROR);
+    }
+    if matches!(
+        outcome,
+        ModelToolTraceOutcome::Failure | ModelToolTraceOutcome::TimedOut
+    ) {
+        return ("PROVIDER_REQUEST_FAILED", ERROR);
+    }
+    if matches!(
+        choice,
+        ModelToolChoice::Required | ModelToolChoice::Specific { .. }
+    ) {
+        return ("PROVIDER_TOOL_CONTRACT_VIOLATION", ERROR);
+    }
+    ("MODEL_CHOSE_TEXT_UNDER_AUTO", WARNING)
+}
+
+fn tool_choice_label(choice: &ModelToolChoice) -> String {
+    match choice {
+        ModelToolChoice::Auto => "auto".to_owned(),
+        ModelToolChoice::None => "none".to_owned(),
+        ModelToolChoice::Required => "required".to_owned(),
+        ModelToolChoice::Specific { name } => format!("specific({name})"),
+    }
+}
+
+fn render_runtime(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(report) = &app.operator_report {
+        let lines = std::iter::once(Line::styled(
+            "ENGINE DOCTOR",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .chain(std::iter::once(Line::default()))
+        .chain(report.iter().map(|line| {
+            let style = if line == "status: ok" {
+                Style::default().fg(ASSISTANT)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::styled(clipped(line, 160), style)
+        }))
+        .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
+    let Some(catalog) = &app.runtime_catalog else {
+        frame.render_widget(
+            Paragraph::new("Runtime catalog is not enabled by this Engine host.")
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("CONFIG  ", Style::default().fg(MUTED)),
+            Span::styled(
+                short_id(&catalog.configuration_sha256),
+                Style::default().fg(ACCENT),
+            ),
+        ]),
+        Line::styled(
+            format!("reload · {}", catalog.reload_strategy),
+            Style::default().fg(MUTED),
+        ),
+        Line::default(),
+        Line::styled("MODEL ROUTE", Style::default().fg(ACCENT)),
+        Line::raw(if catalog.model_route.is_empty() {
+            "  none".to_owned()
+        } else {
+            format!("  {}", catalog.model_route.join(" → "))
+        }),
+    ];
+    for model in &catalog.models {
+        lines.push(Line::styled(
+            format!("  {} · {}", model.id, model.adapter),
+            Style::default().fg(Color::White),
+        ));
+        if let Some(endpoint) = &model.endpoint {
+            lines.push(Line::styled(
+                format!("    {}", clipped(endpoint, 160)),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            format!("SKILLS · {} active", catalog.skills.len()),
+            Style::default().fg(ACCENT),
+        ),
+    ]);
+    for skill in &catalog.skills {
+        lines.push(Line::styled(
+            format!(
+                "  {}@{} · {} · {}",
+                skill.name,
+                skill.version,
+                short_id(&skill.content_sha256),
+                skill.trust
+            ),
+            Style::default().fg(Color::White),
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!("REGISTRIES · {} configured", catalog.skill_registries.len()),
+        Style::default().fg(ACCENT),
+    ));
+    for registry in &catalog.skill_registries {
+        lines.push(Line::styled(
+            format!(
+                "  {} · {} · {} origin(s){}",
+                registry.id,
+                registry.authentication,
+                registry.package_origins.len(),
+                if registry.exclusive_root_ca {
+                    " · private CA"
+                } else {
+                    ""
+                }
+            ),
+            Style::default().fg(Color::White),
+        ));
+        lines.push(Line::styled(
+            format!("    {}", clipped(&registry.catalog_endpoint, 160)),
+            Style::default().fg(MUTED),
+        ));
+        for origin in &registry.package_origins {
+            lines.push(Line::styled(
+                format!("    allow {}", clipped(origin, 160)),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!("TOOLS · {}", catalog.tools.len()),
+        Style::default().fg(ACCENT),
+    ));
+    if !catalog.tools.is_empty() {
+        lines.push(Line::styled(
+            format!("  {}", catalog.tools.join(", ")),
+            Style::default().fg(Color::White),
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!("MCP · {} configured", catalog.mcp_servers.len()),
+        Style::default().fg(ACCENT),
+    ));
+    for server in &catalog.mcp_servers {
+        lines.push(Line::styled(
+            format!(
+                "  {} · {} · {}",
+                server.id,
+                server.transport,
+                if server.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+            ),
+            Style::default().fg(if server.enabled { ASSISTANT } else { MUTED }),
+        ));
+        if let Some(endpoint) = &server.endpoint {
+            lines.push(Line::styled(
+                format!("    {}", clipped(endpoint, 160)),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if !server.registered_tools.is_empty() {
+            lines.push(Line::raw(format!(
+                "    registered · {}",
+                server.registered_tools.join(", ")
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -794,12 +1390,25 @@ fn render_approvals(frame: &mut Frame<'_>, app: &App, area: Rect) {
             &mut state,
         );
     }
+    let detail = app.approvals.get(app.selected_approval).map_or_else(
+        || {
+            "READ-ONLY · settlement requires a separately authenticated approver principal."
+                .to_owned()
+        },
+        |approval| {
+            format!(
+                "READ-ONLY · approval {} · rev {}\nthread {} · turn {}\nSettlement requires a separately authenticated approver principal.",
+                short_id(approval.request.id.as_str()),
+                approval.revision,
+                short_id(approval.request.authorization.thread_id.as_str()),
+                short_id(approval.request.authorization.turn_id.as_str())
+            )
+        },
+    );
     frame.render_widget(
-        Paragraph::new(
-            "Read-only here: settlement requires a separately authenticated approver principal.",
-        )
-        .style(Style::default().fg(MUTED))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(detail)
+            .style(Style::default().fg(MUTED))
+            .wrap(Wrap { trim: false }),
         rows[1],
     );
 }
@@ -878,14 +1487,39 @@ fn render_tasks(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let focused = app.focus == Focus::Composer;
+    let (title, placeholder) = if app.active.is_some() {
+        (
+            " Composer · Enter steer · Ctrl/Alt+Enter newline ",
+            "Steer the active Turn…  /cancel stops its process Operation",
+        )
+    } else {
+        match app.execution.as_ref().map(|execution| execution.state) {
+            Some(TurnExecutionState::Waiting) => (
+                " Composer · WAITING · /resume after approval · /cancelwait ",
+                "A durable wait is active; enter /resume, /cancelwait, or another command",
+            ),
+            Some(TurnExecutionState::Ready) => (
+                " Composer · READY TO RESUME · /resume · /cancelwait ",
+                "Approval settlement is ready; enter /resume to continue",
+            ),
+            Some(TurnExecutionState::Executing) => (
+                " Composer · EXECUTING DETACHED · blind replay forbidden ",
+                "Execution is claimed elsewhere; use /refresh and inspect Activity",
+            ),
+            None => (
+                " Composer · Enter send · Ctrl/Alt+Enter newline ",
+                "Ask the Harness…  /help for commands",
+            ),
+        }
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
-        .title(" Composer · Enter send · Ctrl/Alt+Enter newline ");
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let shown = if app.input.is_empty() {
-        Paragraph::new("Ask the Harness…  /help for commands")
+        Paragraph::new(placeholder)
             .style(Style::default().fg(MUTED))
             .wrap(Wrap { trim: false })
     } else {
@@ -914,11 +1548,23 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .style(Style::default().fg(if app.notice.error { ERROR } else { MUTED })),
         rows[0],
     );
+    let controls = if app.active.is_some() {
+        "Tab focus  ←/→ panel  PgUp/PgDn scroll  Enter steer  Esc /cancel Operation  F1 help  Ctrl+C exit"
+    } else {
+        match app.execution.as_ref().map(|execution| execution.state) {
+            Some(TurnExecutionState::Waiting | TurnExecutionState::Ready) => {
+                "Tab focus  ←/→ panel  PgUp/PgDn scroll  /resume continue  /cancelwait close  F1 help  Ctrl+C exit"
+            }
+            Some(TurnExecutionState::Executing) => {
+                "Tab focus  ←/→ panel  PgUp/PgDn scroll  Ctrl+R refresh  execution detached  F1 help  Ctrl+C exit"
+            }
+            None => {
+                "Tab focus  ←/→ panel  PgUp/PgDn scroll  Ctrl+N new  Ctrl+R refresh  F1 help  Ctrl+C exit"
+            }
+        }
+    };
     frame.render_widget(
-        Paragraph::new(
-            "Tab focus  ←/→ panel  PgUp/PgDn scroll  Ctrl+N new  Ctrl+R refresh  Esc cancel  F1 help  Ctrl+C exit",
-        )
-        .style(Style::default().fg(MUTED)),
+        Paragraph::new(controls).style(Style::default().fg(MUTED)),
         rows[1],
     );
 }
@@ -936,7 +1582,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Enter send                Ctrl/Alt+Enter insert newline"),
         Line::raw("  Tab switch focus          ←/→ switch Inspector panel"),
         Line::raw("  PgUp/PgDn scroll          Ctrl+N create Thread"),
-        Line::raw("  Ctrl+R refresh            Esc/Ctrl+C cancel running Turn"),
+        Line::raw("  Ctrl+R refresh            Esc/Ctrl+C cancel process Operation"),
         Line::raw("  F1 or ? help              Ctrl+C exit when idle"),
         Line::raw(""),
         Line::raw("Commands"),
@@ -947,7 +1593,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  /sessions                 list lineage and resume recent Threads"),
         Line::raw("  /graph <id>               watch a durable Task Graph"),
         Line::raw("  /events | /approvals      open Inspector panel"),
-        Line::raw("  /refresh | /cancel        refresh or cancel"),
+        Line::raw("  /runtime | /models        inspect active capability catalog"),
+        Line::raw("  /trace | /tool-trace      inspect end-to-end Tool evidence"),
+        Line::raw("  /skills | /packages       inspect active package locks"),
+        Line::raw("  /doctor                   preflight config and durable stores"),
+        Line::raw("  /reload                   reload at a settled-Turn boundary"),
+        Line::raw("  /refresh | /cancel        refresh or cancel process Operation"),
+        Line::raw("  /resume                   consume settlement and resume exact wait"),
+        Line::raw("  /cancelwait               close exact unclaimed durable wait"),
         Line::raw("  /quit                     exit"),
         Line::raw(""),
         Line::styled(
@@ -955,7 +1608,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(MUTED),
         ),
         Line::styled(
-            "Approvals and Tasks are accessed exclusively through Protocol v31.",
+            format!(
+                "Approvals, waits, Tasks and Runtime catalog use Protocol v{PROTOCOL_VERSION} exclusively."
+            ),
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -1224,13 +1879,20 @@ fn task_status_color(status: &TaskStatus) -> Color {
 }
 
 fn short_id(identity: &str) -> &str {
-    identity.rsplit('-').next().unwrap_or(identity)
+    let suffix = identity.rsplit('-').next().unwrap_or(identity);
+    suffix.get(..suffix.len().min(12)).unwrap_or(suffix)
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
-    use y_harness::{ItemKind, StateCapacity, StateCapacityLevel};
+    use y_harness::{
+        AgentLoopCloseCommandId, AgentLoopWaitId, ApprovalId, Item, ItemKind, ModelStreamEvent,
+        ModelToolChoice, ModelToolTraceOutcome, ProtocolAdmissionState, RuntimeCatalog,
+        RuntimeMcpCatalogEntry, RuntimeModelCatalogEntry, StateCapacity, StateCapacityLevel,
+        TurnExecutionProjection, TurnExecutionState, TurnStatus, TurnStopReason,
+        WaitClosureEvidence,
+    };
 
     use crate::app::{ActivityEntry, App, SidebarTab};
 
@@ -1324,9 +1986,270 @@ mod tests {
         assert!(!screen.contains("never-render-this-ciphertext"));
         assert!(screen.contains("STEERING QUEUED"));
         assert!(screen.contains("Prefer the durable boundary"));
-        assert!(screen.contains("Keep clients behind Protocol v31"));
+        assert!(screen.contains("Keep clients behind Protocol v37"));
         assert!(screen.contains("Harness design"));
         assert!(screen.contains("Activity"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_trace_panel_proves_forced_tool_contract_violation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(200, 48);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.sidebar_tab = SidebarTab::ToolTrace;
+        app.runtime_catalog = Some(RuntimeCatalog {
+            configuration_sha256: "0".repeat(64),
+            model_route: vec!["gateway/model".to_owned()],
+            models: vec![RuntimeModelCatalogEntry {
+                id: "gateway/model".to_owned(),
+                adapter: "openai_chat_completions".to_owned(),
+                endpoint: Some("https://gateway.example/v1/chat/completions".to_owned()),
+            }],
+            tools: vec!["evidence.uppercase".to_owned()],
+            skills: Vec::new(),
+            skill_registries: Vec::new(),
+            mcp_servers: vec![RuntimeMcpCatalogEntry {
+                id: "evidence".to_owned(),
+                transport: "https".to_owned(),
+                endpoint: Some("https://mcp.example/mcp".to_owned()),
+                enabled: true,
+                registered_tools: vec!["evidence.uppercase".to_owned()],
+            }],
+            reload_strategy: "restart_boundary".to_owned(),
+        });
+        app.tool_trace
+            .push_back(ModelStreamEvent::ToolTraceRequest {
+                model_step: 1,
+                attempt: 1,
+                model_id: "gateway/model".to_owned(),
+                request_sha256: "a".repeat(64),
+                tools: vec!["evidence.uppercase".to_owned()],
+                advertised_tool_count: 1,
+                tools_truncated: false,
+                tool_choice: ModelToolChoice::Specific {
+                    name: "evidence.uppercase".to_owned(),
+                },
+            });
+        app.tool_trace
+            .push_back(ModelStreamEvent::ToolTraceResponse {
+                model_step: 1,
+                attempt: 1,
+                model_id: "gateway/model".to_owned(),
+                duration_micros: 1_500_000,
+                outcome: ModelToolTraceOutcome::Message,
+                structured_tool_calls: 0,
+                tool_syntax_in_text: false,
+                provider_model: Some("vendor/model".to_owned()),
+                provider_request_id: Some("provider-request-1".to_owned()),
+                provider_failure_kind: None,
+                provider_status_code: None,
+            });
+
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("MCP DISCOVERY + REGISTRATION"));
+        assert!(screen.contains("https://mcp.example/mcp"));
+        assert!(screen.contains("specific(evidence.uppercase)"));
+        assert!(screen.contains("structured Tool calls  0"));
+        assert!(screen.contains("PROVIDER_TOOL_CONTRACT_VIOLATION"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_trace_panel_assesses_non_mcp_forced_tool_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(200, 48);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.sidebar_tab = SidebarTab::ToolTrace;
+        app.runtime_catalog = Some(RuntimeCatalog {
+            configuration_sha256: "0".repeat(64),
+            model_route: vec!["gateway/model".to_owned()],
+            models: vec![RuntimeModelCatalogEntry {
+                id: "gateway/model".to_owned(),
+                adapter: "openai_chat_completions".to_owned(),
+                endpoint: Some("https://gateway.example/v1/chat/completions".to_owned()),
+            }],
+            tools: vec!["uppercase".to_owned()],
+            skills: Vec::new(),
+            skill_registries: Vec::new(),
+            mcp_servers: Vec::new(),
+            reload_strategy: "restart_boundary".to_owned(),
+        });
+        app.tool_trace
+            .push_back(ModelStreamEvent::ToolTraceRequest {
+                model_step: 1,
+                attempt: 1,
+                model_id: "gateway/model".to_owned(),
+                request_sha256: "a".repeat(64),
+                tools: vec!["uppercase".to_owned()],
+                advertised_tool_count: 1,
+                tools_truncated: false,
+                tool_choice: ModelToolChoice::Specific {
+                    name: "uppercase".to_owned(),
+                },
+            });
+        app.tool_trace
+            .push_back(ModelStreamEvent::ToolTraceResponse {
+                model_step: 1,
+                attempt: 1,
+                model_id: "gateway/model".to_owned(),
+                duration_micros: 1_500_000,
+                outcome: ModelToolTraceOutcome::Message,
+                structured_tool_calls: 0,
+                tool_syntax_in_text: false,
+                provider_model: Some("vendor/model".to_owned()),
+                provider_request_id: Some("provider-request-1".to_owned()),
+                provider_failure_kind: None,
+                provider_status_code: None,
+            });
+
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("NO MCP SERVER CONFIGURED"));
+        assert!(screen.contains("specific(uppercase)"));
+        assert!(screen.contains("structured Tool calls  0"));
+        assert!(screen.contains("PROVIDER_TOOL_CONTRACT_VIOLATION"));
+        assert!(!screen.contains("MCP_NOT_ENABLED"));
+        Ok(())
+    }
+
+    #[test]
+    fn header_renders_authoritative_service_admission_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (admission, expected) in [
+            (ProtocolAdmissionState::Ready, "READY"),
+            (ProtocolAdmissionState::AtCapacity, "AT CAPACITY"),
+            (ProtocolAdmissionState::Draining, "DRAINING"),
+        ] {
+            let backend = TestBackend::new(120, 32);
+            let mut terminal = Terminal::new(backend)?;
+            let mut app = App::test_fixture()?;
+            app.service_status
+                .as_mut()
+                .expect("fixture has an authoritative service status")
+                .admission = admission;
+
+            terminal.draw(|frame| render(frame, &app))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                screen.contains(expected),
+                "header did not render {admission:?}: {screen}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_wait_phases_are_unambiguous_in_header_composer_and_footer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (state, expected_header, expected_control) in [
+            (
+                TurnExecutionState::Waiting,
+                "WAITING",
+                "/resume after approval",
+            ),
+            (
+                TurnExecutionState::Ready,
+                "READY TO RESUME",
+                "Approval settlement is ready",
+            ),
+            (
+                TurnExecutionState::Executing,
+                "EXECUTING DETACHED",
+                "blind replay forbidden",
+            ),
+        ] {
+            let backend = TestBackend::new(200, 40);
+            let mut terminal = Terminal::new(backend)?;
+            let mut app = App::test_fixture()?;
+            app.input.clear();
+            app.input_cursor = 0;
+            let turn = app.thread.turns.last_mut().ok_or("fixture has no Turn")?;
+            turn.status = TurnStatus::Running;
+            app.execution = Some(TurnExecutionProjection {
+                thread_id: app.thread.id.clone(),
+                turn_id: turn.id.clone(),
+                wait_id: AgentLoopWaitId::from_static("wait-fixture"),
+                revision: 2,
+                state,
+                expires_at_ms: Some(10_000),
+                remaining_active_timeout_ms: Some(120_000),
+                approval_id: ApprovalId::from_static("approval-fixture"),
+            });
+
+            terminal.draw(|frame| render(frame, &app))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                screen.contains(expected_header),
+                "missing {expected_header:?}: {screen}"
+            );
+            assert!(
+                screen.contains(expected_control),
+                "missing {expected_control:?}: {screen}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_wait_closure_is_rendered_only_from_terminal_state_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = TestBackend::new(180, 36);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::test_fixture()?;
+        app.input.clear();
+        app.input_cursor = 0;
+        let turn = app.thread.turns.last_mut().ok_or("fixture has no Turn")?;
+        turn.status = TurnStatus::Cancelled;
+        turn.items.push(Item::new(ItemKind::AgentLoopWaitClosed {
+            evidence: Box::new(WaitClosureEvidence {
+                wait_id: AgentLoopWaitId::from_static("closed-fixture"),
+                previous_revision: 1,
+                revision: 2,
+                command_id: AgentLoopCloseCommandId::from_static("close-fixture"),
+                status: TurnStatus::Cancelled,
+                reason: TurnStopReason::Cancelled,
+                command_sha256: "0".repeat(64),
+                closed_at_ms: 1,
+            }),
+        }));
+
+        terminal.draw(|frame| render(frame, &app))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("WAIT CLOSED · CANCELLED"));
         Ok(())
     }
 
@@ -1433,7 +2356,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("START A CONVERSATION"));
-        assert!(screen.contains("headless Engine through Protocol v31"));
+        assert!(screen.contains("headless Engine through Protocol v37"));
         assert!(screen.contains("press Enter"));
         assert!(screen.contains("first durable decision"));
         Ok(())

@@ -7,7 +7,13 @@ use std::{
 };
 
 use serde_json::json;
-use y_harness::{EventId, Item, ItemKind, SqliteEventStore, StateEngine, ThreadId, TurnStatus};
+use y_harness::{
+    AuthorityContext, CompletionAssurance, CompletionContract, CompletionGeneration, EventId, Item,
+    ItemKind, SqliteEventStore, StateEngine, ThreadId, build_completion_receipt,
+    completion_model_request_sha256, completion_model_route_sha256,
+    completion_runtime_governance_sha256, completion_tool_view_sha256,
+    completion_verifier_manifest_sha256,
+};
 
 const DEFAULT_EVENTS: usize = 200;
 const DEFAULT_SAMPLES: usize = 5;
@@ -112,20 +118,46 @@ async fn run_sample(sample: usize, events: usize) -> Result<Sample, Box<dyn Erro
     let turn = state.start_turn(&thread.id).await?;
 
     let append_started = Instant::now();
+    let mut final_candidate = None;
+    let mut final_request_sha256 = None;
     for index in 0..events {
-        state
-            .append_item(
-                &turn,
-                Item::new(ItemKind::AssistantMessage {
-                    model_id: Some("bench/model".to_owned()),
-                    model_origin: Some(y_harness::CapabilityOrigin::BuiltIn),
-                    content: format!("benchmark-item-{index}"),
-                }),
-            )
-            .await?;
+        let content = format!("benchmark-item-{index}");
+        let model_request_sha256 = completion_model_request_sha256(&json!({
+            "content": &content,
+        }))?;
+        let candidate = Item::new(ItemKind::AssistantMessage {
+            model_id: Some("bench/model".to_owned()),
+            model_origin: Some(y_harness::CapabilityOrigin::BuiltIn),
+            model_request_sha256: Some(model_request_sha256.clone()),
+            content,
+        });
+        state.append_item(&turn, candidate.clone()).await?;
+        final_candidate = Some(candidate.id);
+        final_request_sha256 = Some(model_request_sha256);
     }
     let append = append_started.elapsed();
-    state.finish_turn(&turn, TurnStatus::Completed).await?;
+    let running = state
+        .load_thread(&thread.id)
+        .await?
+        .and_then(|thread| thread.turns.into_iter().next())
+        .ok_or("benchmark running Turn disappeared")?;
+    let generation = CompletionGeneration::new(
+        final_request_sha256.ok_or("benchmark produced no Model request")?,
+        completion_model_route_sha256(&["bench/model"])?,
+        completion_tool_view_sha256(&Vec::<String>::new())?,
+        completion_verifier_manifest_sha256(&[])?,
+        completion_runtime_governance_sha256(&json!({"benchmark": "sqlite_state_journal"}))?,
+        None,
+        CompletionAssurance::RuntimeMeasured,
+    )?;
+    let receipt = build_completion_receipt(
+        &running,
+        &AuthorityContext::local_process(),
+        &final_candidate.ok_or("benchmark produced no completion candidate")?,
+        generation,
+        CompletionContract::v1_no_external_requirements(),
+    )?;
+    state.complete_turn(&running, receipt).await?;
 
     let load_started = Instant::now();
     let projected = state

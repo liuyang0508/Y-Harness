@@ -1,4 +1,4 @@
-//! Product TUI state derived exclusively from Protocol v31 projections.
+//! Product TUI state derived exclusively from Protocol v37 projections.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -7,10 +7,15 @@ use std::{
 };
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use y_harness::ProtocolAdmissionState;
 use y_harness::{
-    ApprovalRecord, ItemKind, MemoryScope, ModelStreamEvent, OperationId, OperationStatus,
-    ProtocolCommand, ProtocolResult, StateCapacity, StateEvent, StoredEvent, TaskGraphSummary,
-    TaskRecord, Thread, ThreadId, ThreadSummary, TurnStatus,
+    AgentLoopCloseCommandId, ApprovalDeliveryStatus, ApprovalRecord, ItemKind,
+    MAX_AGENT_LOOP_WAIT_MS, MemoryScope, ModelStreamEvent, OperationId, OperationStatus,
+    ProtocolCommand, ProtocolResult, ProtocolServiceStatus, RuntimeCatalog, StateCapacity,
+    StateEvent, StoredEvent, TaskGraphSummary, TaskRecord, Thread, ThreadId, ThreadSummary,
+    TurnExecutionProjection, TurnExecutionState, TurnId, TurnStatus,
 };
 
 use crate::{
@@ -21,11 +26,18 @@ use crate::{
 const MAX_COMPOSER_BYTES: usize = 65_536;
 const MAX_PROVISIONAL_BYTES: usize = 65_536;
 const MAX_ACTIVITY: usize = 256;
+const MAX_TOOL_TRACE_EVENTS: usize = 128;
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
 const IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVE_EVENT_WAIT: Duration = Duration::from_millis(25);
 const IDLE_EVENT_WAIT: Duration = Duration::from_millis(250);
+// When the Engine advertises durable waits, the active 120-second Turn timeout
+// is frozen while approval is pending. This independent, server-enforced
+// lifetime lets the TUI opt into worker release. Engines without that optional
+// capability receive no durable-wait field at all.
+const APPROVAL_WAIT_TTL_MS: u64 = MAX_AGENT_LOOP_WAIT_MS;
+const WAIT_CANCEL_COMMAND_DOMAIN: &[u8] = b"y-harness.tui.wait-cancel-command.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -39,27 +51,39 @@ pub(crate) enum SidebarTab {
     Sessions,
     Approvals,
     Tasks,
+    Runtime,
+    ToolTrace,
 }
 
 impl SidebarTab {
-    pub(crate) const ALL: [Self; 4] =
-        [Self::Activity, Self::Sessions, Self::Approvals, Self::Tasks];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Activity,
+        Self::Sessions,
+        Self::Approvals,
+        Self::Tasks,
+        Self::Runtime,
+        Self::ToolTrace,
+    ];
 
     fn next(self) -> Self {
         match self {
             Self::Activity => Self::Sessions,
             Self::Sessions => Self::Approvals,
             Self::Approvals => Self::Tasks,
-            Self::Tasks => Self::Activity,
+            Self::Tasks => Self::Runtime,
+            Self::Runtime => Self::ToolTrace,
+            Self::ToolTrace => Self::Activity,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Activity => Self::Tasks,
+            Self::Activity => Self::ToolTrace,
             Self::Sessions => Self::Activity,
             Self::Approvals => Self::Sessions,
             Self::Tasks => Self::Approvals,
+            Self::Runtime => Self::Tasks,
+            Self::ToolTrace => Self::Runtime,
         }
     }
 }
@@ -71,6 +95,22 @@ pub(crate) struct ActiveTurn {
     pub(crate) stream_gap_through: Option<u64>,
     pub(crate) started_at: Instant,
     cursor: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingWaitCancel {
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    wait_id: y_harness::AgentLoopWaitId,
+    expected_revision: u64,
+    command_id: AgentLoopCloseCommandId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptSubmissionGate {
+    Allowed,
+    BlockedNotice(&'static str),
+    BlockedError(&'static str),
 }
 
 pub(crate) struct Notice {
@@ -100,12 +140,20 @@ pub(crate) struct App {
     pub(crate) tasks: Vec<TaskRecord>,
     pub(crate) tasks_have_more: bool,
     pub(crate) selected_task: usize,
+    pub(crate) service_status: Option<ProtocolServiceStatus>,
+    pub(crate) runtime_catalog: Option<RuntimeCatalog>,
+    pub(crate) tool_trace: VecDeque<ModelStreamEvent>,
+    pub(crate) operator_report: Option<Vec<String>>,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
     pub(crate) transcript_scroll_from_bottom: usize,
     pub(crate) focus: Focus,
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) active: Option<ActiveTurn>,
+    /// Live durable Agent Loop state, independent of a process-local Operation.
+    pub(crate) execution: Option<TurnExecutionProjection>,
+    /// Last delivery observation returned with an Operation wait settlement.
+    pub(crate) approval_delivery: Option<ApprovalDeliveryStatus>,
     pub(crate) notice: Notice,
     pub(crate) help: bool,
     pub(crate) quit: bool,
@@ -120,39 +168,7 @@ impl App {
         client: &mut ProtocolClient,
         initial_thread: Option<String>,
     ) -> ClientResult<Self> {
-        let (server, capabilities, engine_version) =
-            match client.call(ProtocolCommand::Initialize {}).await? {
-                ProtocolResult::Initialized {
-                    server,
-                    capabilities,
-                    compatibility,
-                } => (
-                    server,
-                    capabilities.into_iter().collect::<BTreeSet<_>>(),
-                    compatibility.engine_version,
-                ),
-                result => return Err(unexpected("initialize", result)),
-            };
-        for required in [
-            "operation.cancel",
-            "operation.events",
-            "operation.forget",
-            "operation.get",
-            "thread.capacity",
-            "thread.create",
-            "thread.events",
-            "thread.get",
-            "thread.name",
-            "turn.start",
-            "turn.steer",
-        ] {
-            if !capabilities.contains(required) {
-                return Err(io::Error::other(format!(
-                    "Engine did not advertise required capability {required:?}"
-                ))
-                .into());
-            }
-        }
+        let (server, capabilities, engine_version) = initialize_engine(client).await?;
         let thread = match initial_thread {
             Some(thread_id) => load_thread(client, thread_id).await?,
             None => create_thread(client).await?,
@@ -175,12 +191,18 @@ impl App {
             tasks: Vec::new(),
             tasks_have_more: false,
             selected_task: 0,
+            service_status: None,
+            runtime_catalog: None,
+            tool_trace: VecDeque::new(),
+            operator_report: None,
             input: String::new(),
             input_cursor: 0,
             transcript_scroll_from_bottom: 0,
             focus: Focus::Composer,
             sidebar_tab: SidebarTab::Activity,
             active: None,
+            execution: None,
+            approval_delivery: None,
             notice: Notice {
                 text: "Ready · Enter sends · F1 help".to_owned(),
                 error: false,
@@ -382,7 +404,7 @@ impl App {
                 SidebarTab::Tasks => {
                     self.selected_task = self.selected_task.saturating_sub(1);
                 }
-                SidebarTab::Activity => {}
+                SidebarTab::Activity | SidebarTab::Runtime | SidebarTab::ToolTrace => {}
             },
             KeyCode::Down => match self.sidebar_tab {
                 SidebarTab::Sessions => {
@@ -403,7 +425,7 @@ impl App {
                         .saturating_add(1)
                         .min(self.tasks.len().saturating_sub(1));
                 }
-                SidebarTab::Activity => {}
+                SidebarTab::Activity | SidebarTab::Runtime | SidebarTab::ToolTrace => {}
             },
             KeyCode::Enter if self.sidebar_tab == SidebarTab::Sessions => {
                 let thread_id = self
@@ -431,6 +453,20 @@ impl App {
             self.input.clear();
             self.input_cursor = 0;
             return self.run_command(client, &submitted).await;
+        }
+        match prompt_submission_gate(
+            self.execution.as_ref().map(|execution| execution.state),
+            self.active.is_some(),
+        ) {
+            PromptSubmissionGate::Allowed => {}
+            PromptSubmissionGate::BlockedNotice(message) => {
+                self.set_notice(message);
+                return Ok(());
+            }
+            PromptSubmissionGate::BlockedError(message) => {
+                self.set_error(message);
+                return Ok(());
+            }
         }
         if self.active.is_some() {
             self.refresh_thread(client).await?;
@@ -470,6 +506,10 @@ impl App {
                 memory_scope: MemoryScope::default(),
                 context: Vec::new(),
                 timeout_ms: Some(120_000),
+                approval_wait_ttl_ms: self
+                    .capabilities
+                    .contains("turn.wait.get")
+                    .then_some(APPROVAL_WAIT_TTL_MS),
             })
             .await?;
         let operation_id = match result {
@@ -478,16 +518,9 @@ impl App {
         };
         self.input.clear();
         self.input_cursor = 0;
-        self.transcript_scroll_from_bottom = 0;
-        self.active = Some(ActiveTurn {
-            id: operation_id,
-            provisional: String::new(),
-            provisional_truncated: false,
-            stream_gap_through: None,
-            started_at: Instant::now(),
-            cursor: 0,
-        });
-        self.last_operation_poll = Instant::now();
+        self.execution = None;
+        self.approval_delivery = None;
+        self.install_active_operation(operation_id);
         self.set_notice("Turn running · Esc cancels cooperatively");
         Ok(())
     }
@@ -576,12 +609,54 @@ impl App {
                 self.focus = Focus::Sidebar;
                 Ok(())
             }
+            "/runtime" | "/models" | "/skills" | "/packages" => {
+                self.operator_report = None;
+                self.sidebar_tab = SidebarTab::Runtime;
+                self.focus = Focus::Sidebar;
+                self.refresh_runtime(client).await?;
+                self.set_notice("Loaded active Runtime catalog");
+                Ok(())
+            }
+            "/trace" | "/tool-trace" => {
+                self.operator_report = None;
+                self.sidebar_tab = SidebarTab::ToolTrace;
+                self.focus = Focus::Sidebar;
+                self.refresh_runtime(client).await?;
+                self.set_notice("Tool Trace loaded · latest Turn retained locally");
+                Ok(())
+            }
+            "/doctor" => {
+                let report = client.diagnose().await?;
+                self.operator_report = Some(
+                    report
+                        .lines()
+                        .map(sanitize_operator_line)
+                        .collect::<Vec<_>>(),
+                );
+                self.sidebar_tab = SidebarTab::Runtime;
+                self.focus = Focus::Sidebar;
+                self.set_notice("Engine doctor report loaded");
+                Ok(())
+            }
+            "/reload" => self.reload_engine(client).await,
             "/refresh" => {
                 self.refresh_all(client).await;
                 self.set_notice("Protocol projections refreshed");
                 Ok(())
             }
             "/cancel" => self.cancel_active(client).await,
+            "/resume" => {
+                if parts.next().is_some() {
+                    return Err(io::Error::other("usage: /resume").into());
+                }
+                self.resume_wait(client).await
+            }
+            "/cancelwait" => {
+                if parts.next().is_some() {
+                    return Err(io::Error::other("usage: /cancelwait").into());
+                }
+                self.cancel_wait(client).await
+            }
             "/help" => {
                 self.help = true;
                 Ok(())
@@ -670,6 +745,8 @@ impl App {
         self.event_cursor = 0;
         self.transcript_scroll_from_bottom = 0;
         self.active = None;
+        self.execution = None;
+        self.approval_delivery = None;
     }
 
     async fn cancel_active(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
@@ -693,6 +770,134 @@ impl App {
             }
             result => Err(unexpected("cancel operation", result)),
         }
+    }
+
+    async fn resume_wait(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("turn.wait.resume") {
+            return Err(io::Error::other(
+                "Engine does not advertise durable-wait resume capability",
+            )
+            .into());
+        }
+        if self.active.is_some() {
+            return Err(io::Error::other(
+                "a process Operation is already running; use /cancel before another resume",
+            )
+            .into());
+        }
+        self.refresh_thread(client).await?;
+        self.refresh_execution(client).await?;
+        let execution = self
+            .execution
+            .clone()
+            .ok_or_else(|| io::Error::other("current Thread has no live durable wait"))?;
+        if execution.state == TurnExecutionState::Executing {
+            return Err(io::Error::other(
+                "durable execution was already claimed; blind replay is forbidden",
+            )
+            .into());
+        }
+        let result = client
+            .call(ProtocolCommand::ResumeTurnWait {
+                thread_id: execution.thread_id.to_string(),
+                turn_id: execution.turn_id.to_string(),
+                wait_id: execution.wait_id.to_string(),
+                expected_revision: execution.revision,
+                memory_scope: MemoryScope::default(),
+                context: Vec::new(),
+            })
+            .await?;
+        let operation_id = match result {
+            ProtocolResult::TurnStarted { operation_id } => operation_id,
+            result => return Err(unexpected("resume durable wait", result)),
+        };
+        self.install_active_operation(operation_id);
+        self.set_notice(format!(
+            "Resume requested for wait {} revision {} · verifying durable settlement",
+            short_id(execution.wait_id.as_str()),
+            execution.revision
+        ));
+        Ok(())
+    }
+
+    async fn cancel_wait(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("turn.wait.cancel") {
+            return Err(io::Error::other(
+                "Engine does not advertise durable-wait cancellation capability",
+            )
+            .into());
+        }
+        if self.active.is_some() {
+            return Err(io::Error::other(
+                "a process Operation is running; use /cancel instead of /cancelwait",
+            )
+            .into());
+        }
+        self.refresh_thread(client).await?;
+        self.refresh_execution(client).await?;
+        let intent = match self.execution.as_ref() {
+            Some(execution) if execution.state == TurnExecutionState::Executing => {
+                return Err(io::Error::other(
+                    "durable execution was already claimed and cannot be closed as an unclaimed wait",
+                )
+                .into());
+            }
+            Some(execution) => wait_cancel_intent(execution),
+            // A successful close can race with a lost response or process
+            // restart. Recover the exact command from authoritative closure
+            // evidence and retry it idempotently instead of guessing success.
+            None => terminal_wait_cancel_intent(&self.thread)
+                .ok_or_else(|| io::Error::other("current Thread has no live durable wait"))?,
+        };
+        let expected_terminal_revision = intent
+            .expected_revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("wait revision overflow"))?;
+        let result = client
+            .call(ProtocolCommand::CancelTurnWait {
+                thread_id: intent.thread_id.to_string(),
+                turn_id: intent.turn_id.to_string(),
+                wait_id: intent.wait_id.to_string(),
+                expected_revision: intent.expected_revision,
+                command_id: intent.command_id.to_string(),
+            })
+            .await?;
+        match result {
+            ProtocolResult::TurnWaitCancelled {
+                thread_id: settled_thread,
+                turn_id,
+                wait_id,
+                command_id,
+                revision,
+            } if settled_thread == intent.thread_id
+                && turn_id == intent.turn_id
+                && wait_id == intent.wait_id
+                && command_id == intent.command_id
+                && revision == expected_terminal_revision => {}
+            result => return Err(unexpected("cancel durable wait", result)),
+        }
+        self.execution = None;
+        self.approval_delivery = None;
+        self.refresh_all(client).await;
+        self.set_notice(format!(
+            "Durable wait {} cancelled at revision {expected_terminal_revision}",
+            short_id(intent.wait_id.as_str())
+        ));
+        Ok(())
+    }
+
+    fn install_active_operation(&mut self, operation_id: OperationId) {
+        self.transcript_scroll_from_bottom = 0;
+        self.tool_trace.clear();
+        self.active = Some(ActiveTurn {
+            id: operation_id,
+            provisional: String::new(),
+            provisional_truncated: false,
+            stream_gap_through: None,
+            started_at: Instant::now(),
+            cursor: 0,
+        });
+        self.last_operation_poll = Instant::now();
     }
 
     async fn poll_active(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
@@ -723,30 +928,49 @@ impl App {
                 ),
                 result => return Err(unexpected("read operation events", result)),
             };
-            let Some(active) = self.active.as_mut() else {
-                return Ok(());
-            };
-            if let Some(dropped) = dropped
-                && active.cursor < dropped
             {
-                active.stream_gap_through = Some(dropped);
-                active.cursor = dropped;
-                active.provisional.clear();
-                active.provisional_truncated = false;
+                let Some(active) = self.active.as_mut() else {
+                    return Ok(());
+                };
+                if let Some(dropped) = dropped
+                    && active.cursor < dropped
+                {
+                    active.stream_gap_through = Some(dropped);
+                    active.cursor = dropped;
+                    active.provisional.clear();
+                    active.provisional_truncated = false;
+                }
             }
             for event in events {
-                match event.event {
-                    ModelStreamEvent::TextDelta { delta, .. } => {
-                        append_provisional(active, &delta);
-                    }
+                let trace = matches!(
+                    event.event,
+                    ModelStreamEvent::ToolTraceRequest { .. }
+                        | ModelStreamEvent::ToolTraceResponse { .. }
+                )
+                .then(|| event.event.clone());
+                let Some(active) = self.active.as_mut() else {
+                    return Ok(());
+                };
+                match &event.event {
+                    ModelStreamEvent::TextDelta { delta, .. } => append_provisional(active, delta),
                     ModelStreamEvent::StepInvalidated { .. } => {
                         active.provisional.clear();
                         active.provisional_truncated = false;
                     }
+                    ModelStreamEvent::ToolTraceRequest { .. }
+                    | ModelStreamEvent::ToolTraceResponse { .. } => {}
                 }
                 active.cursor = event.sequence;
+                if let Some(trace) = trace {
+                    self.tool_trace.push_back(trace);
+                    while self.tool_trace.len() > MAX_TOOL_TRACE_EVENTS {
+                        self.tool_trace.pop_front();
+                    }
+                }
             }
-            if let Some(next) = next {
+            if let Some(next) = next
+                && let Some(active) = self.active.as_mut()
+            {
                 active.cursor = next;
             }
             if !has_more {
@@ -764,9 +988,28 @@ impl App {
                 operation: OperationStatus::Running { .. },
             } => {}
             ProtocolResult::Operation {
+                operation:
+                    OperationStatus::Waiting {
+                        execution,
+                        approval_delivery,
+                    },
+            } => {
+                // Operation completion can arrive before the idle projection
+                // refresh. Reload the authoritative Thread before correlating
+                // the durable wait so a fast approval boundary is not shown as
+                // a transient coordinate error.
+                self.refresh_thread(client).await?;
+                validate_execution_coordinates(&self.thread, &execution)?;
+                let notice = approval_delivery_notice(&execution, &approval_delivery);
+                self.execution = Some(execution);
+                self.approval_delivery = Some(approval_delivery);
+                self.finish_operation(client, &operation_id).await?;
+                self.set_notice(notice);
+            }
+            ProtocolResult::Operation {
                 operation: OperationStatus::Completed { .. },
             } => {
-                self.finish_operation(client, &operation_id).await;
+                self.finish_operation(client, &operation_id).await?;
                 self.set_notice("Turn completed");
             }
             ProtocolResult::Operation {
@@ -778,7 +1021,7 @@ impl App {
             | ProtocolResult::Operation {
                 operation: OperationStatus::TimedOut { error },
             } => {
-                self.finish_operation(client, &operation_id).await;
+                self.finish_operation(client, &operation_id).await?;
                 self.set_error(error);
             }
             result => return Err(unexpected("poll operation", result)),
@@ -786,24 +1029,45 @@ impl App {
         Ok(())
     }
 
-    async fn finish_operation(&mut self, client: &mut ProtocolClient, operation_id: &OperationId) {
-        let _ = client
+    async fn finish_operation(
+        &mut self,
+        client: &mut ProtocolClient,
+        operation_id: &OperationId,
+    ) -> ClientResult<()> {
+        match client
             .call(ProtocolCommand::ForgetOperation {
                 operation_id: operation_id.to_string(),
             })
-            .await;
+            .await?
+        {
+            ProtocolResult::OperationForgotten {
+                operation_id: forgotten,
+            } if &forgotten == operation_id => {}
+            result => return Err(unexpected("forget terminal operation", result)),
+        }
         self.active = None;
         self.refresh_all(client).await;
         self.transcript_scroll_from_bottom = 0;
         if self.quit_after_settlement {
             self.quit = true;
         }
+        Ok(())
     }
 
     async fn refresh_all(&mut self, client: &mut ProtocolClient) {
         let mut errors = Vec::new();
-        if let Err(error) = self.refresh_thread(client).await {
+        if let Err(error) = self.refresh_service_status(client).await {
             errors.push(error.to_string());
+        }
+        match self.refresh_thread(client).await {
+            Ok(()) => {
+                if let Err(error) = self.refresh_execution(client).await {
+                    errors.push(error.to_string());
+                }
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+            }
         }
         if let Err(error) = self.refresh_events(client).await {
             errors.push(error.to_string());
@@ -818,6 +1082,9 @@ impl App {
             errors.push(error.to_string());
         }
         if let Err(error) = self.refresh_task(client).await {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = self.refresh_runtime(client).await {
             errors.push(error.to_string());
         }
         if !errors.is_empty() {
@@ -843,6 +1110,44 @@ impl App {
             }
             result => Err(unexpected("refresh Thread", result)),
         }
+    }
+
+    async fn refresh_execution(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("turn.wait.get") {
+            self.execution = None;
+            self.approval_delivery = None;
+            return Ok(());
+        }
+        let Some(turn_id) = running_turn_id(&self.thread)? else {
+            self.execution = None;
+            self.approval_delivery = None;
+            return Ok(());
+        };
+        let result = client
+            .call(ProtocolCommand::GetTurnExecution {
+                thread_id: self.thread.id.to_string(),
+                turn_id: turn_id.to_string(),
+            })
+            .await?;
+        let execution = match result {
+            ProtocolResult::TurnExecution { execution } => execution,
+            result => return Err(unexpected("refresh durable Turn execution", result)),
+        };
+        if let Some(execution) = execution.as_ref() {
+            validate_execution_coordinates(&self.thread, execution)?;
+        }
+        let same_observation =
+            self.execution
+                .as_ref()
+                .zip(execution.as_ref())
+                .is_some_and(|(previous, current)| {
+                    previous.wait_id == current.wait_id && previous.revision == current.revision
+                });
+        if !same_observation {
+            self.approval_delivery = None;
+        }
+        self.execution = execution;
+        Ok(())
     }
 
     async fn refresh_events(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
@@ -992,6 +1297,57 @@ impl App {
         }
     }
 
+    async fn refresh_runtime(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("runtime.catalog") {
+            self.runtime_catalog = None;
+            return Ok(());
+        }
+        match client.call(ProtocolCommand::GetRuntimeCatalog {}).await? {
+            ProtocolResult::RuntimeCatalog { catalog } => {
+                self.runtime_catalog = Some(catalog);
+                Ok(())
+            }
+            result => Err(unexpected("refresh Runtime catalog", result)),
+        }
+    }
+
+    async fn refresh_service_status(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if !self.capabilities.contains("service.status") {
+            self.service_status = None;
+            return Ok(());
+        }
+        match client.call(ProtocolCommand::GetServiceStatus {}).await? {
+            ProtocolResult::ServiceStatus { status } => {
+                self.service_status = Some(status);
+                Ok(())
+            }
+            result => Err(unexpected("refresh service status", result)),
+        }
+    }
+
+    async fn reload_engine(&mut self, client: &mut ProtocolClient) -> ClientResult<()> {
+        if self.active.is_some() {
+            return Err(io::Error::other("cancel the running Turn before reloading").into());
+        }
+        let thread_id = self.thread.id.to_string();
+        client.reload().await?;
+        let (server, capabilities, engine_version) = initialize_engine(client).await?;
+        self.server = server;
+        self.capabilities = capabilities;
+        self.engine_version = engine_version;
+        self.operator_report = None;
+        self.install_thread(load_thread(client, thread_id).await?);
+        self.refresh_all(client).await;
+        let revision = self
+            .runtime_catalog
+            .as_ref()
+            .map_or("unknown", |catalog| short_id(&catalog.configuration_sha256));
+        self.set_notice(format!(
+            "Engine generation reloaded at a settled-Turn boundary · config {revision}"
+        ));
+        Ok(())
+    }
+
     fn insert_text(&mut self, text: &str) {
         for character in text.chars() {
             let character = if character == '\r' { '\n' } else { character };
@@ -1043,6 +1399,27 @@ impl App {
         };
     }
 
+    /// Returns a terminal status only when the latest Turn crossed a durable
+    /// wait boundary. The UI never invents closure from its local wall clock.
+    pub(crate) fn latest_wait_terminal_status(&self) -> Option<&TurnStatus> {
+        let turn = self.thread.turns.last()?;
+        if turn.status == TurnStatus::Running
+            || !turn.items.iter().any(|item| {
+                matches!(
+                    &item.kind,
+                    ItemKind::AgentLoopWaitStarted { .. }
+                        | ItemKind::AgentLoopResumeAccepted { .. }
+                        | ItemKind::AgentLoopReadyClaimed { .. }
+                        | ItemKind::AgentLoopWaitClosed { .. }
+                        | ItemKind::AgentLoopWaitDenied { .. }
+                )
+            })
+        {
+            return None;
+        }
+        Some(&turn.status)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Result<Self, y_harness::HarnessError> {
         let mut thread = Thread::new();
@@ -1078,7 +1455,8 @@ impl App {
             .push(y_harness::Item::new(ItemKind::AssistantMessage {
                 model_id: Some("fixture/model".to_owned()),
                 model_origin: None,
-                content: "Keep clients behind Protocol v31.".to_owned(),
+                model_request_sha256: None,
+                content: "Keep clients behind Protocol v37.".to_owned(),
             }));
         thread.name = Some("Harness design".to_owned());
         let lineage = y_harness::ThreadLineage {
@@ -1104,6 +1482,7 @@ impl App {
             engine_version: "0.1.0".to_owned(),
             capabilities: BTreeSet::from([
                 "approval.pending".to_owned(),
+                "service.status".to_owned(),
                 "task.graph.get".to_owned(),
                 "thread.fork".to_owned(),
                 "thread.list".to_owned(),
@@ -1124,12 +1503,23 @@ impl App {
             tasks: Vec::new(),
             tasks_have_more: false,
             selected_task: 0,
+            service_status: Some(ProtocolServiceStatus {
+                admission: ProtocolAdmissionState::Ready,
+                running_operations: 0,
+                retained_operations: 0,
+                operation_retention_limit: 64,
+            }),
+            runtime_catalog: None,
+            tool_trace: VecDeque::new(),
+            operator_report: None,
             input: "下一步".to_owned(),
             input_cursor: 3,
             transcript_scroll_from_bottom: 0,
             focus: Focus::Composer,
             sidebar_tab: SidebarTab::Activity,
             active: None,
+            execution: None,
+            approval_delivery: None,
             notice: Notice {
                 text: "Ready".to_owned(),
                 error: false,
@@ -1142,6 +1532,230 @@ impl App {
             last_refresh: now,
         })
     }
+}
+
+fn sanitize_operator_line(line: &str) -> String {
+    line.chars()
+        .filter(|character| *character == '\t' || !terminal_unsafe(*character))
+        .collect()
+}
+
+fn running_turn_id(thread: &Thread) -> Result<Option<TurnId>, io::Error> {
+    let mut running = thread
+        .turns
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Running);
+    let turn_id = running.next().map(|turn| turn.id.clone());
+    if running.next().is_some() {
+        return Err(io::Error::other(
+            "authoritative Thread contains multiple running Turns",
+        ));
+    }
+    Ok(turn_id)
+}
+
+fn validate_execution_coordinates(
+    thread: &Thread,
+    execution: &TurnExecutionProjection,
+) -> Result<(), io::Error> {
+    if execution.thread_id != thread.id
+        || running_turn_id(thread)?.as_ref() != Some(&execution.turn_id)
+        || execution.revision == 0
+    {
+        return Err(io::Error::other(
+            "Engine returned a durable execution outside the current running Turn",
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_submission_gate(
+    execution_state: Option<TurnExecutionState>,
+    has_attached_operation: bool,
+) -> PromptSubmissionGate {
+    // An attached Operation owns the only execution path and accepts durable
+    // steering. Its briefly stale wait projection must not make the composer
+    // advertise a second resume while the claim is already in flight.
+    if has_attached_operation {
+        return PromptSubmissionGate::Allowed;
+    }
+    match execution_state {
+        Some(TurnExecutionState::Waiting) => PromptSubmissionGate::BlockedNotice(
+            "Turn is waiting for an external approval · use /resume or /cancelwait",
+        ),
+        Some(TurnExecutionState::Ready) => PromptSubmissionGate::BlockedNotice(
+            "Approval is ready for exact recovery · use /resume or /cancelwait",
+        ),
+        Some(TurnExecutionState::Executing) => PromptSubmissionGate::BlockedError(
+            "Execution was already claimed by another worker; blind replay is forbidden",
+        ),
+        None => PromptSubmissionGate::Allowed,
+    }
+}
+
+/// Derives a restart-stable idempotency identity from typed wait coordinates.
+/// Length prefixes and field tags make the preimage unambiguous even when
+/// opaque identifiers contain separators.
+fn wait_cancel_command_id(
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    wait_id: &y_harness::AgentLoopWaitId,
+    expected_revision: u64,
+) -> AgentLoopCloseCommandId {
+    let mut digest = Sha256::new();
+    digest.update(WAIT_CANCEL_COMMAND_DOMAIN);
+    digest_coordinate(&mut digest, 1, thread_id.as_str().as_bytes());
+    digest_coordinate(&mut digest, 2, turn_id.as_str().as_bytes());
+    digest_coordinate(&mut digest, 3, wait_id.as_str().as_bytes());
+    digest_coordinate(&mut digest, 4, &expected_revision.to_be_bytes());
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    AgentLoopCloseCommandId::from_string(format!("tui-wait-cancel-{encoded}"))
+}
+
+fn digest_coordinate(digest: &mut Sha256, tag: u8, value: &[u8]) {
+    digest.update([tag]);
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+fn wait_cancel_intent(execution: &TurnExecutionProjection) -> PendingWaitCancel {
+    PendingWaitCancel {
+        thread_id: execution.thread_id.clone(),
+        turn_id: execution.turn_id.clone(),
+        wait_id: execution.wait_id.clone(),
+        expected_revision: execution.revision,
+        command_id: wait_cancel_command_id(
+            &execution.thread_id,
+            &execution.turn_id,
+            &execution.wait_id,
+            execution.revision,
+        ),
+    }
+}
+
+/// Recovers only a closure produced by this TUI's deterministic cancellation
+/// namespace. Other clients' cancellations and timeout closures remain closed
+/// facts and are never replayed under a fabricated command.
+fn terminal_wait_cancel_intent(thread: &Thread) -> Option<PendingWaitCancel> {
+    let turn = thread.turns.last()?;
+    if turn.status != TurnStatus::Cancelled {
+        return None;
+    }
+    turn.items.iter().rev().find_map(|item| {
+        let ItemKind::AgentLoopWaitClosed { evidence } = &item.kind else {
+            return None;
+        };
+        let command_id = wait_cancel_command_id(
+            &thread.id,
+            &turn.id,
+            &evidence.wait_id,
+            evidence.previous_revision,
+        );
+        (evidence.command_id == command_id
+            && evidence.previous_revision.checked_add(1) == Some(evidence.revision))
+        .then(|| PendingWaitCancel {
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            wait_id: evidence.wait_id.clone(),
+            expected_revision: evidence.previous_revision,
+            command_id,
+        })
+    })
+}
+
+fn approval_delivery_notice(
+    execution: &TurnExecutionProjection,
+    delivery: &ApprovalDeliveryStatus,
+) -> String {
+    let wait = short_id(execution.wait_id.as_str());
+    match delivery {
+        ApprovalDeliveryStatus::Pending => {
+            format!("Turn waiting · approval pending · wait {wait} · /resume after settlement")
+        }
+        ApprovalDeliveryStatus::Settled => {
+            format!("Turn waiting · settlement observed · wait {wait} · use /resume")
+        }
+        ApprovalDeliveryStatus::Orphaned { reason } => format!(
+            "Turn waiting · approval orphaned · wait {wait} · {}",
+            clipped_notice(reason, 160)
+        ),
+        ApprovalDeliveryStatus::Retry { action, message } => format!(
+            "Turn waiting · Inbox {action:?} retry required · wait {wait} · {}",
+            clipped_notice(message, 160)
+        ),
+    }
+}
+
+fn clipped_notice(value: &str, maximum_chars: usize) -> String {
+    let mut characters = value.chars();
+    let clipped = characters.by_ref().take(maximum_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
+async fn initialize_engine(
+    client: &mut ProtocolClient,
+) -> ClientResult<(String, BTreeSet<String>, String)> {
+    let (server, capabilities, engine_version) =
+        match client.call(ProtocolCommand::Initialize {}).await? {
+            ProtocolResult::Initialized {
+                server,
+                capabilities,
+                compatibility,
+            } => (
+                server,
+                capabilities.into_iter().collect::<BTreeSet<_>>(),
+                compatibility.engine_version,
+            ),
+            result => return Err(unexpected("initialize", result)),
+        };
+    validate_engine_capabilities(&capabilities)?;
+    Ok((server, capabilities, engine_version))
+}
+
+fn validate_engine_capabilities(capabilities: &BTreeSet<String>) -> ClientResult<()> {
+    for required in [
+        "operation.cancel",
+        "operation.events",
+        "operation.forget",
+        "operation.get",
+        "service.status",
+        "thread.capacity",
+        "thread.create",
+        "thread.events",
+        "thread.get",
+        "thread.name",
+        "turn.start",
+        "turn.steer",
+    ] {
+        if !capabilities.contains(required) {
+            return Err(io::Error::other(format!(
+                "Engine did not advertise required capability {required:?}"
+            ))
+            .into());
+        }
+    }
+    let durable_wait_capabilities = ["turn.wait.cancel", "turn.wait.get", "turn.wait.resume"];
+    let durable_wait_count = durable_wait_capabilities
+        .iter()
+        .filter(|capability| capabilities.contains(**capability))
+        .count();
+    if durable_wait_count != 0 && durable_wait_count != durable_wait_capabilities.len() {
+        return Err(io::Error::other(
+            "Engine advertised an incomplete durable-wait capability bundle",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 async fn create_thread(client: &mut ProtocolClient) -> ClientResult<Thread> {
@@ -1192,6 +1806,21 @@ fn describe_event(event: &StoredEvent) -> String {
             short_id(turn_id.as_str()),
             turn_status(status)
         ),
+        StateEvent::TurnCompleted { turn_id, receipt } => {
+            let placement = if receipt.source_thread_id() == &event.thread_id {
+                "receipt-bound".to_owned()
+            } else {
+                format!(
+                    "inherited receipt from {}",
+                    short_id(receipt.source_thread_id().as_str())
+                )
+            };
+            format!(
+                "Turn {} completed · {placement} · candidate {}",
+                short_id(turn_id.as_str()),
+                short_id(receipt.candidate_item_id().as_str())
+            )
+        }
         StateEvent::CheckpointCreated { checkpoint } => format!(
             "Checkpoint {}{}",
             short_id(checkpoint.id.as_str()),
@@ -1203,6 +1832,48 @@ fn describe_event(event: &StoredEvent) -> String {
         StateEvent::ToolCallsAppended { calls, .. } => {
             format!("Tool calls · {} ordered", calls.len())
         }
+        StateEvent::WaitStarted { transition, .. } => match &transition.kind {
+            ItemKind::AgentLoopWaitStarted { envelope } => format!(
+                "Turn waiting · {} · revision {}",
+                short_id(envelope.wait_id.as_str()),
+                envelope.revision
+            ),
+            _ => "Turn wait started · invalid transition".to_owned(),
+        },
+        StateEvent::AcceptResume { transition, .. } => match &transition.kind {
+            ItemKind::AgentLoopResumeAccepted { evidence } => format!(
+                "Turn ready · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            _ => "Turn resume accepted · invalid transition".to_owned(),
+        },
+        StateEvent::ClaimReady { transition, .. } => match &transition.kind {
+            ItemKind::AgentLoopReadyClaimed { evidence } => format!(
+                "Turn execution claimed · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            _ => "Turn execution claimed · invalid transition".to_owned(),
+        },
+        StateEvent::WaitClosed {
+            transition, status, ..
+        } => match &transition.kind {
+            ItemKind::AgentLoopWaitClosed { evidence } => format!(
+                "Turn wait closed · {} · {}",
+                short_id(evidence.wait_id.as_str()),
+                turn_status(status)
+            ),
+            _ => "Turn wait closed · invalid transition".to_owned(),
+        },
+        StateEvent::DenyWait { transition, .. } => match &transition.kind {
+            ItemKind::AgentLoopWaitDenied { evidence } => format!(
+                "Turn wait denied · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            _ => "Turn wait denied · invalid transition".to_owned(),
+        },
         StateEvent::ItemAppended { item, .. } => match &item.kind {
             ItemKind::UserMessage { .. } => "User message".to_owned(),
             ItemKind::ExecutionBinding { binding, .. } => format!(
@@ -1228,6 +1899,31 @@ fn describe_event(event: &StoredEvent) -> String {
             ItemKind::PolicyDecision { .. } => "Policy decision".to_owned(),
             ItemKind::ApprovalRequested { tool, .. } => format!("Approval requested · {tool}"),
             ItemKind::ApprovalDecision { .. } => "Approval settled".to_owned(),
+            ItemKind::AgentLoopWaitStarted { envelope } => format!(
+                "Turn waiting · {} · revision {}",
+                short_id(envelope.wait_id.as_str()),
+                envelope.revision
+            ),
+            ItemKind::AgentLoopResumeAccepted { evidence } => format!(
+                "Turn ready · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            ItemKind::AgentLoopReadyClaimed { evidence } => format!(
+                "Turn execution claimed · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            ItemKind::AgentLoopWaitClosed { evidence } => format!(
+                "Turn wait closed · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
+            ItemKind::AgentLoopWaitDenied { evidence } => format!(
+                "Turn wait denied · {} · revision {}",
+                short_id(evidence.wait_id.as_str()),
+                evidence.revision
+            ),
             ItemKind::ToolResult { is_error, .. } => {
                 if *is_error {
                     "Tool failed".to_owned()
@@ -1278,7 +1974,8 @@ fn append_provisional(active: &mut ActiveTurn, delta: &str) {
 }
 
 fn short_id(identity: &str) -> &str {
-    identity.rsplit('-').next().unwrap_or(identity)
+    let suffix = identity.rsplit('-').next().unwrap_or(identity);
+    suffix.get(..suffix.len().min(12)).unwrap_or(suffix)
 }
 
 fn turn_status(status: &TurnStatus) -> &'static str {
@@ -1299,11 +1996,56 @@ fn unexpected(action: &str, result: ProtocolResult) -> Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{collections::BTreeSet, time::Instant};
 
-    use y_harness::OperationId;
+    use y_harness::{
+        AgentLoopCloseCommandId, AgentLoopWaitId, Item, ItemKind, OperationId, Thread, Turn,
+        TurnExecutionState, TurnStatus, TurnStopReason, WaitClosureEvidence,
+    };
 
-    use super::{ActiveTurn, MAX_PROVISIONAL_BYTES, append_provisional, byte_index};
+    use super::{
+        ActiveTurn, MAX_PROVISIONAL_BYTES, PromptSubmissionGate, append_provisional, byte_index,
+        prompt_submission_gate, sanitize_operator_line, terminal_wait_cancel_intent,
+        validate_engine_capabilities, wait_cancel_command_id,
+    };
+
+    fn minimum_capabilities() -> BTreeSet<String> {
+        [
+            "operation.cancel",
+            "operation.events",
+            "operation.forget",
+            "operation.get",
+            "service.status",
+            "thread.capacity",
+            "thread.create",
+            "thread.events",
+            "thread.get",
+            "thread.name",
+            "turn.start",
+            "turn.steer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn capability_negotiation_accepts_optional_wait_as_all_or_none() {
+        let minimum = minimum_capabilities();
+        assert!(validate_engine_capabilities(&minimum).is_ok());
+
+        let mut partial = minimum.clone();
+        partial.insert("turn.wait.get".to_owned());
+        assert!(validate_engine_capabilities(&partial).is_err());
+
+        partial.insert("turn.wait.cancel".to_owned());
+        partial.insert("turn.wait.resume".to_owned());
+        assert!(validate_engine_capabilities(&partial).is_ok());
+
+        let mut missing_core = minimum;
+        missing_core.remove("turn.start");
+        assert!(validate_engine_capabilities(&missing_core).is_err());
+    }
 
     #[test]
     fn byte_index_preserves_unicode_editing_boundaries() {
@@ -1327,5 +2069,104 @@ mod tests {
         append_provisional(&mut active, "马");
         assert_eq!(active.provisional.len(), MAX_PROVISIONAL_BYTES - 1);
         assert!(active.provisional_truncated);
+    }
+
+    #[test]
+    fn operator_report_removes_terminal_controls_but_keeps_tabs() {
+        assert_eq!(
+            sanitize_operator_line("status:\tok\u{1b}[31m"),
+            "status:\tok[31m"
+        );
+    }
+
+    #[test]
+    fn durable_execution_gate_never_replays_or_steers_the_wrong_phase() {
+        assert!(matches!(
+            prompt_submission_gate(Some(TurnExecutionState::Waiting), false),
+            PromptSubmissionGate::BlockedNotice(_)
+        ));
+        assert!(matches!(
+            prompt_submission_gate(Some(TurnExecutionState::Ready), false),
+            PromptSubmissionGate::BlockedNotice(_)
+        ));
+        assert!(matches!(
+            prompt_submission_gate(Some(TurnExecutionState::Executing), false),
+            PromptSubmissionGate::BlockedError(_)
+        ));
+        assert_eq!(
+            prompt_submission_gate(Some(TurnExecutionState::Ready), true),
+            PromptSubmissionGate::Allowed
+        );
+        assert_eq!(
+            prompt_submission_gate(Some(TurnExecutionState::Executing), true),
+            PromptSubmissionGate::Allowed
+        );
+        assert_eq!(
+            prompt_submission_gate(None, false),
+            PromptSubmissionGate::Allowed
+        );
+    }
+
+    #[test]
+    fn wait_cancel_command_identity_is_stable_and_unambiguous() {
+        let thread_a = y_harness::ThreadId::from_static("a");
+        let thread_ab = y_harness::ThreadId::from_static("ab");
+        let turn_bc = y_harness::TurnId::from_static("bc");
+        let turn_c = y_harness::TurnId::from_static("c");
+        let wait = AgentLoopWaitId::from_static("wait");
+        let first = wait_cancel_command_id(&thread_a, &turn_bc, &wait, 7);
+        let retry = wait_cancel_command_id(&thread_a, &turn_bc, &wait, 7);
+        let ambiguous_without_lengths = wait_cancel_command_id(&thread_ab, &turn_c, &wait, 7);
+        let next_revision = wait_cancel_command_id(&thread_a, &turn_bc, &wait, 8);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, ambiguous_without_lengths);
+        assert_ne!(first, next_revision);
+        assert!(first.as_str().starts_with("tui-wait-cancel-"));
+        assert_eq!(first.as_str().len(), "tui-wait-cancel-".len() + 64);
+    }
+
+    #[test]
+    fn terminal_cancel_evidence_restores_exact_retry_after_restart() {
+        let mut thread = Thread::new();
+        let mut turn = Turn::new(thread.id.clone());
+        let wait_id = AgentLoopWaitId::from_static("restart-safe-wait");
+        let expected_revision = 2;
+        let command_id = wait_cancel_command_id(&thread.id, &turn.id, &wait_id, expected_revision);
+        turn.status = TurnStatus::Cancelled;
+        turn.items.push(Item::new(ItemKind::AgentLoopWaitClosed {
+            evidence: Box::new(WaitClosureEvidence {
+                wait_id: wait_id.clone(),
+                previous_revision: expected_revision,
+                revision: expected_revision + 1,
+                command_id: command_id.clone(),
+                status: TurnStatus::Cancelled,
+                reason: TurnStopReason::Cancelled,
+                command_sha256: "0".repeat(64),
+                closed_at_ms: 1,
+            }),
+        }));
+        thread.turns.push(turn.clone());
+
+        let recovered = terminal_wait_cancel_intent(&thread).expect("recover exact TUI command");
+        assert_eq!(recovered.thread_id, thread.id);
+        assert_eq!(recovered.turn_id, turn.id);
+        assert_eq!(recovered.wait_id, wait_id);
+        assert_eq!(recovered.expected_revision, expected_revision);
+        assert_eq!(recovered.command_id, command_id);
+
+        let ItemKind::AgentLoopWaitClosed { evidence } = &mut thread
+            .turns
+            .last_mut()
+            .expect("terminal Turn")
+            .items
+            .last_mut()
+            .expect("closure Item")
+            .kind
+        else {
+            panic!("fixture closure Item changed kind");
+        };
+        evidence.command_id = AgentLoopCloseCommandId::from_static("foreign-client-command");
+        assert!(terminal_wait_cancel_intent(&thread).is_none());
     }
 }

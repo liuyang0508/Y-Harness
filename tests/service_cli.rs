@@ -7,10 +7,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(unix, feature = "http-probe"))]
+use std::io::Read;
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader},
     os::unix::fs::PermissionsExt,
+};
+#[cfg(feature = "http-probe")]
+use std::{
+    net::{SocketAddr, TcpListener, TcpStream},
+    time::Instant,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -18,24 +25,26 @@ use semver::Version;
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
 use y_harness::{
-    APPROVAL_INBOX_SCHEMA_VERSION, EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION,
-    EFFECT_LEDGER_SCHEMA_VERSION, EffectCommandId, EffectCreateRequest, EffectOperation,
-    HUMAN_HANDOFF_SCHEMA_VERSION, HumanHandoffCommandId, HumanHandoffCreateRequest,
-    HumanHandoffSubject, Item, ItemKind, PROTOCOL_VERSION, ProtocolCommand, ProtocolRequest,
-    ProtocolResponse, ProtocolResponseBody, ProtocolResult, SECRET_API_VERSION,
+    AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION, APPROVAL_INBOX_SCHEMA_VERSION, ActorIdentity,
+    AgentLoopWaitId, ApprovalId, ApprovalRequest, CapabilityOrigin, CompletionAssurance,
+    CompletionGeneration, EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION, EFFECT_LEDGER_SCHEMA_VERSION,
+    EffectCommandId, EffectCreateRequest, EffectOperation, HUMAN_HANDOFF_SCHEMA_VERSION,
+    HumanHandoffCommandId, HumanHandoffCreateRequest, HumanHandoffSubject, Item, ItemKind,
+    PROTOCOL_VERSION, PolicyDecision, ProtocolCommand, ProtocolRequest, ProtocolResponse,
+    ProtocolResponseBody, ProtocolResult, RiskLevel, SECRET_API_VERSION,
     STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION, SignedSkillPackage, SkillPackage,
     SkillSignature, SkillTransparencyReceipt, SqliteEventStore, SqliteTaskCoordinator,
     SqliteWorkflowCoordinator, StateEngine, TASK_GRAPH_SCHEMA_VERSION, TaskCoordinator,
-    TaskDefinition, TaskGraph, TaskGraphId, TaskId, ThreadId, TurnStatus,
-    WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommand, WorkflowCommandId, WorkflowCommandKind,
-    WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRunId, WorkflowStatus,
-    WorkflowTransitionKind, WorkflowWaitId, WorkspaceMode, decode_thread_archive,
+    TaskDefinition, TaskGraph, TaskGraphId, TaskId, ThreadId, ToolAuthorization, ToolDescriptor,
+    TurnStatus, WORKFLOW_RUN_SCHEMA_VERSION, WorkflowCommand, WorkflowCommandId,
+    WorkflowCommandKind, WorkflowCreateRequest, WorkflowDefinition, WorkflowEngine, WorkflowRunId,
+    WorkflowStatus, WorkflowTransitionKind, WorkflowWaitId, WorkspaceMode,
+    completion_model_request_sha256, completion_model_route_sha256,
+    completion_runtime_governance_sha256, completion_tool_view_sha256,
+    completion_verifier_manifest_sha256, decode_thread_archive,
 };
 #[cfg(unix)]
-use y_harness::{
-    CapabilityOrigin, EffectEngine, EffectId, EffectStatus, OperationStatus,
-    SqliteEffectCoordinator,
-};
+use y_harness::{EffectEngine, EffectId, EffectStatus, OperationStatus, SqliteEffectCoordinator};
 
 const STATE_V1_FIXTURE: &str = include_str!("fixtures/state-v1.sql");
 
@@ -85,20 +94,23 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
     let report = String::from_utf8(doctor.stdout).expect("UTF-8 doctor report");
     assert!(report.contains(&format!("protocol: {PROTOCOL_VERSION}")));
     assert!(report.contains(&format!(
-        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
+        "schemas: state={STATE_EVENT_SCHEMA_VERSION}/{STATE_SNAPSHOT_SCHEMA_VERSION} wait-projection={AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION} approval={APPROVAL_INBOX_SCHEMA_VERSION} task={TASK_GRAPH_SCHEMA_VERSION} workflow={WORKFLOW_RUN_SCHEMA_VERSION} handoff={HUMAN_HANDOFF_SCHEMA_VERSION} effect={EFFECT_LEDGER_SCHEMA_VERSION} effect-governance={EFFECT_DISPATCH_GOVERNOR_SCHEMA_VERSION} secret={SECRET_API_VERSION}"
     )));
     assert!(report.contains("model: local/demo"));
     assert!(report.contains("authority: local-process / unscoped"));
     assert!(report.contains("parallel tools: 1 safe / 4 maximum"));
+    assert!(report.contains("progress governor: failure cycle period 1-4 / 5 repetitions"));
     assert!(report.contains("verifiers: 0"));
     assert!(report.contains("evaluation graders: 0"));
     assert!(report.contains("mcp servers: 0 enabled / 0 configured"));
     assert!(report.contains("mcp command locks: 0 / 0 stdio enabled"));
     assert!(report.contains("skills: 0"));
+    assert!(report.contains("skill registries: 0 configured / 0 authenticated"));
     assert!(report.contains("conversation: 32 Turns / 65536 tokens / 65536 bytes"));
     assert!(report.contains("conversation compactor: disabled"));
     assert!(report.contains("temporal: disabled"));
     assert!(report.contains("effect consumer: disabled"));
+    assert!(report.contains("http probe: disabled"));
     assert!(report.contains(
         "stores: state=will be created approval=will be created task=will be created \
          workflow=will be created handoff=will be created effect=will be created"
@@ -107,12 +119,43 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
 
     let initialized = serve(
         &project,
-        vec![request("initialize", ProtocolCommand::Initialize {})],
+        vec![
+            request("initialize", ProtocolCommand::Initialize {}),
+            request("catalog", ProtocolCommand::GetRuntimeCatalog {}),
+            request("status", ProtocolCommand::GetServiceStatus {}),
+        ],
     );
     assert!(matches!(
         initialized[0].body,
         ProtocolResponseBody::Success {
             result: ProtocolResult::Initialized { .. }
+        }
+    ));
+    match &initialized[1].body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::RuntimeCatalog { catalog },
+        } => {
+            assert_eq!(catalog.model_route, ["local/demo"]);
+            assert_eq!(catalog.models.len(), 1);
+            assert_eq!(catalog.models[0].adapter, "deterministic_demo");
+            assert_eq!(catalog.tools, ["echo"]);
+            assert!(catalog.skill_registries.is_empty());
+            assert_eq!(catalog.reload_strategy, "restart_boundary");
+            assert_eq!(catalog.configuration_sha256.len(), 64);
+        }
+        response => panic!("unexpected Runtime catalog response: {response:?}"),
+    }
+    assert!(matches!(
+        initialized[2].body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::ServiceStatus {
+                status: y_harness::ProtocolServiceStatus {
+                    admission: y_harness::ProtocolAdmissionState::Ready,
+                    running_operations: 0,
+                    retained_operations: 0,
+                    operation_retention_limit: 64,
+                }
+            }
         }
     ));
     let current_doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
@@ -133,6 +176,214 @@ fn init_is_no_clobber_and_doctor_validates_the_project() {
             )
     );
     fs::remove_dir_all(project).expect("remove isolated project");
+}
+
+#[cfg(unix)]
+#[test]
+fn service_converts_sigterm_into_a_clean_protocol_shutdown_without_stdin_eof() {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+
+    let project = isolated_project("sigterm-shutdown");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("initialize SIGTERM project");
+    assert!(initialized.status.success());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn service");
+    let mut input = child.stdin.take().expect("service stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("service stdout"));
+    let initialized = exchange(
+        &mut input,
+        &mut output,
+        request("before-sigterm", ProtocolCommand::Initialize {}),
+    );
+    assert!(matches!(
+        initialized.body,
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::Initialized { .. }
+        }
+    ));
+
+    let pid = i32::try_from(child.id()).expect("child PID fits i32");
+    kill(Pid::from_raw(pid), Signal::SIGTERM).expect("send SIGTERM");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait().expect("poll service") {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                child.kill().expect("stop timed-out service");
+                let _ = child.wait();
+                panic!("service did not settle after SIGTERM");
+            }
+        }
+    };
+    drop(input);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("service stderr")
+        .read_to_string(&mut stderr)
+        .expect("read service stderr");
+    assert!(status.success(), "SIGTERM shutdown failed: {stderr}");
+
+    fs::remove_dir_all(project).expect("remove SIGTERM project");
+}
+
+#[cfg(feature = "http-probe")]
+#[test]
+fn configured_service_exposes_protocol_derived_http_probes_and_stops_cleanly() {
+    let project = isolated_project("http-probe");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("initialize HTTP probe project");
+    assert!(initialized.status.success());
+    let config_path = project.join("y-harness.json");
+    let mut config: serde_json::Value = serde_json::from_slice(
+        &fs::read(&config_path).expect("read initialized HTTP probe config"),
+    )
+    .expect("decode initialized HTTP probe config");
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve HTTP probe port");
+    let address = reserved.local_addr().expect("probe address");
+    drop(reserved);
+    config["http_probe"] = serde_json::json!({
+        "bind_address": address.to_string(),
+        "max_connections": 8,
+        "request_timeout_ms": 1_000,
+        "status_timeout_ms": 500,
+        "shutdown_timeout_ms": 1_000
+    });
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("encode HTTP probe config"),
+    )
+    .expect("write HTTP probe config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config_path)
+        .output()
+        .expect("run HTTP probe doctor");
+    assert!(
+        doctor.status.success(),
+        "HTTP probe doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report = String::from_utf8(doctor.stdout).expect("HTTP probe doctor UTF-8");
+    assert!(report.contains(&format!(
+        "http probe: enabled ({address} / 8 connections / 1000 ms request / 500 ms status / 1000 ms shutdown)"
+    )));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["serve", "y-harness.json"])
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn HTTP probe service");
+    let input = child.stdin.take().expect("HTTP probe service stdin");
+    let ready = wait_for_http_probe(address, "/readyz");
+    assert!(ready.starts_with("HTTP/1.1 200 OK"));
+    assert!(ready.ends_with("ready\n"));
+    let live = wait_for_http_probe(address, "/livez");
+    assert!(live.starts_with("HTTP/1.1 200 OK"));
+    assert!(live.ends_with("live\n"));
+
+    drop(input);
+    let settled = child.wait_with_output().expect("settle HTTP probe service");
+    assert!(
+        settled.status.success(),
+        "HTTP probe service failed: {}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    fs::remove_dir_all(project).expect("remove HTTP probe project");
+}
+
+#[cfg(feature = "https-skill")]
+#[test]
+fn doctor_and_runtime_catalog_expose_only_credential_free_registry_metadata() {
+    let project = isolated_project("skill-registry-catalog");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("init")
+        .arg(&project)
+        .output()
+        .expect("initialize Registry project");
+    assert!(initialized.status.success());
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {"type": "demo"},
+          "skill_registries": [{
+            "id": "company/public",
+            "catalog_endpoint": "https://registry.example.test/catalog.json",
+            "package_origins": ["https://packages.example.test"]
+          }]
+        }"#,
+    )
+    .expect("write Registry config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .env_remove("YH_PRIVATE_REGISTRY_TEST_SECRET_DO_NOT_SET")
+        .output()
+        .expect("run Registry doctor");
+    assert!(
+        doctor.status.success(),
+        "Registry doctor failed: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report = String::from_utf8(doctor.stdout).expect("doctor UTF-8");
+    assert!(report.contains("skill registries: 1 configured / 0 authenticated"));
+    assert!(report.contains(
+        "skill registry: company/public / https://registry.example.test/catalog.json / 1 package origin(s) / public"
+    ));
+
+    let responses = serve(
+        &project,
+        vec![
+            request("initialize", ProtocolCommand::Initialize {}),
+            request("catalog", ProtocolCommand::GetRuntimeCatalog {}),
+        ],
+    );
+    match &responses[1].body {
+        ProtocolResponseBody::Success {
+            result: ProtocolResult::RuntimeCatalog { catalog },
+        } => {
+            assert_eq!(catalog.skill_registries.len(), 1);
+            let registry = &catalog.skill_registries[0];
+            assert_eq!(registry.id, "company/public");
+            assert_eq!(registry.authentication, "public");
+            assert_eq!(registry.package_origins, ["https://packages.example.test"]);
+            assert!(!registry.exclusive_root_ca);
+            let encoded = serde_json::to_string(registry).expect("encode Registry projection");
+            assert!(!encoded.contains("secret_reference"));
+            assert!(!encoded.contains("environment"));
+        }
+        response => panic!("unexpected Runtime catalog response: {response:?}"),
+    }
+    fs::remove_dir_all(project).expect("remove Registry catalog project");
 }
 
 #[test]
@@ -356,7 +607,7 @@ fn doctor_and_service_reject_a_partial_effect_governor_store_without_mutation() 
 }
 
 #[test]
-fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
+fn configured_temporal_service_advances_durable_waits_and_stops_cleanly() {
     let project = isolated_project("temporal-service");
     let initialized = Command::new(env!("CARGO_BIN_EXE_yh"))
         .arg("init")
@@ -409,7 +660,7 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
             .as_millis(),
     )
     .expect("Unix milliseconds");
-    let workflow = runtime.block_on(async {
+    let (workflow, run_id, state, state_thread_id) = runtime.block_on(async {
         let tasks = Arc::new(
             SqliteTaskCoordinator::open(project.join(".y-harness/tasks.db"))
                 .await
@@ -469,7 +720,97 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
             )
             .await
             .expect("start durable wait");
-        (workflow, run_id)
+        let state = StateEngine::new(Arc::new(
+            SqliteEventStore::open(project.join(".y-harness/state.db"))
+                .await
+                .expect("open State Event Store"),
+        ));
+        let thread = state.create_thread().await.expect("create State Thread");
+        let turn = state
+            .start_turn(&thread.id)
+            .await
+            .expect("start State Turn");
+        let call_id = "temporal-service-tool-call".to_owned();
+        let descriptor = ToolDescriptor {
+            name: "write_record".to_owned(),
+            description: "Writes one bounded Temporal service fixture".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"]
+            }),
+        };
+        let input = serde_json::json!({"value": 7});
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::ToolCall {
+                    model_id: Some("test/model".to_owned()),
+                    model_origin: Some(CapabilityOrigin::BuiltIn),
+                    call_id: call_id.clone(),
+                    name: descriptor.name.clone(),
+                    input: input.clone(),
+                    batch: None,
+                }),
+            )
+            .await
+            .expect("append State Tool call");
+        state
+            .append_item(
+                &turn,
+                Item::new(ItemKind::PolicyDecision {
+                    call_id: call_id.clone(),
+                    tool_origin: Some(CapabilityOrigin::BuiltIn),
+                    decision: PolicyDecision::Ask {
+                        reason: "operator confirmation required".to_owned(),
+                        risk: RiskLevel::High,
+                    },
+                }),
+            )
+            .await
+            .expect("append State Policy decision");
+        let approval = ApprovalRequest {
+            id: ApprovalId::from_static("temporal-service-approval"),
+            requested_by: ActorIdentity::LocalProcess,
+            authorization: ToolAuthorization {
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                call_id,
+                descriptor,
+                origin: CapabilityOrigin::BuiltIn,
+                input,
+            },
+            reason: "operator confirmation required".to_owned(),
+            risk: RiskLevel::High,
+        };
+        let model_request_sha256 = completion_model_request_sha256(&serde_json::json!({
+            "turn": turn.id.as_str(),
+            "approval": approval.id.as_str()
+        }))
+        .expect("Model request digest");
+        let generation = CompletionGeneration::new(
+            model_request_sha256,
+            completion_model_route_sha256(&["test/model"]).expect("Model route digest"),
+            completion_tool_view_sha256(&Vec::<String>::new()).expect("Tool view digest"),
+            completion_verifier_manifest_sha256(&[]).expect("Verifier manifest digest"),
+            completion_runtime_governance_sha256(&serde_json::json!({"max_steps": 16}))
+                .expect("Runtime governance digest"),
+            None,
+            CompletionAssurance::RuntimeMeasured,
+        )
+        .expect("completion generation");
+        state
+            .start_approval_wait(
+                &turn,
+                AgentLoopWaitId::from_static("temporal-service-agent-loop-wait"),
+                approval,
+                generation,
+                Some(Duration::from_millis(250)),
+                Some(30_000),
+            )
+            .await
+            .expect("start durable Agent Loop wait");
+        (workflow, run_id, state, thread.id)
     });
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_yh"))
@@ -481,7 +822,6 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
         .spawn()
         .expect("spawn Temporal service");
     let input = child.stdin.take().expect("Temporal service stdin");
-    let (workflow, run_id) = workflow;
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -490,6 +830,23 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
                     .await
                     .expect("load Workflow Run")
                     .expect("Workflow Run exists");
+                let thread = state
+                    .load_thread(&state_thread_id)
+                    .await
+                    .expect("load State Thread")
+                    .expect("State Thread exists");
+                let agent_loop_timed_out = matches!(
+                    thread.turns.last().map(|turn| &turn.status),
+                    Some(TurnStatus::TimedOut)
+                ) && thread.turns.last().is_some_and(|turn| {
+                    turn.items.iter().any(|item| {
+                        matches!(
+                            &item.kind,
+                            ItemKind::AgentLoopWaitClosed { evidence }
+                                if evidence.status == TurnStatus::TimedOut
+                        )
+                    })
+                });
                 if matches!(run.run().status(), WorkflowStatus::Running)
                     && matches!(
                         run.run()
@@ -498,6 +855,7 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
                             .map(|transition| &transition.kind),
                         Some(WorkflowTransitionKind::WaitDue { .. })
                     )
+                    && agent_loop_timed_out
                 {
                     return;
                 }
@@ -505,7 +863,7 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
             }
         })
         .await
-        .expect("Temporal service advances due Workflow");
+        .expect("Temporal service advances due Workflow and Agent Loop wait");
     });
 
     drop(input);
@@ -525,6 +883,7 @@ fn configured_temporal_service_advances_durable_wait_and_stops_cleanly() {
         String::from_utf8_lossy(&settled.stderr)
     );
     // Windows cannot delete database files while this test still holds them open.
+    drop(state);
     drop(workflow);
     drop(runtime);
     fs::remove_dir_all(project).expect("remove Temporal service fixture");
@@ -919,7 +1278,7 @@ fn thread_archive_cli_round_trips_without_clobber_or_partial_import() {
             .await
             .expect("append Item");
         state
-            .finish_turn(&turn, TurnStatus::Completed)
+            .finish_turn(&turn, TurnStatus::Interrupted)
             .await
             .expect("finish Turn");
         source.id
@@ -1128,22 +1487,21 @@ fn skill_cli_installs_verifies_and_recoverably_removes_exact_packages() {
     assert!(report.contains("verified skills: 1"));
     assert!(report.contains("status: ok"));
 
-    fs::write(
-        &config_path,
-        format!(
-            r#"{{
-              "schema_version": 1,
-              "data_directory": ".y-harness",
-              "model": {{"type": "demo"}},
-              "skills": {{
-                "package_files": ["skills/{digest}.skill.json"],
-                "activate": [{{"name": "concise-assistant", "version": "1.0.0"}}],
-                "budget_tokens": 256
-              }}
-            }}"#
-        ),
-    )
-    .expect("configure installed Skill");
+    let activated = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["package", "activate", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("activate installed Skill");
+    assert!(
+        activated.status.success(),
+        "Skill activation failed: {}",
+        String::from_utf8_lossy(&activated.stderr)
+    );
+    assert!(String::from_utf8_lossy(&activated.stdout).contains("activated:"));
+    let active_config = fs::read_to_string(&config_path).expect("read active config");
+    assert!(active_config.contains("concise-assistant"));
+    assert!(active_config.contains(&format!("skills/{digest}.skill.json")));
+
     let active_removal = Command::new(env!("CARGO_BIN_EXE_yh"))
         .args(["skill", "remove", "concise-assistant@1.0.0"])
         .arg(&config_path)
@@ -1153,7 +1511,54 @@ fn skill_cli_installs_verifies_and_recoverably_removes_exact_packages() {
     assert!(String::from_utf8_lossy(&active_removal.stderr).contains("active Skill"));
     assert!(installed_path.is_file());
 
-    fs::write(&config_path, default_config).expect("restore default config");
+    let deactivated = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["package", "deactivate", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("deactivate installed Skill");
+    assert!(
+        deactivated.status.success(),
+        "Skill deactivation failed: {}",
+        String::from_utf8_lossy(&deactivated.stderr)
+    );
+    let deactivated_report = String::from_utf8(deactivated.stdout).expect("deactivation report");
+    let active_revision = deactivated_report
+        .lines()
+        .find_map(|line| line.strip_prefix("previous revision: "))
+        .expect("active revision")
+        .to_owned();
+
+    let history = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["package", "history"])
+        .arg(&config_path)
+        .output()
+        .expect("list package history");
+    assert!(history.status.success());
+    assert!(String::from_utf8_lossy(&history.stdout).contains(&active_revision));
+
+    let rolled_back = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["package", "rollback", &active_revision])
+        .arg(&config_path)
+        .output()
+        .expect("rollback Skill activation");
+    assert!(
+        rolled_back.status.success(),
+        "Skill rollback failed: {}",
+        String::from_utf8_lossy(&rolled_back.stderr)
+    );
+    let active_again = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["skill", "remove", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("reject rolled-back active Skill removal");
+    assert!(!active_again.status.success());
+
+    let deactivated = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args(["package", "deactivate", "concise-assistant@1.0.0"])
+        .arg(&config_path)
+        .output()
+        .expect("deactivate rolled-back Skill");
+    assert!(deactivated.status.success());
     let removed = Command::new(env!("CARGO_BIN_EXE_yh"))
         .args(["skill", "remove", "concise-assistant@1.0.0"])
         .arg(&config_path)
@@ -1172,6 +1577,12 @@ fn skill_cli_installs_verifies_and_recoverably_removes_exact_packages() {
             .expect("read Skill trash")
             .count(),
         1
+    );
+
+    assert_ne!(
+        fs::read(&config_path).expect("read final config"),
+        default_config,
+        "package lifecycle retains explicit package pins after deactivation"
     );
 
     fs::remove_dir_all(project).expect("remove isolated project");
@@ -1412,6 +1823,115 @@ fn https_skill_install_reports_the_missing_optional_feature() {
         .expect("run unavailable HTTPS Skill install");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("`https-skill` Cargo feature"));
+
+    for arguments in [
+        vec![
+            "package",
+            "search-https",
+            "https://example.test/catalog.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "*",
+        ],
+        vec![
+            "package",
+            "install-catalog",
+            "https://example.test/catalog.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "example@1.0.0",
+        ],
+        vec![
+            "package",
+            "upgrade-catalog",
+            "https://example.test/catalog.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "example@1.0.0",
+        ],
+        vec![
+            "package",
+            "registry-search",
+            "private/default",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "*",
+        ],
+        vec![
+            "package",
+            "registry-install",
+            "private/default",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "example@1.0.0",
+        ],
+        vec![
+            "package",
+            "registry-upgrade",
+            "private/default",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "example@1.0.0",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yh"))
+            .args(arguments)
+            .output()
+            .expect("run unavailable HTTPS Skill catalog command");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("`https-skill` Cargo feature"));
+    }
+}
+
+#[cfg(feature = "https-skill")]
+#[test]
+fn private_skill_registry_requires_its_request_scoped_credential_before_network() {
+    let project = isolated_project("private-skill-registry-secret");
+    fs::create_dir_all(&project).expect("create private Registry project");
+    let config = project.join("y-harness.json");
+    fs::write(
+        &config,
+        r#"{
+          "schema_version": 1,
+          "data_directory": ".y-harness",
+          "model": {"type": "demo"},
+          "skill_registries": [{
+            "id": "private/default",
+            "catalog_endpoint": "https://registry.example.test/catalog.json",
+            "package_origins": ["https://packages.example.test"],
+            "authentication": {
+              "type": "bearer",
+              "secret_reference": "registry/private",
+              "environment": "YH_PRIVATE_REGISTRY_TEST_SECRET_DO_NOT_SET"
+            }
+          }]
+        }"#,
+    )
+    .expect("write private Registry config");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .arg("doctor")
+        .arg(&config)
+        .output()
+        .expect("run Registry doctor");
+    assert!(!doctor.status.success());
+    let diagnostic = String::from_utf8_lossy(&doctor.stderr);
+    assert!(diagnostic.contains("Skill Registry private/default credential resolution failed"));
+    assert!(!diagnostic.contains("registry/private"));
+    assert!(!diagnostic.contains("YH_PRIVATE_REGISTRY_TEST_SECRET_DO_NOT_SET"));
+
+    let search = Command::new(env!("CARGO_BIN_EXE_yh"))
+        .args([
+            "package",
+            "registry-search",
+            "private/default",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "*",
+        ])
+        .arg(&config)
+        .env_remove("YH_PRIVATE_REGISTRY_TEST_SECRET_DO_NOT_SET")
+        .output()
+        .expect("run private Registry search");
+    assert!(!search.status.success());
+    let diagnostic = String::from_utf8_lossy(&search.stderr);
+    assert!(diagnostic.contains("Skill Registry private/default credential resolution failed"));
+    assert!(!diagnostic.contains("registry/private"));
+    assert!(!diagnostic.contains("YH_PRIVATE_REGISTRY_TEST_SECRET_DO_NOT_SET"));
+    fs::remove_dir_all(project).expect("remove private Registry project");
 }
 
 #[cfg(not(feature = "https-mcp"))]
@@ -1917,6 +2437,7 @@ printf '%s' '{"type":"message","content":"configured command model"}'
                                 id: origin_id
                             }),
                         content,
+                        ..
                     } if model_id == "external/fixture"
                         && origin_id == "json-command-model/external/fixture"
                         && content == "configured command model"
@@ -2340,7 +2861,8 @@ printf '%s' '{"status":"passed","summary":"configured verification passed"}'
                 verifier,
                 outcome: y_harness::VerificationOutcome::Passed {
                     summary: Some(summary)
-                }
+                },
+                ..
             } if verifier == "external.fixture-verifier"
                 && summary == "configured verification passed"
         )
@@ -2937,6 +3459,7 @@ fn run_turn_to_completion(
                 memory_scope: Default::default(),
                 context: Vec::new(),
                 timeout_ms: Some(5_000),
+                approval_wait_ttl_ms: None,
             },
         ),
     );
@@ -3006,6 +3529,35 @@ fn serve(project: &Path, requests: Vec<ProtocolRequest>) -> Vec<ProtocolResponse
         .lines()
         .map(|line| serde_json::from_str(line).expect("decode service response"))
         .collect()
+}
+
+#[cfg(feature = "http-probe")]
+fn wait_for_http_probe(address: SocketAddr, path: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set HTTP probe read timeout");
+                write!(
+                    stream,
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write HTTP probe request");
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .expect("read HTTP probe response");
+                return response;
+            }
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("HTTP probe did not start at {address}: {error}"),
+        }
+    }
 }
 
 #[cfg(unix)]

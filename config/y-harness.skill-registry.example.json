@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "data_directory": ".y-harness",
+  "model": {
+    "type": "demo",
+    "id": "local/demo"
+  },
+  "skill_registries": [
+    {
+      "id": "company/internal",
+      "catalog_endpoint": "https://registry.example.com/y-harness/catalog.json",
+      "package_origins": [
+        "https://packages.example.com"
+      ],
+      "authentication": {
+        "type": "bearer",
+        "secret_reference": "skill-registry/company",
+        "environment": "YH_SKILL_REGISTRY_TOKEN"
+      }
+    }
+  ]
+}

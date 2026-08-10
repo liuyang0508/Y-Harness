@@ -718,10 +718,10 @@ mod tests {
 
     async fn finish(state: &StateEngine, turn: &mut Turn) {
         state
-            .finish_turn(turn, TurnStatus::Completed)
+            .finish_turn(turn, TurnStatus::Interrupted)
             .await
             .expect("finish Turn");
-        turn.status = TurnStatus::Completed;
+        turn.status = TurnStatus::Interrupted;
     }
 
     #[tokio::test]

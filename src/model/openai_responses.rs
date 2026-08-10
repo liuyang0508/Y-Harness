@@ -25,10 +25,12 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(86_400);
 const MAX_MODEL_NAME_BYTES: usize = 256;
 const MAX_REQUEST_BYTES: usize = 16_777_216;
 const MAX_STREAM_EVENTS: usize = 4_096;
+const MAX_ENDPOINT_BYTES: usize = 2_048;
 
 /// Validated direct OpenAI Responses API configuration.
 #[derive(Clone)]
 pub struct OpenAiResponsesModelConfig {
+    endpoint: String,
     model: String,
     api_key: SecretReference,
     request_timeout: Duration,
@@ -41,6 +43,7 @@ impl OpenAiResponsesModelConfig {
     /// Creates a configuration for one explicit OpenAI model identity.
     pub fn new(model: impl Into<String>, api_key: SecretReference) -> Result<Self, HarnessError> {
         let config = Self {
+            endpoint: OPENAI_RESPONSES_ENDPOINT.to_owned(),
             model: model.into(),
             api_key,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -50,6 +53,19 @@ impl OpenAiResponsesModelConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Selects an explicit HTTPS endpoint implementing the OpenAI Responses
+    /// wire contract.
+    ///
+    /// This is intentionally a protocol-compatible endpoint override rather
+    /// than a claim that every vendor API is interchangeable. The transport
+    /// still disables redirects, ambient proxies, and retries, and the
+    /// Harness remains authoritative for tools, Policy, and State.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, HarnessError> {
+        self.endpoint = endpoint.into();
+        self.validate()?;
+        Ok(self)
     }
 
     /// Replaces time, response-retention, and concurrency bounds.
@@ -74,7 +90,38 @@ impl OpenAiResponsesModelConfig {
         &self.model
     }
 
+    /// Returns the validated Responses-compatible endpoint.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     fn validate(&self) -> Result<(), HarnessError> {
+        if self.endpoint.is_empty()
+            || self.endpoint.len() > MAX_ENDPOINT_BYTES
+            || self.endpoint.chars().any(char::is_control)
+        {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "Responses-compatible endpoint must contain 1..={MAX_ENDPOINT_BYTES} non-control bytes"
+            )));
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint).map_err(|_| {
+            HarnessError::InvalidConfiguration(
+                "Responses-compatible endpoint must be an absolute URL".to_owned(),
+            )
+        })?;
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(HarnessError::InvalidConfiguration(
+                "Responses-compatible endpoint must use HTTPS with a host and no userinfo, query, or fragment"
+                    .to_owned(),
+            ));
+        }
         if self.model.trim().is_empty()
             || self.model.len() > MAX_MODEL_NAME_BYTES
             || self.model.chars().any(char::is_control)
@@ -111,6 +158,7 @@ impl fmt::Debug for OpenAiResponsesModelConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenAiResponsesModelConfig")
+            .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("api_key", &self.api_key)
             .field("request_timeout", &self.request_timeout)
@@ -135,7 +183,7 @@ pub struct OpenAiResponsesModel {
 }
 
 impl OpenAiResponsesModel {
-    /// Builds one adapter over the official HTTPS endpoint.
+    /// Builds one adapter over the configured Responses-compatible endpoint.
     pub fn new(
         id: impl Into<String>,
         config: OpenAiResponsesModelConfig,
@@ -201,7 +249,7 @@ impl OpenAiResponsesModel {
                 })?;
             let response = self
                 .client
-                .post(OPENAI_RESPONSES_ENDPOINT)
+                .post(&self.config.endpoint)
                 .header(AUTHORIZATION, authorization)
                 .header(
                     ACCEPT,
@@ -327,9 +375,11 @@ fn build_request_body(
                     })?
                 }));
             }
-            ItemKind::VerificationResult { verifier, outcome } => {
+            ItemKind::VerificationResult {
+                verifier, outcome, ..
+            } => {
                 input.push(json!({
-                    "role": "developer",
+                    "role": "user",
                     "content": format!(
                         "Y-Harness verifier {verifier} returned: {}",
                         serde_json::to_string(outcome).map_err(|_| {
@@ -889,11 +939,14 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{OpenAiSseDecoder, build_request_body, decode_response, parse_retry_after_ms};
+    use super::{
+        OpenAiResponsesModelConfig, OpenAiSseDecoder, build_request_body, decode_response,
+        parse_retry_after_ms,
+    };
     use crate::{
         CapabilityOrigin, ContextBlock, ContextSource, Item, ItemKind, ModelContinuation,
         ModelEventSink, ModelOutput, ModelRequest, ModelStream, ModelStreamEvent, ModelToolCall,
-        ThreadId, ToolDescriptor, TurnId,
+        SecretReference, ThreadId, ToolDescriptor, TurnId, VerificationOutcome,
     };
 
     #[derive(Default)]
@@ -907,6 +960,38 @@ mod tests {
                 .push(event.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn compatible_endpoint_is_explicit_https_authority() {
+        let reference = SecretReference::new("provider/test".to_owned()).expect("reference");
+        let config = OpenAiResponsesModelConfig::new("vendor-model", reference.clone())
+            .expect("default config")
+            .with_endpoint("https://models.example.test/v1/responses")
+            .expect("compatible endpoint");
+        assert_eq!(
+            config.endpoint(),
+            "https://models.example.test/v1/responses"
+        );
+        for invalid in [
+            "http://models.example.test/v1/responses",
+            "https://user@models.example.test/v1/responses",
+            "https://models.example.test/v1/responses?key=secret",
+        ] {
+            assert!(
+                OpenAiResponsesModelConfig::new("vendor-model", reference.clone())
+                    .expect("base config")
+                    .with_endpoint(invalid)
+                    .is_err(),
+                "accepted invalid endpoint {invalid}"
+            );
+        }
+        assert!(
+            OpenAiResponsesModelConfig::new("vendor-model", reference)
+                .expect("base config")
+                .with_endpoint(format!("https://models.example.test/{}", "x".repeat(2_048)))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1000,6 +1085,36 @@ mod tests {
         assert_eq!(root["input"][1]["encrypted_content"], "opaque");
         assert_eq!(root["input"][2]["type"], "function_call");
         assert_eq!(root["input"][3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn verifier_feedback_is_non_privileged_user_observation() {
+        let mut request = request();
+        request.items.push(Item::new(ItemKind::VerificationResult {
+            verifier: "quality".to_owned(),
+            candidate_item_id: None,
+            verifier_origin: Some(CapabilityOrigin::BuiltIn),
+            verifier_binding_sha256: Some("0".repeat(64)),
+            outcome: VerificationOutcome::Failed {
+                reason: "revise the candidate".to_owned(),
+                retryable: true,
+            },
+        }));
+
+        let encoded = build_request_body("model-explicit", &request, false).expect("request");
+        let root: Value = serde_json::from_slice(&encoded).expect("json");
+        let feedback = root["input"]
+            .as_array()
+            .expect("input")
+            .last()
+            .expect("feedback");
+        assert_eq!(feedback["role"], "user");
+        assert!(
+            feedback["content"]
+                .as_str()
+                .expect("feedback text")
+                .contains("Y-Harness verifier quality returned")
+        );
     }
 
     #[test]

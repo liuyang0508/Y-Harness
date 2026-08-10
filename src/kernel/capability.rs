@@ -238,6 +238,25 @@ impl ModelStream {
         }
     }
 
+    /// Emits one bounded diagnostic event without treating it as provisional
+    /// user-visible output. This distinction preserves failover semantics.
+    pub(crate) fn emit_tool_trace(&self, event: ModelStreamEvent) {
+        let Some(sink) = &self.state.sink else {
+            return;
+        };
+        if !matches!(
+            event,
+            ModelStreamEvent::ToolTraceRequest { .. } | ModelStreamEvent::ToolTraceResponse { .. }
+        ) {
+            self.state.dropped_events.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| sink.emit(&event)));
+        if !matches!(result, Ok(Ok(()))) {
+            self.state.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.gate.close();
     }
@@ -247,6 +266,11 @@ impl ModelStream {
 pub trait LanguageModel: Send + Sync {
     /// Stable provider/model identity for evidence and diagnostics.
     fn id(&self) -> &str;
+
+    /// Returns the effective provider Tool-selection policy for this request.
+    fn tool_choice(&self, _request: &ModelRequest) -> crate::ModelToolChoice {
+        crate::ModelToolChoice::Auto
+    }
 
     /// Produces the next message or tool-call decision.
     fn complete<'a>(&'a self, request: ModelRequest) -> HarnessFuture<'a, ModelOutput>;

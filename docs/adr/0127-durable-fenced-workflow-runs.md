@@ -38,6 +38,18 @@ Workflow wait variants would also merge distinct authority and effect models.
   attribution, monotonic server application time, command digest, and bounded
   materialization. Deserialization reconstructs the current projection and
   every command digest instead of trusting cached fields.
+- Treat 4,096 transitions and 16 MiB of encoded state as work-admission
+  ceilings. Starting a wait, scheduling a retry, and migrating a definition
+  consume work capacity. Reserve two additional transitions and 278,528
+  additional encoded bytes exclusively for signal/timer recovery and terminal
+  settlement. This lets a Run use its final work slot to enter `waiting`, then
+  wake and still fail, complete, or cancel without making either reserve
+  available to further expansion.
+- Keep the reserve finite: the absolute hard boundaries are 4,098 transitions
+  and 17,055,744 encoded bytes. Exact duplicate recognition still precedes
+  admission so an uncertain response remains retryable at either boundary.
+  Deserialization rejects work transitions placed in the reserved transition
+  window. These rules change no serialized field or enum representation.
 - Permit definition migration only at a durable wait boundary, and only to the
   same name with a strictly newer semantic version and different immutable
   digest. Migration does not rewrite historical transitions or mutate the
@@ -60,7 +72,9 @@ Workflow wait variants would also merge distinct authority and effect models.
 
 ## Bounds and recovery
 
-- One Run retains at most 4,096 transitions and 16 MiB of encoded state.
+- One Run admits ordinary work through 4,096 transitions and 16 MiB of encoded
+  state. Its recovery/settlement-only hard limits are 4,098 transitions and
+  17,055,744 encoded bytes.
 - One command is limited to 128 KiB; summaries, failure reasons, and
   cancellation reasons are limited to 64 KiB.
 - Protocol transition pages contain 1–64 records and at most 4 MiB.
