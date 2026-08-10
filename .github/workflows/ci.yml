@@ -145,15 +145,16 @@ jobs:
         env:
           YH_BENCH_EVENTS: "1000"
           YH_BENCH_SAMPLES: "5"
-          # Shared-runner fsync latency under synchronous=FULL measured 515 ms
-          # on 2026-08-03; this bound only catches catastrophic regressions.
-          YH_BENCH_MAX_APPEND_MS: "900"
-          YH_BENCH_MAX_PROJECT_MS: "15"
-          YH_BENCH_MAX_FORK_MS: "50"
-          YH_BENCH_MAX_ARCHIVE_EXPORT_MS: "50"
-          YH_BENCH_MAX_ARCHIVE_IMPORT_MS: "50"
+          # Shared-runner medians measured 2026-08-03..2026-08-10: append
+          # 515 ms, project 15.6 ms, fork 49 ms, archive export 27 ms /
+          # import 36 ms, snapshot load 18.7 ms. Bounds are >=2x measured and
+          # only catch catastrophic regressions; docs/performance-baseline.md
+          # keeps the calibrated local numbers.
+          YH_BENCH_MAX_APPEND_MS: "1000"
+          YH_BENCH_MAX_PROJECT_MS: "40"
+          YH_BENCH_MAX_FORK_MS: "100"
+          YH_BENCH_MAX_ARCHIVE_EXPORT_MS: "80"
+          YH_BENCH_MAX_ARCHIVE_IMPORT_MS: "80"
           YH_BENCH_MAX_THREAD_LIST_MS: "50"
-          # Shared-runner snapshot load measured 18.5 ms on 2026-08-10; this
-          # bound only catches catastrophic regressions.
           YH_BENCH_MAX_SNAPSHOT_LOAD_MS: "40"
         run: cargo run --locked --release --bin yh-state-bench
