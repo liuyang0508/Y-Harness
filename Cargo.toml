@@ -52,7 +52,7 @@ fs2 = "=0.4.3"
 futures = { version = "=0.3.33", optional = true }
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"], optional = true }
 rmcp = { version = "=2.2.0", default-features = false, features = ["client", "transport-async-rw"] }
-rustls = { version = "=0.23.42", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
