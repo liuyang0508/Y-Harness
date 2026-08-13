@@ -407,6 +407,147 @@ pub struct WaitDenialEvidence {
     pub denied_at_ms: u64,
 }
 
+/// Cross-domain Inbox side-effect journaled by [`crate::state::StateEngine`].
+///
+/// Every CAS that depends on a follow-up Approval Inbox side effect commits
+/// one of these rows in the same transaction. The repair worker drains the
+/// queue; an op is never partially executed across a crash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxRepairOpKind {
+    /// Original `ApprovalRequest` must reach the Inbox.
+    Submit,
+    /// A previously submitted Inbox record must be settled with a decision.
+    Settle,
+    /// An orphan Inbox record must be closed by the runtime.
+    OrphanClose,
+}
+
+impl InboxRepairOpKind {
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Submit => "submit",
+            Self::Settle => "settle",
+            Self::OrphanClose => "orphan_close",
+        }
+    }
+}
+
+/// Lifecycle of one [`InboxRepairOpKind`] row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxRepairOpStatus {
+    Pending,
+    InFlight,
+    Succeeded,
+    Exhausted,
+}
+
+impl InboxRepairOpStatus {
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InFlight => "in_flight",
+            Self::Succeeded => "succeeded",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+/// Stable row identity for an outbox entry.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct InboxRepairOpId(pub String);
+
+impl InboxRepairOpId {
+    pub fn generate() -> Self {
+        Self(format!("op-{}", crate::kernel::now_ms()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Stable tombstone identity — the `(wait_id, reason)` pair is the natural key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxTombstoneReason {
+    Settled,
+    Cancelled,
+    Timeout,
+    Denied,
+    TerminalFailure,
+}
+
+impl InboxTombstoneReason {
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
+            Self::Denied => "denied",
+            Self::TerminalFailure => "terminal_failure",
+        }
+    }
+}
+
+/// Bounded retry policy for [`crate::state::InboxRepairWorker`].
+///
+/// Defaults: 8 attempts, exponential backoff starting at 100ms doubling each
+/// attempt, capped at 60s. Older `attempt_count` rows past the limit transition
+/// to `Exhausted` and require operator intervention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboxRepairRetryPolicy {
+    pub max_attempts: u8,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl Default for InboxRepairRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 60_000,
+        }
+    }
+}
+
+impl InboxRepairRetryPolicy {
+    pub fn next_attempt_ms(&self, attempt_count: u8, now_ms: u64) -> u64 {
+        let shift = u32::from(attempt_count.min(31));
+        let backoff = self.initial_backoff_ms.saturating_mul(1u64 << shift);
+        let backoff = backoff.min(self.max_backoff_ms);
+        now_ms.saturating_add(backoff)
+    }
+
+    pub fn is_exhausted(&self, attempt_count: u8) -> bool {
+        attempt_count >= self.max_attempts
+    }
+}
+
+/// Operational counters surfaced through [`crate::transport::ProtocolServiceStatus`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct InboxRepairMetrics {
+    /// Currently `pending` outbox rows.
+    pub pending_ops: u64,
+    /// Currently `in_flight` outbox rows (claimed by the worker).
+    pub in_flight_ops: u64,
+    /// Permanently `exhausted` rows (operator must intervene).
+    pub exhausted_ops: u64,
+    /// Age of the oldest `pending` row, in milliseconds. `0` if no rows
+    /// are pending. Triggers the probe `degraded` threshold at 5 minutes.
+    pub oldest_pending_age_ms: u64,
+    /// `succeeded` rows in the last 24h sliding window.
+    pub succeeded_ops_window: u64,
+    /// `exhausted` rows in the last 24h sliding window.
+    pub failed_ops_window: u64,
+    /// Unix milliseconds of the last worker tick completion.
+    pub last_tick_at_ms: u64,
+    /// Repairs drained during cold start (process boot).
+    pub coldstart_repaired_at_startup: u64,
+}
+
 /// Coarse lifecycle phase of a [`crate::runtime::HarnessRuntime`].
 ///
 /// Distinct from [`AgentLoopExecution`]: the latter describes one durable
@@ -2302,6 +2443,16 @@ pub enum HarnessError {
         /// Raw phase byte observed at the failed CAS.
         observed: u32,
     },
+    /// An Inbox settlement arrived after a State-resident tombstone made
+    /// the wait terminal. The Inbox must not mutate the now-closed record.
+    StaleWaitSettlement {
+        /// Wait whose tombstone made the settlement a no-op.
+        wait_id: AgentLoopWaitId,
+        /// Tombstone reason recorded by the State terminal transaction.
+        reason: InboxTombstoneReason,
+        /// Unix milliseconds when the tombstone was committed.
+        tombstoned_at_ms: u64,
+    },
 }
 
 impl Display for HarnessError {
@@ -2431,6 +2582,16 @@ impl Display for HarnessError {
                 write!(
                     formatter,
                     "runtime phase invariant violated; observed raw byte={observed}"
+                )
+            }
+            Self::StaleWaitSettlement {
+                wait_id,
+                reason,
+                tombstoned_at_ms,
+            } => {
+                write!(
+                    formatter,
+                    "stale settlement against wait {wait_id}: tombstoned at {tombstoned_at_ms}ms reason={reason:?}"
                 )
             }
         }
