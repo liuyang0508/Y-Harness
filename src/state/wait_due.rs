@@ -20,7 +20,7 @@ use crate::{
 /// This matches the Temporal Driver's per-source hard ceiling.
 pub const MAX_AGENT_LOOP_DUE_SCAN_LIMIT: usize = 256;
 
-const MAX_STATE_IDENTITY_BYTES: usize = 256;
+pub(crate) const MAX_STATE_IDENTITY_BYTES: usize = 256;
 const LOWER_SHA256_BYTES: usize = 64;
 const TIMEOUT_COMMAND_DOMAIN: &str = "y-harness.agent-loop.wait-timeout-command.v1";
 const DENIAL_COMMAND_DOMAIN: &str = "y-harness.agent-loop.wait-denial-maintenance-command.v1";
@@ -705,7 +705,7 @@ pub(super) fn validate_due_scan_request(
     Ok(())
 }
 
-fn validate_identity(kind: &str, value: &str) -> Result<(), HarnessError> {
+pub(crate) fn validate_identity(kind: &str, value: &str) -> Result<(), HarnessError> {
     if value.is_empty()
         || value.len() > MAX_STATE_IDENTITY_BYTES
         || value.chars().any(char::is_control)

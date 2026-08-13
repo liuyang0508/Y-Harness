@@ -207,7 +207,7 @@ pub use state::{
     AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION, AgentLoopDueCursor, AgentLoopDuePhase,
     AgentLoopDueScanPage, AgentLoopDueWait, AgentLoopReadyClaimCommand, AgentLoopWaitCloseCommand,
     AgentLoopWaitStartCommand, EventAppendDisposition, EventAppendResult, EventStore,
-    MAX_AGENT_LOOP_DUE_SCAN_LIMIT, MAX_AGENT_LOOP_WAIT_MS, MAX_THREAD_ARCHIVE_BYTES,
+    InboxTombstoneRecord, MAX_AGENT_LOOP_DUE_SCAN_LIMIT, MAX_AGENT_LOOP_WAIT_MS, MAX_THREAD_ARCHIVE_BYTES,
     MemoryEventStore, STATE_EVENT_SCHEMA_VERSION, STATE_SNAPSHOT_SCHEMA_VERSION,
     STATE_TERMINAL_EVENT_RESERVE, STATE_TERMINAL_RECOVERY_BYTE_RESERVE, STATE_THREAD_EVENT_LIMIT,
     STATE_THREAD_RECOVERY_BYTE_LIMIT, SnapshotMaintenanceConfig, SnapshotMaintenanceFailure,

@@ -34,9 +34,9 @@ use crate::{
     AgentLoopResumeCommandId, AgentLoopWaitId, AgentLoopWorkerId, ApprovalRecord,
     ApprovalRecordStatus, ApprovalSettlementEvidence, AuthorityContext, Checkpoint, CheckpointId,
     CompletionGeneration, CompletionReceipt, EventId, ExecutionClaimEvidence, ExecutionPhase,
-    HarnessError, HarnessFuture, Item, ItemId, ItemKind, NewStreamEvent, PendingEvent,
-    ResumeEvidence, StateEvent, StoredEvent, Thread, ThreadId, ThreadImportOrigin, ThreadLineage,
-    Turn, TurnId, TurnStatus, TurnStopReason, TurnWaitEnvelope, WaitClosureEvidence,
+    HarnessError, HarnessFuture, InboxTombstoneReason, Item, ItemId, ItemKind, NewStreamEvent,
+    PendingEvent, ResumeEvidence, StateEvent, StoredEvent, Thread, ThreadId, ThreadImportOrigin,
+    ThreadLineage, Turn, TurnId, TurnStatus, TurnStopReason, TurnWaitEnvelope, WaitClosureEvidence,
     WaitDenialEvidence, WaitKind,
     completion::{
         completion_receipt_sha256, validate_inherited_projected_turn_completion_receipt,
@@ -649,6 +649,50 @@ pub trait EventStore: Send + Sync {
             ))
         })
     }
+
+    /// Looks up an existing inbox-orphan tombstone for one wait.
+    ///
+    /// Returns `Ok(None)` when no tombstone is recorded, or the backends
+    /// do not support durable inbox repair. Compatibility default.
+    fn lookup_inbox_tombstone<'a>(
+        &'a self,
+        _wait_id: &'a AgentLoopWaitId,
+    ) -> HarnessFuture<'a, Option<InboxTombstoneRecord>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Records one inbox-orphan tombstone in the same transaction as the
+    /// State wait-terminal CAS that depends on it.
+    ///
+    /// Compatibility default returns `Ok(())` so backends without durable
+    /// inbox repair remain functional. SQLite override commits the row.
+    fn record_inbox_tombstone<'a>(
+        &'a self,
+        _wait_id: &'a AgentLoopWaitId,
+        _reason: InboxTombstoneReason,
+        _source_revision: u64,
+        _tombstoned_at_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Whether this backend persists the inbox-repair outbox + tombstone.
+    fn supports_inbox_repair_durability(&self) -> bool {
+        false
+    }
+}
+
+/// Tombstone returned by [`EventStore::lookup_inbox_tombstone`].
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct InboxTombstoneRecord {
+    /// Wait whose tombstone made the settlement a no-op.
+    pub wait_id: AgentLoopWaitId,
+    /// Tombstone reason recorded by the State terminal transaction.
+    pub reason: InboxTombstoneReason,
+    /// Final wait revision observed at tombstone commit time.
+    pub source_revision: u64,
+    /// Unix milliseconds when the tombstone was committed.
+    pub tombstoned_at_ms: u64,
 }
 
 #[derive(Default)]
@@ -2380,6 +2424,105 @@ impl EventStore for SqliteEventStore {
             .await
         })
     }
+
+    fn lookup_inbox_tombstone<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+    ) -> HarnessFuture<'a, Option<InboxTombstoneRecord>> {
+        let wait_id = wait_id.clone();
+        Box::pin(async move {
+            wait_due::validate_identity("wait", wait_id.as_str())?;
+            self.with_connection(move |connection| {
+                let mut stmt = connection
+                    .prepare(
+                        "SELECT reason, source_revision, tombstoned_ms
+                         FROM inbox_orphan_tombstone
+                         WHERE wait_id = ?1",
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let row = stmt
+                    .query_row(params![wait_id.as_str()], |row| {
+                        let reason: String = row.get(0)?;
+                        let source_revision: i64 = row.get(1)?;
+                        let tombstoned_ms: i64 = row.get(2)?;
+                        Ok((reason, source_revision, tombstoned_ms))
+                    })
+                    .optional()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                row.map(|(reason, source_revision, tombstoned_ms)| {
+                    Ok(InboxTombstoneRecord {
+                        wait_id: wait_id.clone(),
+                        reason: decode_tombstone_reason(&reason)?,
+                        source_revision: to_u64(source_revision, "tombstone source revision")?,
+                        tombstoned_at_ms: to_u64(tombstoned_ms, "tombstone timestamp")?,
+                    })
+                })
+                .transpose()
+            })
+            .await
+        })
+    }
+
+    fn record_inbox_tombstone<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+        reason: InboxTombstoneReason,
+        source_revision: u64,
+        tombstoned_at_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        let wait_id = wait_id.clone();
+        Box::pin(async move {
+            wait_due::validate_identity("wait", wait_id.as_str())?;
+            self.with_connection(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO inbox_orphan_tombstone
+                            (wait_id, tombstoned_ms, reason, source_revision)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            wait_id.as_str(),
+                            to_sql_u64("tombstone timestamp", tombstoned_at_ms)?,
+                            reason.as_sql(),
+                            to_sql_u64("tombstone source revision", source_revision)?,
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .commit()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn supports_inbox_repair_durability(&self) -> bool {
+        true
+    }
+}
+
+fn decode_tombstone_reason(raw: &str) -> Result<InboxTombstoneReason, HarnessError> {
+    match raw {
+        "settled" => Ok(InboxTombstoneReason::Settled),
+        "cancelled" => Ok(InboxTombstoneReason::Cancelled),
+        "timeout" => Ok(InboxTombstoneReason::Timeout),
+        "denied" => Ok(InboxTombstoneReason::Denied),
+        "terminal_failure" => Ok(InboxTombstoneReason::TerminalFailure),
+        other => Err(HarnessError::State(format!(
+            "unknown inbox tombstone reason: {other}"
+        ))),
+    }
+}
+
+fn to_sql_u64(label: &str, value: u64) -> Result<i64, HarnessError> {
+    i64::try_from(value).map_err(|_| HarnessError::State(format!("{label} overflows i64")))
+}
+
+fn to_u64(value: i64, label: &str) -> Result<u64, HarnessError> {
+    u64::try_from(value).map_err(|_| HarnessError::State(format!("{label} is negative")))
 }
 
 struct SnapshotMaintenanceMetrics {
@@ -2523,6 +2666,33 @@ impl StateEngine {
             heads: Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_maintenance: None,
         }
+    }
+
+    /// Looks up the tombstone for one wait, if the underlying store
+    /// persists inbox-repair durability.
+    pub fn lookup_inbox_tombstone<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+    ) -> HarnessFuture<'a, Option<InboxTombstoneRecord>> {
+        self.store.lookup_inbox_tombstone(wait_id)
+    }
+
+    /// Records an inbox-orphan tombstone for one wait. Compatibility
+    /// stores no-op; SQLite writes the row.
+    pub fn record_inbox_tombstone<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+        reason: InboxTombstoneReason,
+        source_revision: u64,
+        tombstoned_at_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        self.store
+            .record_inbox_tombstone(wait_id, reason, source_revision, tombstoned_at_ms)
+    }
+
+    /// Whether the underlying store persists inbox-repair durability.
+    pub fn supports_inbox_repair_durability(&self) -> bool {
+        self.store.supports_inbox_repair_durability()
     }
 
     /// Enables failure-isolated automatic snapshots after terminal Turns.
@@ -10075,6 +10245,7 @@ mod tests {
     use crate::{
         ActorIdentity, AgentLoopClaimId, AgentLoopCloseCommandId, AgentLoopDenyCommandId,
         AgentLoopExecution, AgentLoopResumeCommandId, AgentLoopWaitId, AgentLoopWorkerId,
+        InboxTombstoneReason,
         ApprovalDecision, ApprovalId, ApprovalRecord, ApprovalRecordStatus, ApprovalRequest,
         AuthorityContext, CapabilityOrigin, CompletionAssurance, CompletionContract,
         CompletionGeneration, CompletionReceipt, ConnectorEvidence, ConnectorEvidenceClaim,
@@ -17164,5 +17335,112 @@ mod tests {
             }),
         };
         assert!(super::validate_state_event_schema(&wait_event, 15).is_err());
+    }
+
+    #[tokio::test]
+    async fn inbox_tombstone_recorded_and_looked_up_by_wait() {
+        let store = Arc::new(SqliteEventStore::open(scratch_path("inbox-tombstone")).await.unwrap());
+        let engine = StateEngine::new(store.clone());
+        let wait_id = AgentLoopWaitId::from_static("wait-tombstone-1");
+
+        let initial = engine
+            .lookup_inbox_tombstone(&wait_id)
+            .await
+            .expect("tombstone lookup");
+        assert!(initial.is_none());
+
+        engine
+            .record_inbox_tombstone(&wait_id, InboxTombstoneReason::Denied, 7, 123)
+            .await
+            .expect("record tombstone");
+
+        let after = engine
+            .lookup_inbox_tombstone(&wait_id)
+            .await
+            .expect("tombstone lookup after record");
+        let record = after.expect("tombstone must be present");
+        assert_eq!(record.wait_id, wait_id);
+        assert_eq!(record.reason, InboxTombstoneReason::Denied);
+        assert_eq!(record.source_revision, 7);
+        assert_eq!(record.tombstoned_at_ms, 123);
+    }
+
+    #[tokio::test]
+    async fn inbox_tombstone_isolated_per_wait_id() {
+        let store = Arc::new(SqliteEventStore::open(scratch_path("inbox-tombstone-iso")).await.unwrap());
+        let engine = StateEngine::new(store.clone());
+        let wait_a = AgentLoopWaitId::from_static("wait-a");
+        let wait_b = AgentLoopWaitId::from_static("wait-b");
+
+        engine
+            .record_inbox_tombstone(&wait_a, InboxTombstoneReason::Cancelled, 1, 100)
+            .await
+            .expect("record a");
+
+        assert!(engine
+            .lookup_inbox_tombstone(&wait_a)
+            .await
+            .expect("lookup a")
+            .is_some());
+        assert!(engine
+            .lookup_inbox_tombstone(&wait_b)
+            .await
+            .expect("lookup b")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_tombstone_record_overwrites_with_latest_revision() {
+        let store = Arc::new(SqliteEventStore::open(scratch_path("inbox-tombstone-replace")).await.unwrap());
+        let engine = StateEngine::new(store.clone());
+        let wait = AgentLoopWaitId::from_static("wait-replace");
+
+        engine
+            .record_inbox_tombstone(&wait, InboxTombstoneReason::Settled, 1, 100)
+            .await
+            .expect("first record");
+        engine
+            .record_inbox_tombstone(&wait, InboxTombstoneReason::TerminalFailure, 5, 200)
+            .await
+            .expect("second record");
+
+        let record = engine
+            .lookup_inbox_tombstone(&wait)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(record.reason, InboxTombstoneReason::TerminalFailure);
+        assert_eq!(record.source_revision, 5);
+        assert_eq!(record.tombstoned_at_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn memory_backend_reports_no_tombstone_and_supports_flag_false() {
+        let engine = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        assert!(!engine.supports_inbox_repair_durability());
+        assert!(engine
+            .lookup_inbox_tombstone(&AgentLoopWaitId::from_static("any"))
+            .await
+            .expect("memory lookup")
+            .is_none());
+        engine
+            .record_inbox_tombstone(
+                &AgentLoopWaitId::from_static("any"),
+                InboxTombstoneReason::Denied,
+                1,
+                1,
+            )
+            .await
+            .expect("memory record is a no-op");
+    }
+
+    fn scratch_path(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "y-harness-tombstone-test-{label}-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
     }
 }
