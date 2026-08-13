@@ -37,7 +37,8 @@ use crate::{
     ApprovalDecision, ApprovalId, ApprovalRecord, ApprovalRecordStatus, ApprovalRequest,
     AuthorityContext, CapabilityOrigin, CompletionAssurance, CompletionContract,
     CompletionGeneration, ConnectorEvidence, ContextBlock, ContextEngine, ContextSource,
-    ExecutionPhase, HarnessError, InvocationContextEvidence, Item, ItemId, ItemKind,
+    ExecutionPhase, HarnessError, InboxRepairOpKind, InboxTombstoneReason,
+    InvocationContextEvidence, Item, ItemId, ItemKind,
     MAX_AGENT_LOOP_WAIT_MS, MemoryContextRecordStatus, MemoryContextStatus, MemoryScope,
     ModelContinuation, ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest,
     ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelToolTraceOutcome,
@@ -2877,20 +2878,24 @@ impl HarnessRuntime {
         request: &ApprovalRequest,
         authority: &AuthorityContext,
     ) -> Result<ApprovalRecord, HarnessError> {
+        self.reject_if_tombstoned(&request.id.to_string()).await?;
         let cancellation = crate::CancellationToken::new();
         let delivery_deadline = deadline(Some(DURABLE_APPROVAL_DELIVERY_TIMEOUT))?;
-        self.controlled_observed(
-            ObservationTarget::new(
-                &request.authorization.thread_id,
-                &request.authorization.turn_id,
-                "approval-handler-submit",
-                ExecutionPhase::Approval,
-            ),
-            &cancellation,
-            delivery_deadline,
-            || self.approvals.submit_wait_as(request, authority),
-        )
-        .await
+        let record = self
+            .controlled_observed(
+                ObservationTarget::new(
+                    &request.authorization.thread_id,
+                    &request.authorization.turn_id,
+                    "approval-handler-submit",
+                    ExecutionPhase::Approval,
+                ),
+                &cancellation,
+                delivery_deadline,
+                || self.approvals.submit_wait_as(request, authority),
+            )
+            .await?;
+        self.enqueue_submit_repair_op(request).await;
+        Ok(record)
     }
 
     async fn read_durable_approval(
@@ -2921,6 +2926,10 @@ impl HarnessRuntime {
         reason: &str,
         authority: &AuthorityContext,
     ) -> Result<(), HarnessError> {
+        let orphan_key = format!("{}::{}", thread_id.as_str(), turn_id.as_str());
+        if self.tombstone_exists(&orphan_key).await? {
+            return Ok(());
+        }
         let cancellation = crate::CancellationToken::new();
         let delivery_deadline = deadline(Some(DURABLE_APPROVAL_DELIVERY_TIMEOUT))?;
         self.controlled_observed(
@@ -2937,7 +2946,109 @@ impl HarnessRuntime {
                     .abandon_turn_as(thread_id, turn_id, reason, authority)
             },
         )
-        .await
+        .await?;
+        self.record_tombstone(&orphan_key, InboxTombstoneReason::Cancelled)
+            .await?;
+        self.enqueue_orphan_close_repair_op(thread_id, turn_id, reason)
+            .await;
+        Ok(())
+    }
+
+    /// CAS guard: looks up the tombstone row in State and rejects if present.
+    async fn reject_if_tombstoned(&self, wait_id: &str) -> Result<(), HarnessError> {
+        let id = AgentLoopWaitId::from_string(wait_id.to_owned());
+        match self.state.lookup_inbox_tombstone(&id).await? {
+            None => Ok(()),
+            Some(tombstone) => Err(HarnessError::StaleWaitSettlement {
+                wait_id: id,
+                reason: tombstone.reason,
+                tombstoned_at_ms: tombstone.tombstoned_at_ms,
+            }),
+        }
+    }
+
+    async fn tombstone_exists(&self, key: &str) -> Result<bool, HarnessError> {
+        let id = AgentLoopWaitId::from_string(key.to_owned());
+        Ok(self.state.lookup_inbox_tombstone(&id).await?.is_some())
+    }
+
+    async fn record_tombstone(
+        &self,
+        key: &str,
+        reason: InboxTombstoneReason,
+    ) -> Result<(), HarnessError> {
+        let wait_id = AgentLoopWaitId::from_string(key.to_owned());
+        self.state
+            .record_inbox_tombstone(&wait_id, reason, 0, crate::kernel::now_ms())
+            .await
+    }
+
+    async fn enqueue_submit_repair_op(&self, request: &ApprovalRequest) {
+        if !self.state.supports_inbox_repair_durability() {
+            return;
+        }
+        let payload = encode_submit_payload(request);
+        let wait_id = AgentLoopWaitId::from_string(request.id.as_str().to_owned());
+        if let Err(error) = self
+            .state
+            .enqueue_repair_op(&wait_id, InboxRepairOpKind::Submit, payload)
+            .await
+        {
+            eprintln!(
+                "warning: inbox repair submit enqueue failed (wait_id={wait_id}, error={error})",
+                wait_id = wait_id.as_str(),
+                error = error,
+            );
+        }
+    }
+
+    async fn enqueue_settle_repair_op(
+        &self,
+        approval_id: &ApprovalId,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) {
+        if !self.state.supports_inbox_repair_durability() {
+            return;
+        }
+        let payload = encode_settle_payload(approval_id, thread_id, turn_id);
+        let wait_id = AgentLoopWaitId::from_string(approval_id.as_str().to_owned());
+        if let Err(error) = self
+            .state
+            .enqueue_repair_op(&wait_id, InboxRepairOpKind::Settle, payload)
+            .await
+        {
+            eprintln!(
+                "warning: inbox repair settle enqueue failed (wait_id={wait_id}, error={error})",
+                wait_id = wait_id.as_str(),
+                error = error,
+            );
+        }
+    }
+
+    async fn enqueue_orphan_close_repair_op(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        reason: &str,
+    ) {
+        if !self.state.supports_inbox_repair_durability() {
+            return;
+        }
+        let payload = encode_orphan_payload(thread_id, turn_id, reason);
+        let wait_id =
+            AgentLoopWaitId::from_string(format!("{}::{}", thread_id.as_str(), turn_id.as_str()));
+        if let Err(error) = self
+            .state
+            .enqueue_repair_op(&wait_id, InboxRepairOpKind::OrphanClose, payload)
+            .await
+        {
+            eprintln!(
+                "warning: inbox repair orphan enqueue failed (wait_id={wait_id}, error={error})",
+                wait_id = wait_id.as_str(),
+                error = error,
+            );
+        }
     }
 
     async fn prepare_approval_resume(
@@ -3079,6 +3190,7 @@ impl HarnessRuntime {
             reason: evidence.reason,
             risk: evidence.risk,
         };
+        self.reject_if_tombstoned(&request.id.to_string()).await?;
         let approval = self
             .controlled_observed(
                 ObservationTarget::new(
@@ -3093,6 +3205,13 @@ impl HarnessRuntime {
             )
             .await?;
         validate_approval_decision(&approval)?;
+        self.record_tombstone(
+            &request.id.to_string(),
+            InboxTombstoneReason::Settled,
+        )
+        .await?;
+        self.enqueue_settle_repair_op(&request.id, thread_id, turn_id)
+            .await;
 
         let mut turn = turn;
         self.record(
@@ -3747,6 +3866,7 @@ impl HarnessRuntime {
                     },
                 )
                 .await?;
+                self.reject_if_tombstoned(&request.id.to_string()).await?;
                 let approval = match self
                     .controlled_observed(
                         ObservationTarget::new(
@@ -3781,6 +3901,13 @@ impl HarnessRuntime {
                     self.settle_error(turn, &error).await?;
                     return Err(error);
                 }
+                self.record_tombstone(
+                    &request.id.to_string(),
+                    InboxTombstoneReason::Settled,
+                )
+                .await?;
+                self.enqueue_settle_repair_op(&request.id, &turn.thread_id, &turn.id)
+                    .await;
                 self.record(
                     turn,
                     ItemKind::ApprovalDecision {
@@ -4651,6 +4778,40 @@ impl HarnessRuntime {
 }
 
 type PreparedExecution = (Turn, Vec<Item>, Vec<ContextBlock>, usize, BTreeSet<String>);
+
+/// Encodes the durable `Submit` outbox payload from an `ApprovalRequest`.
+/// Format is an opaque JSON envelope; the worker treats it as bytes.
+fn encode_submit_payload(request: &ApprovalRequest) -> Vec<u8> {
+    serde_json::to_vec(request).unwrap_or_default()
+}
+
+/// Encodes the durable `Settle` outbox payload from the approval identifiers
+/// the worker needs to re-issue the settlement.
+fn encode_settle_payload(
+    approval_id: &ApprovalId,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+) -> Vec<u8> {
+    serde_json::json!({
+        "approval_id": approval_id.as_str(),
+        "thread_id": thread_id.as_str(),
+        "turn_id": turn_id.as_str(),
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Encodes the durable `OrphanClose` outbox payload from the turn identifiers
+/// and the human-readable close reason.
+fn encode_orphan_payload(thread_id: &ThreadId, turn_id: &TurnId, reason: &str) -> Vec<u8> {
+    serde_json::json!({
+        "thread_id": thread_id.as_str(),
+        "turn_id": turn_id.as_str(),
+        "reason": reason,
+    })
+    .to_string()
+    .into_bytes()
+}
 
 fn superseded_tool_result(call_id: &str) -> ItemKind {
     ItemKind::ToolResult {
@@ -6736,26 +6897,27 @@ mod tests {
         validate_tool_output,
     };
     use crate::{
-        ActorIdentity, AgentLoopExecution, ApprovalActor, ApprovalDecision, ApprovalInbox,
-        ApprovalRecordStatus, ApprovalRequest, AuthorityContext,
+        ActorIdentity, AgentLoopExecution, AgentLoopWaitId, ApprovalActor, ApprovalDecision,
+        ApprovalInbox, ApprovalRecordStatus, ApprovalRequest, AuthorityContext,
         CONVERSATION_COMPACTOR_API_VERSION, CancellationToken, CapabilityOrigin,
         CompletionAssurance, CompletionRequirementStatus, ConnectorEvidenceClaim, ContextEngine,
         ContextSource, ConversationCompactionConfig, ConversationCompactionRequest,
         ConversationCompactionResponse, ConversationCompactor, ConversationCompactorDescriptor,
         ConversationCompactorRegistry, ConversationContextConfig, EventId, EventStore,
         ExecutionBinding, ExecutionPhase, HarnessError, HarnessFuture, InboxApprovalHandler,
-        ItemKind, MEMORY_API_VERSION, MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack,
-        MemoryContextRecordStatus, MemoryEventStore, MemoryFailureMode, MemoryOperation,
-        MemoryProvider, MemoryProviderDescriptor, MemoryReference, MemoryRegistry,
-        MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
-        ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
+        InboxRepairOpKind, InboxTombstoneReason, ItemKind, MEMORY_API_VERSION,
+        MemoryApprovalInbox, MemoryContextConfig, MemoryContextPack, MemoryContextRecordStatus,
+        MemoryEventStore, MemoryFailureMode, MemoryOperation, MemoryProvider,
+        MemoryProviderDescriptor, MemoryReference, MemoryRegistry, MemorySearchRequest,
+        MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink, ModelOutput,
+        ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
         ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, Observability,
-        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, RuntimePhase, SqliteApprovalInbox,
-        SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
-        ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution, ToolContext,
-        ToolDescriptor, ToolExecutionResult, ToolRegistry, TraceCollector, TurnContextInput,
-        TurnStatus, TurnStopReason, VerificationOutcome, VerificationRegistry, VerificationRequest,
-        Verifier, VerifierDescriptor,
+        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, RuntimePhase,
+        SqliteApprovalInbox, SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine,
+        StateEvent, StoredEvent, ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution,
+        ToolContext, ToolDescriptor, ToolExecutionResult, ToolRegistry, TraceCollector,
+        TurnContextInput, TurnStatus, TurnStopReason, VerificationOutcome, VerificationRegistry,
+        VerificationRequest, Verifier, VerifierDescriptor,
     };
 
     struct EchoTool {
@@ -15842,5 +16004,80 @@ mod tests {
             assert_eq!(RuntimePhase::from_code(phase.code()), Some(phase));
         }
         assert_eq!(RuntimePhase::from_code(99), None);
+    }
+
+    #[tokio::test]
+    async fn tombstone_record_and_lookup_round_trip_on_sqlite_state() {
+        let path = temp_sqlite_path();
+        let engine = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open sqlite"),
+        ));
+        let wait = AgentLoopWaitId::from_static("wait-cas");
+        assert!(engine.lookup_inbox_tombstone(&wait).await.expect("lookup").is_none());
+        engine
+            .record_inbox_tombstone(&wait, InboxTombstoneReason::Settled, 0, crate::kernel::now_ms())
+            .await
+            .expect("record");
+        let tombstone = engine
+            .lookup_inbox_tombstone(&wait)
+            .await
+            .expect("lookup after record")
+            .expect("tombstone present");
+        assert_eq!(tombstone.reason, InboxTombstoneReason::Settled);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tombstone_record_is_overwritable_with_a_newer_reason() {
+        let path = temp_sqlite_path();
+        let engine = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open sqlite"),
+        ));
+        let wait = AgentLoopWaitId::from_static("wait-overwrite");
+        engine
+            .record_inbox_tombstone(&wait, InboxTombstoneReason::Cancelled, 0, 1)
+            .await
+            .expect("record first");
+        engine
+            .record_inbox_tombstone(&wait, InboxTombstoneReason::TerminalFailure, 0, 2)
+            .await
+            .expect("record second");
+        let tombstone = engine
+            .lookup_inbox_tombstone(&wait)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(tombstone.reason, InboxTombstoneReason::TerminalFailure);
+        assert_eq!(tombstone.tombstoned_at_ms, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn enqueue_repair_op_persists_a_pending_row_visible_to_metrics() {
+        let path = temp_sqlite_path();
+        let engine = StateEngine::new(Arc::new(
+            SqliteEventStore::open(&path).await.expect("open sqlite"),
+        ));
+        let wait = AgentLoopWaitId::from_static("wait-enqueue");
+        let op_id = engine
+            .enqueue_repair_op(&wait, InboxRepairOpKind::Submit, b"{\"a\":1}".to_vec())
+            .await
+            .expect("enqueue");
+        assert!(op_id.starts_with("op-"));
+        let metrics = engine.inbox_repair_metrics().await.expect("metrics");
+        assert_eq!(metrics.pending_ops, 1);
+        let ops = engine.fetch_pending_repair_ops(8).await.expect("fetch");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind, InboxRepairOpKind::Submit);
+        assert_eq!(ops[0].payload, b"{\"a\":1}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_sqlite_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "y-harness-runtime-cas-{}-{}.sqlite",
+            EventId::generate().as_str(),
+            std::process::id()
+        ))
     }
 }
