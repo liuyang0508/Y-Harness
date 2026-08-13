@@ -86,7 +86,8 @@ pub use evaluation::{
     BaselineComparison, BaselineFailure, BaselineRequirement, EVALUATION_FORMAT_VERSION,
     EvaluationBaseline, EvaluationCase, EvaluationCaseReport, EvaluationEngine,
     EvaluationExecution, EvaluationReport, EvaluationSample, EvaluationSuite, EvaluationTarget,
-    Grade, GradeOutcome, GradeRecord, Grader, GraderDescriptor, GraderRegistry, RegisteredGrader,
+    FnEvaluationTarget, Grade, GradeOutcome, GradeRecord, Grader, GraderDescriptor,
+    GraderRegistry, RegisteredGrader,
 };
 pub use execution::{
     CompensationContext, CompensationDescriptor, CompensationRequest, CompensationTool,

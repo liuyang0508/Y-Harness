@@ -173,6 +173,46 @@ impl EvaluationTarget for HarnessRuntime {
     }
 }
 
+/// Closure-backed [`EvaluationTarget`] that runs each case through a
+/// caller-supplied async function. Lets the evaluation engine drive any
+/// arbitrary execution surface without depending on [`HarnessRuntime`].
+pub struct FnEvaluationTarget {
+    runner: Box<dyn Fn(EvaluationCase, CancellationToken) -> HarnessFuture<'static, TurnOutcome>
+        + Send
+        + Sync>,
+}
+
+impl FnEvaluationTarget {
+    /// Wraps an async closure as an [`EvaluationTarget`].
+    pub fn new<F>(runner: F) -> Self
+    where
+        F: Fn(EvaluationCase, CancellationToken) -> HarnessFuture<'static, TurnOutcome>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            runner: Box::new(runner),
+        }
+    }
+}
+
+impl EvaluationTarget for FnEvaluationTarget {
+    fn execute<'a>(
+        &'a self,
+        case: EvaluationCase,
+        cancellation: CancellationToken,
+    ) -> HarnessFuture<'a, TurnOutcome> {
+        let outcome = (self.runner)(case, cancellation);
+        Box::pin(async move {
+            match outcome.await {
+                Ok(turn_outcome) => Ok(turn_outcome),
+                Err(error) => Err(error),
+            }
+        })
+    }
+}
+
 /// Captured target execution supplied to every grader.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1070,8 +1110,8 @@ mod tests {
     use super::{
         BaselineRequirement, EvaluationBaseline, EvaluationCase, EvaluationCaseReport,
         EvaluationEngine, EvaluationExecution, EvaluationReport, EvaluationSample, EvaluationSuite,
-        EvaluationTarget, Grade, GradeOutcome, GradeRecord, Grader, GraderDescriptor,
-        GraderRegistry, MAX_BASELINE_REQUIREMENTS,
+        EvaluationTarget, FnEvaluationTarget, Grade, GradeOutcome, GradeRecord, Grader,
+        GraderDescriptor, GraderRegistry, MAX_BASELINE_REQUIREMENTS,
     };
     use crate::{
         CapabilityOrigin, HarnessError, HarnessFuture, Item, ItemKind, MemoryScope, ThreadId, Turn,
@@ -1624,5 +1664,66 @@ mod tests {
             &report.cases[0].grades[0].outcome,
             GradeOutcome::Error { message } if message == "grader timed out"
         ));
+    }
+
+    #[tokio::test]
+    async fn fn_evaluation_target_runs_without_harness_runtime() {
+        let target = FnEvaluationTarget::new(|case, _cancellation| {
+            let prompt = case.prompt.clone();
+            Box::pin(async move {
+                Ok(TurnOutcome {
+                    turn: Turn {
+                        id: TurnId::from_static("decoupled-turn"),
+                        thread_id: ThreadId::from_static("decoupled-thread"),
+                        status: TurnStatus::Completed,
+                        items: Vec::new(),
+                        completion_receipt: None,
+                    },
+                    final_text: format!("echo: {prompt}"),
+                })
+            })
+                as HarnessFuture<'static, TurnOutcome>
+        });
+        let case = EvaluationCase {
+            id: "decoupled-case".to_owned(),
+            prompt: "hello".to_owned(),
+            memory_scope: MemoryScope::default(),
+            timeout_ms: None,
+            metadata: json!({}),
+        };
+        let outcome = target
+            .execute(case, crate::CancellationToken::new())
+            .await
+            .expect("fn target");
+        assert_eq!(outcome.final_text, "echo: hello");
+    }
+
+    #[tokio::test]
+    async fn fn_evaluation_target_propagates_runner_errors() {
+        let target = FnEvaluationTarget::new(|_case, _cancellation| {
+            Box::pin(async {
+                Err::<TurnOutcome, HarnessError>(HarnessError::InvalidConfiguration(
+                    "synthetic failure".to_owned(),
+                ))
+            })
+                as HarnessFuture<'static, TurnOutcome>
+        });
+        let case = EvaluationCase {
+            id: "fail-case".to_owned(),
+            prompt: "x".to_owned(),
+            memory_scope: MemoryScope::default(),
+            timeout_ms: None,
+            metadata: json!({}),
+        };
+        let error = target
+            .execute(case, crate::CancellationToken::new())
+            .await
+            .expect_err("should fail");
+        match error {
+            HarnessError::InvalidConfiguration(message) => {
+                assert_eq!(message, "synthetic failure");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }
