@@ -2310,6 +2310,17 @@ pub enum HarnessError {
     InvalidCapability(String),
     /// A capability attempted to replace an existing name.
     DuplicateCapability(String),
+    /// The capability seam bundle (origin + descriptor + binding) failed an
+    /// integrity check. Indicates the bundle was either hand-crafted or
+    /// tampered with after construction.
+    CapabilityBindingMismatch {
+        /// Stable identity of the capability whose binding failed.
+        identity: String,
+        /// SHA-256 fingerprint recorded on the bundle.
+        expected_fingerprint: String,
+        /// SHA-256 fingerprint recomputed from current origin + descriptor.
+        actual_fingerprint: String,
+    },
     /// The model requested an unknown tool.
     UnknownTool(String),
     /// Runtime configuration selected an unregistered model.
@@ -2486,6 +2497,14 @@ impl Display for HarnessError {
             }
             Self::InvalidCapability(message) => write!(formatter, "invalid capability: {message}"),
             Self::DuplicateCapability(name) => write!(formatter, "duplicate capability: {name}"),
+            Self::CapabilityBindingMismatch {
+                identity,
+                expected_fingerprint,
+                actual_fingerprint,
+            } => write!(
+                formatter,
+                "capability binding mismatch for {identity}: expected {expected_fingerprint}, got {actual_fingerprint}"
+            ),
             Self::UnknownTool(name) => write!(formatter, "unknown tool: {name}"),
             Self::UnknownModel(id) => write!(formatter, "unknown model: {id}"),
             Self::PolicyDenied { tool, reason } => {

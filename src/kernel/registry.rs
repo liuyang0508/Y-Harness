@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
@@ -338,6 +339,125 @@ pub(crate) fn validate_model_id(id: &str) -> Result<(), HarnessError> {
         Err(HarnessError::InvalidCapability(format!(
             "model id {id:?} must be 1-128 portable ASCII identity characters"
         )))
+    }
+}
+
+/// Immutable bundle tying a capability's three seam pieces together: the
+/// trust-bearing [`CapabilityOrigin`], the model-visible descriptor identity,
+/// and a SHA-256 binding fingerprint over the first two. The bundle is the
+/// canonical type passed across the trusted kernel boundary so that every
+/// downstream consumer sees the same origin + descriptor + binding as a unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundCapability {
+    /// Trust-bearing origin recorded at registration time.
+    pub origin: CapabilityOrigin,
+    /// Stable identity of the capability (tool name or model id).
+    pub identity: String,
+    /// SHA-256 of `(origin_json, identity)` captured at construction.
+    pub binding_fingerprint: String,
+}
+
+impl BoundCapability {
+    /// Constructs a bundle and captures the binding fingerprint. Validates the
+    /// origin in the same step so an invalid origin never reaches a consumer.
+    pub fn new(
+        origin: CapabilityOrigin,
+        identity: impl Into<String>,
+    ) -> Result<Self, HarnessError> {
+        validate_capability_origin(&origin)?;
+        let identity = identity.into();
+        let binding_fingerprint = compute_capability_fingerprint(&origin, &identity);
+        Ok(Self {
+            origin,
+            identity,
+            binding_fingerprint,
+        })
+    }
+
+    /// Re-derives the binding fingerprint from the current origin + identity
+    /// and compares it against the stored one. Returns
+    /// [`HarnessError::CapabilityBindingMismatch`] on any divergence.
+    pub fn validate_binding(&self) -> Result<(), HarnessError> {
+        let actual = compute_capability_fingerprint(&self.origin, &self.identity);
+        if actual == self.binding_fingerprint {
+            Ok(())
+        } else {
+            Err(HarnessError::CapabilityBindingMismatch {
+                identity: self.identity.clone(),
+                expected_fingerprint: self.binding_fingerprint.clone(),
+                actual_fingerprint: actual,
+            })
+        }
+    }
+}
+
+fn compute_capability_fingerprint(origin: &CapabilityOrigin, identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let origin_json = serde_json::to_string(origin).unwrap_or_default();
+    hasher.update(origin_json.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+#[cfg(test)]
+mod bound_capability_tests {
+    use super::*;
+
+    #[test]
+    fn bound_capability_validates_built_in_origin() {
+        let bundle = BoundCapability::new(CapabilityOrigin::BuiltIn, "echo").expect("built-in");
+        assert_eq!(bundle.identity, "echo");
+        assert!(!bundle.binding_fingerprint.is_empty());
+        bundle.validate_binding().expect("validate");
+    }
+
+    #[test]
+    fn bound_capability_validates_trusted_extension_origin() {
+        let bundle = BoundCapability::new(
+            CapabilityOrigin::TrustedExtension { id: "ext-42".to_owned() },
+            "tool-x",
+        )
+        .expect("trusted extension");
+        bundle.validate_binding().expect("validate");
+    }
+
+    #[test]
+    fn bound_capability_rejects_invalid_origin_id() {
+        let bad = BoundCapability::new(
+            CapabilityOrigin::External { id: "   ".to_owned() },
+            "tool",
+        );
+        assert!(matches!(bad, Err(HarnessError::InvalidCapability(_))));
+    }
+
+    #[test]
+    fn bound_capability_detects_tampered_identity() {
+        let mut bundle =
+            BoundCapability::new(CapabilityOrigin::BuiltIn, "echo").expect("bundle");
+        bundle.identity = "tampered".to_owned();
+        let error = bundle.validate_binding().expect_err("must mismatch");
+        match error {
+            HarnessError::CapabilityBindingMismatch { identity, .. } => {
+                assert_eq!(identity, "tampered");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bound_capability_fingerprints_are_deterministic() {
+        let a = BoundCapability::new(CapabilityOrigin::BuiltIn, "echo").expect("a");
+        let b = BoundCapability::new(CapabilityOrigin::BuiltIn, "echo").expect("b");
+        assert_eq!(a.binding_fingerprint, b.binding_fingerprint);
+        let c = BoundCapability::new(CapabilityOrigin::BuiltIn, "different").expect("c");
+        assert_ne!(a.binding_fingerprint, c.binding_fingerprint);
     }
 }
 

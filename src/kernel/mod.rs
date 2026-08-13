@@ -10,7 +10,8 @@ pub use capability::{
 };
 pub use control::CancellationToken;
 pub use registry::{
-    CapabilityOrigin, ModelRegistry, RegisteredModel, RegisteredTool, ToolRegistry,
+    BoundCapability, CapabilityOrigin, ModelRegistry, RegisteredModel, RegisteredTool,
+    ToolRegistry,
 };
 pub(crate) use registry::{
     capture_capability_metadata, validate_capability_name, validate_capability_origin,

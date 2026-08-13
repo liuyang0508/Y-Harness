@@ -115,7 +115,7 @@ pub use kernel::{
     ActorIdentity, AgentLoopClaimId, AgentLoopCloseCommandId, AgentLoopDenyCommandId,
     AgentLoopExecution, AgentLoopResumeCommandId, AgentLoopWaitId, AgentLoopWorkerId,
     ApprovalActor, ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalSettlementEvidence,
-    ArtifactId, AuthorityContext, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId,
+    ArtifactId, AuthorityContext, BoundCapability, CancellationToken, CapabilityOrigin, Checkpoint, CheckpointId,
     ConnectorEvidence, ConnectorEvidenceClaim, EffectCommandId, EffectId, EffectLeaseId, EventId,
     ExecutionBinding, ExecutionClaimEvidence, ExecutionPhase, HarnessError, HarnessFuture,
     HumanHandoffClaimId, HumanHandoffCommandId, HumanHandoffId, InboxRepairMetrics,
