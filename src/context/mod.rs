@@ -823,6 +823,96 @@ pub(crate) fn model_visible_items(items: &[Item]) -> Vec<Item> {
     items.iter().filter_map(model_visible_item).collect()
 }
 
+/// Canonical entry point that derives the model-visible message list from
+/// the append-only event log. `prior_items` are items committed by earlier
+/// turns (post-compaction if applicable) and `current_items` are items
+/// appended to the active turn. The function is pure: it does not mutate
+/// either input and produces an item list suitable for the next Model call.
+///
+/// Why this exists: the runtime never mutates the items list in place.
+/// Every correction or follow-up is a new append-only item, and the
+/// model-visible message list is computed on demand from the canonical log.
+/// Centralising that derivation here keeps the rest of the runtime honest
+/// about the append-only invariant.
+pub(crate) fn derive_messages(prior_items: &[Item], current_items: &[Item]) -> Vec<Item> {
+    let mut messages = Vec::with_capacity(prior_items.len() + current_items.len());
+    messages.extend(model_visible_items(prior_items));
+    messages.extend(model_visible_items(current_items));
+    messages
+}
+
+#[cfg(test)]
+mod derive_messages_tests {
+    use super::*;
+
+    fn user_item(content: &str) -> Item {
+        Item::new(ItemKind::UserMessage {
+            content: content.to_owned(),
+        })
+    }
+
+    fn assistant_item(content: &str) -> Item {
+        Item::new(ItemKind::AssistantMessage {
+            model_id: Some("test-model".to_owned()),
+            model_origin: None,
+            model_request_sha256: None,
+            content: content.to_owned(),
+        })
+    }
+
+    fn runtime_error_item() -> Item {
+        Item::new(ItemKind::RuntimeError {
+            message: "internal".to_owned(),
+        })
+    }
+
+    #[test]
+    fn derive_messages_filters_out_non_visible_items() {
+        let prior = vec![user_item("hello"), runtime_error_item()];
+        let current = vec![assistant_item("hi")];
+        let messages = derive_messages(&prior, &current);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0].kind, ItemKind::UserMessage { .. }));
+        assert!(matches!(messages[1].kind, ItemKind::AssistantMessage { .. }));
+    }
+
+    #[test]
+    fn derive_messages_preserves_prior_then_current_order() {
+        let prior = vec![user_item("p1"), assistant_item("p2")];
+        let current = vec![user_item("c1"), assistant_item("c2")];
+        let messages = derive_messages(&prior, &current);
+        assert_eq!(messages.len(), 4);
+        match &messages[0].kind {
+            ItemKind::UserMessage { content } => assert_eq!(content, "p1"),
+            _ => panic!("expected UserMessage"),
+        }
+        match &messages[3].kind {
+            ItemKind::AssistantMessage { content, .. } => assert_eq!(content, "c2"),
+            _ => panic!("expected AssistantMessage"),
+        }
+    }
+
+    #[test]
+    fn derive_messages_handles_empty_inputs() {
+        assert!(derive_messages(&[], &[]).is_empty());
+        let prior = vec![user_item("solo")];
+        assert_eq!(derive_messages(&prior, &[]).len(), 1);
+        let current = vec![assistant_item("solo")];
+        assert_eq!(derive_messages(&[], &current).len(), 1);
+    }
+
+    #[test]
+    fn derive_messages_does_not_mutate_inputs() {
+        let prior = vec![user_item("a")];
+        let current = vec![assistant_item("b")];
+        let prior_before = prior.clone();
+        let current_before = current.clone();
+        let _ = derive_messages(&prior, &current);
+        assert_eq!(prior, prior_before);
+        assert_eq!(current, current_before);
+    }
+}
+
 fn has_model_visible_items(items: &[Item]) -> bool {
     items.iter().any(is_model_visible)
 }

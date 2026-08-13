@@ -47,7 +47,7 @@ use crate::{
     ThreadId, ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
     ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, TurnWaitEnvelope,
     VerificationOutcome, VerificationRegistry, VerificationRequest, WaitKind,
-    context::{model_visible_items, validate_turn_context_inputs},
+    context::{derive_messages, validate_turn_context_inputs},
     kernel::{validate_capability_origin, validate_model_id},
 };
 
@@ -1691,8 +1691,7 @@ impl HarnessRuntime {
                 PreStepDecision::Continue => {}
                 PreStepDecision::Stop { reason: _ } => break 'agent,
             }
-            let mut items = conversation_items.clone();
-            items.extend(model_visible_items(&turn.items));
+            let items = derive_messages(&conversation_items, &turn.items);
             let request = ModelRequest {
                 thread_id: thread_id.clone(),
                 turn_id: turn.id.clone(),
@@ -2688,10 +2687,10 @@ impl HarnessRuntime {
         let compilation = self
             .context
             .merge_turn_context(compilation, &options.context)?;
-        let mut original_items = conversation.items.clone();
-        original_items.extend(model_visible_items(
+        let original_items = derive_messages(
+            &conversation.items,
             &boundary_turn.items[..evidence.model_request_item_index],
-        ));
+        );
         let original_request = ModelRequest {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -3199,10 +3198,10 @@ impl HarnessRuntime {
         let compilation = self
             .context
             .merge_turn_context(compilation, &options.context)?;
-        let mut original_items = conversation.items.clone();
-        original_items.extend(model_visible_items(
+        let original_items = derive_messages(
+            &conversation.items,
             &turn.items[..evidence.model_request_item_index],
-        ));
+        );
         let original_request = ModelRequest {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
