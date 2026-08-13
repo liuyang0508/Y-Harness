@@ -3,10 +3,16 @@
 mod migration;
 mod wait_due;
 
+pub mod inbox_repair;
+
 pub use migration::{StateMigrationReport, StateMigrationStatus};
 pub use wait_due::{
     AgentLoopDueCursor, AgentLoopDuePhase, AgentLoopDueScanPage, AgentLoopDueWait,
     MAX_AGENT_LOOP_DUE_SCAN_LIMIT,
+};
+pub use inbox_repair::{
+    InboxRepairExecuteOutcome, InboxRepairExecutor, InboxRepairOpRow, InboxRepairTickOutcome,
+    InboxRepairWorker, NoopInboxRepairExecutor, default_worker, reason_label,
 };
 
 use std::{
@@ -679,6 +685,53 @@ pub trait EventStore: Send + Sync {
     /// Whether this backend persists the inbox-repair outbox + tombstone.
     fn supports_inbox_repair_durability(&self) -> bool {
         false
+    }
+
+    /// Fetches up to `max_ops` pending inbox-repair outbox rows.
+    fn fetch_pending_repair_ops<'a>(
+        &'a self,
+        _max_ops: usize,
+    ) -> HarnessFuture<'a, Vec<InboxRepairOpRow>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Updates the status (and optional last_error) of one outbox row.
+    fn update_repair_op_status<'a>(
+        &'a self,
+        _op_id: &'a str,
+        _status: crate::InboxRepairOpStatus,
+        _last_error: Option<String>,
+    ) -> HarnessFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Records the next attempt time and incremented attempt count for retry.
+    fn reschedule_repair_op<'a>(
+        &'a self,
+        _op_id: &'a str,
+        _attempt_count: u8,
+        _next_attempt_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Aggregates operational counters from the inbox-repair outbox.
+    fn inbox_repair_metrics<'a>(&'a self) -> HarnessFuture<'a, crate::InboxRepairMetrics> {
+        Box::pin(async { Ok(crate::InboxRepairMetrics::default()) })
+    }
+
+    /// Enqueues one inbox-repair op against the outbox. Returns `op_id`.
+    fn enqueue_repair_op<'a>(
+        &'a self,
+        _wait_id: &'a AgentLoopWaitId,
+        _kind: crate::InboxRepairOpKind,
+        _payload: Vec<u8>,
+    ) -> HarnessFuture<'a, String> {
+        Box::pin(async {
+            Err(HarnessError::State(
+                "Event Store does not support inbox-repair enqueue".to_owned(),
+            ))
+        })
     }
 }
 
@@ -2502,6 +2555,204 @@ impl EventStore for SqliteEventStore {
     fn supports_inbox_repair_durability(&self) -> bool {
         true
     }
+
+    fn fetch_pending_repair_ops<'a>(
+        &'a self,
+        max_ops: usize,
+    ) -> HarnessFuture<'a, Vec<InboxRepairOpRow>> {
+        Box::pin(async move {
+            if max_ops == 0 {
+                return Ok(Vec::new());
+            }
+            self.with_connection(move |connection| {
+                let now = crate::kernel::now_ms() as i64;
+                let mut stmt = connection
+                    .prepare(
+                        "SELECT op_id, wait_id, op_kind, payload_json, attempt_count, created_ms
+                         FROM inbox_repair_outbox
+                         WHERE status = 'pending' AND next_attempt_ms <= ?1
+                         ORDER BY next_attempt_ms ASC
+                         LIMIT ?2",
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let rows = stmt
+                    .query_map(params![now, max_ops as i64], |row| {
+                        let op_id: String = row.get(0)?;
+                        let wait_id: String = row.get(1)?;
+                        let op_kind: String = row.get(2)?;
+                        let payload: Vec<u8> = row.get(3)?;
+                        let attempt_count: i64 = row.get(4)?;
+                        let created_ms: i64 = row.get(5)?;
+                        Ok((op_id, wait_id, op_kind, payload, attempt_count, created_ms))
+                    })
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let (op_id, wait_id, op_kind, payload, attempt_count, created_ms) =
+                        row.map_err(|error| HarnessError::State(error.to_string()))?;
+                    out.push(InboxRepairOpRow {
+                        op_id,
+                        wait_id: AgentLoopWaitId::from_string(wait_id),
+                        kind: decode_repair_op_kind(&op_kind)?,
+                        payload,
+                        attempt_count: i64_to_u8(attempt_count, "attempt_count")?,
+                        created_at_ms: i64_to_u64(created_ms, "created_ms")?,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn update_repair_op_status<'a>(
+        &'a self,
+        op_id: &'a str,
+        status: crate::InboxRepairOpStatus,
+        last_error: Option<String>,
+    ) -> HarnessFuture<'a, ()> {
+        let op_id = op_id.to_owned();
+        Box::pin(async move {
+            wait_due::validate_identity("op", &op_id)?;
+            self.with_connection(move |connection| {
+                let now = crate::kernel::now_ms() as i64;
+                connection
+                    .execute(
+                        "UPDATE inbox_repair_outbox
+                         SET status = ?2, last_error = ?3, last_attempt_ms = ?4
+                         WHERE op_id = ?1",
+                        params![
+                            op_id,
+                            status.as_sql(),
+                            last_error,
+                            now,
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn reschedule_repair_op<'a>(
+        &'a self,
+        op_id: &'a str,
+        attempt_count: u8,
+        next_attempt_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        let op_id = op_id.to_owned();
+        Box::pin(async move {
+            wait_due::validate_identity("op", &op_id)?;
+            self.with_connection(move |connection| {
+                let now = crate::kernel::now_ms() as i64;
+                connection
+                    .execute(
+                        "UPDATE inbox_repair_outbox
+                         SET status = 'pending', attempt_count = ?2, next_attempt_ms = ?3,
+                             last_attempt_ms = ?4
+                         WHERE op_id = ?1",
+                        params![
+                            op_id,
+                            attempt_count as i64,
+                            next_attempt_ms as i64,
+                            now,
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn inbox_repair_metrics<'a>(&'a self) -> HarnessFuture<'a, crate::InboxRepairMetrics> {
+        Box::pin(async move {
+            self.with_connection(move |connection| {
+                let pending: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM inbox_repair_outbox WHERE status = 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                let in_flight: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM inbox_repair_outbox WHERE status = 'in_flight'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                let exhausted: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM inbox_repair_outbox WHERE status = 'exhausted'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                let oldest: i64 = connection
+                    .query_row(
+                        "SELECT COALESCE(MIN(?1 - last_attempt_ms), 0) FROM inbox_repair_outbox
+                         WHERE status = 'pending' AND last_attempt_ms IS NOT NULL",
+                        params![crate::kernel::now_ms() as i64],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok(crate::InboxRepairMetrics {
+                    pending_ops: pending.max(0) as u64,
+                    in_flight_ops: in_flight.max(0) as u64,
+                    exhausted_ops: exhausted.max(0) as u64,
+                    oldest_pending_age_ms: oldest.max(0) as u64,
+                    succeeded_ops_window: 0,
+                    failed_ops_window: 0,
+                    last_tick_at_ms: crate::kernel::now_ms(),
+                    coldstart_repaired_at_startup: 0,
+                })
+            })
+            .await
+        })
+    }
+
+    fn enqueue_repair_op<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+        kind: crate::InboxRepairOpKind,
+        payload: Vec<u8>,
+    ) -> HarnessFuture<'a, String> {
+        let wait_id = wait_id.clone();
+        Box::pin(async move {
+            wait_due::validate_identity("wait", wait_id.as_str())?;
+            self.with_connection(move |connection| {
+                let now = crate::kernel::now_ms();
+                let op_id = format!("op-{}", now);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .execute(
+                        "INSERT INTO inbox_repair_outbox
+                            (op_id, wait_id, op_kind, payload_json, status,
+                             attempt_count, last_attempt_ms, next_attempt_ms,
+                             last_error, created_ms)
+                         VALUES (?1, ?2, ?3, ?4, 'pending', 0, NULL, ?5, NULL, ?6)",
+                        params![
+                            op_id,
+                            wait_id.as_str(),
+                            kind.as_sql(),
+                            payload,
+                            now as i64,
+                            now as i64,
+                        ],
+                    )
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                transaction
+                    .commit()
+                    .map_err(|error| HarnessError::State(error.to_string()))?;
+                Ok(op_id)
+            })
+            .await
+        })
+    }
 }
 
 fn decode_tombstone_reason(raw: &str) -> Result<InboxTombstoneReason, HarnessError> {
@@ -2523,6 +2774,25 @@ fn to_sql_u64(label: &str, value: u64) -> Result<i64, HarnessError> {
 
 fn to_u64(value: i64, label: &str) -> Result<u64, HarnessError> {
     u64::try_from(value).map_err(|_| HarnessError::State(format!("{label} is negative")))
+}
+
+fn i64_to_u64(value: i64, label: &str) -> Result<u64, HarnessError> {
+    to_u64(value, label)
+}
+
+fn i64_to_u8(value: i64, label: &str) -> Result<u8, HarnessError> {
+    u8::try_from(value).map_err(|_| HarnessError::State(format!("{label} out of u8 range")))
+}
+
+fn decode_repair_op_kind(raw: &str) -> Result<crate::InboxRepairOpKind, HarnessError> {
+    match raw {
+        "submit" => Ok(crate::InboxRepairOpKind::Submit),
+        "settle" => Ok(crate::InboxRepairOpKind::Settle),
+        "orphan_close" => Ok(crate::InboxRepairOpKind::OrphanClose),
+        other => Err(HarnessError::State(format!(
+            "unknown inbox repair op kind: {other}"
+        ))),
+    }
 }
 
 struct SnapshotMaintenanceMetrics {
@@ -2693,6 +2963,50 @@ impl StateEngine {
     /// Whether the underlying store persists inbox-repair durability.
     pub fn supports_inbox_repair_durability(&self) -> bool {
         self.store.supports_inbox_repair_durability()
+    }
+
+    /// Fetches up to `max_ops` pending inbox-repair outbox rows.
+    pub fn fetch_pending_repair_ops<'a>(
+        &'a self,
+        max_ops: usize,
+    ) -> HarnessFuture<'a, Vec<InboxRepairOpRow>> {
+        self.store.fetch_pending_repair_ops(max_ops)
+    }
+
+    /// Updates the status (and optional last_error) of one outbox row.
+    pub fn update_repair_op_status<'a>(
+        &'a self,
+        op_id: &'a str,
+        status: crate::InboxRepairOpStatus,
+        last_error: Option<String>,
+    ) -> HarnessFuture<'a, ()> {
+        self.store.update_repair_op_status(op_id, status, last_error)
+    }
+
+    /// Records the next attempt time and incremented attempt count for retry.
+    pub fn reschedule_repair_op<'a>(
+        &'a self,
+        op_id: &'a str,
+        attempt_count: u8,
+        next_attempt_ms: u64,
+    ) -> HarnessFuture<'a, ()> {
+        self.store.reschedule_repair_op(op_id, attempt_count, next_attempt_ms)
+    }
+
+    /// Aggregates operational counters from the inbox-repair outbox.
+    pub fn inbox_repair_metrics<'a>(&'a self) -> HarnessFuture<'a, crate::InboxRepairMetrics> {
+        self.store.inbox_repair_metrics()
+    }
+
+    /// Enqueues one inbox-repair op (Submit/Settle/OrphanClose) against the
+    /// State-resident outbox. Returns the assigned `op_id`.
+    pub fn enqueue_repair_op<'a>(
+        &'a self,
+        wait_id: &'a AgentLoopWaitId,
+        kind: crate::InboxRepairOpKind,
+        payload: Vec<u8>,
+    ) -> HarnessFuture<'a, String> {
+        self.store.enqueue_repair_op(wait_id, kind, payload)
     }
 
     /// Enables failure-isolated automatic snapshots after terminal Turns.
