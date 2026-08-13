@@ -9,6 +9,7 @@ use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
+    sync::atomic::{AtomicU8, Ordering},
     time::Duration,
 };
 
@@ -41,7 +42,7 @@ use crate::{
     ModelContinuation, ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest,
     ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelToolTraceOutcome,
     Observability, ObservationOutcome, PhaseObservation, PolicyDecision, ResumeEvidence,
-    StateCapacity, StateEngine, StateEvent, SteeringId, StoredEvent, Thread, ThreadArchive,
+    RuntimePhase, StateCapacity, StateEngine, StateEvent, SteeringId, StoredEvent, Thread, ThreadArchive,
     ThreadId, ToolAuthorization, ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext,
     ToolRegistry, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, TurnWaitEnvelope,
     VerificationOutcome, VerificationRegistry, VerificationRequest, WaitKind,
@@ -360,6 +361,7 @@ pub struct HarnessRuntime {
     active_threads: Mutex<BTreeSet<ThreadId>>,
     turn_controls: Mutex<BTreeMap<ThreadId, Arc<tokio::sync::Mutex<ActiveTurnControl>>>>,
     worker_id: AgentLoopWorkerId,
+    phase: AtomicU8,
     max_concurrent_turns: usize,
     max_parallel_tool_calls: usize,
     max_model_attempts_per_step: usize,
@@ -393,6 +395,7 @@ impl HarnessRuntime {
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
             worker_id: AgentLoopWorkerId::generate(),
+            phase: AtomicU8::new(RuntimePhase::Idle.code()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
@@ -440,12 +443,77 @@ impl HarnessRuntime {
             active_threads: Mutex::new(BTreeSet::new()),
             turn_controls: Mutex::new(BTreeMap::new()),
             worker_id: AgentLoopWorkerId::generate(),
+            phase: AtomicU8::new(RuntimePhase::Idle.code()),
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
             max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             max_model_attempts_per_step: DEFAULT_MAX_MODEL_ATTEMPTS_PER_STEP,
             progress_policy: ProgressPolicy::default(),
             max_steps: DEFAULT_MAX_AGENT_STEPS,
         })
+    }
+
+    /// Returns the runtime's coarse lifecycle phase.
+    ///
+    /// Distinct from [`crate::AgentLoopExecution`], which describes one
+    /// durable wait lifecycle; `RuntimePhase` describes the runtime as a
+    /// whole (worker in service, suspended for maintenance, or torn down).
+    pub fn phase(&self) -> RuntimePhase {
+        RuntimePhase::from_code(self.phase.load(Ordering::Acquire)).unwrap_or(RuntimePhase::Disposed)
+    }
+
+    /// Transitions `Idle → Running`. Returns the previous phase on success.
+    ///
+    /// Fails when the runtime is already `Running` (a single runtime must
+    /// not be double-claimed) or when it has left the live service
+    /// (`Maintenance`, `Disposed`).
+    pub fn enter_running(&self) -> Result<RuntimePhase, HarnessError> {
+        self.transition_phase(RuntimePhase::Idle, RuntimePhase::Running)
+    }
+
+    /// Transitions `Running → Maintenance`. Returns the previous phase on
+    /// success. Used by control-plane operations that need to drain
+    /// in-flight turns before quiescing the worker.
+    ///
+    /// Fails when the runtime is not currently `Running`.
+    pub fn enter_maintenance(&self) -> Result<RuntimePhase, HarnessError> {
+        self.transition_phase(RuntimePhase::Running, RuntimePhase::Maintenance)
+    }
+
+    /// Transitions `Maintenance → Running`. Returns the previous phase on
+    /// success. Fails when the runtime is not currently in `Maintenance`.
+    pub fn leave_maintenance(&self) -> Result<RuntimePhase, HarnessError> {
+        self.transition_phase(RuntimePhase::Maintenance, RuntimePhase::Running)
+    }
+
+    /// Marks the runtime as `Disposed`. Idempotent — calling twice is a
+    /// no-op. After this call `phase()` always returns `Disposed` and
+    /// `accepts_work()` returns `false`.
+    pub fn mark_disposed(&self) {
+        self.phase
+            .store(RuntimePhase::Disposed.code(), Ordering::Release);
+    }
+
+    /// CAS helper used by typed transition methods. Returns the previous
+    /// phase on success; errors with the actual current phase on failure.
+    fn transition_phase(
+        &self,
+        expected: RuntimePhase,
+        next: RuntimePhase,
+    ) -> Result<RuntimePhase, HarnessError> {
+        let expected_code = expected.code();
+        match self.phase.compare_exchange(
+            expected_code,
+            next.code(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(prev) => RuntimePhase::from_code(prev).ok_or(HarnessError::PhaseInvariantViolation {
+                observed: prev as u32,
+            }),
+            Err(actual) => Err(HarnessError::PhaseInvariantViolation {
+                observed: actual as u32,
+            }),
+        }
     }
 
     #[must_use]
@@ -6682,7 +6750,7 @@ mod tests {
         MemorySearchRequest, MemorySearchResponse, MemoryView, ModelContinuation, ModelEventSink,
         ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRegistry, ModelRequest,
         ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelUsage, Observability,
-        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, SqliteApprovalInbox,
+        ObservationOutcome, PendingEvent, PolicyDecision, RiskLevel, RuntimePhase, SqliteApprovalInbox,
         SqliteEventStore, StateCapacity, StateCapacityLevel, StateEngine, StateEvent, StoredEvent,
         ThreadHandoffConfig, ThreadId, ToolAuthorization, ToolBatchExecution, ToolContext,
         ToolDescriptor, ToolExecutionResult, ToolRegistry, TraceCollector, TurnContextInput,
@@ -15670,5 +15738,109 @@ mod tests {
             .register(CapabilityOrigin::BuiltIn, Arc::new(EchoTool { calls }))
             .expect_err("duplicate must fail");
         assert_eq!(error, HarnessError::DuplicateCapability("echo".to_owned()));
+    }
+
+    fn runtime_phase_test_fixture() -> HarnessRuntime {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = StateEngine::new(Arc::new(MemoryEventStore::new()));
+        runtime(
+            calls,
+            AllowListPolicy::deny_by_default().allow("echo"),
+            state,
+        )
+    }
+
+    #[test]
+    fn runtime_phase_starts_idle_and_accepts_work() {
+        let harness = runtime_phase_test_fixture();
+        assert_eq!(harness.phase(), RuntimePhase::Idle);
+        assert!(harness.phase().accepts_work());
+    }
+
+    #[test]
+    fn runtime_phase_typed_transitions_round_trip() {
+        let harness = runtime_phase_test_fixture();
+        assert_eq!(
+            harness.enter_running().expect("idle → running"),
+            RuntimePhase::Idle
+        );
+        assert_eq!(harness.phase(), RuntimePhase::Running);
+        assert!(harness.phase().accepts_work());
+
+        assert_eq!(
+            harness.enter_maintenance().expect("running → maintenance"),
+            RuntimePhase::Running
+        );
+        assert_eq!(harness.phase(), RuntimePhase::Maintenance);
+        assert!(!harness.phase().accepts_work());
+
+        assert_eq!(
+            harness.leave_maintenance().expect("maintenance → running"),
+            RuntimePhase::Maintenance
+        );
+        assert_eq!(harness.phase(), RuntimePhase::Running);
+        assert!(harness.phase().accepts_work());
+    }
+
+    #[test]
+    fn runtime_phase_rejects_illegal_transitions() {
+        let harness = runtime_phase_test_fixture();
+        let error = harness
+            .enter_maintenance()
+            .expect_err("idle → maintenance must be rejected");
+        assert!(matches!(
+            error,
+            HarnessError::PhaseInvariantViolation { .. }
+        ));
+
+        let error = harness
+            .leave_maintenance()
+            .expect_err("idle → leave_maintenance must be rejected");
+        assert!(matches!(
+            error,
+            HarnessError::PhaseInvariantViolation { .. }
+        ));
+
+        let _ = harness.enter_running().expect("idle → running");
+        let error = harness
+            .enter_running()
+            .expect_err("running → running must be rejected");
+        assert!(matches!(
+            error,
+            HarnessError::PhaseInvariantViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_phase_disposed_is_terminal_and_idempotent() {
+        let harness = runtime_phase_test_fixture();
+        let _ = harness.enter_running().expect("idle → running");
+        harness.mark_disposed();
+        assert_eq!(harness.phase(), RuntimePhase::Disposed);
+        assert!(!harness.phase().accepts_work());
+
+        harness.mark_disposed();
+        assert_eq!(harness.phase(), RuntimePhase::Disposed);
+
+        let error = harness
+            .enter_running()
+            .expect_err("disposed is terminal");
+        assert!(matches!(
+            error,
+            HarnessError::PhaseInvariantViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_phase_codec_round_trip() {
+        for phase in [
+            RuntimePhase::Idle,
+            RuntimePhase::Running,
+            RuntimePhase::Maintenance,
+            RuntimePhase::Disposed,
+        ] {
+            assert_eq!(RuntimePhase::from_code(phase.code()), Some(phase));
+        }
+        assert_eq!(RuntimePhase::from_code(99), None);
     }
 }

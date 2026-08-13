@@ -407,6 +407,56 @@ pub struct WaitDenialEvidence {
     pub denied_at_ms: u64,
 }
 
+/// Coarse lifecycle phase of a [`crate::runtime::HarnessRuntime`].
+///
+/// Distinct from [`AgentLoopExecution`]: the latter describes one durable
+/// wait lifecycle. `RuntimePhase` describes the runtime as a whole
+/// (worker in service, suspended for maintenance, or torn down).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePhase {
+    /// Constructed but not yet processing any turns.
+    Idle,
+    /// At least one turn is active or the runtime is admitting new turns.
+    Running,
+    /// The runtime is in a maintenance window (snapshot, replay, repair).
+    /// New turns are rejected; in-flight turns may finish or be drained.
+    Maintenance,
+    /// The runtime has been disposed; no further work will be accepted.
+    Disposed,
+}
+
+impl RuntimePhase {
+    /// Encodes the phase as a `u8` for atomic storage.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::Maintenance => 2,
+            Self::Disposed => 3,
+        }
+    }
+
+    /// Decodes a `u8` back into a phase. Returns `None` for unknown codes.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Idle),
+            1 => Some(Self::Running),
+            2 => Some(Self::Maintenance),
+            3 => Some(Self::Disposed),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when the runtime can still accept new work.
+    #[must_use]
+    pub const fn accepts_work(self) -> bool {
+        matches!(self, Self::Idle | Self::Running)
+    }
+}
+
 /// Deterministic live projection of the latest durable Agent Loop wait.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
@@ -2245,6 +2295,13 @@ pub enum HarnessError {
         /// Operation active when the deadline elapsed.
         phase: ExecutionPhase,
     },
+    /// A typed phase transition was attempted from a non-matching source
+    /// phase. `observed` is the actual raw `AtomicU8` payload found on
+    /// the runtime, useful for diagnostics.
+    PhaseInvariantViolation {
+        /// Raw phase byte observed at the failed CAS.
+        observed: u32,
+    },
 }
 
 impl Display for HarnessError {
@@ -2369,6 +2426,12 @@ impl Display for HarnessError {
             }
             Self::TimedOut { phase } => {
                 write!(formatter, "turn timed out during {phase:?}")
+            }
+            Self::PhaseInvariantViolation { observed } => {
+                write!(
+                    formatter,
+                    "runtime phase invariant violated; observed raw byte={observed}"
+                )
             }
         }
     }

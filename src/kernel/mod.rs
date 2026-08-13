@@ -30,7 +30,7 @@ pub use types::{
     ModelContinuation, ModelOutput, ModelProviderFailure, ModelProviderFailureKind, ModelRequest,
     ModelResponse, ModelStreamEvent, ModelToolCall, ModelToolChoice, ModelToolTraceOutcome,
     ModelUsage, NewStreamEvent, OperationId, PendingEvent, PolicyDecision, ResumeEvidence,
-    RiskLevel, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId,
+    RiskLevel, RuntimePhase, StateEvent, SteeringId, StoredEvent, TaskGraphId, TaskId, TaskLeaseId,
     TaskMessageId, Thread, ThreadId, ThreadImportOrigin, ThreadLineage, ToolAuthorization,
     ToolBatchExecution, ToolCallBatch, ToolCallBatchId, ToolContext, ToolDescriptor,
     ToolExecutionResult, Turn, TurnId, TurnOutcome, TurnStatus, TurnStopReason, TurnWaitEnvelope,
