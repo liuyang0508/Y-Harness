@@ -598,6 +598,29 @@ impl RuntimePhase {
     }
 }
 
+/// Outcome of the explicit Pre-Step decision point that gates every iteration
+/// of the Agent Loop. The decision runs before any Model call and before any
+/// tool execution, so a `Stop` verdict exits the loop cleanly without ever
+/// hitting the Model provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreStepDecision {
+    /// Take the next step.
+    Continue,
+    /// Stop the loop with a named reason; the runtime still finalizes the Turn.
+    Stop {
+        /// Short machine-readable reason (e.g. `"max_steps"`, `"cancelled"`).
+        reason: &'static str,
+    },
+}
+
+impl PreStepDecision {
+    /// Returns `true` if the decision is `Continue`.
+    #[must_use]
+    pub const fn is_continue(self) -> bool {
+        matches!(self, Self::Continue)
+    }
+}
+
 /// Deterministic live projection of the latest durable Agent Loop wait.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]

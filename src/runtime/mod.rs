@@ -38,7 +38,7 @@ use crate::{
     AuthorityContext, CapabilityOrigin, CompletionAssurance, CompletionContract,
     CompletionGeneration, ConnectorEvidence, ContextBlock, ContextEngine, ContextSource,
     ExecutionPhase, HarnessError, InboxRepairOpKind, InboxTombstoneReason,
-    InvocationContextEvidence, Item, ItemId, ItemKind,
+    InvocationContextEvidence, Item, ItemId, ItemKind, PreStepDecision,
     MAX_AGENT_LOOP_WAIT_MS, MemoryContextRecordStatus, MemoryContextStatus, MemoryScope,
     ModelContinuation, ModelOutput, ModelProviderFailureKind, ModelRegistry, ModelRequest,
     ModelResponse, ModelStream, ModelStreamEvent, ModelToolCall, ModelToolTraceOutcome,
@@ -1684,8 +1684,13 @@ impl HarnessRuntime {
             .map_or_else(ModelStream::disabled, ModelStream::new)
             .with_cancellation(options.cancellation.clone());
         'agent: for step in starting_step..self.max_steps {
-            self.govern_progress_at_safe_boundary(&mut progress, &mut turn, false)
-                .await?;
+            match self
+                .decide_pre_step(step, &mut progress, &mut turn, &options)
+                .await?
+            {
+                PreStepDecision::Continue => {}
+                PreStepDecision::Stop { reason: _ } => break 'agent,
+            }
             let mut items = conversation_items.clone();
             items.extend(model_visible_items(&turn.items));
             let request = ModelRequest {
@@ -2319,6 +2324,42 @@ impl HarnessRuntime {
         drop(control);
         self.settle_error(turn, &error).await?;
         Err(error)
+    }
+
+    /// Explicit Pre-Step decision point. Runs once per Agent Loop iteration
+    /// before any Model call or tool execution. Each check is named so the
+    /// stop reason is machine-readable; the loop never reaches the Model
+    /// provider if this returns [`PreStepDecision::Stop`].
+    async fn decide_pre_step(
+        &self,
+        step: usize,
+        progress: &mut ProgressGovernor,
+        turn: &mut Turn,
+        options: &TurnExecutionOptions,
+    ) -> Result<PreStepDecision, HarnessError> {
+        // 1. Runtime phase: a disposed or maintained runtime must not consume
+        //    another Model call even on existing turns.
+        let phase = self.phase();
+        if !phase.accepts_work() {
+            return Ok(PreStepDecision::Stop { reason: "phase_disposed" });
+        }
+        // 2. Cancellation: a triggered cancellation token short-circuits the
+        //    loop before any provider round-trip.
+        if options.cancellation.is_cancelled() {
+            return Ok(PreStepDecision::Stop { reason: "cancelled" });
+        }
+        // 3. Step budget: the for-loop bound is the hard ceiling, but we
+        //    surface a stable reason when it is reached so callers reading
+        //    `PreStepDecision` see the same vocabulary the loop uses.
+        if step >= self.max_steps {
+            return Ok(PreStepDecision::Stop { reason: "max_steps" });
+        }
+        // 4. Progress governance: a NoProgress verdict closes the loop. The
+        //    governance method already settles the turn on failure; we only
+        //    need to forward that decision here.
+        self.govern_progress_at_safe_boundary(progress, turn, false)
+            .await?;
+        Ok(PreStepDecision::Continue)
     }
 
     async fn prepare_durable_wait_resume(
@@ -6890,8 +6931,8 @@ mod tests {
     use super::{
         AllowListPolicy, ApprovalHandler, ApprovalWaitStatus, HarnessRuntime, LanguageModel,
         MAX_PENDING_STEERING, MAX_PENDING_STEERING_BYTES, MAX_PROVIDER_EVIDENCE_ID_BYTES,
-        ModelRetryPolicy, ModelRoute, PolicyEngine, ProgressGovernor, ProgressPolicy, Tool,
-        TurnExecutionOptions, TurnExecutionResult, require_runtime_capacity,
+        ModelRetryPolicy, ModelRoute, PolicyEngine, PreStepDecision, ProgressGovernor,
+        ProgressPolicy, Tool, TurnExecutionOptions, TurnExecutionResult, require_runtime_capacity,
         validate_approval_decision, validate_model_request, validate_model_response,
         validate_model_tool_call, validate_model_tool_calls, validate_policy_decision,
         validate_tool_output,
@@ -16079,5 +16120,31 @@ mod tests {
             EventId::generate().as_str(),
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn pre_step_decision_continue_reports_is_continue_true() {
+        let decision = PreStepDecision::Continue;
+        assert!(decision.is_continue());
+    }
+
+    #[test]
+    fn pre_step_decision_stop_reports_is_continue_false() {
+        let decision = PreStepDecision::Stop { reason: "max_steps" };
+        assert!(!decision.is_continue());
+        assert_eq!(decision, PreStepDecision::Stop { reason: "max_steps" });
+    }
+
+    #[test]
+    fn pre_step_decision_stop_carries_machine_readable_reason() {
+        let reasons = ["phase_disposed", "cancelled", "max_steps"];
+        for reason in reasons {
+            let decision = PreStepDecision::Stop { reason };
+            assert!(!decision.is_continue());
+            match decision {
+                PreStepDecision::Stop { reason: r } => assert_eq!(r, reason),
+                PreStepDecision::Continue => panic!("unexpected Continue"),
+            }
+        }
     }
 }
