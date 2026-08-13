@@ -260,6 +260,36 @@ fn agent_loop_wait_projection_schema_sql() -> String {
                 tenant_key, due_at_ms, thread_id, turn_id, wait_id
             )
             WHERE due_at_ms IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS inbox_repair_outbox (
+            op_id           TEXT PRIMARY KEY,
+            wait_id         TEXT NOT NULL,
+            op_kind         TEXT NOT NULL CHECK (op_kind IN ('submit','settle','orphan_close')),
+            payload_json    BLOB NOT NULL,
+            status          TEXT NOT NULL CHECK (status IN ('pending','in_flight','succeeded','exhausted')),
+            attempt_count   INTEGER NOT NULL DEFAULT 0,
+            last_attempt_ms INTEGER,
+            next_attempt_ms INTEGER NOT NULL,
+            last_error      TEXT,
+            created_ms      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_outbox_pending
+            ON inbox_repair_outbox(next_attempt_ms) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS idx_outbox_wait
+            ON inbox_repair_outbox(wait_id);
+
+        CREATE TABLE IF NOT EXISTS inbox_orphan_tombstone (
+            wait_id         TEXT PRIMARY KEY,
+            tombstoned_ms   INTEGER NOT NULL,
+            reason          TEXT NOT NULL CHECK (reason IN ('settled','cancelled','timeout','denied','terminal_failure')),
+            source_revision INTEGER NOT NULL
+        );
+        CREATE VIEW IF NOT EXISTS inbox_retry_age_view AS
+            SELECT op_id, wait_id, op_kind, status, attempt_count,
+                   (CAST((strftime('%s','now')*1000) AS INTEGER) - last_attempt_ms) AS age_ms,
+                   last_error
+            FROM inbox_repair_outbox
+            WHERE status IN ('pending','in_flight');
         "
     )
 }
@@ -1129,12 +1159,32 @@ fn validate_agent_loop_wait_projection(connection: &Connection) -> Result<(), Ha
             "SQLite State store is partial: missing {AGENT_LOOP_WAIT_DUE_INDEX} index"
         )));
     }
+    validate_inbox_repair_tables(connection)?;
     let expected = projected_agent_loop_waits(connection)?;
     let actual = stored_agent_loop_wait_projection(connection)?;
     if actual != expected {
         return Err(HarnessError::State(
             "SQLite State Agent Loop wait projection does not match authoritative lifecycle events"
                 .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_inbox_repair_tables(connection: &Connection) -> Result<(), HarnessError> {
+    if !table_exists(connection, "inbox_repair_outbox")? {
+        return Err(HarnessError::State(
+            "SQLite State store is partial: missing inbox_repair_outbox table".to_owned(),
+        ));
+    }
+    if !table_exists(connection, "inbox_orphan_tombstone")? {
+        return Err(HarnessError::State(
+            "SQLite State store is partial: missing inbox_orphan_tombstone table".to_owned(),
+        ));
+    }
+    if !index_exists(connection, "idx_outbox_pending")? {
+        return Err(HarnessError::State(
+            "SQLite State store is partial: missing idx_outbox_pending index".to_owned(),
         ));
     }
     Ok(())
@@ -1668,7 +1718,8 @@ mod tests {
         BACKUP_MANIFEST_TABLE, STATE_METADATA_TABLE, StateMigrationStatus, migrate_with_stop,
     };
     use crate::{
-        ActorIdentity, AgentLoopCloseCommandId, AgentLoopResumeCommandId, AgentLoopWaitId,
+        ActorIdentity, AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION,
+        AgentLoopCloseCommandId, AgentLoopResumeCommandId, AgentLoopWaitId,
         ApprovalDecision, ApprovalId, ApprovalRecord, ApprovalRecordStatus, ApprovalRequest,
         CapabilityOrigin, Checkpoint, CheckpointId, CompletionAssurance, CompletionGeneration,
         EventId, EventStore, Item, ItemKind, PolicyDecision, RiskLevel, STATE_EVENT_SCHEMA_VERSION,
@@ -2049,7 +2100,10 @@ mod tests {
         assert_eq!(report.from_event_schema, STATE_EVENT_SCHEMA_VERSION);
         assert_eq!(report.to_event_schema, STATE_EVENT_SCHEMA_VERSION);
         assert_eq!(report.from_agent_loop_wait_projection_schema, None);
-        assert_eq!(report.to_agent_loop_wait_projection_schema, 1);
+        assert_eq!(
+            report.to_agent_loop_wait_projection_schema,
+            AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION
+        );
         assert!(backup.is_file());
 
         let snapshot_count: i64 = Connection::open(&source)
@@ -2075,7 +2129,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("projection coordinate");
-        assert_eq!(projection_schema, 1);
+        assert_eq!(
+            projection_schema,
+            i64::from(AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION)
+        );
         cleanup(&source);
         cleanup(&backup);
     }

@@ -58,7 +58,7 @@ use wait_due::{
 /// Current append-only State event schema.
 pub const STATE_EVENT_SCHEMA_VERSION: u32 = 16;
 /// Current transactionally maintained live Agent Loop wait projection layout.
-pub const AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION: u32 = 2;
 // A Runtime text field is bounded at 1 MiB, but JSON control-character
 // escaping can expand each input byte sixfold. Keep the journal envelope above
 // that worst case while retaining an absolute per-event allocation bound.
@@ -1201,6 +1201,34 @@ impl SqliteEventStore {
                             tenant_key, due_at_ms, thread_id, turn_id, wait_id
                         )
                         WHERE due_at_ms IS NOT NULL;
+                    CREATE TABLE IF NOT EXISTS inbox_repair_outbox (
+                        op_id           TEXT PRIMARY KEY,
+                        wait_id         TEXT NOT NULL,
+                        op_kind         TEXT NOT NULL CHECK (op_kind IN ('submit','settle','orphan_close')),
+                        payload_json    BLOB NOT NULL,
+                        status          TEXT NOT NULL CHECK (status IN ('pending','in_flight','succeeded','exhausted')),
+                        attempt_count   INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_ms INTEGER,
+                        next_attempt_ms INTEGER NOT NULL,
+                        last_error      TEXT,
+                        created_ms      INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_outbox_pending
+                        ON inbox_repair_outbox(next_attempt_ms) WHERE status = 'pending';
+                    CREATE INDEX IF NOT EXISTS idx_outbox_wait
+                        ON inbox_repair_outbox(wait_id);
+                    CREATE TABLE IF NOT EXISTS inbox_orphan_tombstone (
+                        wait_id         TEXT PRIMARY KEY,
+                        tombstoned_ms   INTEGER NOT NULL,
+                        reason          TEXT NOT NULL CHECK (reason IN ('settled','cancelled','timeout','denied','terminal_failure')),
+                        source_revision INTEGER NOT NULL
+                    );
+                    CREATE VIEW IF NOT EXISTS inbox_retry_age_view AS
+                        SELECT op_id, wait_id, op_kind, status, attempt_count,
+                               (CAST((strftime('%s','now')*1000) AS INTEGER) - last_attempt_ms) AS age_ms,
+                               last_error
+                        FROM inbox_repair_outbox
+                        WHERE status IN ('pending','in_flight');
                     INSERT OR IGNORE INTO streams (thread_id, version)
                         SELECT thread_id, COUNT(*)
                         FROM events
