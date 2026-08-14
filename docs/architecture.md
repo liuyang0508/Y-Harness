@@ -352,7 +352,9 @@ direction:
   intent before execution, tenant-scopes operation/idempotency identity,
   fences one finite worker attempt, treats lease expiry as `unknown`, and
   requires exact content-free receipt or authoritative reconciliation before
-  retry or terminal settlement;
+  retry or terminal settlement; a database-neutral persistence protocol keeps
+  strict hydration and lifecycle preparation in Core while a host-owned store
+  supplies the atomic unique insert, revision CAS, and bounded ordered query;
 - embedded Governed Effect Executor API 1 with frozen exact-versioned
   Connector descriptors, explicit target/Connector idempotency contracts,
   default-deny pre-Claim Policy, complete pending-page revalidation,

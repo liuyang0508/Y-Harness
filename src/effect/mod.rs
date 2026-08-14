@@ -10,6 +10,7 @@ mod engine;
 mod executor;
 mod governor;
 mod page;
+mod persistence;
 mod reconciler;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -41,6 +42,10 @@ pub use governor::{
     EffectDispatchAdmissionDecision, EffectDispatchAdmissionRequest, EffectDispatchGovernor,
     EffectDispatchGovernorPolicy, EffectDispatchSettlement, MemoryEffectDispatchGovernor,
     SqliteEffectDispatchGovernor,
+};
+pub use persistence::{
+    EffectIdempotencyCoordinate, EffectPersistenceProtocol, EffectPreparedCommand,
+    EffectPreparedCreate, EffectStoredRecord, EffectStoredRecordParts,
 };
 pub use reconciler::{
     AllowListEffectReconciliationPolicy, DenyAllEffectReconciliations,

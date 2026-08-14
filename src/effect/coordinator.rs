@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task};
 
 use super::{
-    Effect, EffectApplyOutcome, EffectCommand, EffectCreateRequest, EffectStatus,
-    MAX_EFFECT_IDENTITY_BYTES, MAX_EFFECT_JSON_BYTES, validate_application_time, validate_identity,
+    Effect, EffectApplyOutcome, EffectCommand, EffectCreateRequest, EffectPersistenceProtocol,
+    EffectStatus, EffectStoredRecord, EffectStoredRecordParts, MAX_EFFECT_IDENTITY_BYTES,
+    MAX_EFFECT_JSON_BYTES, validate_application_time, validate_identity,
 };
 use crate::{
     AuthorityContext, EffectId, EffectLeaseId, HarnessError, HarnessFuture,
@@ -29,11 +30,11 @@ const MAX_EFFECT_CAPABILITY_BYTES: usize = 128;
 /// Immutable revisioned Effect projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EffectSnapshot {
-    id: EffectId,
+    pub(super) id: EffectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tenant_id: Option<String>,
-    revision: u64,
-    effect: Effect,
+    pub(super) tenant_id: Option<String>,
+    pub(super) revision: u64,
+    pub(super) effect: Effect,
 }
 
 impl EffectSnapshot {
@@ -280,14 +281,18 @@ impl EffectCoordinator for MemoryEffectCoordinator {
         authority: &'a AuthorityContext,
     ) -> HarnessFuture<'a, EffectSnapshot> {
         Box::pin(async move {
-            validate_access(&effect_id, authority)?;
-            let proposed = Effect::new(request.clone(), applied_at_ms, authority)?;
+            let prepared = EffectPersistenceProtocol::prepare_create(
+                effect_id.clone(),
+                request.clone(),
+                applied_at_ms,
+                authority,
+            )?;
             let tenant = tenant_storage_key(authority.tenant_id()).to_owned();
             let identity = (tenant.clone(), effect_id.clone());
             let idempotency = idempotency_coordinate(&tenant, &request);
             let mut state = self.state.lock().await;
             if let Some(existing) = state.effects.get(&identity) {
-                if existing.effect.create_matches(&request, authority)? {
+                if EffectPersistenceProtocol::create_matches(existing, &request, authority)? {
                     return Ok(existing.clone());
                 }
                 return Err(HarnessError::Effect(format!(
@@ -303,7 +308,7 @@ impl EffectCoordinator for MemoryEffectCoordinator {
                             "Effect idempotency index points to missing state".to_owned(),
                         )
                     })?;
-                if existing.effect.create_matches(&request, authority)? {
+                if EffectPersistenceProtocol::create_matches(existing, &request, authority)? {
                     return Ok(existing.clone());
                 }
                 return Err(HarnessError::Effect(
@@ -311,12 +316,7 @@ impl EffectCoordinator for MemoryEffectCoordinator {
                         .to_owned(),
                 ));
             }
-            let snapshot = EffectSnapshot {
-                id: effect_id.clone(),
-                tenant_id: authority.tenant_id().map(str::to_owned),
-                revision: 1,
-                effect: proposed,
-            };
+            let snapshot = prepared.into_committed_snapshot();
             state.idempotency.insert(idempotency, effect_id);
             state.effects.insert(identity, snapshot.clone());
             Ok(snapshot)
@@ -415,33 +415,17 @@ impl EffectCoordinator for MemoryEffectCoordinator {
                 .get(&key)
                 .cloned()
                 .ok_or_else(|| missing_effect(effect_id))?;
-            if current.effect.recognizes_command(&command, authority)? {
-                return Ok(EffectCommandResult {
-                    snapshot: current,
-                    outcome: EffectApplyOutcome::Duplicate,
-                });
+            let prepared = EffectPersistenceProtocol::prepare_command(
+                &current,
+                expected_revision,
+                command,
+                applied_at_ms,
+                authority,
+            )?;
+            if prepared.changes_record() {
+                state.effects.insert(key, prepared.snapshot().clone());
             }
-            if current.revision != expected_revision {
-                return Err(HarnessError::EffectConflict {
-                    effect_id: effect_id.clone(),
-                    expected: expected_revision,
-                    actual: current.revision,
-                });
-            }
-            let mut effect = current.effect.clone();
-            let outcome = effect.apply(command, applied_at_ms, authority)?;
-            let revision = current
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| HarnessError::Effect("Effect revision overflow".to_owned()))?;
-            let snapshot = EffectSnapshot {
-                id: effect_id.clone(),
-                tenant_id: current.tenant_id,
-                revision,
-                effect,
-            };
-            state.effects.insert(key, snapshot.clone());
-            Ok(EffectCommandResult { snapshot, outcome })
+            Ok(prepared.into_committed_result())
         })
     }
 }
@@ -494,8 +478,12 @@ impl EffectCoordinator for SqliteEffectCoordinator {
         let connection = self.connection.clone();
         let authority = authority.clone();
         Box::pin(async move {
-            validate_access(&effect_id, &authority)?;
-            let effect = Effect::new(request.clone(), applied_at_ms, &authority)?;
+            let prepared = EffectPersistenceProtocol::prepare_create(
+                effect_id.clone(),
+                request.clone(),
+                applied_at_ms,
+                &authority,
+            )?;
             task::spawn_blocking(move || {
                 let mut connection = connection
                     .lock()
@@ -506,7 +494,7 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                 if let Some(existing) =
                     load_snapshot(&transaction, &effect_id, authority.tenant_id())?
                 {
-                    if existing.effect.create_matches(&request, &authority)? {
+                    if EffectPersistenceProtocol::create_matches(&existing, &request, &authority)? {
                         transaction.commit().map_err(sql_error)?;
                         return Ok(existing);
                     }
@@ -517,7 +505,7 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                 if let Some(existing) =
                     load_by_idempotency(&transaction, authority.tenant_id(), &request)?
                 {
-                    if existing.effect.create_matches(&request, &authority)? {
+                    if EffectPersistenceProtocol::create_matches(&existing, &request, &authority)? {
                         transaction.commit().map_err(sql_error)?;
                         return Ok(existing);
                     }
@@ -526,7 +514,7 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                             .to_owned(),
                     ));
                 }
-                let encoded = encode_effect(&effect)?;
+                let record = prepared.record();
                 let changed = transaction
                     .execute(
                         "INSERT INTO effects
@@ -535,14 +523,14 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                          VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             tenant_storage_key(authority.tenant_id()),
-                            effect_id.as_str(),
-                            EFFECT_LEDGER_SCHEMA_VERSION,
-                            effect.operation().capability,
-                            effect.operation().operation,
-                            effect.idempotency_key(),
-                            sql_time(effect.created_at_ms())?,
-                            status_name(effect.status()),
-                            encoded
+                            record.effect_id(),
+                            record.schema_version(),
+                            record.capability(),
+                            record.operation(),
+                            record.idempotency_key(),
+                            sql_time(record.created_at_ms())?,
+                            record.status(),
+                            record.effect_json()
                         ],
                     )
                     .map_err(sql_error)?;
@@ -552,12 +540,7 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                     ));
                 }
                 transaction.commit().map_err(sql_error)?;
-                Ok(EffectSnapshot {
-                    id: effect_id,
-                    tenant_id: authority.tenant_id().map(str::to_owned),
-                    revision: 1,
-                    effect,
-                })
+                Ok(prepared.into_committed_snapshot())
             })
             .await
             .map_err(|error| {
@@ -735,36 +718,27 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                     .map_err(sql_error)?;
                 let current = load_snapshot(&transaction, &effect_id, authority.tenant_id())?
                     .ok_or_else(|| missing_effect(&effect_id))?;
-                if current.effect.recognizes_command(&command, &authority)? {
+                let prepared = EffectPersistenceProtocol::prepare_command(
+                    &current,
+                    expected_revision,
+                    command,
+                    applied_at_ms,
+                    &authority,
+                )?;
+                if !prepared.changes_record() {
                     transaction.commit().map_err(sql_error)?;
-                    return Ok(EffectCommandResult {
-                        snapshot: current,
-                        outcome: EffectApplyOutcome::Duplicate,
-                    });
+                    return Ok(prepared.into_committed_result());
                 }
-                if current.revision != expected_revision {
-                    return Err(HarnessError::EffectConflict {
-                        effect_id,
-                        expected: expected_revision,
-                        actual: current.revision,
-                    });
-                }
-                let mut effect = current.effect.clone();
-                let outcome = effect.apply(command, applied_at_ms, &authority)?;
-                let revision = current
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| HarnessError::Effect("Effect revision overflow".to_owned()))?;
-                let encoded = encode_effect(&effect)?;
+                let record = prepared.record();
                 let changed = transaction
                     .execute(
                         "UPDATE effects
                          SET revision = ?1, status = ?2, effect_json = ?3
                          WHERE tenant_id = ?4 AND effect_id = ?5 AND revision = ?6",
                         params![
-                            sql_revision(revision)?,
-                            status_name(effect.status()),
-                            encoded,
+                            sql_revision(record.revision())?,
+                            record.status(),
+                            record.effect_json(),
                             tenant_storage_key(authority.tenant_id()),
                             effect_id.as_str(),
                             sql_revision(current.revision)?
@@ -777,15 +751,7 @@ impl EffectCoordinator for SqliteEffectCoordinator {
                     ));
                 }
                 transaction.commit().map_err(sql_error)?;
-                Ok(EffectCommandResult {
-                    snapshot: EffectSnapshot {
-                        id: effect_id,
-                        tenant_id: current.tenant_id,
-                        revision,
-                        effect,
-                    },
-                    outcome,
-                })
+                Ok(prepared.into_committed_result())
             })
             .await
             .map_err(|error| HarnessError::Effect(format!("Effect command task failed: {error}")))?
@@ -1021,52 +987,26 @@ fn decode_row(tenant_id: Option<&str>, row: EffectRow) -> Result<EffectSnapshot,
         status,
         encoded,
     ) = row;
-    let effect_id = EffectId::from_string(effect_id);
-    if schema != i64::from(EFFECT_LEDGER_SCHEMA_VERSION) {
-        return Err(HarnessError::Effect(format!(
-            "Effect {effect_id} uses unsupported schema {schema}"
-        )));
-    }
+    let schema_version = u32::try_from(schema)
+        .map_err(|_| HarnessError::Effect("invalid Effect schema version".to_owned()))?;
     let revision = u64::try_from(revision)
         .map_err(|_| HarnessError::Effect("invalid Effect revision".to_owned()))?;
     validate_expected_revision(revision)?;
     let created_at_ms = u64::try_from(created_at_ms)
         .map_err(|_| HarnessError::Effect("invalid Effect creation time".to_owned()))?;
-    let effect: Effect = serde_json::from_str(&encoded)
-        .map_err(|error| HarnessError::Effect(format!("decode Effect: {error}")))?;
-    effect.validate()?;
-    let transition_count = u64::try_from(effect.transition_count())
-        .map_err(|_| HarnessError::Effect("Effect transition count overflow".to_owned()))?;
-    if revision != transition_count
-        || effect.tenant_id() != tenant_id
-        || effect.operation().capability != capability
-        || effect.operation().operation != operation
-        || effect.idempotency_key() != idempotency_key
-        || effect.created_at_ms() != created_at_ms
-        || status_name(effect.status()) != status
-    {
-        return Err(HarnessError::Effect(
-            "Effect SQLite projection differs from aggregate".to_owned(),
-        ));
-    }
-    Ok(EffectSnapshot {
-        id: effect_id,
-        tenant_id: tenant_id.map(str::to_owned),
+    let record = EffectStoredRecord::try_from_parts(EffectStoredRecordParts {
+        schema_version,
+        effect_id,
+        tenant_storage_key: tenant_storage_key(tenant_id).to_owned(),
         revision,
-        effect,
-    })
-}
-
-fn encode_effect(effect: &Effect) -> Result<String, HarnessError> {
-    effect.validate()?;
-    let encoded = serde_json::to_string(effect)
-        .map_err(|_| HarnessError::Effect("cannot encode Effect".to_owned()))?;
-    if encoded.len() > MAX_EFFECT_JSON_BYTES {
-        return Err(HarnessError::Effect(format!(
-            "Effect exceeds {MAX_EFFECT_JSON_BYTES} encoded bytes"
-        )));
-    }
-    Ok(encoded)
+        capability,
+        operation,
+        idempotency_key,
+        created_at_ms,
+        status,
+        effect_json: encoded,
+    })?;
+    EffectPersistenceProtocol::restore_in_scope(record, tenant_id)
 }
 
 fn validate_access(effect_id: &EffectId, authority: &AuthorityContext) -> Result<(), HarnessError> {
@@ -1076,7 +1016,7 @@ fn validate_access(effect_id: &EffectId, authority: &AuthorityContext) -> Result
     validate_identity("Effect", effect_id.as_str())
 }
 
-fn validate_list(
+pub(super) fn validate_list(
     status: Option<&str>,
     after: Option<&EffectPageCursor>,
     limit: usize,
@@ -1099,7 +1039,7 @@ fn validate_list(
     Ok(())
 }
 
-fn validate_due_scan(
+pub(super) fn validate_due_scan(
     at_ms: u64,
     after_effect_id: Option<&EffectId>,
     scan_limit: usize,
@@ -1143,7 +1083,10 @@ fn validate_status_filter(status: &str) -> Result<(), HarnessError> {
     }
 }
 
-fn page_from_candidates(mut candidates: Vec<EffectSnapshot>, limit: usize) -> EffectPage {
+pub(super) fn page_from_candidates(
+    mut candidates: Vec<EffectSnapshot>,
+    limit: usize,
+) -> EffectPage {
     let has_more = candidates.len() > limit;
     candidates.truncate(limit);
     let next_cursor = candidates.last().map(|snapshot| EffectPageCursor {
@@ -1156,7 +1099,7 @@ fn page_from_candidates(mut candidates: Vec<EffectSnapshot>, limit: usize) -> Ef
     }
 }
 
-fn due_page_from_scan(
+pub(super) fn due_page_from_scan(
     visited: &mut Vec<EffectSnapshot>,
     scan_limit: usize,
     at_ms: u64,

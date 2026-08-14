@@ -415,6 +415,13 @@ Coordinators share exact idempotency uniqueness, tenant fencing, bounded
 identity paging, and expired-lease scans. Effect schema 1 is a new independent
 store with no inferred migration or mixed-version writer support.
 
+The additive embedded `EffectPersistenceProtocol` reuses the same schema-1
+aggregate and lifecycle rules for host-owned transactional stores. It does not
+change Protocol 29 or authorize non-atomic adapters: the host must provide the
+unique create transaction, revision CAS, non-null tenant partition, bytewise
+ordered bounded queries, and trusted time. See
+[ADR 0160](adr/0160-portable-effect-persistence-protocol.md).
+
 Temporal Driver API 3 additively composes optional Effect and State Engines. It scans
 the same bounded tenant-local identity space and applies only the existing
 `expire_lease`, Agent Loop timeout, or denial-convergence command after complete

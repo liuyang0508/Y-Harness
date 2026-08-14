@@ -1142,6 +1142,14 @@ actor-bound idempotency, exact claim ownership, and bounded queue/transition
 paging. Protocol 29 adds an optional schema-1 Effect Ledger with
 tenant-scoped idempotency uniqueness, finite worker leases, fail-closed
 unknown outcomes, explicit reconciliation, and content-free external receipts.
+Embedded hosts that own another transactional database can reuse the
+database-neutral `EffectPersistenceProtocol` for bounded records, strict
+hydration, exact replay, command preparation, paging, and due-lease derivation
+without copying the Effect state machine. The host remains responsible for its
+atomic unique insert, revision CAS, trusted time, migrations, and operations;
+the tenant partition is non-null (empty means unscoped), paging uses stable
+bytewise order, and a prepared candidate is not proof of persistence. See
+[ADR 0160](docs/adr/0160-portable-effect-persistence-protocol.md).
 Protocol 30 advertises Secret Provider API 3 and its typed Turn, Effect, and
 service use contexts; it adds no Secret-bearing client command or durable
 schema. Protocol 31 advertises Task Graph schema 4 and its bounded immutable
