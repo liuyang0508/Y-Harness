@@ -4,6 +4,10 @@
 //! `BEGIN IMMEDIATE` transactions in the fixed Task-store then Workflow-store
 //! order. The caller receives only validated snapshots and domain-separated
 //! digests; table names, columns, connections, and transactions stay private.
+//! The guard is valid only inside the controlled-local immutable namespace
+//! lifecycle documented by both SQLite Coordinators. Same-file checks detect
+//! aliases and observable replacement; they are not a durable store UUID and
+//! do not make hot replacement safe.
 
 use std::{sync::mpsc, time::Duration};
 
@@ -107,6 +111,8 @@ impl std::fmt::Debug for GuardedWorkflowRunCurrent {
 /// The owning blocking task retains both database write reservations until
 /// [`Self::release`] or `Drop`. Callers must keep this scope short and must not
 /// perform network, model, Tool, or other unbounded work while it is held.
+/// The database, `-wal`, and `-shm` paths must not be renamed, unlinked, or
+/// replaced from before Coordinator open until all Coordinators and guards drop.
 pub struct SqliteTaskWorkflowCurrentGuard {
     task_graph: GuardedTaskGraphCurrent,
     workflow_run: GuardedWorkflowRunCurrent,
@@ -116,6 +122,11 @@ pub struct SqliteTaskWorkflowCurrentGuard {
 
 impl SqliteTaskWorkflowCurrentGuard {
     /// Acquires exact current records under one authority in fixed Task→Workflow order.
+    ///
+    /// Only controlled local filesystems whose writer locking is provided by
+    /// SQLite are supported. Memory stores, same-file aliases, and observable
+    /// path replacement fail closed. Uncontrolled same-permission processes and
+    /// hot replacement remain outside the supported authority model.
     pub async fn acquire_as(
         tasks: &SqliteTaskCoordinator,
         graph_id: &TaskGraphId,
@@ -354,7 +365,7 @@ fn is_lock_contention(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Cross-platform physical identities reject path, symlink, and hard-link aliases.
+/// Same-file handles reject path, symlink, and hard-link aliases within the lifecycle.
 fn same_store(task_store: &SqliteStoreIdentity, workflow_store: &SqliteStoreIdentity) -> bool {
     task_store == workflow_store
 }

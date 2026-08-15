@@ -389,6 +389,12 @@ impl SqliteWorkflowCoordinator {
     }
 
     /// Opens or creates a schema-1 Workflow store with durable WAL settings.
+    ///
+    /// From before this call until every Coordinator and current guard for the
+    /// store is dropped, the database path and its `-wal`/`-shm` sidecars must
+    /// remain in one immutable local-filesystem namespace. Renaming, unlinking,
+    /// replacing, or hot-swapping those paths is unsupported, as is an
+    /// uncontrolled same-permission process that can bypass this lifecycle.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, HarnessError> {
         let path = path.as_ref().to_owned();
         let connection = task::spawn_blocking(move || {

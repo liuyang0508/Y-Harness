@@ -191,6 +191,13 @@ Turn、路由 IM、唤醒对话或执行业务操作。库级 Temporal Driver �
 租约到期只进入 `unknown`，绝不自动重试。Reference
 Service 默认仍不轮询；需要宿主承担时间与生命周期时，显式加入：
 
+SQLite 部署采用受控本地、不可变命名空间契约：从任一 Coordinator 打开前，
+直到引用同一库的所有 Coordinator 与 caller-held guard 全部释放，数据库主文件
+及其 `-wal`／`-shm` 旁路文件都不得重命名、删除、替换或热切换。只支持 SQLite
+锁语义可靠的本地文件系统；不得让不受控的同权限进程绕过该生命周期修改这些路径。
+运行时 same-file 检查只能在此契约内拒绝可观察的替换与别名，不是持久 store UUID，
+也不能把契约外的路径 ABA、共享网络文件系统或热替换变成安全能力。
+
 ```json
 {
   "temporal": {

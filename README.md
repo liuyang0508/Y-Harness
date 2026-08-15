@@ -83,6 +83,17 @@ persists State, approvals, Task coordination, Workflow Runs, and Human
 Handoffs, and durable external Effects under `.y-harness/`. A
 language-neutral Task Worker example is included:
 
+All file-backed SQLite adapters use a controlled-local, immutable namespace
+lifecycle. From before the first Coordinator opens a store until every
+Coordinator and caller-held guard for it has been dropped, the database path
+and its `-wal`/`-shm` sidecars must not be renamed, unlinked, replaced, or hot
+swapped. Deploy only on a local filesystem whose writer locking is supported by
+SQLite, and do not grant an uncontrolled same-permission process authority to
+mutate those paths. Runtime same-file checks reject observable replacement and
+aliases within this contract; they are not a durable store UUID, do not close a
+path-replacement ABA outside the contract, and do not make hot replacement or
+shared-network-filesystem coordination safe.
+
 ```bash
 YH_BIN="$(command -v yh)" \
 python3 /path/to/Y-Harness/examples/task_worker_client.py y-harness.json

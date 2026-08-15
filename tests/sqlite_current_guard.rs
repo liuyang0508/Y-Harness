@@ -410,6 +410,45 @@ async fn pair_guard_rejects_foreign_coordinates_and_has_one_lock_order() {
     drop(same_tasks);
     drop(same_workflows);
     remove_database_files(&same_path);
+
+    assert!(
+        SqliteTaskCoordinator::open(":memory:").await.is_err(),
+        "memory Task stores must fail closed before guard acquisition"
+    );
+    assert!(
+        SqliteWorkflowCoordinator::open(":memory:").await.is_err(),
+        "memory Workflow stores must fail closed before guard acquisition"
+    );
+
+    let displaced = fixture.task_path.with_extension("displaced.db");
+    if std::fs::rename(&fixture.task_path, &displaced).is_ok() {
+        std::fs::write(&fixture.task_path, b"replacement").expect("write replacement path");
+        let replacement = timeout(
+            Duration::from_secs(1),
+            SqliteTaskWorkflowCurrentGuard::acquire_as(
+                &fixture.tasks,
+                &fixture.graph_id,
+                &fixture.workflows,
+                &fixture.run_id,
+                &fixture.authority,
+            ),
+        )
+        .await
+        .expect("replacement rejection must be bounded");
+        assert!(
+            replacement.is_err(),
+            "observable replacement must fail closed"
+        );
+        std::fs::remove_file(&fixture.task_path).expect("remove replacement path");
+        std::fs::rename(&displaced, &fixture.task_path).expect("restore fixture path");
+    }
+
+    let readme = include_str!("../README.md");
+    let quickstart = include_str!("../docs/quickstart.zh-CN.md");
+    assert!(readme.contains("immutable namespace"));
+    assert!(readme.contains("durable store UUID"));
+    assert!(quickstart.contains("不可变命名空间契约"));
+    assert!(quickstart.contains("路径 ABA"));
     fixture.remove_files();
 }
 

@@ -6,12 +6,16 @@ use rusqlite::{Connection, OpenFlags, Row, types::Type};
 use same_file::Handle;
 use sha2::{Digest, Sha256};
 
-/// Stable identity of the file already opened by one SQLite Coordinator.
+/// Process-lifetime same-file token inside an immutable namespace lifecycle.
+///
+/// This is not a durable store UUID and cannot authorize path replacement or
+/// hot swapping. Operators must keep the database namespace unchanged while
+/// every Coordinator and guard is alive.
 #[derive(Debug)]
 pub(crate) struct SqliteStoreIdentity {
     /// Canonical path used only to reopen the same existing file.
     path: PathBuf,
-    /// Cross-platform physical file handle retained for exact equality checks.
+    /// Cross-platform same-file handle retained for alias comparison.
     handle: Handle,
 }
 
@@ -24,7 +28,7 @@ impl PartialEq for SqliteStoreIdentity {
 }
 
 impl SqliteStoreIdentity {
-    /// Captures a canonical file identity, rejecting memory and temporary stores.
+    /// Captures a same-file token, rejecting memory and temporary stores.
     pub(crate) fn capture(path: &Path) -> Option<Self> {
         let path = std::fs::canonicalize(path).ok()?;
         let handle = Handle::from_path(&path).ok()?;
@@ -36,7 +40,7 @@ impl SqliteStoreIdentity {
         &self.path
     }
 
-    /// Revalidates that the path still names the exact file opened originally.
+    /// Best-effort rejects a path that no longer names the originally opened file.
     pub(crate) fn is_current(&self) -> bool {
         Handle::from_path(&self.path).is_ok_and(|handle| handle == self.handle)
     }
