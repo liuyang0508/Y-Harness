@@ -1,8 +1,74 @@
 //! Shared guards for values crossing the SQLite allocation boundary.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, Row, types::Type};
+use same_file::Handle;
+use sha2::{Digest, Sha256};
+
+/// Stable identity of the file already opened by one SQLite Coordinator.
+#[derive(Debug)]
+pub(crate) struct SqliteStoreIdentity {
+    /// Canonical path used only to reopen the same existing file.
+    path: PathBuf,
+    /// Cross-platform physical file handle retained for exact equality checks.
+    handle: Handle,
+}
+
+impl Eq for SqliteStoreIdentity {}
+
+impl PartialEq for SqliteStoreIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
+}
+
+impl SqliteStoreIdentity {
+    /// Captures a canonical file identity, rejecting memory and temporary stores.
+    pub(crate) fn capture(path: &Path) -> Option<Self> {
+        let path = std::fs::canonicalize(path).ok()?;
+        let handle = Handle::from_path(&path).ok()?;
+        Some(Self { path, handle })
+    }
+
+    /// Returns the private canonical path for a dedicated guard connection.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Revalidates that the path still names the exact file opened originally.
+    pub(crate) fn is_current(&self) -> bool {
+        Handle::from_path(&self.path).is_ok_and(|handle| handle == self.handle)
+    }
+}
+
+/// Builds one domain-separated digest over exact SQLite current-row bytes.
+///
+/// Length framing prevents adjacent identity and body fields from being
+/// spliced into an equivalent byte stream. Callers must validate the row and
+/// schema version before treating this digest as current evidence.
+pub(crate) fn current_row_digest(
+    domain: &[u8],
+    tenant_id: Option<&str>,
+    record_id: &str,
+    schema_version: u32,
+    revision: u64,
+    body: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in [
+        domain,
+        tenant_id.unwrap_or("").as_bytes(),
+        record_id.as_bytes(),
+        &schema_version.to_be_bytes(),
+        &revision.to_be_bytes(),
+        body,
+    ] {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
 
 /// Opens an existing SQLite database without create or write authority.
 pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {

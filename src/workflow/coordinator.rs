@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     AuthorityContext, HarnessError, HarnessFuture, WorkflowRunId, WorkflowWaitId,
-    sqlite::{bounded_text, open_read_only},
+    sqlite::{SqliteStoreIdentity, bounded_text, open_read_only},
 };
 
 /// Current durable Workflow Run schema.
@@ -364,6 +364,7 @@ impl WorkflowCoordinator for MemoryWorkflowCoordinator {
 /// SQLite Workflow Coordinator using one immediate transaction per mutation.
 pub struct SqliteWorkflowCoordinator {
     connection: Arc<StdMutex<Connection>>,
+    current_guard_store: Option<Arc<SqliteStoreIdentity>>,
 }
 
 impl SqliteWorkflowCoordinator {
@@ -397,16 +398,46 @@ impl SqliteWorkflowCoordinator {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| HarnessError::Workflow(error.to_string()))?;
             }
-            let mut connection = Connection::open(path)
+            let mut connection = Connection::open(&path)
                 .map_err(|error| HarnessError::Workflow(error.to_string()))?;
             configure_connection(&connection)?;
             initialize_or_validate(&mut connection)?;
-            Ok::<_, HarnessError>(connection)
+            let current_guard_store = SqliteStoreIdentity::capture(&path).map(Arc::new);
+            Ok::<_, HarnessError>((connection, current_guard_store))
         })
         .await
         .map_err(|error| HarnessError::Workflow(format!("Workflow open task failed: {error}")))??;
+        let (connection, current_guard_store) = connection;
         Ok(Self {
             connection: Arc::new(StdMutex::new(connection)),
+            current_guard_store,
+        })
+    }
+
+    /// Returns the canonical on-disk store identity for the paired current guard.
+    pub(crate) fn current_guard_store(&self) -> Option<Arc<SqliteStoreIdentity>> {
+        self.current_guard_store.clone()
+    }
+
+    /// Strictly hydrates one exact Workflow Run current row for the paired guard.
+    pub(crate) fn load_current_for_guard(
+        connection: &Connection,
+        run_id: &WorkflowRunId,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<(WorkflowRunSnapshot, [u8; 32])>, HarnessError> {
+        validate_identity("Workflow Run", run_id.as_str())?;
+        load_stored_snapshot(connection, run_id, tenant_id).map(|stored| {
+            stored.map(|stored| {
+                let digest = crate::sqlite::current_row_digest(
+                    b"y-harness:sqlite-workflow-run-current:v1",
+                    tenant_id,
+                    run_id.as_str(),
+                    WORKFLOW_RUN_SCHEMA_VERSION,
+                    stored.snapshot.revision,
+                    stored.encoded.as_bytes(),
+                );
+                (stored.snapshot, digest)
+            })
         })
     }
 }
@@ -754,11 +785,20 @@ fn validate_store(connection: &Connection) -> Result<(), HarnessError> {
     Ok(())
 }
 
-fn load_snapshot(
+/// Exact persisted Workflow Run row retained long enough to bind its raw bytes.
+struct StoredWorkflowRunSnapshot {
+    /// Strictly decoded aggregate snapshot.
+    snapshot: WorkflowRunSnapshot,
+    /// Exact stored JSON bytes used by the current digest.
+    encoded: String,
+}
+
+/// Loads and validates one exact Workflow Run row without exposing its schema.
+fn load_stored_snapshot(
     connection: &Connection,
     run_id: &WorkflowRunId,
     tenant_id: Option<&str>,
-) -> Result<Option<WorkflowRunSnapshot>, HarnessError> {
+) -> Result<Option<StoredWorkflowRunSnapshot>, HarnessError> {
     let row = connection
         .query_row(
             "SELECT schema_version, revision,
@@ -778,7 +818,24 @@ fn load_snapshot(
     let Some((schema_version, revision, encoded)) = row else {
         return Ok(None);
     };
-    decode_snapshot(run_id.clone(), tenant_id, schema_version, revision, encoded).map(Some)
+    let snapshot = decode_snapshot(
+        run_id.clone(),
+        tenant_id,
+        schema_version,
+        revision,
+        encoded.clone(),
+    )?;
+    Ok(Some(StoredWorkflowRunSnapshot { snapshot, encoded }))
+}
+
+/// Loads one strict Workflow snapshot for existing Coordinator operations.
+fn load_snapshot(
+    connection: &Connection,
+    run_id: &WorkflowRunId,
+    tenant_id: Option<&str>,
+) -> Result<Option<WorkflowRunSnapshot>, HarnessError> {
+    load_stored_snapshot(connection, run_id, tenant_id)
+        .map(|stored| stored.map(|stored| stored.snapshot))
 }
 
 fn decode_snapshot(

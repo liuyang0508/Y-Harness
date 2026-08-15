@@ -26,6 +26,7 @@ mod runtime;
 mod secret;
 mod skill;
 mod sqlite;
+mod sqlite_current_guard;
 mod state;
 mod temporal;
 mod transport;
@@ -202,6 +203,10 @@ pub use skill::{
     SkillDependency, SkillEngine, SkillId, SkillKeyRevocation, SkillManifest, SkillPackage,
     SkillPublisherPolicy, SkillRegistry, SkillSignature, SkillTransparencyReceipt,
     SkillTransparencyRequirement, SkillTrustStore, VerifiedSkillTransparency,
+};
+pub use sqlite_current_guard::{
+    GuardedTaskGraphCurrent, GuardedWorkflowRunCurrent, SqliteCurrentDigest,
+    SqliteTaskWorkflowCurrentGuard,
 };
 pub use state::{
     AGENT_LOOP_WAIT_PROJECTION_SCHEMA_VERSION, AgentLoopDueCursor, AgentLoopDuePhase,

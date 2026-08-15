@@ -14,7 +14,7 @@ use tokio::{sync::Mutex, task};
 use super::{MAX_TASK_GRAPH_JSON_BYTES, TaskGraph};
 use crate::{
     AuthorityContext, HarnessError, HarnessFuture, TaskGraphId,
-    sqlite::{bounded_text, open_read_only},
+    sqlite::{SqliteStoreIdentity, bounded_text, open_read_only},
 };
 
 /// Current durable Task Coordinator graph schema.
@@ -231,6 +231,7 @@ impl TaskCoordinator for MemoryTaskCoordinator {
 /// SQLite coordinator using one transaction per graph creation or CAS.
 pub struct SqliteTaskCoordinator {
     connection: Arc<StdMutex<Connection>>,
+    current_guard_store: Option<Arc<SqliteStoreIdentity>>,
 }
 
 impl SqliteTaskCoordinator {
@@ -268,7 +269,7 @@ impl SqliteTaskCoordinator {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
             }
-            let connection = Connection::open(path)
+            let connection = Connection::open(&path)
                 .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
             connection
                 .busy_timeout(Duration::from_secs(5))
@@ -298,7 +299,8 @@ impl SqliteTaskCoordinator {
                 )
                 .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
             validate_current_table(&connection)?;
-            Ok(connection)
+            let current_guard_store = SqliteStoreIdentity::capture(&path).map(Arc::new);
+            Ok((connection, current_guard_store))
         })
         .await
         .map_err(|error| {
@@ -306,8 +308,10 @@ impl SqliteTaskCoordinator {
                 "SQLite coordinator initialization task failed: {error}"
             ))
         })??;
+        let (connection, current_guard_store) = connection;
         Ok(Self {
             connection: Arc::new(StdMutex::new(connection)),
+            current_guard_store,
         })
     }
 
@@ -327,6 +331,33 @@ impl SqliteTaskCoordinator {
         .map_err(|error| {
             HarnessError::Orchestration(format!("SQLite coordinator task failed: {error}"))
         })?
+    }
+
+    /// Returns the canonical on-disk store identity for the paired current guard.
+    pub(crate) fn current_guard_store(&self) -> Option<Arc<SqliteStoreIdentity>> {
+        self.current_guard_store.clone()
+    }
+
+    /// Strictly hydrates one exact Task Graph current row for the paired guard.
+    pub(crate) fn load_current_for_guard(
+        connection: &Connection,
+        graph_id: &TaskGraphId,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<(TaskGraphSnapshot, [u8; 32])>, HarnessError> {
+        validate_graph_id(graph_id)?;
+        load_stored_snapshot(connection, graph_id, tenant_id).map(|stored| {
+            stored.map(|stored| {
+                let digest = crate::sqlite::current_row_digest(
+                    b"y-harness:sqlite-task-graph-current:v1",
+                    tenant_id,
+                    graph_id.as_str(),
+                    TASK_GRAPH_SCHEMA_VERSION,
+                    stored.snapshot.revision,
+                    stored.encoded.as_bytes(),
+                );
+                (stored.snapshot, digest)
+            })
+        })
     }
 }
 
@@ -384,47 +415,13 @@ impl TaskCoordinator for SqliteTaskCoordinator {
             authority.validate_current("Task Coordinator authority")?;
             validate_graph_id(graph_id)?;
             let requested_id = graph_id.clone();
-            let requested_tenant = tenant_storage_key(authority.tenant_id()).to_owned();
+            let tenant_id = authority.tenant_id().map(str::to_owned);
             let loaded = self
                 .with_connection(move |connection| {
-                    connection
-                        .query_row(
-                            "SELECT length(CAST(tenant_id AS BLOB)), tenant_id,
-                                    schema_version, revision,
-                                    length(CAST(graph_json AS BLOB)), graph_json
-                             FROM task_graphs
-                             WHERE tenant_id = ?1 AND graph_id = ?2",
-                            params![requested_tenant, requested_id.as_str()],
-                            |row| {
-                                Ok((
-                                    bounded_text(row, 0, 1, 256, "stored Task tenant")?,
-                                    row.get::<_, i64>(2)?,
-                                    row.get::<_, i64>(3)?,
-                                    bounded_text(
-                                        row,
-                                        4,
-                                        5,
-                                        MAX_TASK_GRAPH_JSON_BYTES,
-                                        "stored Task Graph snapshot",
-                                    )?,
-                                ))
-                            },
-                        )
-                        .optional()
-                        .map_err(|error| HarnessError::Orchestration(error.to_string()))
+                    load_stored_snapshot(connection, &requested_id, tenant_id.as_deref())
                 })
                 .await?;
-            loaded
-                .map(|(stored_tenant, schema_version, revision, graph_json)| {
-                    decode_snapshot(
-                        graph_id.clone(),
-                        &stored_tenant,
-                        schema_version,
-                        revision,
-                        &graph_json,
-                    )
-                })
-                .transpose()
+            Ok(loaded.map(|stored| stored.snapshot))
         })
     }
 
@@ -559,6 +556,58 @@ pub(super) fn encode_graph(
         )));
     }
     Ok(json)
+}
+
+/// Exact persisted Task Graph row retained long enough to bind its raw bytes.
+struct StoredTaskGraphSnapshot {
+    /// Strictly decoded aggregate snapshot.
+    snapshot: TaskGraphSnapshot,
+    /// Exact stored JSON bytes used by the current digest.
+    encoded: String,
+}
+
+/// Loads and validates one exact Task Graph row without exposing its schema.
+fn load_stored_snapshot(
+    connection: &Connection,
+    graph_id: &TaskGraphId,
+    tenant_id: Option<&str>,
+) -> Result<Option<StoredTaskGraphSnapshot>, HarnessError> {
+    let loaded = connection
+        .query_row(
+            "SELECT length(CAST(tenant_id AS BLOB)), tenant_id,
+                    schema_version, revision,
+                    length(CAST(graph_json AS BLOB)), graph_json
+             FROM task_graphs
+             WHERE tenant_id = ?1 AND graph_id = ?2",
+            params![tenant_storage_key(tenant_id), graph_id.as_str()],
+            |row| {
+                Ok((
+                    bounded_text(row, 0, 1, 256, "stored Task tenant")?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    bounded_text(
+                        row,
+                        4,
+                        5,
+                        MAX_TASK_GRAPH_JSON_BYTES,
+                        "stored Task Graph snapshot",
+                    )?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| HarnessError::Orchestration(error.to_string()))?;
+    let Some((stored_tenant, schema_version, revision, encoded)) = loaded else {
+        return Ok(None);
+    };
+    let snapshot = decode_snapshot(
+        graph_id.clone(),
+        &stored_tenant,
+        schema_version,
+        revision,
+        &encoded,
+    )?;
+    Ok(Some(StoredTaskGraphSnapshot { snapshot, encoded }))
 }
 
 pub(super) fn decode_snapshot(
